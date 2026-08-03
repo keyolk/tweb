@@ -1182,17 +1182,13 @@ function handleNativeShortcut(tab, action, value) {
       break;
     case "native-hover":
       if ([value?.x, value?.y].every(Number.isFinite)) {
-        contents.sendInputEvent({
-          type: "mouseMove",
-          x: Math.max(0, Math.round(value.x)),
-          y: Math.max(0, Math.round(value.y)),
-        });
+        const { x, y } = pageToWindowPoint(contents, value);
+        contents.sendInputEvent({ type: "mouseMove", x, y });
       }
       break;
     case "native-click":
       if ([value?.x, value?.y].every(Number.isFinite)) {
-        const x = Math.max(0, Math.round(value.x));
-        const y = Math.max(0, Math.round(value.y));
+        const { x, y } = pageToWindowPoint(contents, value);
         contents.sendInputEvent({ type: "mouseMove", x, y });
         contents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
         contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
@@ -1228,6 +1224,17 @@ ipcMain.on("tweb-shortcut", (event, message) => {
   if (!tab) return;
   handleNativeShortcut(tab, message.action, message.value);
 });
+
+// The page reports CSS pixels but sendInputEvent takes unzoomed window
+// coordinates, so every synthetic pointer event has to be scaled by the zoom
+// factor. Without this a click lands off-target on any page that is not at 100%.
+function pageToWindowPoint(contents, point) {
+  const zoom = contents.getZoomFactor() || 1;
+  return {
+    x: Math.max(0, Math.round(point.x * zoom)),
+    y: Math.max(0, Math.round(point.y * zoom)),
+  };
+}
 
 function showBrowserContextMenu(tab, inputParams) {
   if (tab !== win || tab.isDestroyed()) return;
