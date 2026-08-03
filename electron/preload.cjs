@@ -13,6 +13,7 @@ const { ipcRenderer } = require("electron");
   let visualState = null;
   let inspectState = null;
   let tabListState = null;
+  let helpHost = null;
   let indicatorHost = null;
   let indicatorLabel = null;
   let lastSearch = "";
@@ -27,6 +28,7 @@ const { ipcRenderer } = require("electron");
     inspect: "I",
     tabs: "T",
     omnibox: "O",
+    help: "?",
     passthrough: "P",
   };
 
@@ -470,6 +472,112 @@ const { ipcRenderer } = require("electron");
       }
       normalMode();
     });
+  }
+
+
+  const shortcutHelpSections = [
+    ["이동", [
+      ["h · j · k · l", "왼쪽 · 아래 · 위 · 오른쪽 스크롤"],
+      ["d · u", "반 페이지 아래 · 위"],
+      ["gg · G", "페이지 맨 위 · 맨 아래"],
+      ["H · L", "history 뒤로 · 앞으로"],
+    ]],
+    ["열기와 탭", [
+      ["f · F", "hint로 열기 · 새 탭에서 열기"],
+      ["o · O / t", "현재 탭 · 새 탭 omnibox"],
+      ["b", "열린 탭 목록"],
+      ["J · K", "이전 · 다음 탭"],
+      ["x · X", "탭 닫기 · 최근 탭 복원"],
+      ["r · gi", "새로고침 · 첫 입력 요소 focus"],
+    ]],
+    ["검색과 선택", [
+      ["/ · n · N", "검색 · 다음 · 이전 결과"],
+      ["v · V", "visual picker · 페이지 전체 선택"],
+      ["h/l · b/w/e · j/k · 0/$", "visual 선택 범위 조정"],
+      ["y · Y · u", "smart copy · text copy · URL copy"],
+      ["o/O · p · d", "링크 열기 · 붙여넣기 · inspect"],
+      ["I", "inspect picker"],
+    ]],
+    ["Browser와 mode", [
+      ["zi · zo · zz", "확대 · 축소 · 기본 배율"],
+      ["Ctrl + / - / 0", "browser zoom"],
+      ["Ctrl-Tab / PgUp / PgDn", "browser tab 전환"],
+      ["Ctrl-W", "현재 browser tab 닫기"],
+      ["Ctrl-;", "Shortcuts ↔ web passthrough"],
+      ["Ctrl-C", "Shortcuts mode에서 TWeb 종료"],
+      ["Esc", "현재 mode 또는 입력 focus 해제"],
+    ]],
+  ];
+
+  function cancelHelp(restoreMode = true) {
+    helpHost?.remove();
+    helpHost = null;
+    if (restoreMode) normalMode();
+  }
+
+  function showHelp() {
+    cancelTransient(false);
+    const host = document.createElement("div");
+    host.id = "__tweb_help__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:auto";
+    const shadow = host.attachShadow({ mode: "open" });
+    const backdrop = document.createElement("div");
+    backdrop.style.cssText = "box-sizing:border-box;display:flex;align-items:flex-start;justify-content:center;width:100%;height:100%;padding:clamp(16px,5vh,48px) 16px;background:#000a;overflow:auto";
+    const panel = document.createElement("section");
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", "TWeb shortcuts");
+    panel.style.cssText = "box-sizing:border-box;width:min(920px,100%);padding:18px;border:1px solid #5f6368;border-radius:10px;background:#202124;color:#e8eaed;box-shadow:0 16px 48px #000c;font:13px/1.45 system-ui,-apple-system,sans-serif";
+    const header = document.createElement("header");
+    header.style.cssText = "display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px";
+    const heading = document.createElement("div");
+    heading.innerHTML = '<strong style="display:block;font-size:19px;color:#fff">TWeb shortcuts</strong><span style="color:#9aa0a6">Shortcuts mode · <kbd>?</kbd> 또는 <kbd>Esc</kbd>로 닫기</span>';
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "닫기  Esc";
+    close.style.cssText = "padding:5px 9px;border:1px solid #5f6368;border-radius:5px;background:#303134;color:#e8eaed;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer";
+    close.onclick = () => cancelHelp();
+    header.append(heading, close);
+    const grid = document.createElement("div");
+    grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:10px";
+    for (const [title, entries] of shortcutHelpSections) {
+      const group = document.createElement("section");
+      group.style.cssText = "padding:11px;border:1px solid #ffffff18;border-radius:7px;background:#ffffff08";
+      const name = document.createElement("strong");
+      name.textContent = title;
+      name.style.cssText = "display:block;margin-bottom:7px;color:#8ab4f8;font-size:13px";
+      const list = document.createElement("dl");
+      list.style.cssText = "display:grid;grid-template-columns:minmax(108px,auto) 1fr;gap:5px 12px;margin:0";
+      for (const [keys, description] of entries) {
+        const key = document.createElement("dt");
+        key.textContent = keys;
+        key.style.cssText = "margin:0;color:#fdd663;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap";
+        const detail = document.createElement("dd");
+        detail.textContent = description;
+        detail.style.cssText = "margin:0;color:#bdc1c6";
+        list.append(key, detail);
+      }
+      group.append(name, list);
+      grid.append(group);
+    }
+    panel.append(header, grid);
+    backdrop.append(panel);
+    backdrop.addEventListener("click", (event) => {
+      if (event.target === backdrop) cancelHelp();
+    });
+    shadow.append(backdrop);
+    document.documentElement.append(host);
+    helpHost = host;
+    setMode("help", "?·Esc 닫기");
+    requestAnimationFrame(() => close.focus({ preventScroll: true }));
+  }
+
+  function handleHelpKey(event, key) {
+    if (!helpHost) return false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (key === "?" || key === "Escape") cancelHelp();
+    return true;
   }
 
   function cancelPrompt(restoreMode = true) {
@@ -934,6 +1042,7 @@ const { ipcRenderer } = require("electron");
     cancelVisual(false);
     cancelInspect(false);
     cancelTabList(false);
+    cancelHelp(false);
     document.getElementById("__tweb_context_menu__")?.remove();
     resetPendingG();
     resetPendingZ();
@@ -941,7 +1050,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function hasTransientMode() {
-    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
+    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || helpHost || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
 
   function handleNormalKey(event) {
@@ -957,6 +1066,7 @@ const { ipcRenderer } = require("electron");
       return;
     }
 
+    if (handleHelpKey(event, key)) return;
     if (handlePickerKey(event, key)) return;
     if (handleVisualKey(event, key)) return;
     if (handleInspectKey(event, key)) return;
@@ -999,6 +1109,7 @@ const { ipcRenderer } = require("electron");
 
     let handled = true;
     switch (key) {
+      case "?": showHelp(); break;
       case "f": startHints(false); break;
       case "F": startHints(true); break;
       case "v": startVisual(); break;

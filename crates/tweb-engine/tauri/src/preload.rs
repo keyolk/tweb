@@ -59,6 +59,9 @@ mod tests {
         let (script, token) = bridge_script();
         assert!(script.contains("startHints"));
         assert!(script.contains("showTabList"));
+        assert!(script.contains("showHelp"));
+        assert!(script.contains("__tweb_help__"));
+        assert!(script.contains("case \"?\": showHelp()"));
         assert!(script.contains("tweb-action://"));
         assert!(script.contains("nonce=${++requestSerial}"));
         assert!(script.contains("__tweb_caret__"));
