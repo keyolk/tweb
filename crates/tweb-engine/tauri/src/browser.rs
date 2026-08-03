@@ -481,6 +481,11 @@ impl BrowserRuntime {
                     });
                 }
             }
+            "native-hover" => {
+                if let Some(point) = CssPoint::from_value(&action.value) {
+                    self.with_active_window(|window| dispatch_native_hover(window, point));
+                }
+            }
             "native-click" => {
                 if let Some(point) = CssPoint::from_value(&action.value) {
                     self.with_active_window(|window| dispatch_native_click(window, point));
@@ -1574,6 +1579,51 @@ impl CssPoint {
         })
     }
 }
+
+#[cfg(target_os = "macos")]
+fn dispatch_native_hover(window: &WebviewWindow, point: CssPoint) {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::NSPoint;
+    use objc2_web_kit::WKWebView;
+    use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static EVENT_NUMBER: AtomicIsize = AtomicIsize::new(1);
+    static EVENT_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+    let _ = window.with_webview(move |platform| unsafe {
+        let webview = &*(platform.inner() as *mut WKWebView);
+        let bounds = webview.bounds();
+        let local_point = NSPoint::new(
+            point.x.clamp(0.0, (bounds.size.width - 1.0).max(0.0)),
+            point.y.clamp(0.0, (bounds.size.height - 1.0).max(0.0)),
+        );
+        let location = webview.convertPoint_toView(local_point, None);
+        let Some(native_window) = webview.window() else {
+            return;
+        };
+        let event_number = EVENT_NUMBER.fetch_add(1, AtomicOrdering::Relaxed);
+        let timestamp = EVENT_CLOCK.get_or_init(Instant::now).elapsed().as_secs_f64();
+        let Some(event) = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            NSEventType::MouseMoved,
+            location,
+            NSEventModifierFlags::empty(),
+            timestamp,
+            native_window.windowNumber(),
+            None,
+            event_number,
+            0,
+            0.0,
+        ) else {
+            return;
+        };
+        webview.mouseMoved(&event);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dispatch_native_hover(_window: &WebviewWindow, _point: CssPoint) {}
 
 #[cfg(target_os = "macos")]
 fn dispatch_native_click(window: &WebviewWindow, point: CssPoint) {

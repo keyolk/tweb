@@ -284,6 +284,13 @@ const { ipcRenderer } = require("electron");
     "ㅠ": "b", "ᅲ": "b", "ㅜ": "n", "ᅮ": "n", "ㅡ": "m", "ᅳ": "m",
   }));
 
+  function commandKey(value, shiftKey = false) {
+    if (typeof value !== "string") return value;
+    const mapped = koreanLangmap.get(value) || koreanLangmap.get(value.normalize("NFD"));
+    if (!mapped) return value;
+    return shiftKey && mapped.length === 1 ? mapped.toUpperCase() : mapped;
+  }
+
   function physicalKey(event) {
     if (/^Key[A-Z]$/.test(event.code)) {
       const letter = event.code.slice(3).toLowerCase();
@@ -308,7 +315,7 @@ const { ipcRenderer } = require("electron");
       Space: " ",
       Tab: "Tab",
     };
-    return keys[event.code] || event.key;
+    return commandKey(keys[event.code] || event.key, event.shiftKey);
   }
 
   function visibleRect(element) {
@@ -410,13 +417,21 @@ const { ipcRenderer } = require("electron");
     return [...found];
   }
 
+  const mediaControlPresentation = {
+    play: { glyph: "▶", label: "재생/일시정지" },
+    mute: { glyph: "◕", label: "음소거" },
+    fullscreen: { glyph: "⛶", label: "전체화면" },
+    menu: { glyph: "⋮", label: "메뉴" },
+  };
+
   function mediaControlTargets(media) {
     const rect = visibleRect(media);
     if (!rect) return [];
-    if (!media.controls || rect.width < 160 || rect.height < 70) {
+    if (rect.width < 160 || rect.height < 70 || !(media instanceof HTMLVideoElement) && !media.controls) {
       return [{
         element: media,
         rect,
+        mediaRect: rect,
         nativePoint: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
       }];
     }
@@ -439,6 +454,7 @@ const { ipcRenderer } = require("electron");
         width: 16,
         height: 16,
       },
+      mediaRect: rect,
       nativePoint: { x: rect.left + offset, y },
       mediaControl,
     }));
@@ -499,6 +515,79 @@ const { ipcRenderer } = require("electron");
     if (restoreMode) normalMode();
   }
 
+  function showHintFeedback(item) {
+    const point = item.nativePoint || {
+      x: item.rect.left + item.rect.width / 2,
+      y: item.rect.top + item.rect.height / 2,
+    };
+    const host = document.createElement("div");
+    host.id = "__tweb_hint_feedback__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "open" });
+    const outline = document.createElement("div");
+    outline.style.cssText = [
+      "position:fixed", `left:${Math.max(0, item.rect.left - 3)}px`, `top:${Math.max(0, item.rect.top - 3)}px`,
+      `width:${Math.max(8, item.rect.width + 6)}px`, `height:${Math.max(8, item.rect.height + 6)}px`,
+      "box-sizing:border-box", "border:3px solid #ffb300", "border-radius:7px", "background:#ffd75f33",
+      "box-shadow:0 0 0 2px #111b,0 0 18px #ffb300", "transition:opacity .32s ease,transform .32s ease",
+    ].join(";");
+    const ripple = document.createElement("div");
+    ripple.style.cssText = [
+      "position:fixed", `left:${point.x - 9}px`, `top:${point.y - 9}px`, "width:18px", "height:18px",
+      "box-sizing:border-box", "border:3px solid #fff", "border-radius:50%", "background:#ffb300aa",
+      "box-shadow:0 0 0 2px #111a", "transition:opacity .32s ease,transform .32s ease",
+    ].join(";");
+    shadow.append(outline, ripple);
+    document.documentElement.append(host);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      outline.style.opacity = "0";
+      outline.style.transform = "scale(1.04)";
+      ripple.style.opacity = "0";
+      ripple.style.transform = "scale(2.8)";
+    }));
+    setTimeout(() => host.remove(), 380);
+  }
+
+  function renderMediaControlOverlays(shadow, targets) {
+    const groups = new Map();
+    for (const target of targets) {
+      if (!target.mediaControl || !target.mediaRect) continue;
+      const group = groups.get(target.element) || { rect: target.mediaRect, targets: [] };
+      group.targets.push(target);
+      groups.set(target.element, group);
+    }
+    for (const [media, group] of groups) {
+      const { rect } = group;
+      const frame = document.createElement("div");
+      frame.style.cssText = [
+        "position:fixed", `left:${rect.left}px`, `top:${rect.top}px`, `width:${rect.width}px`, `height:${rect.height}px`,
+        "box-sizing:border-box", "border:2px solid #ffd75f", "border-radius:5px", "box-shadow:inset 0 0 0 1px #0008",
+      ].join(";");
+      const bar = document.createElement("div");
+      const barHeight = Math.min(58, Math.max(38, rect.height * .18));
+      bar.style.cssText = [
+        "position:fixed", `left:${rect.left}px`, `top:${rect.bottom - barHeight}px`, `width:${rect.width}px`, `height:${barHeight}px`,
+        "box-sizing:border-box", "background:linear-gradient(transparent,#000e 48%)", "border-radius:0 0 5px 5px",
+      ].join(";");
+      shadow.append(frame, bar);
+      for (const target of group.targets) {
+        const presentation = mediaControlPresentation[target.mediaControl];
+        const control = document.createElement("div");
+        control.textContent = presentation?.glyph || "•";
+        control.title = presentation?.label || target.mediaControl;
+        control.style.cssText = [
+          "position:fixed", `left:${target.nativePoint.x - 13}px`, `top:${target.nativePoint.y - 13}px`, "width:26px", "height:26px",
+          "display:grid", "place-items:center", "border:1px solid #fff8", "border-radius:50%", "background:#111d", "color:#fff",
+          "box-shadow:0 1px 5px #000", "font:700 15px/1 system-ui,sans-serif",
+        ].join(";");
+        shadow.append(control);
+      }
+      const hoverPoint = group.targets.find((target) => target.mediaControl === "play")?.nativePoint;
+      if (hoverPoint) send("native-hover", hoverPoint);
+      media.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: hoverPoint?.x, clientY: hoverPoint?.y }));
+    }
+  }
+
   function startPicker(targets, mode, onPick) {
     cancelTransient(false);
     if (targets.length === 0) {
@@ -511,11 +600,14 @@ const { ipcRenderer } = require("electron");
     host.id = "__tweb_picker__";
     host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
     const shadow = host.attachShadow({ mode: "open" });
+    renderMediaControlOverlays(shadow, targets);
     const items = targets.map((target, index) => {
       const badge = document.createElement("span");
+      const badgeLeft = target.mediaControl ? target.nativePoint.x - 10 : target.rect.left;
+      const badgeTop = target.mediaControl ? target.nativePoint.y - 39 : target.rect.top;
       badge.textContent = labels[index];
       badge.style.cssText = [
-        "position:fixed", `left:${Math.max(0, target.rect.left)}px`, `top:${Math.max(0, target.rect.top)}px`,
+        "position:fixed", `left:${Math.max(0, badgeLeft)}px`, `top:${Math.max(0, badgeTop)}px`,
         "padding:1px 4px", "border:1px solid #9b6b00", "border-radius:3px", "background:#ffd75f",
         "color:#161616", "box-shadow:0 1px 4px #0008", "font:700 12px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace",
       ].join(";");
@@ -538,6 +630,7 @@ const { ipcRenderer } = require("electron");
     if (exact || matches.length === 1 && pickerState.typed.length > 0) {
       const selected = exact || matches[0];
       const onPick = pickerState.onPick;
+      showHintFeedback(selected);
       cancelPicker(false);
       onPick(selected);
     } else if (matches.length === 0) {
@@ -586,20 +679,38 @@ const { ipcRenderer } = require("electron");
     return false;
   }
 
+  function topViewportPoint(point) {
+    let x = point.x;
+    let y = point.y;
+    let frameWindow = window;
+    try {
+      while (frameWindow !== frameWindow.top) {
+        const frame = frameWindow.frameElement;
+        if (!(frame instanceof Element)) break;
+        const rect = frame.getBoundingClientRect();
+        x += rect.left;
+        y += rect.top;
+        frameWindow = frameWindow.parent;
+      }
+    } catch (_) {}
+    return { x, y };
+  }
+
+  function hintClickPoint(item) {
+    if (item.mediaControl && item.nativePoint) return topViewportPoint(item.nativePoint);
+    const rect = visibleRect(item.element) || item.rect;
+    return topViewportPoint({
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    });
+  }
+
   function startHints(newTab) {
     startPicker(interactiveTargets(), "hint", (item) => {
       const link = item.element.closest("a[href]");
       if (newTab && link?.href) send("new-tab", link.href);
       else if (performMediaControl(item)) {}
-      else if (item.nativeSurface || item.nativePoint) {
-        send("native-click", item.nativePoint || {
-          x: item.rect.left + item.rect.width / 2,
-          y: item.rect.top + item.rect.height / 2,
-        });
-      } else {
-        item.element.focus({ preventScroll: true });
-        item.element.click();
-      }
+      else send("native-click", hintClickPoint(item));
       normalMode();
     });
   }
@@ -1394,7 +1505,7 @@ const { ipcRenderer } = require("electron");
 
   ipcRenderer.on("tweb-terminal-text", (_event, text) => {
     if (!shortcutsEnabled || !shortcutFrame || typeof text !== "string" || [...text].length !== 1) return;
-    const mapped = koreanLangmap.get(text);
+    const mapped = commandKey(text);
     if (!mapped || eventIsEditable({ composedPath: () => [] })) return;
     // Only the frame that owns focus handles terminal text. The main frame
     // yields when an iframe is focused; background subframes ignore it.
@@ -1417,7 +1528,9 @@ const { ipcRenderer } = require("electron");
     if (!payload || typeof payload.key !== "string") return;
     const active = activeElement() || document.body;
     const editable = isEditable(active);
-    const mapped = shortcutsEnabled && shortcutFrame && !editable ? koreanLangmap.get(payload.key) || payload.key : payload.key;
+    const mapped = shortcutsEnabled && shortcutFrame && !editable
+      ? commandKey(payload.key, Boolean(payload.shiftKey))
+      : payload.key;
     let prevented = false;
     let stopped = false;
     const event = {

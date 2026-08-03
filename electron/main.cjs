@@ -1180,6 +1180,15 @@ function handleNativeShortcut(tab, action, value) {
     case "paste":
       contents.paste();
       break;
+    case "native-hover":
+      if ([value?.x, value?.y].every(Number.isFinite)) {
+        contents.sendInputEvent({
+          type: "mouseMove",
+          x: Math.max(0, Math.round(value.x)),
+          y: Math.max(0, Math.round(value.y)),
+        });
+      }
+      break;
     case "native-click":
       if ([value?.x, value?.y].every(Number.isFinite)) {
         const x = Math.max(0, Math.round(value.x));
@@ -1821,7 +1830,6 @@ function dispatchText(buffer) {
     const text = utf8Decoder.write(buffer.subarray(offset));
     for (const char of text) {
       const codepoint = char.codePointAt(0);
-      if (codepoint > 0x7f) sendToTabFrames(win, "tweb-terminal-text", char);
       const modifierMask = codepoint >= 65 && codepoint <= 90 ? 2 : 1;
       dispatchKey(codepoint, modifierMask);
     }

@@ -74,7 +74,13 @@ mod tests {
         assert!(script.contains("case \"?\": showHelp()"));
         assert!(script.contains("hitTestTargets"));
         assert!(script.contains("native-click"));
+        assert!(script.contains("native-hover"));
+        assert!(script.contains("showHintFeedback"));
+        assert!(script.contains("renderMediaControlOverlays"));
         assert!(script.contains("performMediaControl"));
+        assert!(script.contains("hintClickPoint"));
+        assert!(script.contains("topViewportPoint"));
+        assert!(script.contains("else send(\"native-click\", hintClickPoint(item))"));
         assert!(script.contains("media.requestFullscreen"));
         assert!(script.contains("top.location.origin === location.origin"));
         assert!(script.contains("const shortcutFrame = topFrame || sameOriginFrame"));
