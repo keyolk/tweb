@@ -24,7 +24,7 @@ impl TmuxRuntime {
             .as_deref()
             .and_then(|pane| tmux_output(&["display-message", "-p", "-t", pane, "#{pane_title}"]));
         if pane.is_some() {
-            std::thread::spawn(Self::ensure_passthrough_table);
+            Self::ensure_passthrough_table();
         }
         Self {
             pane,
@@ -115,6 +115,7 @@ impl TmuxRuntime {
     }
 
     fn ensure_passthrough_table() {
+        configure_root_toggle_binding();
         let user_keys = [
             (110, 5001),
             (111, 5009),
@@ -132,17 +133,6 @@ impl TmuxRuntime {
         let _ = tmux_status(&[
             "bind-key",
             "-T",
-            "root",
-            "User110",
-            "if-shell",
-            "-F",
-            "#{==:#{@tweb_browser},1}",
-            "send-keys -H 1b 5b 35 30 30 31 7e; switch-client -T tweb-pass",
-            "send-keys -H 1b 5b 35 30 30 31 7e",
-        ]);
-        let _ = tmux_status(&[
-            "bind-key",
-            "-T",
             PASSTHROUGH_TABLE,
             "User110",
             "send-keys",
@@ -157,7 +147,7 @@ impl TmuxRuntime {
             ";",
             "switch-client",
             "-T",
-            "root",
+            PASSTHROUGH_TABLE,
         ]);
         for (key, code) in [
             ("User113", 5002),
@@ -178,17 +168,18 @@ impl TmuxRuntime {
                 )
             );
             let parts: Vec<&str> = bytes.split_whitespace().collect();
-            let mut root = vec!["bind-key", "-T", "root", key, "send-keys", "-H"];
-            root.extend(parts.iter().copied());
-            let _ = tmux_status(&root);
             let mut passthrough = vec!["bind-key", "-T", PASSTHROUGH_TABLE, key, "send-keys", "-H"];
             passthrough.extend(parts.iter().copied());
             passthrough.extend([";", "switch-client", "-T", PASSTHROUGH_TABLE]);
             let _ = tmux_status(&passthrough);
         }
-        for table in ["root", PASSTHROUGH_TABLE] {
-            let _ = tmux_status(&["bind-key", "-T", table, "User112", "detach-client"]);
-        }
+        let _ = tmux_status(&[
+            "bind-key",
+            "-T",
+            PASSTHROUGH_TABLE,
+            "User112",
+            "detach-client",
+        ]);
         let private = [
             ("User100", ["35", "30", "30", "35"]),
             ("User101", ["35", "30", "30", "36"]),
@@ -255,6 +246,53 @@ impl TmuxRuntime {
 impl Drop for TmuxRuntime {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+fn root_binding(key: &str) -> Option<String> {
+    tmux_output(&["list-keys", "-T", "root", key])
+}
+
+fn configure_root_toggle_binding() {
+    let binding = root_binding("User110").unwrap_or_default();
+    let legacy = binding.contains("@tweb_browser") && binding.contains("35 30 30 31");
+    let neutral =
+        binding.contains("send-keys -H 1b 5b 35 30 30 31 7e") && !binding.contains("@tweb_browser");
+    if legacy {
+        for (key, signatures) in [
+            ("User112", &["detach-client"][..]),
+            ("User113", &["send-keys -H", "35 30 30 32"][..]),
+            ("User114", &["send-keys -H", "35 30 30 33"][..]),
+            ("User115", &["send-keys -H", "35 30 30 34"][..]),
+            ("User116", &["send-keys -H", "35 30 30 37"][..]),
+        ] {
+            let current = root_binding(key).unwrap_or_default();
+            if signatures
+                .iter()
+                .all(|signature| current.contains(signature))
+            {
+                let _ = tmux_status(&["unbind-key", "-T", "root", key]);
+            }
+        }
+    }
+    if binding.is_empty() || legacy {
+        let _ = tmux_status(&[
+            "bind-key",
+            "-T",
+            "root",
+            "User110",
+            "send-keys",
+            "-H",
+            "1b",
+            "5b",
+            "35",
+            "30",
+            "30",
+            "31",
+            "7e",
+        ]);
+    } else if !neutral && std::env::var_os("TWEB_DEBUG").is_some() {
+        eprintln!("tweb: preserving custom root User110 binding; Ctrl-; toggle may be unavailable");
     }
 }
 

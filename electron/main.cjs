@@ -185,8 +185,57 @@ const passthroughMouseKeys = [
   "WheelUpPane", "WheelDownPane",
 ];
 
+function tmuxRootBinding(key) {
+  try {
+    return execFileSync(
+      "tmux",
+      ["list-keys", "-T", "root", key],
+      { encoding: "utf8", timeout: 1000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+  } catch (error) {
+    return "";
+  }
+}
+
+function configureTmuxRootBindings() {
+  // User110은 Ghostty의 Ctrl-; private sequence다. root에서는 sequence만 pane에
+  // 전달하고, engine이 현재 client table을 기록한 뒤 tweb-pass로 전환한다.
+  const toggle = tmuxRootBinding("User110");
+  const legacyToggle = toggle.includes("@tweb_browser") && toggle.includes("35 30 30 31");
+  const neutralToggle = toggle.includes("send-keys -H 1b 5b 35 30 30 31 7e")
+    && !toggle.includes("@tweb_browser");
+  if (legacyToggle) {
+    const legacyBindings = new Map([
+      ["User112", ["detach-client"]],
+      ["User113", ["send-keys -H", "35 30 30 32"]],
+      ["User114", ["send-keys -H", "35 30 30 33"]],
+      ["User115", ["send-keys -H", "35 30 30 34"]],
+      ["User116", ["send-keys -H", "35 30 30 37"]],
+    ]);
+    for (const [key, signatures] of legacyBindings) {
+      const binding = tmuxRootBinding(key);
+      if (!signatures.every((signature) => binding.includes(signature))) continue;
+      try {
+        execFileSync("tmux", ["unbind-key", "-T", "root", key], { timeout: 1000, stdio: "ignore" });
+      } catch (error) {}
+    }
+  }
+  if (!toggle || legacyToggle) {
+    try {
+      execFileSync(
+        "tmux",
+        ["bind-key", "-T", "root", "User110", "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e"],
+        { timeout: 1000, stdio: "ignore" }
+      );
+    } catch (error) {}
+  } else if (!neutralToggle && process.env.TWEB_DEBUG) {
+    console.error("tweb: preserving custom root User110 binding; Ctrl-; toggle may be unavailable");
+  }
+}
+
 function ensureTmuxPassthroughTable() {
   if (!process.env.TMUX_PANE) return;
+  configureTmuxRootBindings();
   const zoomUserKeys = [
     [113, "User113", 5002],
     [114, "User114", 5003],
@@ -199,31 +248,20 @@ function ensureTmuxPassthroughTable() {
     ["set-option", "-s", "user-keys[111]", "\x1b[5009~"],
     ["set-option", "-s", "user-keys[112]", "\x1b[5010~"],
     [
-      "bind-key", "-T", "root", "User110", "if-shell", "-F",
-      "#{==:#{@tweb_browser},1}",
-      `send-keys -H 1b 5b 35 30 30 31 7e; switch-client -T ${passthroughTable}`,
-      "send-keys -H 1b 5b 35 30 30 31 7e",
-    ],
-    [
       "bind-key", "-T", passthroughTable, "User110",
       "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
-      "\\;", "switch-client", "-T", "root",
+      "\\;", "switch-client", "-T", passthroughTable,
     ],
   ];
   for (const [_index, key, code] of zoomUserKeys) {
     const codeHex = [...String(code)].map((digit) => digit.charCodeAt(0).toString(16));
-    commands.push(
-      ["bind-key", "-T", "root", key, "send-keys", "-H", "1b", "5b", ...codeHex, "7e"],
-      [
-        "bind-key", "-T", passthroughTable, key,
-        "send-keys", "-H", "1b", "5b", ...codeHex, "7e",
-        "\\;", "switch-client", "-T", passthroughTable,
-      ],
-    );
+    commands.push([
+      "bind-key", "-T", passthroughTable, key,
+      "send-keys", "-H", "1b", "5b", ...codeHex, "7e",
+      "\\;", "switch-client", "-T", passthroughTable,
+    ]);
   }
-  for (const table of ["root", passthroughTable]) {
-    commands.push(["bind-key", "-T", table, "User112", "detach-client"]);
-  }
+  commands.push(["bind-key", "-T", passthroughTable, "User112", "detach-client"]);
   for (const [key, ...digits] of [
     ["User100", "35", "30", "30", "35"],
     ["User101", "35", "30", "30", "36"],
@@ -240,18 +278,15 @@ function ensureTmuxPassthroughTable() {
     commands.push(["bind-key", "-T", passthroughTable, key, "send-keys", "-M", "\\;", "switch-client", "-T", passthroughTable]);
   }
 
-  let index = 0;
-  const runNext = () => {
-    const args = commands[index++];
-    if (!args) return;
-    execFile("tmux", args, { timeout: 1000 }, (error) => {
-      if (error && process.env.TWEB_DEBUG) {
+  for (const args of commands) {
+    try {
+      execFileSync("tmux", args, { timeout: 1000, stdio: "ignore" });
+    } catch (error) {
+      if (process.env.TWEB_DEBUG) {
         console.error(`tweb: passthrough command failed: ${error.message}`);
       }
-      runNext();
-    });
-  };
-  runNext();
+    }
+  }
 }
 
 function listTmuxClientStates() {
@@ -971,6 +1006,7 @@ function broadcastShortcutMode() {
 function toggleBrowserShortcuts() {
   browserShortcutsEnabled = !browserShortcutsEnabled;
   broadcastShortcutMode();
+  if (!browserShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
   reconcileTmuxPassthrough();
   updatePaneTitle();
   if (process.env.TWEB_DEBUG) {
@@ -1604,6 +1640,22 @@ function keyName(codepoint) {
   return null;
 }
 
+function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
+  const event = {
+    keyCode: key,
+    modifiers,
+  };
+  if (eventKind === 3) {
+    contents.sendInputEvent({ ...event, type: "keyUp" });
+    return;
+  }
+  contents.sendInputEvent({ ...event, type: "rawKeyDown" });
+  if (text && !modifiers.includes("control") && !modifiers.includes("meta")) {
+    contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
+  }
+  if (eventKind === 1) contents.sendInputEvent({ ...event, type: "keyUp" });
+}
+
 function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints = []) {
   if (!win || !key) return;
   const modifiers = electronModifiers(modifierMask);
@@ -1655,6 +1707,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
         ? key
         : ""
     : "";
+  if (!browserShortcutsEnabled) {
+    dispatchNativeKey(win.webContents, key, text, modifiers, eventKind);
+    return;
+  }
   sendToFocusedTabFrame(win, "tweb-terminal-key", {
     key,
     code: "",

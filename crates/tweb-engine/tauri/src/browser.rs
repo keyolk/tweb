@@ -546,7 +546,11 @@ impl BrowserRuntime {
             }
         }
         self.with_active_window(|window| {
-            dispatch_key(window, key, modifier_mask, event_kind, text)
+            if shortcuts {
+                dispatch_key(window, key, modifier_mask, event_kind, text);
+            } else {
+                dispatch_native_key(window, key, modifier_mask, event_kind, text);
+            }
         });
         true
     }
@@ -729,6 +733,9 @@ impl BrowserRuntime {
         };
         self.tmux.set_shortcuts_enabled(enabled);
         self.send_shortcut_mode();
+        if !enabled {
+            self.with_active_window(focus_native_input);
+        }
         self.tmux.notify(if enabled {
             "browser shortcuts ON"
         } else {
@@ -1179,6 +1186,188 @@ fn dispatch_key(
         "synthesizeKeyUp": event_kind == 1,
     });
     let _ = window.eval(format!("window.__twebTerminalKey?.({payload})"));
+}
+
+#[cfg(target_os = "macos")]
+fn native_key_data(key: &str, text: Option<&str>) -> (String, u16) {
+    use objc2_app_kit::{
+        NSDeleteFunctionKey, NSDownArrowFunctionKey, NSEndFunctionKey, NSHomeFunctionKey,
+        NSInsertFunctionKey, NSLeftArrowFunctionKey, NSPageDownFunctionKey, NSPageUpFunctionKey,
+        NSRightArrowFunctionKey, NSUpArrowFunctionKey,
+    };
+
+    let special = match key {
+        "Escape" => Some(('\u{1b}', 53)),
+        "Enter" => Some(('\r', 36)),
+        "Tab" => Some(('\t', 48)),
+        "Backspace" => Some(('\u{8}', 51)),
+        "Delete" => char::from_u32(NSDeleteFunctionKey).map(|value| (value, 117)),
+        "Insert" => char::from_u32(NSInsertFunctionKey).map(|value| (value, 114)),
+        "ArrowLeft" => char::from_u32(NSLeftArrowFunctionKey).map(|value| (value, 123)),
+        "ArrowRight" => char::from_u32(NSRightArrowFunctionKey).map(|value| (value, 124)),
+        "ArrowDown" => char::from_u32(NSDownArrowFunctionKey).map(|value| (value, 125)),
+        "ArrowUp" => char::from_u32(NSUpArrowFunctionKey).map(|value| (value, 126)),
+        "Home" => char::from_u32(NSHomeFunctionKey).map(|value| (value, 115)),
+        "End" => char::from_u32(NSEndFunctionKey).map(|value| (value, 119)),
+        "PageUp" => char::from_u32(NSPageUpFunctionKey).map(|value| (value, 116)),
+        "PageDown" => char::from_u32(NSPageDownFunctionKey).map(|value| (value, 121)),
+        _ => None,
+    };
+    if let Some((character, code)) = special {
+        return (character.to_string(), code);
+    }
+
+    let value = text.filter(|value| !value.is_empty()).unwrap_or(key);
+    let code = match key.to_ascii_lowercase().as_str() {
+        "a" => 0,
+        "s" => 1,
+        "d" => 2,
+        "f" => 3,
+        "h" => 4,
+        "g" => 5,
+        "z" => 6,
+        "x" => 7,
+        "c" => 8,
+        "v" => 9,
+        "b" => 11,
+        "q" => 12,
+        "w" => 13,
+        "e" => 14,
+        "r" => 15,
+        "y" => 16,
+        "t" => 17,
+        "1" => 18,
+        "2" => 19,
+        "3" => 20,
+        "4" => 21,
+        "6" => 22,
+        "5" => 23,
+        "=" => 24,
+        "9" => 25,
+        "7" => 26,
+        "-" => 27,
+        "8" => 28,
+        "0" => 29,
+        "]" => 30,
+        "o" => 31,
+        "u" => 32,
+        "[" => 33,
+        "i" => 34,
+        "p" => 35,
+        "l" => 37,
+        "j" => 38,
+        "'" => 39,
+        "k" => 40,
+        ";" => 41,
+        "\\" => 42,
+        "," => 43,
+        "/" => 44,
+        "n" => 45,
+        "m" => 46,
+        "." => 47,
+        " " => 49,
+        "`" => 50,
+        _ => 0,
+    };
+    (value.to_string(), code)
+}
+
+#[cfg(target_os = "macos")]
+fn focus_native_input(window: &WebviewWindow) {
+    use objc2_web_kit::WKWebView;
+    let _ = window.with_webview(|platform| unsafe {
+        let webview = &*(platform.inner() as *mut WKWebView);
+        if let Some(native_window) = webview.window() {
+            native_window.makeFirstResponder(Some(webview));
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn focus_native_input(_window: &WebviewWindow) {}
+
+#[cfg(target_os = "macos")]
+fn dispatch_native_key(
+    window: &WebviewWindow,
+    key: &str,
+    modifier_mask: u32,
+    event_kind: u32,
+    text: Option<&str>,
+) {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::{NSPoint, NSString};
+    use objc2_web_kit::WKWebView;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static EVENT_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+    let (characters, key_code) = native_key_data(key, text);
+    let bits = modifier_mask.saturating_sub(1);
+    let synthesize_key_up = event_kind == 1;
+    let event_type = if event_kind == 3 {
+        NSEventType::KeyUp
+    } else {
+        NSEventType::KeyDown
+    };
+    let _ = window.with_webview(move |platform| unsafe {
+        let webview = &*(platform.inner() as *mut WKWebView);
+        let Some(native_window) = webview.window() else {
+            return;
+        };
+        let mut modifiers = NSEventModifierFlags::empty();
+        if bits & 1 != 0 {
+            modifiers.insert(NSEventModifierFlags::Shift);
+        }
+        if bits & 2 != 0 {
+            modifiers.insert(NSEventModifierFlags::Option);
+        }
+        if bits & 4 != 0 {
+            modifiers.insert(NSEventModifierFlags::Control);
+        }
+        if bits & (8 | 32) != 0 {
+            modifiers.insert(NSEventModifierFlags::Command);
+        }
+        let characters = NSString::from_str(&characters);
+        let timestamp = EVENT_CLOCK.get_or_init(Instant::now).elapsed().as_secs_f64();
+        let make_event = |event_type| {
+            NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                event_type,
+                NSPoint::new(0.0, 0.0),
+                modifiers,
+                timestamp,
+                native_window.windowNumber(),
+                None,
+                &characters,
+                &characters,
+                false,
+                key_code,
+            )
+        };
+        if let Some(event) = make_event(event_type) {
+            if event_type == NSEventType::KeyUp {
+                webview.keyUp(&event);
+            } else {
+                webview.keyDown(&event);
+            }
+        }
+        if synthesize_key_up {
+            if let Some(event) = make_event(NSEventType::KeyUp) {
+                webview.keyUp(&event);
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dispatch_native_key(
+    window: &WebviewWindow,
+    key: &str,
+    modifier_mask: u32,
+    event_kind: u32,
+    text: Option<&str>,
+) {
+    dispatch_key(window, key, modifier_mask, event_kind, text);
 }
 
 #[cfg(target_os = "macos")]
