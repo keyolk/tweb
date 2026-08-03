@@ -1,0 +1,13 @@
+{
+  "name": "tweb-electron",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test mouse-click-state.test.cjs"
+  },
+  "dependencies": {
+    "electron": "^43.2.0"
+  }
+}

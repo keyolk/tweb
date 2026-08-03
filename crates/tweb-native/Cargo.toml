@@ -1,0 +1,12 @@
+[package]
+name = "tweb-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tweb-core.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true

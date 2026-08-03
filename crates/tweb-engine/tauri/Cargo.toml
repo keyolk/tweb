@@ -1,0 +1,33 @@
+[package]
+name = "tweb-engine-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tweb-tauri"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "=4.5.48", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+url.workspace = true
+libc = "=0.2.177"
+tauri = { version = "=2.11.5", default-features = false, features = ["wry", "devtools"] }
+base64 = "=0.22.1"
+sha2 = "=0.10.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "=0.6.2"
+objc2 = "=0.6.4"
+objc2-app-kit = { version = "=0.3.2", features = ["NSBitmapImageRep", "NSEvent", "NSGraphicsContext", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSView", "NSWindow"] }
+objc2-core-foundation = "=0.3.2"
+objc2-foundation = { version = "=0.3.2", features = ["NSDictionary", "NSError", "NSData", "NSString"] }
+objc2-web-kit = { version = "=0.3.2", features = ["WKWebView", "WKSnapshotConfiguration", "block2", "objc2-core-foundation"] }
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }

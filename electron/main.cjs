@@ -1,0 +1,1994 @@
+// tweb-electron/main.cjs — Electron offscreen browser → Kitty graphics.
+//
+// cliweb 방식 정확히 따름:
+// - tmux passthrough: ESC 두 번 escape + pane origin anchor
+// - a=T transfer&display, C=1, f=100 PNG, local file transport
+// - frame file로 terminal byte flood를 피하고 direct transfer는 fallback으로 사용
+// - alternate screen, raw mode는 tweb-pane(Rust)이 처리
+
+const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen } = require("electron");
+const {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} = require("node:fs");
+const { execFile, execFileSync } = require("node:child_process");
+const { createHash } = require("node:crypto");
+const { Worker } = require("node:worker_threads");
+const path = require("node:path");
+const { StringDecoder } = require("node:string_decoder");
+const { MouseClickState } = require("./mouse-click-state.cjs");
+
+if (process.env.TWEB_USER_DATA_DIR) {
+  app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
+}
+if (process.platform === "darwin") {
+  app.setActivationPolicy("prohibited");
+}
+
+let win = null;
+const tabs = [];
+const closedTabs = [];
+let activeTabIndex = -1;
+let quitting = false;
+let browserShortcutsEnabled = true;
+let terminalVisible = true;
+let visibilityCheckRunning = false;
+let visibleClientTtys = new Set();
+const passthroughClientTables = new Map();
+let tmuxIdentity = null;
+let originalPaneTitle = null;
+const tabFrames = new Map();
+const tabZoomFactors = new Map();
+const tabSessionUrls = new Map();
+const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
+let windowSessionPath = null;
+let windowSessionSaveTimer = null;
+let hiddenWindowWatchdog = null;
+// Electron logs an ipcNative error when frame.send races preload setup or navigation.
+// A frame opts in only after its preload has installed all IPC listeners.
+const readyFrameKeysByTab = new WeakMap();
+function commandLineValue(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+function commandLineUrl() {
+  const optionsWithValues = new Set(["--tweb-frame-rate", "--tweb-adaptive-frame-rate"]);
+  const args = process.argv.slice(2);
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === ".") continue;
+    if (optionsWithValues.has(argument)) {
+      index += 1;
+      continue;
+    }
+    if (!argument.startsWith("--")) return argument;
+  }
+  return undefined;
+}
+
+const configuredFrameRate = Number.parseInt(
+  commandLineValue("--tweb-frame-rate") || process.env.TWEB_FRAME_RATE || "",
+  10
+);
+const maxActiveFrameRate = Number.isFinite(configuredFrameRate)
+  ? Math.min(60, Math.max(1, configuredFrameRate))
+  : 30;
+const configuredAdaptiveFrameRate = commandLineValue("--tweb-adaptive-frame-rate");
+const adaptiveFrameRate = configuredAdaptiveFrameRate !== undefined
+  ? configuredAdaptiveFrameRate !== "0"
+  : process.env.TWEB_ADAPTIVE_FRAME_RATE !== "0";
+const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxActiveFrameRate;
+let activeFrameRate = maxActiveFrameRate;
+let frameIntervalMs = Math.ceil(1000 / activeFrameRate);
+let frameIdleTimer = null;
+const configuredDefaultZoom = Number.parseFloat(process.env.TWEB_DEFAULT_ZOOM || "");
+const defaultZoomFactor = Number.isFinite(configuredDefaultZoom)
+  ? Math.min(2, Math.max(0.5, configuredDefaultZoom))
+  : 0.8;
+const configuredDeviceScaleFactor = Number.parseFloat(process.env.TWEB_DEVICE_SCALE_FACTOR || "");
+let pendingFrame = null;
+let pendingFrameTimer = null;
+let lastFrameSentAt = 0;
+const configuredImageId = Number.parseInt(process.env.TWEB_IMAGE_ID || "", 10);
+const imageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
+  ? configuredImageId
+  : 1;
+const frameTransport = process.env.TWEB_FRAME_TRANSPORT === "direct" ? "direct" : "file";
+const frameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.png`);
+let lastViewport = null;
+let viewportGeneration = 0;
+let loggedFrameGeneration = -1;
+let gfxWorkerBusy = false;
+let activeGfxGeneration = null;
+let pendingGfxFrame = null;
+let droppedGfxFrames = 0;
+const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"));
+gfxWorker.unref();
+
+const ESC = "\x1b";
+const CSI = (s) => `${ESC}[${s}`;
+
+// --- tmux passthrough (cliweb escapeCodes.ts 방식) ---
+
+let tmuxOrigin = null;
+
+function getTmuxPaneOrigin() {
+  if (!process.env.TMUX_PANE) return;
+  const configured = String(process.env.TWEB_PANE_ORIGIN || "").split(/[ ,]+/).map(Number);
+  if (configured.length === 2 && configured.every(Number.isFinite)) {
+    tmuxOrigin = { left: configured[0], top: configured[1] };
+    return;
+  }
+  try {
+    const out = execFileSync(
+      "tmux",
+      ["display-message", "-p", "-t", process.env.TMUX_PANE, "#{pane_left}\t#{pane_top}"],
+      { encoding: "utf8", timeout: 1000 }
+    ).trim();
+    const parts = out.split("\t").map(Number);
+    if (parts.length >= 2) {
+      tmuxOrigin = { left: parts[0], top: parts[1] };
+    }
+  } catch (e) {}
+}
+
+// cliweb wrapTmuxPassthrough: ESC를 두 번으로 escape.
+function wrapTmuxPassthrough(sequence) {
+  const escaped = sequence.split(ESC).join(ESC + ESC);
+  return `${ESC}Ptmux;${escaped}${ESC}\\`;
+}
+
+// cliweb anchorTmuxGraphics: pane origin에 cursor 이동 후 graphics, 복원.
+function anchorTmuxGraphics(sequence) {
+  if (!tmuxOrigin) return wrapTmuxPassthrough(sequence);
+  const row = tmuxOrigin.top + 1;
+  const col = tmuxOrigin.left + 1;
+  return wrapTmuxPassthrough(`${ESC}7${ESC}[${row};${col}H${sequence}${ESC}8`);
+}
+
+function graphicsPassthrough(sequence) {
+  if (!process.env.TMUX) return sequence;
+  return anchorTmuxGraphics(sequence);
+}
+
+function rawKittyDelete() {
+  return `${ESC}_Ga=d,d=I,i=${imageId},q=2${ESC}\\`;
+}
+
+function deleteImageFromClientTty(tty) {
+  let fd;
+  try {
+    fd = openSync(tty, "w");
+    writeSync(fd, rawKittyDelete());
+  } catch (error) {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: client tty delete failed ${tty}: ${error.message}`);
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch (e) {}
+    }
+  }
+}
+
+const passthroughTable = "tweb-pass";
+const passthroughMouseKeys = [
+  "MouseDown1Pane", "MouseDown2Pane", "MouseDown3Pane",
+  "MouseUp1Pane", "MouseUp2Pane", "MouseUp3Pane",
+  "MouseDrag1Pane", "MouseDrag2Pane", "MouseDrag3Pane",
+  "MouseDragEnd1Pane", "MouseDragEnd2Pane", "MouseDragEnd3Pane",
+  "WheelUpPane", "WheelDownPane",
+];
+
+function ensureTmuxPassthroughTable() {
+  if (!process.env.TMUX_PANE) return;
+  const zoomUserKeys = [
+    [113, "User113", 5002],
+    [114, "User114", 5003],
+    [115, "User115", 5004],
+    [116, "User116", 5007],
+  ];
+  const commands = [
+    ...zoomUserKeys.map(([index, _key, code]) => ["set-option", "-s", `user-keys[${index}]`, `\x1b[${code}~`]),
+    ["set-option", "-s", "user-keys[110]", "\x1b[5001~"],
+    ["set-option", "-s", "user-keys[111]", "\x1b[5009~"],
+    ["set-option", "-s", "user-keys[112]", "\x1b[5010~"],
+    [
+      "bind-key", "-T", "root", "User110", "if-shell", "-F",
+      "#{==:#{@tweb_browser},1}",
+      `send-keys -H 1b 5b 35 30 30 31 7e; switch-client -T ${passthroughTable}`,
+      "send-keys -H 1b 5b 35 30 30 31 7e",
+    ],
+    [
+      "bind-key", "-T", passthroughTable, "User110",
+      "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
+      "\\;", "switch-client", "-T", "root",
+    ],
+  ];
+  for (const [_index, key, code] of zoomUserKeys) {
+    const codeHex = [...String(code)].map((digit) => digit.charCodeAt(0).toString(16));
+    commands.push(
+      ["bind-key", "-T", "root", key, "send-keys", "-H", "1b", "5b", ...codeHex, "7e"],
+      [
+        "bind-key", "-T", passthroughTable, key,
+        "send-keys", "-H", "1b", "5b", ...codeHex, "7e",
+        "\\;", "switch-client", "-T", passthroughTable,
+      ],
+    );
+  }
+  for (const table of ["root", passthroughTable]) {
+    commands.push(["bind-key", "-T", table, "User112", "detach-client"]);
+  }
+  for (const [key, ...digits] of [
+    ["User100", "35", "30", "30", "35"],
+    ["User101", "35", "30", "30", "36"],
+    ["User111", "35", "30", "30", "39"],
+  ]) {
+    commands.push([
+      "bind-key", "-T", passthroughTable, key,
+      "send-keys", "-H", "1b", "5b", ...digits, "7e",
+      "\\;", "switch-client", "-T", passthroughTable,
+    ]);
+  }
+  commands.push(["bind-key", "-T", passthroughTable, "Any", "send-keys", "\\;", "switch-client", "-T", passthroughTable]);
+  for (const key of passthroughMouseKeys) {
+    commands.push(["bind-key", "-T", passthroughTable, key, "send-keys", "-M", "\\;", "switch-client", "-T", passthroughTable]);
+  }
+
+  let index = 0;
+  const runNext = () => {
+    const args = commands[index++];
+    if (!args) return;
+    execFile("tmux", args, { timeout: 1000 }, (error) => {
+      if (error && process.env.TWEB_DEBUG) {
+        console.error(`tweb: passthrough command failed: ${error.message}`);
+      }
+      runNext();
+    });
+  };
+  runNext();
+}
+
+function listTmuxClientStates() {
+  if (!process.env.TMUX_PANE) return new Map();
+  try {
+    const output = execFileSync(
+      "tmux",
+      ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{pane_id}\t#{client_key_table}"],
+      { encoding: "utf8", timeout: 1000 }
+    );
+    const states = new Map();
+    for (const line of output.trim().split("\n")) {
+      const [tty, session, windowId, paneId, keyTable] = line.split("\t");
+      if (tty) states.set(tty, { session, windowId, paneId, keyTable: keyTable || "root" });
+    }
+    return states;
+  } catch (error) {
+    return new Map();
+  }
+}
+
+function switchTmuxClientTable(tty, table) {
+  try {
+    execFileSync(
+      "tmux",
+      ["switch-client", "-c", tty, "-T", table],
+      { timeout: 1000, stdio: "ignore" }
+    );
+    return true;
+  } catch (error) {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: client table switch failed ${tty}: ${error.message}`);
+    return false;
+  }
+}
+
+function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
+  if (!process.env.TMUX_PANE) return;
+  const paneId = process.env.TMUX_PANE;
+
+  for (const [tty, originalTable] of [...passthroughClientTables]) {
+    const state = states.get(tty);
+    if (browserShortcutsEnabled || !state || state.paneId !== paneId) {
+      if (state) switchTmuxClientTable(tty, originalTable);
+      passthroughClientTables.delete(tty);
+      if (process.env.TWEB_DEBUG) {
+        console.error(`tweb: passthrough client restore ${tty} ${state?.paneId || "detached"} -> ${originalTable}`);
+      }
+    }
+  }
+
+  if (browserShortcutsEnabled) return;
+  for (const [tty, state] of states) {
+    if (state.paneId !== paneId || passthroughClientTables.has(tty)) continue;
+    const originalTable = state.keyTable === passthroughTable ? "root" : state.keyTable;
+    if (switchTmuxClientTable(tty, passthroughTable)) {
+      passthroughClientTables.set(tty, originalTable || "root");
+      if (process.env.TWEB_DEBUG) {
+        console.error(`tweb: passthrough client arm ${tty} ${state.paneId} from ${originalTable || "root"}`);
+      }
+    }
+  }
+}
+
+function restoreTmuxPassthroughClients() {
+  for (const [tty, originalTable] of [...passthroughClientTables]) {
+    switchTmuxClientTable(tty, originalTable);
+    passthroughClientTables.delete(tty);
+  }
+}
+
+function initializeTmuxVisibility() {
+  if (!process.env.TMUX_PANE) return;
+  ensureTmuxPassthroughTable();
+  try {
+    const output = execFileSync(
+      "tmux",
+      [
+        "display-message",
+        "-p",
+        "-t",
+        process.env.TMUX_PANE,
+        "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{pane_title}",
+      ],
+      { encoding: "utf8", timeout: 1000 }
+    ).trim();
+    const [socketPath, serverStartedAt, session, windowId, ...titleParts] = output.split("\t");
+    if (socketPath && serverStartedAt && session && windowId) {
+      tmuxIdentity = { socketPath, serverStartedAt, session, windowId };
+      const identity = [socketPath, serverStartedAt, windowId].join("\0");
+      const key = createHash("sha256").update(identity).digest("hex").slice(0, 24);
+      windowSessionPath = path.join(app.getPath("userData"), "window-sessions", `${key}.json`);
+    }
+    originalPaneTitle = titleParts.join("\t");
+
+    if (tmuxIdentity) {
+      const clients = execFileSync(
+        "tmux",
+        ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}"],
+        { encoding: "utf8", timeout: 1000 }
+      );
+      const initial = new Set();
+      for (const line of clients.trim().split("\n")) {
+        const [tty, clientSession, clientWindow] = line.split("\t");
+        if (tty && clientSession === tmuxIdentity.session && clientWindow === tmuxIdentity.windowId) {
+          initial.add(tty);
+        }
+      }
+      visibleClientTtys = initial;
+      terminalVisible = initial.size > 0;
+    }
+  } catch (error) {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: visibility init failed: ${error.message}`);
+  }
+  syncTmuxVisibility();
+  const timer = setInterval(syncTmuxVisibility, 150);
+  timer.unref();
+}
+
+function syncTmuxVisibility() {
+  if (!tmuxIdentity || visibilityCheckRunning) return;
+  visibilityCheckRunning = true;
+  execFile(
+    "tmux",
+    ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}"],
+    { encoding: "utf8", timeout: 1000 },
+    (error, stdout) => {
+      visibilityCheckRunning = false;
+      if (error) return;
+      const next = new Set();
+      for (const line of stdout.trim().split("\n")) {
+        const [tty, session, windowId] = line.split("\t");
+        if (tty && session === tmuxIdentity.session && windowId === tmuxIdentity.windowId) {
+          next.add(tty);
+        }
+      }
+
+      const wasVisible = terminalVisible;
+      for (const tty of visibleClientTtys) {
+        if (!next.has(tty)) deleteImageFromClientTty(tty);
+      }
+      const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
+      visibleClientTtys = next;
+      terminalVisible = next.size > 0;
+      reconcileTmuxPassthrough();
+      if (wasVisible !== terminalVisible) {
+        updatePaintingState();
+        if (process.env.TWEB_DEBUG) {
+          console.error(`tweb: visibility ${terminalVisible ? "visible" : "hidden"}`);
+        }
+      }
+      if (becameVisible) repaintActiveTab();
+    }
+  );
+}
+
+// --- Kitty graphics ---
+
+function dispatchGfxFrame(frame) {
+  const png = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
+    ? frame.png
+    : Buffer.from(frame.png);
+  gfxWorkerBusy = true;
+  activeGfxGeneration = frame.generation;
+  try {
+    gfxWorker.postMessage({
+      type: "frame",
+      buffer: png.buffer,
+      byteOffset: png.byteOffset,
+      byteLength: png.byteLength,
+      header: frame.header,
+      transport: frameTransport,
+      filePath: frameFilePath,
+      tmux: Boolean(process.env.TMUX),
+      origin: tmuxOrigin,
+    }, [png.buffer]);
+  } catch (error) {
+    gfxWorkerBusy = false;
+    activeGfxGeneration = null;
+    console.error(`tweb: graphics dispatch failed: ${error.message}`);
+  }
+}
+
+function handleGfxWorkerReady() {
+  const staleOutput = activeGfxGeneration !== null && activeGfxGeneration !== viewportGeneration;
+  gfxWorkerBusy = false;
+  activeGfxGeneration = null;
+  if (staleOutput) writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
+  const frame = pendingGfxFrame;
+  pendingGfxFrame = null;
+  if (frame && frame.generation === viewportGeneration) dispatchGfxFrame(frame);
+}
+
+gfxWorker.on("message", (message) => {
+  if (message?.type === "error") {
+    console.error(`tweb: graphics writer failed: ${message.message}`);
+  }
+  handleGfxWorkerReady();
+});
+gfxWorker.on("error", (error) => {
+  gfxWorkerBusy = false;
+  activeGfxGeneration = null;
+  pendingGfxFrame = null;
+  console.error(`tweb: graphics writer crashed: ${error.stack || error.message}`);
+});
+
+function queueGfxFrame(png, header, generation) {
+  if (generation !== viewportGeneration) return;
+  const frame = { png, header, generation };
+  if (!gfxWorkerBusy) {
+    dispatchGfxFrame(frame);
+    return;
+  }
+  if (pendingGfxFrame) droppedGfxFrames += 1;
+  pendingGfxFrame = frame;
+}
+
+function writeGfx(header, payload) {
+  // ESC _ G <header> [; <payload>] ESC \
+  let raw = `${ESC}_G${header}`;
+  if (payload && payload.length > 0) {
+    raw += `;${payload}`;
+  }
+  raw += `${ESC}\\`;
+  // tmux passthrough로 감쌈.
+  const wrapped = graphicsPassthrough(raw);
+  try {
+    writeSync(1, wrapped);
+  } catch (e) {}
+}
+
+// --- terminal setup ---
+// 주의: tmux 안에서는 alternate screen(1049h)이나 clear screen(2J)이
+// 다른 pane에 영향을 줄 수 있으므로 사용하지 않음.
+// image가 pane 영역에만 placement되도록 cell 단위 placement 사용.
+
+function terminalSetup() {
+  // 아무것도 안 함. image가 자연스럽게 pane에 표시됨.
+}
+
+function requestTrackedKeyboardModeRestore() {
+  if (!process.env.TMUX) return;
+  const frontendPid = Number.parseInt(process.env.TWEB_FRONTEND_PID || "", 10);
+  if (!Number.isSafeInteger(frontendPid) || frontendPid <= 1) return;
+  try {
+    // Electron may be reparented while Chromium starts, so process.ppid is not
+    // a stable frontend identity. Rust passes its PID explicitly.
+    process.kill(frontendPid, "SIGUSR1");
+    if (process.env.TWEB_DEBUG) console.error(`tweb: keyboard mode restore requested ${frontendPid}`);
+  } catch (error) {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: keyboard mode restore request failed: ${error.message}`);
+  }
+}
+
+function scheduleTrackedKeyboardModeRestore() {
+  for (const delay of [0, 100, 500, 1000]) {
+    setTimeout(requestTrackedKeyboardModeRestore, delay);
+  }
+}
+
+function terminalCleanup() {
+  try {
+    // image delete만 수행.
+    writeGfx(`a=d,d=I,i=${imageId}`, "");
+  } catch (e) {}
+}
+
+// --- frame 전송 ---
+
+function applyActiveFrameRate(rate) {
+  const next = Math.min(maxActiveFrameRate, Math.max(1, Math.round(rate)));
+  if (next === activeFrameRate) return;
+  activeFrameRate = next;
+  frameIntervalMs = Math.ceil(1000 / activeFrameRate);
+  if (win && !win.isDestroyed() && terminalVisible) win.webContents.setFrameRate(activeFrameRate);
+  if (process.env.TWEB_DEBUG) console.error(`tweb: frame rate ${activeFrameRate}fps`);
+}
+
+function markInteractionActivity() {
+  if (!adaptiveFrameRate) return;
+  applyActiveFrameRate(maxActiveFrameRate);
+  if (frameIdleTimer) clearTimeout(frameIdleTimer);
+  frameIdleTimer = setTimeout(() => {
+    frameIdleTimer = null;
+    applyActiveFrameRate(idleFrameRate);
+  }, 700);
+}
+
+function sendFrameNow(image, generation) {
+  if (!terminalVisible || generation !== viewportGeneration || !image || image.isEmpty()) return;
+  const viewport = lastViewport;
+  const size = image.getSize();
+  const expected = viewport && renderedFrameSize(viewport);
+  if (!expected || size.width !== expected.width || size.height !== expected.height) return;
+  try {
+    // PNG 생성 후 base64 변환과 terminal write는 worker에 맡긴다. stdout
+    // backpressure가 생겨도 Electron main thread와 keyboard input은 멈추지 않는다.
+    const png = image.toPNG();
+    const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`;
+    queueGfxFrame(png, header, generation);
+    lastFrameSentAt = Date.now();
+  } catch (error) {
+    console.error(`tweb: frame encode failed: ${error.message}`);
+  }
+}
+
+function flushPendingFrame() {
+  pendingFrameTimer = null;
+  const frame = pendingFrame;
+  pendingFrame = null;
+  if (!frame || frame.tab !== win || frame.generation !== viewportGeneration || !terminalVisible) return;
+  sendFrameNow(frame.image, frame.generation);
+}
+
+function queueFrame(tab, image, immediate = false) {
+  const generation = viewportGeneration;
+  const viewport = lastViewport;
+  const size = image?.getSize();
+  const expected = viewport && renderedFrameSize(viewport);
+  if (!expected || !size || size.width !== expected.width || size.height !== expected.height) return;
+  tabFrames.set(tab, { image, generation });
+  if (tab !== win || !terminalVisible) return;
+  pendingFrame = { tab, image, generation };
+  if (pendingFrameTimer) return;
+  const elapsed = Date.now() - lastFrameSentAt;
+  const delay = immediate ? 0 : Math.max(0, frameIntervalMs - elapsed);
+  pendingFrameTimer = setTimeout(flushPendingFrame, delay);
+}
+
+function repaintActiveTab() {
+  if (!terminalVisible || !win || win.isDestroyed()) return;
+  const frame = tabFrames.get(win);
+  if (frame && frame.generation === viewportGeneration && !frame.image.isEmpty()) {
+    queueFrame(win, frame.image, true);
+    if (process.env.TWEB_DEBUG) console.error("tweb: visibility repaint");
+    return;
+  }
+  win.webContents.invalidate();
+}
+
+// --- viewport size query ---
+
+function parseViewport(value) {
+  if (!value) return null;
+  const parts = value.trim().split(/[ ,]+/).map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isFinite(part) || part <= 0)) {
+    return null;
+  }
+  const [cols, rows, width, height] = parts.map(Math.round);
+  return { cols, rows, width, height };
+}
+
+function queryTmuxViewport() {
+  if (!process.env.TMUX_PANE) return null;
+  try {
+    const { execFileSync } = require("node:child_process");
+    const out = execFileSync(
+      "tmux",
+      [
+        "display-message",
+        "-p",
+        "-t",
+        process.env.TMUX_PANE,
+        "#{pane_width} #{pane_height} #{client_cell_width} #{client_cell_height}",
+      ],
+      { encoding: "utf8", timeout: 1000 }
+    );
+    const [cols, rows, cellWidth, cellHeight] = out.trim().split(/\s+/).map(Number);
+    if (cols > 0 && rows > 0 && cellWidth > 0 && cellHeight > 0) {
+      return {
+        cols,
+        rows,
+        width: Math.round(cols * cellWidth),
+        height: Math.round(rows * cellHeight),
+      };
+    }
+  } catch (e) {}
+  return null;
+}
+
+// tmux의 pane cell 수와 Ghostty client cell pixel 크기를 최우선으로 사용한다.
+function queryViewportSize() {
+  return parseViewport(process.env.TWEB_VIEWPORT)
+    || queryTmuxViewport()
+    || lastViewport
+    || { cols: 80, rows: 24, width: 640, height: 384 };
+}
+
+let paneCells = { cols: 80, rows: 24 };
+
+// --- browser window ---
+
+function normalizeUrl(input) {
+  const value = (input || "").trim();
+  if (!value) return "https://example.com";
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(value)) {
+    return `http://${value}`;
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^(about|data|file):/i.test(value)) {
+    return value;
+  }
+  return `https://${value}`;
+}
+
+function errorPage(url, code, description) {
+  const html = `<!doctype html><meta charset="utf-8"><style>
+    :root{color-scheme:light dark}body{font:16px system-ui;margin:3rem;line-height:1.5}
+    code{overflow-wrap:anywhere}small{opacity:.7}
+  </style><h1>페이지를 열 수 없음</h1><p><code>${escapeHtml(url)}</code></p>
+  <p>${escapeHtml(description)} <small>(${code})</small></p>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderScaleFactor() {
+  if (Number.isFinite(configuredDeviceScaleFactor)) {
+    return Math.min(3, Math.max(1, configuredDeviceScaleFactor));
+  }
+  return Math.min(3, Math.max(1, screen.getPrimaryDisplay().scaleFactor || 1));
+}
+
+function logicalContentSize(vp) {
+  // tmux/Ghostty viewport는 device pixel이고 BrowserWindow 크기는 DIP이다.
+  // CSS 크기는 scale로 나누되 offscreen output은 같은 scale로 렌더링해
+  // 최종 bitmap이 pane의 실제 pixel 크기에 최대한 가깝게 한다.
+  const scaleFactor = renderScaleFactor();
+  return {
+    width: Math.max(1, Math.round(vp.width / scaleFactor)),
+    height: Math.max(1, Math.round(vp.height / scaleFactor)),
+  };
+}
+
+function renderedFrameSize(vp) {
+  const logical = logicalContentSize(vp);
+  const scaleFactor = renderScaleFactor();
+  return {
+    width: Math.max(1, Math.round(logical.width * scaleFactor)),
+    height: Math.max(1, Math.round(logical.height * scaleFactor)),
+  };
+}
+
+function browserWindowOptions(vp = lastViewport || queryViewportSize()) {
+  const logical = logicalContentSize(vp);
+  return {
+    width: logical.width,
+    height: logical.height,
+    useContentSize: true,
+    x: -10_000,
+    y: -10_000,
+    show: false,
+    opacity: 0,
+    paintWhenInitiallyHidden: true,
+    frame: false,
+    focusable: false,
+    skipTaskbar: true,
+    resizable: false,
+    fullscreenable: false,
+    enableLargerThanScreen: true,
+    webPreferences: {
+      offscreen: { deviceScaleFactor: renderScaleFactor() },
+      preload: path.join(__dirname, "preload.cjs"),
+      devTools: false,
+      nodeIntegration: false,
+      nodeIntegrationInSubFrames: true,
+      contextIsolation: true,
+    },
+  };
+}
+
+function tabLabel(tab, index) {
+  const title = tab.webContents.getTitle() || tab.webContents.getURL() || "새 탭";
+  return `${index + 1}/${tabs.length} ${title}`;
+}
+
+function readWindowSession() {
+  if (!restoreWindowSession || !windowSessionPath) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(windowSessionPath, "utf8"));
+    if (parsed?.version !== 1 || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
+    const restoredTabs = parsed.tabs.slice(0, 50).flatMap((entry) => {
+      if (!entry || typeof entry.url !== "string" || !entry.url || entry.url.length > 2_000_000) return [];
+      const zoom = Number.isFinite(entry.zoom)
+        ? Math.min(2, Math.max(0.5, entry.zoom))
+        : defaultZoomFactor;
+      return [{ url: entry.url, zoom }];
+    });
+    if (restoredTabs.length === 0) return null;
+    const activeIndex = Number.isInteger(parsed.activeIndex)
+      ? Math.min(restoredTabs.length - 1, Math.max(0, parsed.activeIndex))
+      : 0;
+    return { tabs: restoredTabs, activeIndex };
+  } catch (error) {
+    if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+      console.error(`tweb: window session restore failed: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+function writeWindowSession() {
+  if (!windowSessionPath || tabs.length === 0) return;
+  const savedTabs = tabs.flatMap((tab) => {
+    if (tab.isDestroyed()) return [];
+    const url = tabSessionUrls.get(tab) || tab.webContents.getURL() || "about:blank";
+    const zoom = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+    return [{ url, zoom }];
+  });
+  if (savedTabs.length === 0) return;
+  const state = {
+    version: 1,
+    activeIndex: Math.min(savedTabs.length - 1, Math.max(0, activeTabIndex)),
+    tabs: savedTabs,
+  };
+  const temporaryPath = `${windowSessionPath}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.dirname(windowSessionPath), { recursive: true });
+    writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPath, windowSessionPath);
+  } catch (error) {
+    try { unlinkSync(temporaryPath); } catch {}
+    if (process.env.TWEB_DEBUG) console.error(`tweb: window session save failed: ${error.message}`);
+  }
+}
+
+function scheduleWindowSessionSave() {
+  if (!windowSessionPath || quitting) return;
+  if (windowSessionSaveTimer) clearTimeout(windowSessionSaveTimer);
+  windowSessionSaveTimer = setTimeout(() => {
+    windowSessionSaveTimer = null;
+    writeWindowSession();
+  }, 100);
+  windowSessionSaveTimer.unref();
+}
+
+function notify(message) {
+  if (process.env.TMUX && process.env.TMUX_PANE) {
+    execFile("tmux", ["display-message", "-t", process.env.TMUX_PANE, message], () => {});
+  }
+  if (process.env.TWEB_DEBUG) console.error(`tweb: ${message}`);
+}
+
+function updatePaneTitle() {
+  if (!win || !process.env.TMUX_PANE) return;
+  execFile(
+    "tmux",
+    ["select-pane", "-t", process.env.TMUX_PANE, "-T", `tweb ${tabLabel(win, activeTabIndex)}`],
+    () => {}
+  );
+}
+
+function restorePaneTitle() {
+  if (!process.env.TMUX_PANE || originalPaneTitle === null) return;
+  try {
+    execFileSync(
+      "tmux",
+      ["select-pane", "-t", process.env.TMUX_PANE, "-T", originalPaneTitle],
+      { timeout: 1000, stdio: "ignore" }
+    );
+  } catch (e) {}
+}
+
+function updatePaintingState() {
+  for (const tab of tabs) {
+    if (tab.isDestroyed()) continue;
+    const active = tab === win && terminalVisible;
+    tab.webContents.setBackgroundThrottling(!active);
+    tab.webContents.setFrameRate(active ? activeFrameRate : 1);
+    if (active) tab.webContents.startPainting();
+    else tab.webContents.stopPainting();
+  }
+}
+
+function installPageEnhancements(tab = win) {
+  if (!tab || tab.isDestroyed()) return;
+  void tab.webContents.executeJavaScript(`(() => {
+    document.getElementById('__tweb_status__')?.remove();
+    let style = document.getElementById('__tweb_caret_style__');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = '__tweb_caret_style__';
+      style.textContent = 'input,textarea,[contenteditable]:focus{caret-color:#00e5ff!important}';
+      (document.head || document.documentElement).append(style);
+    }
+
+    if (!window.__twebCaretInstalled) {
+      window.__twebCaretInstalled = true;
+      const caret = document.createElement('div');
+      caret.id = '__tweb_caret__';
+      caret.style.cssText = 'display:none;position:fixed;z-index:2147483646;width:2px;pointer-events:none;background:#00e5ff;box-shadow:0 0 3px #001bff,0 0 1px #fff';
+      document.documentElement.append(caret);
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      const textInput = (element) => element instanceof HTMLInputElement && !['checkbox','radio','button','submit','reset','file','range','color'].includes(element.type);
+      const updateCaret = () => {
+        const element = document.activeElement;
+        if (!element || (!textInput(element) && !(element instanceof HTMLTextAreaElement) && !element.isContentEditable)) {
+          caret.style.display = 'none';
+          return;
+        }
+        const box = element.getBoundingClientRect();
+        const computed = getComputedStyle(element);
+        let x = box.left + parseFloat(computed.paddingLeft || 0) + 1;
+        let y = box.top + parseFloat(computed.paddingTop || 0) + 1;
+        let height = Math.max(12, parseFloat(computed.lineHeight) || parseFloat(computed.fontSize) * 1.25 || 16);
+        if (textInput(element)) {
+          context.font = computed.font;
+          const before = element.value.slice(0, element.selectionStart ?? element.value.length);
+          x += context.measureText(before).width - element.scrollLeft;
+          y = box.top + Math.max(1, (box.height - height) / 2);
+        } else if (element instanceof HTMLTextAreaElement) {
+          const mirror = document.createElement('div');
+          const properties = ['font','letterSpacing','lineHeight','padding','border','boxSizing','whiteSpace','wordBreak','overflowWrap','width'];
+          mirror.style.cssText = 'position:fixed;visibility:hidden;white-space:pre-wrap;word-wrap:break-word;top:' + box.top + 'px;left:' + box.left + 'px';
+          for (const property of properties) mirror.style[property] = computed[property];
+          mirror.textContent = element.value.slice(0, element.selectionStart ?? 0);
+          const marker = document.createElement('span');
+          marker.textContent = '\\u200b';
+          mirror.append(marker);
+          document.documentElement.append(mirror);
+          const markerBox = marker.getBoundingClientRect();
+          x = markerBox.left - element.scrollLeft;
+          y = markerBox.top - element.scrollTop;
+          mirror.remove();
+        } else {
+          const selection = getSelection();
+          if (selection && selection.rangeCount) {
+            const range = selection.getRangeAt(0).cloneRange();
+            range.collapse(true);
+            const rangeBox = range.getBoundingClientRect();
+            if (rangeBox.left || rangeBox.top) {
+              x = rangeBox.left;
+              y = rangeBox.top;
+              height = rangeBox.height || height;
+            }
+          }
+        }
+        caret.style.cssText += '';
+        caret.style.display = 'block';
+        caret.style.left = Math.max(0, x) + 'px';
+        caret.style.top = Math.max(0, y) + 'px';
+        caret.style.height = Math.min(box.height || height, height) + 'px';
+      };
+      for (const event of ['focusin','focusout','input','keyup','click','selectionchange']) {
+        document.addEventListener(event, updateCaret, true);
+      }
+      document.addEventListener('scroll', updateCaret, true);
+      window.addEventListener('resize', updateCaret);
+      window.setInterval(updateCaret, 500);
+      updateCaret();
+    }
+  })()`, true).catch((error) => {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: page enhancements failed: ${error.message}`);
+  });
+}
+
+function frameKey(frame) {
+  return `${frame.processId}:${frame.frameToken}`;
+}
+
+function readyFrameKeys(tab) {
+  let keys = readyFrameKeysByTab.get(tab);
+  if (!keys) {
+    keys = new Set();
+    readyFrameKeysByTab.set(tab, keys);
+  }
+  return keys;
+}
+
+function sendToTabFrames(tab, channel, ...args) {
+  if (!tab || tab.isDestroyed()) return;
+  const readyKeys = readyFrameKeys(tab);
+  try {
+    const mainFrame = tab.webContents.mainFrame;
+    const frames = new Set([mainFrame, ...(mainFrame?.framesInSubtree || [])].filter(Boolean));
+    const liveKeys = new Set();
+    for (const frame of frames) {
+      if (frame.isDestroyed() || frame.detached) continue;
+      const key = frameKey(frame);
+      liveKeys.add(key);
+      if (readyKeys.has(key)) frame.send(channel, ...args);
+    }
+    for (const key of readyKeys) {
+      if (!liveKeys.has(key)) readyKeys.delete(key);
+    }
+  } catch (error) {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: frame broadcast failed: ${error.message}`);
+  }
+}
+
+function sendToFocusedTabFrame(tab, channel, ...args) {
+  if (!tab || tab.isDestroyed()) return;
+  try {
+    const contents = tab.webContents;
+    const focused = contents.focusedFrame;
+    const frame = focused && !focused.isDestroyed() && !focused.detached
+      ? focused
+      : contents.mainFrame;
+    if (frame && readyFrameKeys(tab).has(frameKey(frame))) frame.send(channel, ...args);
+  } catch (error) {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: focused frame send failed: ${error.message}`);
+  }
+}
+
+function broadcastShortcutMode() {
+  for (const tab of tabs) {
+    sendToTabFrames(tab, "tweb-shortcuts-enabled", browserShortcutsEnabled);
+  }
+}
+
+function toggleBrowserShortcuts() {
+  browserShortcutsEnabled = !browserShortcutsEnabled;
+  broadcastShortcutMode();
+  reconcileTmuxPassthrough();
+  updatePaneTitle();
+  if (process.env.TWEB_DEBUG) {
+    console.error(`tweb: input mode ${browserShortcutsEnabled ? "shortcuts" : "passthrough"}`);
+  }
+  notify(browserShortcutsEnabled ? "browser shortcuts ON" : "web passthrough ON");
+}
+
+function activateTab(index) {
+  if (tabs.length === 0) {
+    win = null;
+    activeTabIndex = -1;
+    return;
+  }
+  const normalized = ((index % tabs.length) + tabs.length) % tabs.length;
+  activeTabIndex = normalized;
+  win = tabs[normalized];
+  mouseClicks.reset();
+  writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
+  updatePaintingState();
+  win.webContents.invalidate();
+  updatePaneTitle();
+  scheduleWindowSessionSave();
+  if (process.env.TWEB_DEBUG) console.error(`tweb: tab active ${tabLabel(win, normalized)}`);
+}
+
+function cycleTab(direction) {
+  if (tabs.length > 1) activateTab(activeTabIndex + direction);
+}
+
+function closeTab(index = activeTabIndex) {
+  const tab = tabs[index];
+  if (!tab || tab.isDestroyed()) return;
+  const url = tab.webContents.getURL();
+  if (url && url !== "about:blank") {
+    closedTabs.push(url);
+    if (closedTabs.length > 25) closedTabs.shift();
+  }
+  if (tabs.length === 1) {
+    app.quit();
+    return;
+  }
+  tab.close();
+}
+
+function restoreClosedTab() {
+  const url = closedTabs.pop();
+  if (url) createTab(url, true);
+}
+
+function normalizeOmniboxInput(input) {
+  const value = String(input || "").trim();
+  if (!value) return null;
+  if (/^(?:[a-z][a-z0-9+.-]*:\/\/|about:|data:|file:)/i.test(value)) return value;
+  if (/^(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(value)) return `http://${value}`;
+  if (!/\s/.test(value) && (/^[^/]+\.[^/]+(?:\/|$)/.test(value) || /^[^/]+:\d+(?:\/|$)/.test(value))) {
+    return `https://${value}`;
+  }
+  return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
+}
+
+function handleNativeShortcut(tab, action, value) {
+  if (!browserShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
+  if (process.env.TWEB_DEBUG) console.error(`tweb: native shortcut ${action}`);
+  const contents = tab.webContents;
+  switch (action) {
+    case "history-back":
+      if (contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+      break;
+    case "history-forward":
+      if (contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+      break;
+    case "previous-tab": cycleTab(-1); break;
+    case "next-tab": cycleTab(1); break;
+    case "list-tabs":
+      sendToTabFrames(tab, "tweb-tabs", {
+        activeIndex: activeTabIndex,
+        tabs: tabs.map((candidate, index) => ({
+          index,
+          title: candidate.webContents.getTitle() || "새 탭",
+          url: candidate.webContents.getURL() || "about:blank",
+        })),
+      });
+      break;
+    case "activate-tab":
+      if (Number.isInteger(value) && value >= 0 && value < tabs.length) activateTab(value);
+      break;
+    case "close-tab": closeTab(); break;
+    case "restore-tab": restoreClosedTab(); break;
+    case "reload": contents.reload(); break;
+    case "zoom-in": setBrowserZoom("in"); break;
+    case "zoom-out": setBrowserZoom("out"); break;
+    case "zoom-reset": setBrowserZoom("reset"); break;
+    case "find": {
+      const query = String(value?.query || "");
+      if (query) {
+        contents.findInPage(query, {
+          forward: value?.forward !== false,
+          findNext: Boolean(value?.findNext),
+        });
+      }
+      break;
+    }
+    case "stop-find":
+      contents.stopFindInPage(["clearSelection", "keepSelection", "activateSelection"].includes(value) ? value : "clearSelection");
+      break;
+    case "copy-text":
+      clipboard.writeText(String(value || ""));
+      break;
+    case "copy-image":
+      if ([value?.x, value?.y, value?.width, value?.height].every(Number.isFinite)) {
+        const rect = {
+          x: Math.max(0, Math.round(value.x)),
+          y: Math.max(0, Math.round(value.y)),
+          width: Math.max(1, Math.round(value.width)),
+          height: Math.max(1, Math.round(value.height)),
+        };
+        // Let the renderer remove its visual outline before capturing the
+        // rendered image region. This works for img, canvas, SVG and video in
+        // offscreen Chromium, where copyImageAt may not update the pasteboard.
+        setTimeout(() => {
+          void contents.capturePage(rect).then((image) => {
+            if (!image.isEmpty()) clipboard.writeImage(nativeImage.createFromBuffer(image.toPNG()));
+          }).catch((error) => {
+            if (process.env.TWEB_DEBUG) console.error(`tweb: image copy failed: ${error.message}`);
+          });
+        }, 0);
+      }
+      break;
+    case "paste":
+      contents.paste();
+      break;
+    case "frame-mode":
+      sendToTabFrames(tab, "tweb-frame-mode", value);
+      break;
+    case "navigate": {
+      const url = normalizeOmniboxInput(value);
+      if (url) void contents.loadURL(url);
+      break;
+    }
+    case "new-tab": {
+      const url = normalizeOmniboxInput(value);
+      if (url) createTab(url, true);
+      break;
+    }
+  }
+}
+
+ipcMain.on("tweb-preload-ready", (event) => {
+  const tab = BrowserWindow.fromWebContents(event.sender);
+  const frame = event.senderFrame;
+  if (!tab || !frame || frame.isDestroyed() || frame.detached) return;
+  readyFrameKeys(tab).add(frameKey(frame));
+  event.reply("tweb-shortcuts-enabled", browserShortcutsEnabled);
+});
+
+ipcMain.on("tweb-shortcut", (event, message) => {
+  if (!message || typeof message.action !== "string") return;
+  const tab = tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
+  if (!tab) return;
+  handleNativeShortcut(tab, message.action, message.value);
+});
+
+function showBrowserContextMenu(tab, inputParams) {
+  if (tab !== win || tab.isDestroyed()) return;
+  const contents = tab.webContents;
+  const params = {
+    x: 0,
+    y: 0,
+    isEditable: false,
+    selectionText: "",
+    linkURL: "",
+    editFlags: {},
+    ...inputParams,
+  };
+  const items = [];
+  if (params.isEditable) {
+    items.push(
+      { label: "실행 취소", action: "undo", enabled: params.editFlags.canUndo },
+      { label: "다시 실행", action: "redo", enabled: params.editFlags.canRedo },
+      { separator: true },
+      { label: "잘라내기", action: "cut", enabled: params.editFlags.canCut },
+      { label: "복사", action: "copy", enabled: params.editFlags.canCopy },
+      { label: "붙여넣기", action: "paste", enabled: params.editFlags.canPaste },
+      { label: "전체 선택", action: "selectAll", enabled: params.editFlags.canSelectAll },
+    );
+  } else if (params.selectionText) {
+    items.push({ label: "복사", action: "copy", enabled: true }, { separator: true });
+  }
+  if (params.linkURL) {
+    items.push(
+      { label: "링크를 새 탭에서 열기", action: "openLink", value: params.linkURL, enabled: true },
+      { label: "링크 주소 복사", action: "copyLink", value: params.linkURL, enabled: true },
+      { separator: true },
+    );
+  }
+  items.push(
+    { label: "뒤로", action: "back", enabled: contents.navigationHistory.canGoBack() },
+    { label: "앞으로", action: "forward", enabled: contents.navigationHistory.canGoForward() },
+    { label: "새로고침", action: "reload", enabled: true },
+  );
+
+  const model = JSON.stringify({ x: params.x, y: params.y, items });
+  void contents.executeJavaScript(`(() => {
+    const model = ${model};
+    document.getElementById('__tweb_context_menu__')?.remove();
+    const host = document.createElement('div');
+    host.id = '__tweb_context_menu__';
+    host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none';
+    const shadow = host.attachShadow({mode:'closed'});
+    const backdrop = document.createElement('div');
+    backdrop.style.cssText = 'position:fixed;inset:0;pointer-events:auto';
+    const menu = document.createElement('div');
+    menu.setAttribute('role', 'menu');
+    menu.style.cssText = 'position:fixed;min-width:190px;padding:5px;background:#202124;color:#f1f3f4;border:1px solid #5f6368;border-radius:7px;box-shadow:0 8px 24px #0008;font:13px/1.35 system-ui,-apple-system,sans-serif;pointer-events:auto';
+    for (const item of model.items) {
+      if (item.separator) {
+        const separator = document.createElement('div');
+        separator.style.cssText = 'height:1px;margin:4px 2px;background:#5f6368';
+        menu.append(separator);
+        continue;
+      }
+      const button = document.createElement('button');
+      button.textContent = item.label;
+      button.disabled = !item.enabled;
+      button.style.cssText = 'display:block;width:100%;padding:6px 10px;border:0;border-radius:4px;background:transparent;color:inherit;text-align:left;font:inherit';
+      if (!item.enabled) button.style.opacity = '.45';
+      button.onmouseenter = () => { if (!button.disabled) button.style.background = '#3c4043'; };
+      button.onmouseleave = () => { button.style.background = 'transparent'; };
+      button.onclick = async () => {
+        host.remove();
+        switch (item.action) {
+          case 'undo': document.execCommand('undo'); break;
+          case 'redo': document.execCommand('redo'); break;
+          case 'cut': document.execCommand('cut'); break;
+          case 'copy': document.execCommand('copy'); break;
+          case 'paste': document.execCommand('paste'); break;
+          case 'selectAll': document.execCommand('selectAll'); break;
+          case 'openLink': window.open(item.value, '_blank'); break;
+          case 'copyLink': await navigator.clipboard.writeText(item.value); break;
+          case 'back': history.back(); break;
+          case 'forward': history.forward(); break;
+          case 'reload': location.reload(); break;
+        }
+      };
+      menu.append(button);
+    }
+    backdrop.onclick = () => host.remove();
+    backdrop.oncontextmenu = (event) => { event.preventDefault(); host.remove(); };
+    shadow.append(backdrop, menu);
+    document.documentElement.append(host);
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.max(4, Math.min(model.x, innerWidth - rect.width - 4)) + 'px';
+    menu.style.top = Math.max(4, Math.min(model.y, innerHeight - rect.height - 4)) + 'px';
+  })()`, true).then(() => {
+    if (process.env.TWEB_DEBUG) console.error("tweb: context menu shown");
+  }).catch((error) => {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: context menu failed: ${error.message}`);
+  });
+}
+
+function keepWindowHidden(tab) {
+  if (!tab || tab.isDestroyed()) return;
+  const bounds = tab.getBounds();
+  if (bounds.x !== -10_000 || bounds.y !== -10_000) {
+    tab.setBounds({ ...bounds, x: -10_000, y: -10_000 });
+  }
+  if (tab.getOpacity() !== 0) tab.setOpacity(0);
+  if (tab.isFocusable()) tab.setFocusable(false);
+  tab.setSkipTaskbar(true);
+  tab.setIgnoreMouseEvents(true);
+  if (tab.isFocused()) tab.blur();
+  if (tab.isVisible()) tab.hide();
+}
+
+function enforceHiddenWindows() {
+  for (const window of BrowserWindow.getAllWindows()) keepWindowHidden(window);
+}
+
+function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
+  const contents = tab.webContents;
+  const keepHidden = () => keepWindowHidden(tab);
+  keepHidden();
+  tab.on("show", keepHidden);
+  tab.on("focus", keepHidden);
+  tab.on("move", keepHidden);
+  contents.on("preload-error", (_event, preloadPath, error) => {
+    console.error(`tweb: preload failed ${preloadPath}: ${error.stack || error.message}`);
+  });
+  tabZoomFactors.set(tab, initialZoomFactor);
+  contents.setZoomFactor(initialZoomFactor);
+  contents.setBackgroundThrottling(true);
+  contents.setFrameRate(1);
+  contents.on("paint", (_event, _dirty, image) => {
+    const size = image.getSize();
+    const expected = lastViewport && renderedFrameSize(lastViewport);
+    if (loggedFrameGeneration !== viewportGeneration && !image.isEmpty()
+      && size.width === expected?.width && size.height === expected?.height) {
+      loggedFrameGeneration = viewportGeneration;
+      if (process.env.TWEB_DEBUG) {
+        const vp = lastViewport || queryViewportSize();
+        console.error(
+          `tweb: frame generation=${viewportGeneration} ${size.width}x${size.height}, `
+          + `pane ${vp.width}x${vp.height}, scale ${renderScaleFactor().toFixed(2)}`
+        );
+      }
+    }
+    queueFrame(tab, image);
+  });
+
+  // Electron이 custom offscreen child를 연결하기 전에 macOS OffScreenView
+  // placeholder를 native popup으로 노출할 수 있다. 원 요청은 거부하고 URL을
+  // 별도 TWeb tab으로 직접 열어 native popup 생성 자체를 막는다.
+  contents.setWindowOpenHandler((details) => {
+    const target = details.url || "about:blank";
+    setImmediate(() => createTab(target, true));
+    return { action: "deny" };
+  });
+
+  contents.on("did-start-navigation", (details) => {
+    if (details.isSameDocument || !details.frame) return;
+    readyFrameKeys(tab).delete(frameKey(details.frame));
+  });
+  contents.on("context-menu", (_event, params) => {
+    if (browserShortcutsEnabled) showBrowserContextMenu(tab, params);
+  });
+  contents.on("media-started-playing", () => {
+    if (process.env.TWEB_DEBUG) {
+      setTimeout(() => {
+        if (!contents.isDestroyed()) {
+          console.error(`tweb: media playing audible=${contents.isCurrentlyAudible()} muted=${contents.audioMuted}`);
+        }
+      }, 250);
+    }
+  });
+  contents.on("media-paused", () => {
+    if (process.env.TWEB_DEBUG) console.error("tweb: media paused");
+  });
+  contents.on("found-in-page", (_event, result) => {
+    sendToTabFrames(tab, "tweb-find-result", result);
+  });
+
+  let showingLoadError = false;
+  const recordNavigation = (url) => {
+    if (showingLoadError || typeof url !== "string" || !url) return;
+    tabSessionUrls.set(tab, url);
+    scheduleWindowSessionSave();
+  };
+  contents.on("did-navigate", (_event, url) => recordNavigation(url));
+  contents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
+    if (isMainFrame) recordNavigation(url);
+  });
+
+  let initialZoomApplied = false;
+  contents.on("did-finish-load", () => {
+    showingLoadError = false;
+    const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+    contents.setZoomFactor(zoomFactor);
+    contents.invalidate();
+    if (!initialZoomApplied) {
+      initialZoomApplied = true;
+      if (process.env.TWEB_DEBUG) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
+    }
+    installPageEnhancements(tab);
+    sendToTabFrames(tab, "tweb-shortcuts-enabled", browserShortcutsEnabled);
+    if (process.env.TWEB_DEBUG) {
+      console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
+    }
+  });
+  tab.on("page-title-updated", (_event, title) => {
+    if (tab === win) updatePaneTitle();
+    if (process.env.TWEB_DEBUG) console.error(`tweb: title ${title}`);
+  });
+  contents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
+    if (!isMainFrame || code === -3 || showingLoadError) return;
+    showingLoadError = true;
+    console.error(`tweb: failed to load ${failedUrl}: ${description} (${code})`);
+    void contents.loadURL(errorPage(failedUrl || contents.getURL(), code, description));
+  });
+}
+
+function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
+  if (tabs.includes(tab)) return tab;
+  configureTab(tab, initialZoomFactor);
+  tabSessionUrls.set(tab, url || "about:blank");
+  tabs.push(tab);
+  const index = tabs.length - 1;
+
+  tab.on("closed", () => {
+    const closedIndex = tabs.indexOf(tab);
+    if (closedIndex < 0) return;
+    const wasActive = tab === win;
+    tabFrames.delete(tab);
+    tabZoomFactors.delete(tab);
+    tabSessionUrls.delete(tab);
+    tabs.splice(closedIndex, 1);
+    if (tabs.length === 0) {
+      win = null;
+      activeTabIndex = -1;
+      if (!quitting) app.quit();
+      return;
+    }
+    if (wasActive) activateTab(Math.min(closedIndex, tabs.length - 1));
+    else if (closedIndex < activeTabIndex) activeTabIndex -= 1;
+    scheduleWindowSessionSave();
+  });
+
+  if (activate) activateTab(index);
+  else scheduleWindowSessionSave();
+  if (process.env.TWEB_DEBUG) console.error(`tweb: tab opened ${index + 1} ${url}`);
+  return tab;
+}
+
+function createTab(
+  url = "about:blank",
+  activate = true,
+  initialZoomFactor = defaultZoomFactor
+) {
+  const tab = adoptTab(
+    new BrowserWindow(browserWindowOptions()),
+    url,
+    activate,
+    initialZoomFactor
+  );
+  // did-fail-load owns user-visible failures. loadURL also rejects for a normal
+  // client-side redirect with ERR_ABORTED, which must not replace the new page.
+  void tab.loadURL(url).catch((error) => {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: navigation superseded ${url}: ${error.message}`);
+  });
+  return tab;
+}
+
+function applyViewport(vp, origin = tmuxOrigin) {
+  if (!vp) return;
+  const viewportChanged = !lastViewport ||
+    lastViewport.cols !== vp.cols || lastViewport.rows !== vp.rows ||
+    lastViewport.width !== vp.width || lastViewport.height !== vp.height;
+  const originChanged = origin?.left !== tmuxOrigin?.left || origin?.top !== tmuxOrigin?.top;
+  if (!viewportChanged && !originChanged) return;
+
+  viewportGeneration += 1;
+  mouseClicks.reset();
+  if (pendingFrameTimer) {
+    clearTimeout(pendingFrameTimer);
+    pendingFrameTimer = null;
+  }
+  pendingFrame = null;
+  pendingGfxFrame = null;
+  tabFrames.clear();
+  // 이전 origin에 남은 placement를 먼저 지운 뒤 새 frame의 anchor를 교체한다.
+  writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
+  tmuxOrigin = origin;
+  paneCells = { cols: vp.cols, rows: vp.rows };
+  lastViewport = vp;
+  const logical = logicalContentSize(vp);
+  if (process.env.TWEB_DEBUG) {
+    const anchor = tmuxOrigin ? `${tmuxOrigin.left},${tmuxOrigin.top}` : "none";
+    console.error(
+      `tweb: resize generation=${viewportGeneration} cells=${vp.cols}x${vp.rows} `
+      + `pixels=${vp.width}x${vp.height} logical=${logical.width}x${logical.height} origin=${anchor}`
+    );
+  }
+  if (viewportChanged) {
+    for (const tab of tabs) {
+      if (!tab.isDestroyed()) tab.setContentSize(logical.width, logical.height);
+    }
+  }
+  win?.webContents.invalidate();
+}
+
+function createWindow(url) {
+  const vp = queryViewportSize();
+  paneCells = { cols: vp.cols, rows: vp.rows };
+  lastViewport = vp;
+
+  const session = readWindowSession();
+  if (!session) return createTab(url, true);
+
+  for (const tab of session.tabs) {
+    createTab(tab.url, false, tab.zoom);
+  }
+  activateTab(session.activeIndex);
+  if (process.env.TWEB_DEBUG) {
+    console.error(`tweb: restored ${session.tabs.length} tabs for tmux window`);
+  }
+  return win;
+}
+
+// --- browser input ---
+
+let rawInput = Buffer.alloc(0);
+let rawInputFlushTimer = null;
+const utf8Decoder = new StringDecoder("utf8");
+const mouseClicks = new MouseClickState();
+
+function electronModifiers(mask) {
+  const bits = Math.max(0, mask - 1);
+  const modifiers = [];
+  if (bits & 1) modifiers.push("shift");
+  if (bits & 2) modifiers.push("alt");
+  if (bits & 4) modifiers.push("control");
+  if (bits & 8 || bits & 32) modifiers.push("meta");
+  return modifiers;
+}
+
+function mouseModifiers(cb) {
+  const modifiers = [];
+  if (cb & 4) modifiers.push("shift");
+  if (cb & 8) modifiers.push("alt");
+  if (cb & 16) modifiers.push("control");
+  return modifiers;
+}
+
+function logicalMousePoint(rawX, rawY) {
+  const vp = lastViewport || queryViewportSize();
+  const logical = logicalContentSize(vp);
+  if (process.env.TMUX) {
+    // tmux는 1016을 받아도 pane-relative cell 좌표를 전달한다.
+    return {
+      x: Math.min(logical.width - 1, Math.max(0, Math.floor((rawX - 0.5) * logical.width / vp.cols))),
+      y: Math.min(logical.height - 1, Math.max(0, Math.floor((rawY - 0.5) * logical.height / vp.rows))),
+    };
+  }
+  const scale = screen.getPrimaryDisplay().scaleFactor || 1;
+  return {
+    x: Math.max(0, Math.floor((rawX - 1) / scale)),
+    y: Math.max(0, Math.floor((rawY - 1) / scale)),
+  };
+}
+
+function setBrowserZoom(action) {
+  if (!win) return;
+  const contents = win.webContents;
+  const current = contents.getZoomFactor();
+  const next = action === "reset"
+    ? defaultZoomFactor
+    : Math.min(2, Math.max(0.5, current * (action === "in" ? 1.2 : 1 / 1.2)));
+  tabZoomFactors.set(win, next);
+  contents.setZoomFactor(next);
+  contents.invalidate();
+  scheduleWindowSessionSave();
+  if (process.env.TWEB_DEBUG) console.error(`tweb: zoom ${next.toFixed(3)}`);
+}
+
+function hasZoomModifier(modifiers) {
+  // Cmd +/-는 Ghostty의 font zoom이 먼저 소비하므로 browser shortcut으로 쓰지 않는다.
+  return modifiers.includes("control") && !modifiers.includes("meta");
+}
+
+function dispatchMouse(cb, rawX, rawY, release) {
+  if (!win) return;
+  const contents = win.webContents;
+  const { x, y } = logicalMousePoint(rawX, rawY);
+  const modifiers = mouseModifiers(cb);
+  const buttonCode = cb & 3;
+  const motion = (cb & 32) !== 0;
+  const wheel = (cb & 64) !== 0;
+
+  if (wheel) {
+    const direction = buttonCode === 0 ? 1 : buttonCode === 1 ? -1 : 0;
+    if (browserShortcutsEnabled && direction !== 0 && hasZoomModifier(modifiers)) {
+      setBrowserZoom(direction > 0 ? "in" : "out");
+      return;
+    }
+    contents.sendInputEvent({
+      type: "mouseWheel",
+      x,
+      y,
+      deltaX: buttonCode === 2 ? -100 : buttonCode === 3 ? 100 : 0,
+      deltaY: direction * 100,
+      wheelTicksX: buttonCode === 2 ? -1 : buttonCode === 3 ? 1 : 0,
+      wheelTicksY: direction,
+      accelerationRatioX: 0.5,
+      accelerationRatioY: 0.5,
+      hasPreciseScrollingDeltas: false,
+      canScroll: true,
+      modifiers,
+    });
+    return;
+  }
+
+  const button = buttonCode === 0 ? "left" : buttonCode === 1 ? "middle" : buttonCode === 2 ? "right" : undefined;
+  let type = "mouseMove";
+  if (!motion && button) type = release ? "mouseUp" : "mouseDown";
+  let clickCount = 0;
+  if (type === "mouseDown") {
+    clickCount = mouseClicks.press(button, x, y);
+  } else if (type === "mouseUp") {
+    clickCount = mouseClicks.release(button).count;
+  } else {
+    mouseClicks.move(button, x, y);
+  }
+  contents.sendInputEvent({
+    type,
+    x,
+    y,
+    button,
+    modifiers,
+    clickCount,
+  });
+  // 일부 offscreen Chromium 경로는 right mouseUp만으로 contextmenu를 만들지 않는다.
+  if (type === "mouseUp" && button === "right") {
+    contents.sendInputEvent({
+      type: "contextMenu",
+      x,
+      y,
+      button: "right",
+      modifiers,
+    });
+    // Browser shortcut mode에서만 TWeb navigation menu를 덧붙인다.
+    if (browserShortcutsEnabled) showBrowserContextMenu(win, { x, y });
+  }
+  if (process.env.TWEB_DEBUG && type !== "mouseMove") {
+    console.error(`tweb: ${type} ${button} ${x},${y}`);
+  }
+}
+
+const KITTY_KEYS = new Map([
+  [27, "Escape"], [13, "Enter"], [9, "Tab"], [127, "Backspace"],
+  [57344, "Escape"], [57345, "Enter"], [57346, "Tab"], [57347, "Backspace"],
+  [57348, "Insert"], [57349, "Delete"], [57350, "ArrowLeft"], [57351, "ArrowRight"],
+  [57352, "ArrowUp"], [57353, "ArrowDown"], [57354, "PageUp"], [57355, "PageDown"],
+  [57356, "Home"], [57357, "End"],
+]);
+
+function keyName(codepoint) {
+  if (KITTY_KEYS.has(codepoint)) return KITTY_KEYS.get(codepoint);
+  if (codepoint >= 32 && codepoint <= 0x10ffff) {
+    try { return String.fromCodePoint(codepoint); } catch (e) {}
+  }
+  return null;
+}
+
+function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints = []) {
+  if (!win || !key) return;
+  const modifiers = electronModifiers(modifierMask);
+  const pressed = eventKind !== 3;
+  const control = modifiers.includes("control");
+  const shift = modifiers.includes("shift");
+
+  // tmux가 modifier를 제거하지 않는 환경에서는 표준 CSI-u도 지원한다.
+  // release도 소비해 웹페이지에 orphan keyUp이 전달되지 않게 한다.
+  if (control && key === ";") {
+    if (pressed) toggleBrowserShortcuts();
+    return;
+  }
+
+  if (modifiers.includes("meta") && key.toLowerCase() === "a") {
+    if (pressed) sendToTabFrames(win, "tweb-select-all");
+    return;
+  }
+
+  // Browser shortcut mode에서만 Ctrl-C를 pane 종료로 사용한다. Web passthrough
+  // mode에서는 페이지의 KeyboardEvent로 그대로 전달한다.
+  if (browserShortcutsEnabled && key.toLowerCase() === "c" && control) {
+    if (pressed) app.quit();
+    return;
+  }
+
+  if (browserShortcutsEnabled) {
+    const tabCycle = control && (key === "Tab" || key === "PageDown" || key === "PageUp");
+    const tabClose = control && key.toLowerCase() === "w";
+    const zoom = hasZoomModifier(modifiers) && ["+", "=", "-", "0"].includes(key);
+    if (tabCycle || tabClose || zoom) {
+      if (pressed) {
+        if (key === "Tab") cycleTab(shift ? -1 : 1);
+        else if (key === "PageDown") cycleTab(1);
+        else if (key === "PageUp") cycleTab(-1);
+        else if (tabClose) closeTab();
+        else if (key === "+" || key === "=") setBrowserZoom("in");
+        else if (key === "-") setBrowserZoom("out");
+        else if (key === "0") setBrowserZoom("reset");
+      }
+      return;
+    }
+  }
+
+  const text = eventKind !== 3
+    ? textCodepoints.length > 0
+      ? textCodepoints.map((value) => keyName(value) || "").join("")
+      : key.length === 1 && !modifiers.includes("control") && !modifiers.includes("meta")
+        ? key
+        : ""
+    : "";
+  sendToFocusedTabFrame(win, "tweb-terminal-key", {
+    key,
+    code: "",
+    event: eventKind === 3 ? "keyup" : "keydown",
+    text,
+    shiftKey: modifiers.includes("shift"),
+    altKey: modifiers.includes("alt"),
+    ctrlKey: control,
+    metaKey: modifiers.includes("meta"),
+    synthesizeKeyUp: eventKind === 1,
+  });
+}
+
+function dispatchKey(codepoint, modifierMask = 1, eventKind = 1, textCodepoints = []) {
+  const key = keyName(codepoint);
+  if (key) dispatchNamedKey(key, modifierMask, eventKind, textCodepoints);
+}
+
+function dispatchControlByte(byte, extraModifierBits = 0) {
+  if (byte === 0) {
+    dispatchKey(32, 1 + 4 + extraModifierBits);
+    return true;
+  }
+  if (byte >= 1 && byte <= 26) {
+    dispatchKey(96 + byte, 1 + 4 + extraModifierBits);
+    return true;
+  }
+  const controlKeys = new Map([
+    [28, "\\".codePointAt(0)],
+    [29, "]".codePointAt(0)],
+    [30, "^".codePointAt(0)],
+    [31, "_".codePointAt(0)],
+  ]);
+  if (controlKeys.has(byte)) {
+    dispatchKey(controlKeys.get(byte), 1 + 4 + extraModifierBits);
+    return true;
+  }
+  return false;
+}
+
+function dispatchText(buffer) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const byte = buffer[offset];
+    if (byte === 10 || byte === 13) {
+      dispatchNamedKey("Enter");
+      offset += byte === 13 && buffer[offset + 1] === 10 ? 2 : 1;
+      continue;
+    }
+    if (byte < 0x20 && byte !== 9) {
+      if (!dispatchControlByte(byte)) dispatchKey(byte);
+      offset += 1;
+      continue;
+    }
+    const text = utf8Decoder.write(buffer.subarray(offset));
+    for (const char of text) {
+      const codepoint = char.codePointAt(0);
+      if (codepoint > 0x7f) sendToTabFrames(win, "tweb-terminal-text", char);
+      const modifierMask = codepoint >= 65 && codepoint <= 90 ? 2 : 1;
+      dispatchKey(codepoint, modifierMask);
+    }
+    break;
+  }
+}
+
+function dispatchPrivateShortcut(code) {
+  if (process.env.TWEB_DEBUG) console.error(`tweb: private key ${code}`);
+  if (code === 5001) {
+    toggleBrowserShortcuts();
+    return;
+  }
+  if (browserShortcutsEnabled) {
+    if (code === 5002 || code === 5007) setBrowserZoom("in");
+    else if (code === 5003) setBrowserZoom("out");
+    else if (code === 5004) setBrowserZoom("reset");
+    else if (code === 5008) dispatchNamedKey("Enter", 2);
+    else if (code === 5009) dispatchKey(",".codePointAt(0), 5);
+    return;
+  }
+
+  if (code === 5002) dispatchKey("=".codePointAt(0), 5);
+  else if (code === 5003) dispatchKey("-".codePointAt(0), 5);
+  else if (code === 5004) dispatchKey("0".codePointAt(0), 5);
+  else if (code === 5005) dispatchKey("H".codePointAt(0), 8);
+  else if (code === 5006) dispatchKey("L".codePointAt(0), 8);
+  else if (code === 5007) dispatchKey("+".codePointAt(0), 6);
+  else if (code === 5008) dispatchNamedKey("Enter", 2);
+  else if (code === 5009) dispatchKey(",".codePointAt(0), 5);
+}
+
+function scheduleRawInputFlush() {
+  if (rawInputFlushTimer || rawInput.length === 0) return;
+  rawInputFlushTimer = setTimeout(() => {
+    rawInputFlushTimer = null;
+    if (rawInput[0] === 0x1b) {
+      // ESC-prefix sequence가 추가 byte 없이 끝나면 실제 Escape key다. 짧은
+      // disambiguation 시간 후 첫 ESC를 전달하고 나머지는 다시 파싱한다.
+      dispatchKey(27);
+      rawInput = rawInput.subarray(1);
+      consumeRawInput();
+    }
+  }, 35);
+}
+
+function consumeRawInput() {
+  for (;;) {
+    if (rawInput.length === 0) return;
+    const escape = rawInput.indexOf(0x1b);
+    if (escape > 0) {
+      dispatchText(rawInput.subarray(0, escape));
+      rawInput = rawInput.subarray(escape);
+      continue;
+    }
+    if (escape < 0) {
+      dispatchText(rawInput);
+      rawInput = Buffer.alloc(0);
+      return;
+    }
+
+    const input = rawInput.toString("utf8");
+
+    // Focus reporting은 사용하지 않는다. 이전 실행이나 tmux/terminal 상태에서
+    // 남아 들어온 ESC[I/ESC[O도 browser text 또는 shell 문자열로 보내지 않는다.
+    const focus = /^\x1b\[[IO]/.exec(input);
+    if (focus) {
+      rawInput = rawInput.subarray(Buffer.byteLength(focus[0]));
+      continue;
+    }
+
+    let match = /^\x1b\[(500[1-9])~/.exec(input);
+    if (match) {
+      dispatchPrivateShortcut(Number(match[1]));
+      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      continue;
+    }
+
+    match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(input);
+    if (match) {
+      dispatchMouse(Number(match[1]), Number(match[2]), Number(match[3]), match[4] === "m");
+      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      continue;
+    }
+
+    match = /^\x1b\[([0-9]+)(?::[0-9]+)*(?:;([0-9]+)(?::([123]))?)?(?:;([0-9:]+))?u/.exec(input);
+    if (match) {
+      const text = match[4] ? match[4].split(":").map(Number).filter(Number.isFinite) : [];
+      dispatchKey(Number(match[1]), Number(match[2] || 1), Number(match[3] || 1), text);
+      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      continue;
+    }
+
+    match = /^\x1b\[(?:1;([2-8]))?([ABCDHF])/.exec(input);
+    if (match) {
+      const keys = { A: "ArrowUp", B: "ArrowDown", C: "ArrowRight", D: "ArrowLeft", H: "Home", F: "End" };
+      dispatchNamedKey(keys[match[2]], Number(match[1] || 1));
+      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      continue;
+    }
+
+    match = /^\x1b\[(\d+)(?:;([2-8]))?~/.exec(input);
+    if (match) {
+      const keys = {
+        1: "Home", 2: "Insert", 3: "Delete", 4: "End", 5: "PageUp", 6: "PageDown",
+        11: "F1", 12: "F2", 13: "F3", 14: "F4", 15: "F5", 17: "F6",
+        18: "F7", 19: "F8", 20: "F9", 21: "F10", 23: "F11", 24: "F12",
+      };
+      if (keys[match[1]]) dispatchNamedKey(keys[match[1]], Number(match[2] || 1));
+      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      continue;
+    }
+
+    match = /^\x1bO([P-SABCDHF])/.exec(input);
+    if (match) {
+      const keys = {
+        P: "F1", Q: "F2", R: "F3", S: "F4",
+        A: "ArrowUp", B: "ArrowDown", C: "ArrowRight", D: "ArrowLeft", H: "Home", F: "End",
+      };
+      dispatchNamedKey(keys[match[1]]);
+      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      continue;
+    }
+
+    match = /^\x1b\[27;([2-8]);(\d+)~/.exec(input);
+    if (match) {
+      dispatchKey(Number(match[2]), Number(match[1]));
+      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      continue;
+    }
+
+    // Modified keys use modifyOtherKeys or Kitty CSI-u, both enabled by the
+    // frontend. Treating ESC + printable as legacy Alt swallows a quick
+    // Escape followed by a normal-mode key; the fallback below emits Escape
+    // and then reparses the remaining printable input instead.
+
+    // escape sequence가 아직 덜 들어왔다면 다음 INPUT chunk를 기다린다.
+    // 단독 ESC는 짧은 판별 시간이 지나면 Escape key로 확정한다.
+    if (/^\x1b(?:\[|\[<|O)?[0-9;:<]*$/.test(input)) {
+      scheduleRawInputFlush();
+      return;
+    }
+
+    // 알 수 없는 ESC는 Escape key로 전달하고 한 byte만 소비한다.
+    dispatchKey(27);
+    rawInput = rawInput.subarray(1);
+  }
+}
+
+// --- resize/input control channel ---
+// tweb-pane이 SIGWINCH와 raw terminal input을 이 pipe로 전달한다.
+let controlBuffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  controlBuffer += chunk;
+  for (;;) {
+    const newline = controlBuffer.indexOf("\n");
+    if (newline < 0) break;
+    const line = controlBuffer.slice(0, newline).trim();
+    controlBuffer = controlBuffer.slice(newline + 1);
+
+    const resize = /^RESIZE\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)(?:\s+(\d+)\s+(\d+))?$/.exec(line);
+    if (resize) {
+      markInteractionActivity();
+      const origin = resize[5] !== undefined && resize[6] !== undefined
+        ? { left: Number(resize[5]), top: Number(resize[6]) }
+        : tmuxOrigin;
+      applyViewport({
+        cols: Number(resize[1]),
+        rows: Number(resize[2]),
+        width: Number(resize[3]),
+        height: Number(resize[4]),
+      }, origin);
+      continue;
+    }
+
+    const input = /^INPUT\s+([0-9a-f]*)$/i.exec(line);
+    if (input && input[1].length % 2 === 0) {
+      markInteractionActivity();
+      if (rawInputFlushTimer) {
+        clearTimeout(rawInputFlushTimer);
+        rawInputFlushTimer = null;
+      }
+      rawInput = Buffer.concat([rawInput, Buffer.from(input[1], "hex")]);
+      consumeRawInput();
+    }
+  }
+});
+process.stdin.resume();
+
+// --- app lifecycle ---
+
+app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
+
+app.whenReady().then(() => {
+  if (process.platform === "darwin") app.dock?.hide();
+  hiddenWindowWatchdog = setInterval(enforceHiddenWindows, 50);
+  hiddenWindowWatchdog.unref();
+  enforceHiddenWindows();
+  getTmuxPaneOrigin();
+
+  // Electron app path 다음의 첫 인자를 URL로 사용한다. scheme 없는 host도 허용한다.
+  const rawUrl = process.env.TWEB_URL
+    || commandLineUrl()
+    || "https://example.com";
+  const currentUrl = normalizeUrl(rawUrl);
+
+  terminalSetup();
+  if (restoreWindowSession) {
+    initializeTmuxVisibility();
+    createWindow(currentUrl);
+  } else {
+    createWindow(currentUrl);
+    setImmediate(initializeTmuxVisibility);
+  }
+  markInteractionActivity();
+  // Chromium startup may reset the terminal modified-key mode after the Rust
+  // frontend enabled it. Re-declare it from the PTY-owning parent once startup
+  // has settled.
+  scheduleTrackedKeyboardModeRestore();
+  notify(
+    `browser shortcuts ON — toggle: Ctrl-; · frame: ${adaptiveFrameRate ? `adaptive 4-${maxActiveFrameRate}` : `${maxActiveFrameRate}`}fps`
+    + ` · zoom: Ctrl +/-/0 · default: ${Math.round(defaultZoomFactor * 100)}%`
+  );
+});
+
+function cleanupFrameFiles() {
+  for (const filePath of [frameFilePath, `${frameFilePath}.tmp`]) {
+    try { unlinkSync(filePath); } catch (error) {
+      if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+        console.error(`tweb: frame file cleanup failed ${filePath}: ${error.message}`);
+      }
+    }
+  }
+}
+
+app.on("window-all-closed", () => {
+  if (!quitting) app.quit();
+});
+
+app.on("before-quit", () => {
+  if (hiddenWindowWatchdog) {
+    clearInterval(hiddenWindowWatchdog);
+    hiddenWindowWatchdog = null;
+  }
+  if (windowSessionSaveTimer) {
+    clearTimeout(windowSessionSaveTimer);
+    windowSessionSaveTimer = null;
+  }
+  writeWindowSession();
+  quitting = true;
+  mouseClicks.reset();
+  if (pendingFrameTimer) {
+    clearTimeout(pendingFrameTimer);
+    pendingFrameTimer = null;
+    pendingFrame = null;
+  }
+  pendingGfxFrame = null;
+  void gfxWorker.terminate();
+  cleanupFrameFiles();
+  if (process.env.TWEB_DEBUG && droppedGfxFrames > 0) {
+    console.error(`tweb: dropped ${droppedGfxFrames} superseded graphics frames`);
+  }
+  for (const tab of tabs) {
+    if (!tab.isDestroyed()) tab.webContents.stopPainting();
+  }
+  restoreTmuxPassthroughClients();
+  terminalCleanup();
+  for (const tty of visibleClientTtys) deleteImageFromClientTty(tty);
+  restorePaneTitle();
+});
+
+// process exit에서도 image delete (안전망).
+process.on("exit", () => {
+  cleanupFrameFiles();
+  try {
+    writeGfx(`a=d,d=I,i=${imageId}`, "");
+  } catch (e) {}
+});

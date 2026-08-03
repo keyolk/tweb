@@ -1,0 +1,27 @@
+[package]
+name = "tweb-pane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "tweb_pane"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tweb-pane"
+path = "src/main.rs"
+
+[dependencies]
+tweb-core.workspace = true
+tweb-transport.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+which = "6"
+libc = "0.2"
+clap = { version = "=4.5.48", features = ["derive"] }

@@ -1,0 +1,33 @@
+# Rust build output
+/target/
+
+# JavaScript dependencies
+/electron/node_modules/
+node_modules/
+
+# Tauri generated bundles and local state
+/crates/tweb-engine/tauri/target/
+*.app
+
+# Runtime/session artifacts
+.gw/
+*.log
+*.pid
+*.sock
+*.tmp
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Coverage
+coverage/
+*.profraw
