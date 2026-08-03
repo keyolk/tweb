@@ -62,6 +62,12 @@ mod tests {
         assert!(script.contains("showHelp"));
         assert!(script.contains("__tweb_help__"));
         assert!(script.contains("case \"?\": showHelp()"));
+        assert!(script.contains("hitTestTargets"));
+        assert!(script.contains("native-click"));
+        assert!(script.contains("performMediaControl"));
+        assert!(script.contains("media.requestFullscreen"));
+        assert!(script.contains("__tweb_open_hints__"));
+        assert!(script.contains("event.source !== parent"));
         assert!(script.contains("tweb-action://"));
         assert!(script.contains("nonce=${++requestSerial}"));
         assert!(script.contains("__tweb_caret__"));

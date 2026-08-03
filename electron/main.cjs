@@ -1149,6 +1149,15 @@ function handleNativeShortcut(tab, action, value) {
     case "paste":
       contents.paste();
       break;
+    case "native-click":
+      if ([value?.x, value?.y].every(Number.isFinite)) {
+        const x = Math.max(0, Math.round(value.x));
+        const y = Math.max(0, Math.round(value.y));
+        contents.sendInputEvent({ type: "mouseMove", x, y });
+        contents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
+        contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+      }
+      break;
     case "frame-mode":
       sendToTabFrames(tab, "tweb-frame-mode", value);
       break;

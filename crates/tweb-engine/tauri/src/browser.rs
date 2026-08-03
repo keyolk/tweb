@@ -453,6 +453,11 @@ impl BrowserRuntime {
                     });
                 }
             }
+            "native-click" => {
+                if let Some(point) = CssPoint::from_value(&action.value) {
+                    self.with_active_window(|window| dispatch_native_click(window, point));
+                }
+            }
             "inspect-devtools" => self.with_active_window(|window| {
                 window.open_devtools();
                 if let (Some(x), Some(y)) = (
@@ -1474,6 +1479,76 @@ impl ImageRect {
         })
     }
 }
+
+#[derive(Clone, Copy)]
+struct CssPoint {
+    x: f64,
+    y: f64,
+}
+
+impl CssPoint {
+    fn from_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            x: value.get("x")?.as_f64()?.max(0.0),
+            y: value.get("y")?.as_f64()?.max(0.0),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_native_click(window: &WebviewWindow, point: CssPoint) {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::NSPoint;
+    use objc2_web_kit::WKWebView;
+    use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static EVENT_NUMBER: AtomicIsize = AtomicIsize::new(1);
+    static EVENT_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+    let _ = window.with_webview(move |platform| unsafe {
+        let webview = &*(platform.inner() as *mut WKWebView);
+        let bounds = webview.bounds();
+        let local_point = NSPoint::new(
+            point.x.clamp(0.0, (bounds.size.width - 1.0).max(0.0)),
+            point.y.clamp(0.0, (bounds.size.height - 1.0).max(0.0)),
+        );
+        let location = webview.convertPoint_toView(local_point, None);
+        let Some(native_window) = webview.window() else {
+            return;
+        };
+        let timestamp = EVENT_CLOCK.get_or_init(Instant::now).elapsed().as_secs_f64();
+        for event_type in [
+            NSEventType::MouseMoved,
+            NSEventType::LeftMouseDown,
+            NSEventType::LeftMouseUp,
+        ] {
+            let event_number = EVENT_NUMBER.fetch_add(1, AtomicOrdering::Relaxed);
+            let Some(event) = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                event_type,
+                location,
+                NSEventModifierFlags::empty(),
+                timestamp,
+                native_window.windowNumber(),
+                None,
+                event_number,
+                if event_type == NSEventType::MouseMoved { 0 } else { 1 },
+                if event_type == NSEventType::LeftMouseDown { 1.0 } else { 0.0 },
+            ) else {
+                continue;
+            };
+            match event_type {
+                NSEventType::LeftMouseDown => webview.mouseDown(&event),
+                NSEventType::LeftMouseUp => webview.mouseUp(&event),
+                _ => webview.mouseMoved(&event),
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dispatch_native_click(_window: &WebviewWindow, _point: CssPoint) {}
 
 #[cfg(target_os = "macos")]
 fn copy_image(window: &WebviewWindow, rect: ImageRect) {

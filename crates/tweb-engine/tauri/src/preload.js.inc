@@ -430,15 +430,111 @@
     return targets.sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
+  const interactiveSelector = [
+    "a[href]", "button", "input:not([type=hidden])", "textarea", "select", "summary", "label[for]",
+    "iframe", "audio", "video", "canvas", "[contenteditable=true]", "[onclick]",
+    "[jsaction]:not([jsaction=''])", "[aria-haspopup]", "[aria-controls]",
+    "[role=button]", "[role=link]", "[role=menuitem]", "[role=menuitemcheckbox]", "[role=menuitemradio]",
+    "[role=option]", "[role=tab]", "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=treeitem]",
+    "[tabindex]:not([tabindex='-1'])",
+  ].join(",");
+
+  function hasPointerIntent(element) {
+    if (!(element instanceof Element) || element.id.startsWith("__tweb_")) return false;
+    const style = getComputedStyle(element);
+    if (style.pointerEvents === "none") return false;
+    if (element.matches(interactiveSelector) || typeof element.onclick === "function") return true;
+    if ([...element.attributes].some((attribute) => /^on(?:click|mouse|pointer|touch|key)/i.test(attribute.name))) return true;
+    if (style.cursor !== "pointer") return false;
+    const root = element.getRootNode();
+    const parent = element.parentElement || root instanceof ShadowRoot && root.host || null;
+    return !(parent instanceof Element) || getComputedStyle(parent).cursor !== "pointer";
+  }
+
+  function clickableAncestor(element) {
+    let current = element;
+    while (current instanceof Element) {
+      if (hasPointerIntent(current)) return current;
+      const root = current.getRootNode();
+      current = current.parentElement || root instanceof ShadowRoot && root.host || null;
+    }
+    return null;
+  }
+
+  function hitTestTargets(semantic) {
+    const found = new Set(semantic);
+    const roots = collectRoots();
+
+    // Topmost hit targets reveal delegated click surfaces whose child owns the
+    // pixels while a pointer-styled ancestor owns the interaction.
+    const stepX = Math.max(32, Math.min(72, Math.floor(innerWidth / 18)));
+    const stepY = Math.max(28, Math.min(64, Math.floor(innerHeight / 14)));
+    const points = [];
+    for (let y = stepY / 2; y < innerHeight; y += stepY) {
+      for (let x = stepX / 2; x < innerWidth; x += stepX) points.push([x, y]);
+    }
+    for (const element of found) {
+      const rect = visibleRect(element);
+      if (rect) points.push([
+        Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2)),
+        Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2)),
+      ]);
+    }
+    for (const [x, y] of points.slice(0, 600)) {
+      for (const root of roots) {
+        const hits = typeof root.elementsFromPoint === "function" ? root.elementsFromPoint(x, y) : [];
+        const target = hits.map(clickableAncestor).find(Boolean);
+        if (target) found.add(target);
+      }
+    }
+    return [...found];
+  }
+
+  function mediaControlTargets(media) {
+    const rect = visibleRect(media);
+    if (!rect) return [];
+    if (!media.controls || rect.width < 160 || rect.height < 70) {
+      return [{
+        element: media,
+        rect,
+        nativePoint: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+      }];
+    }
+    const y = rect.bottom - Math.min(50, Math.max(28, rect.height * 0.14));
+    const controls = media instanceof HTMLVideoElement
+      ? [
+        [26, "play"],
+        [Math.max(58, rect.width - 122), "mute"],
+        [Math.max(86, rect.width - 72), "fullscreen"],
+        [Math.max(114, rect.width - 26), "menu"],
+      ]
+      : [[24, "play"], [Math.max(54, rect.width - 28), "mute"]];
+    return controls.map(([offset, mediaControl]) => ({
+      element: media,
+      rect: {
+        left: rect.left + offset - 8,
+        top: y - 8,
+        right: rect.left + offset + 8,
+        bottom: y + 8,
+        width: 16,
+        height: 16,
+      },
+      nativePoint: { x: rect.left + offset, y },
+      mediaControl,
+    }));
+  }
+
   function interactiveTargets() {
-    const selector = [
-      "a[href]", "button", "input:not([type=hidden])", "textarea", "select", "summary", "label[for]",
-      "[contenteditable=true]", "[onclick]", "[jsaction]:not([jsaction=''])", "[aria-haspopup]", "[aria-controls]",
-      "[role=button]", "[role=link]", "[role=menuitem]", "[role=menuitemcheckbox]", "[role=menuitemradio]",
-      "[role=option]", "[role=tab]", "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=treeitem]",
-      "[tabindex]:not([tabindex='-1'])",
-    ].join(",");
-    return uniqueVisibleTargets(collectRoots().flatMap((root) => [...root.querySelectorAll(selector)]));
+    const roots = collectRoots();
+    const semantic = roots.flatMap((root) => [...root.querySelectorAll(interactiveSelector)]);
+    const media = semantic.filter((element) => element.matches("video,audio"));
+    const elements = semantic.filter((element) => !element.matches("video,audio"));
+    const targets = uniqueVisibleTargets(hitTestTargets(elements), (element) => ({
+      frameSurface: element instanceof HTMLIFrameElement,
+      nativeSurface: element instanceof HTMLCanvasElement,
+    })).filter((item) => !item.element.matches("video,audio"));
+    return [...targets, ...media.flatMap(mediaControlTargets)]
+      .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
   function visualTargets() {
@@ -551,11 +647,41 @@
     return true;
   }
 
+  function performMediaControl(item) {
+    const media = item.element;
+    if (!(media instanceof HTMLMediaElement)) return false;
+    if (item.mediaControl === "play") {
+      if (media.paused) void media.play().catch(() => {});
+      else media.pause();
+      return true;
+    }
+    if (item.mediaControl === "mute") {
+      media.muted = !media.muted;
+      return true;
+    }
+    if (item.mediaControl === "fullscreen") {
+      if (document.fullscreenElement) void document.exitFullscreen?.();
+      else void media.requestFullscreen?.();
+      return true;
+    }
+    return false;
+  }
+
   function startHints(newTab) {
     startPicker(interactiveTargets(), "hint", (item) => {
       const link = item.element.closest("a[href]");
       if (newTab && link?.href) send("new-tab", link.href);
-      else {
+      else if (performMediaControl(item)) {}
+      else if (item.frameSurface) {
+        item.element.focus({ preventScroll: true });
+        item.element.contentWindow?.focus();
+        item.element.contentWindow?.postMessage({ type: "__tweb_open_hints__", newTab }, "*");
+      } else if (item.nativeSurface || item.nativePoint) {
+        send("native-click", item.nativePoint || {
+          x: item.rect.left + item.rect.width / 2,
+          y: item.rect.top + item.rect.height / 2,
+        });
+      } else {
         item.element.focus({ preventScroll: true });
         item.element.click();
       }
@@ -1234,6 +1360,11 @@
       event.stopImmediatePropagation();
     }
   }
+
+  addEventListener("message", (event) => {
+    if (topFrame || event.source !== parent || event.data?.type !== "__tweb_open_hints__" || !shortcutsEnabled) return;
+    startHints(Boolean(event.data.newTab));
+  });
 
   ipcRenderer.on("tweb-shortcuts-enabled", (_event, enabled) => {
     shortcutsEnabled = Boolean(enabled);
