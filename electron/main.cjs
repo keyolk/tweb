@@ -23,6 +23,7 @@ const { Worker } = require("node:worker_threads");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
+const { startAgentServer } = require("./agent-server.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
@@ -52,6 +53,7 @@ const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
 let windowSessionPath = null;
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
+let agentServer = null;
 // Electron logs an ipcNative error when frame.send races preload setup or navigation.
 // A frame opts in only after its preload has installed all IPC listeners.
 const readyFrameKeysByTab = new WeakMap();
@@ -1225,6 +1227,213 @@ ipcMain.on("tweb-shortcut", (event, message) => {
   handleNativeShortcut(tab, message.action, message.value);
 });
 
+// --- agent bridge ---
+
+const agentPending = new Map();
+let agentRequestSerial = 0;
+// Console output is the first thing an agent debugging a frontend asks for, and
+// it is gone by the time it thinks to ask, so keep a bounded rolling buffer.
+const consoleLog = [];
+const consoleLogLimit = 500;
+
+function recordConsoleMessage(entry) {
+  consoleLog.push({ ...entry, at: new Date().toISOString() });
+  if (consoleLog.length > consoleLogLimit) consoleLog.splice(0, consoleLog.length - consoleLogLimit);
+}
+
+function watchConsole(contents) {
+  contents.on("console-message", (...args) => {
+    // Electron ≥ 36 passes a single event object; older builds pass positionals.
+    const [first, level, message, line, sourceId] = args;
+    const detail = typeof first === "object" && first !== null && "message" in first
+      ? { level: first.level, message: first.message, line: first.lineNumber, source: first.sourceId }
+      : { level, message, line, source: sourceId };
+    const numericLevels = ["debug", "info", "warning", "error"];
+    recordConsoleMessage({
+      level: typeof detail.level === "number"
+        ? numericLevels[detail.level] || "info"
+        : String(detail.level ?? "info"),
+      message: String(detail.message ?? ""),
+      line: detail.line,
+      source: detail.source,
+      url: contents.getURL(),
+    });
+  });
+}
+
+ipcMain.on("tweb-agent-response", (_event, response) => {
+  const settle = agentPending.get(response?.id);
+  if (!settle) return;
+  agentPending.delete(response.id);
+  clearTimeout(settle.timer);
+  if (response.error) settle.reject(new Error(response.error));
+  else settle.resolve(response.result);
+});
+
+// Ask the active page's top frame to run an agent method.
+function agentPageRequest(method, params, timeoutMs = 10000) {
+  const tab = win;
+  if (!tab || tab.isDestroyed()) throw new Error("no active tab");
+  const id = ++agentRequestSerial;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      agentPending.delete(id);
+      reject(new Error(`page did not answer ${method} within ${timeoutMs}ms`));
+    }, timeoutMs);
+    agentPending.set(id, { resolve, reject, timer });
+    sendToFocusedTabFrame(tab, "tweb-agent-request", { id, method, params });
+  });
+}
+
+function agentContents() {
+  if (!win || win.isDestroyed()) throw new Error("no active tab");
+  return win.webContents;
+}
+
+function agentNativeClick(point) {
+  const contents = agentContents();
+  const { x, y } = pageToWindowPoint(contents, point);
+  contents.sendInputEvent({ type: "mouseMove", x, y });
+  contents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
+  contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+}
+
+function agentPressKey(key, modifiers = []) {
+  const contents = agentContents();
+  contents.sendInputEvent({ type: "keyDown", keyCode: key, modifiers });
+  if (key.length === 1 && modifiers.length === 0) {
+    contents.sendInputEvent({ type: "char", keyCode: key });
+  }
+  contents.sendInputEvent({ type: "keyUp", keyCode: key, modifiers });
+}
+
+async function agentWaitFor(params) {
+  const deadline = Date.now() + (params.timeout ?? 10000);
+  const interval = 100;
+  for (;;) {
+    if (params.ms !== undefined) {
+      await new Promise((resolve) => setTimeout(resolve, Number(params.ms)));
+      return { waited: Number(params.ms) };
+    }
+    const info = await agentPageRequest("info", {});
+    if (params.url && info.url.includes(params.url)) return info;
+    if (params.load && info.readyState === "complete") return info;
+    if (params.selector) {
+      try {
+        return await agentPageRequest("query", { selector: params.selector });
+      } catch (_) {}
+    }
+    if (params.text) {
+      const found = await agentContents().executeJavaScript(
+        `document.body?.innerText?.includes(${JSON.stringify(params.text)}) || false`, true);
+      if (found) return info;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`wait timed out after ${params.timeout ?? 10000}ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+}
+
+function agentTabList() {
+  return {
+    active: activeTabIndex,
+    tabs: tabs.map((tab, index) => ({
+      index,
+      title: tab.isDestroyed() ? "" : tab.webContents.getTitle(),
+      url: tab.isDestroyed() ? "" : tab.webContents.getURL(),
+      active: index === activeTabIndex,
+    })),
+  };
+}
+
+async function agentScreenshot(params) {
+  const contents = agentContents();
+  const image = await contents.capturePage();
+  if (!params.path) return { png: image.toPNG().toString("base64") };
+  const target = path.resolve(params.path);
+  writeFileSync(target, image.toPNG());
+  return { path: target, size: image.getSize() };
+}
+
+async function handleAgentCommand(method, params) {
+  switch (method) {
+    // Page-side methods run inside the preload, next to the hint machinery.
+    case "snapshot":
+    case "info":
+    case "query":
+      return agentPageRequest(method, params);
+    case "act": {
+      const result = await agentPageRequest("act", params);
+      if (result.click) {
+        agentNativeClick(result.click);
+        return { ok: true, clicked: result.click };
+      }
+      if (result.hover) {
+        const contents = agentContents();
+        contents.sendInputEvent({ type: "mouseMove", ...pageToWindowPoint(contents, result.hover) });
+        return { ok: true, hovered: result.hover };
+      }
+      return { ok: true, ...result };
+    }
+    case "navigate": {
+      const url = normalizeUrl(String(params.url || ""));
+      await agentContents().loadURL(url);
+      return { url: agentContents().getURL() };
+    }
+    case "back": {
+      const history = agentContents().navigationHistory;
+      if (!history.canGoBack()) throw new Error("no earlier entry in history");
+      history.goBack();
+      return { ok: true };
+    }
+    case "forward": {
+      const history = agentContents().navigationHistory;
+      if (!history.canGoForward()) throw new Error("no later entry in history");
+      history.goForward();
+      return { ok: true };
+    }
+    case "reload":
+      agentContents().reload();
+      return { ok: true };
+    case "press":
+      agentPressKey(String(params.key || ""), params.modifiers || []);
+      return { ok: true };
+    case "type":
+      agentContents().insertText(String(params.text ?? ""));
+      return { ok: true };
+    case "eval":
+      return { value: await agentContents().executeJavaScript(String(params.script || ""), true) };
+    case "screenshot":
+      return agentScreenshot(params);
+    case "wait":
+      return agentWaitFor(params);
+    case "tabs":
+      return agentTabList();
+    case "tab":
+      activateTab(Number(params.index));
+      return agentTabList();
+    case "tab-new":
+      createTab(normalizeUrl(String(params.url || "about:blank")), true);
+      return agentTabList();
+    case "tab-close":
+      closeTab(params.index === undefined ? activeTabIndex : Number(params.index));
+      return agentTabList();
+    case "console":
+      return { messages: params.clear ? consoleLog.splice(0) : consoleLog.slice(-(params.limit || 100)) };
+    case "errors":
+      return { errors: consoleLog.filter((entry) => entry.level === "error").slice(-(params.limit || 50)) };
+    case "status":
+      return {
+        pid: process.pid,
+        pane: process.env.TMUX_PANE || null,
+        tabs: agentTabList(),
+      };
+    default:
+      throw new Error(`unknown method ${JSON.stringify(method)}`);
+  }
+}
+
 // The page reports CSS pixels but sendInputEvent takes unzoomed window
 // coordinates, so every synthetic pointer event has to be scaled by the zoom
 // factor. Without this a click lands off-target on any page that is not at 100%.
@@ -1362,6 +1571,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.on("preload-error", (_event, preloadPath, error) => {
     console.error(`tweb: preload failed ${preloadPath}: ${error.stack || error.message}`);
   });
+  watchConsole(contents);
   tabZoomFactors.set(tab, initialZoomFactor);
   contents.setZoomFactor(initialZoomFactor);
   contents.setBackgroundThrottling(true);
@@ -2053,6 +2263,12 @@ app.whenReady().then(() => {
     setImmediate(initializeTmuxVisibility);
   }
   markInteractionActivity();
+  agentServer = startAgentServer({
+    dispatch: handleAgentCommand,
+    log: (message) => {
+      if (process.env.TWEB_DEBUG) console.error(`tweb: ${message}`);
+    },
+  });
   // Chromium startup may reset the terminal modified-key mode after the Rust
   // frontend enabled it. Re-declare it from the PTY-owning parent once startup
   // has settled.
@@ -2078,6 +2294,10 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  if (agentServer) {
+    agentServer.close();
+    agentServer = null;
+  }
   if (hiddenWindowWatchdog) {
     clearInterval(hiddenWindowWatchdog);
     hiddenWindowWatchdog = null;

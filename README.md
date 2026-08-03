@@ -45,9 +45,10 @@ tweb open --frame-rate 24 --adaptive-frame-rate https://localhost:5173
 tweb open --frame-rate 15 --no-adaptive-frame-rate https://localhost:5173
 
 # 특정 pane의 browser를 agent/CLI로 제어
+tweb panes
 tweb snapshot --pane %3
-tweb click --pane %3 --ref d1-n13
-tweb screenshot --pane %3 --send-to %1
+tweb click a --pane %3
+tweb screenshot shot.png --pane %3
 
 # Browser resource 관리
 tweb resource list --window @1
@@ -59,6 +60,44 @@ tweb profile bootstrap chrome
 # 지원 환경 진단
 tweb doctor
 ```
+
+## Agent 제어 (CLI · MCP)
+
+터미널에서 FE 작업을 끝내려면 agent도 같은 browser를 몰 수 있어야 합니다. 실행 중인 browser pane은
+runtime directory에 unix socket(`agent-%3.sock`)을 열고, `tweb` CLI와 `tweb mcp`가 그 socket에
+line-delimited JSON-RPC로 붙습니다. headless 세션을 따로 띄우지 않으므로 **agent가 조작하는 화면이
+사용자가 보고 있는 그 화면**입니다.
+
+ref는 `f` hint가 그리는 label과 같은 값입니다. agent가 `@a`를 클릭하면 사용자는 화면에서 `a` badge가
+붙어 있던 그 요소가 눌리는 것을 보고, 사람이 화면을 보며 "a 눌러줘"라고 말할 수 있습니다. 별도 좌표계나
+번역이 없습니다.
+
+```bash
+tweb panes                       # 제어 가능한 browser pane 목록
+tweb snapshot                    # 상호작용 요소 + ref (--text로 읽기용 snapshot)
+tweb click a                     # 신뢰된 native click (isTrusted=true)
+tweb fill s "agent@example.com"  # framework-safe value 설정
+tweb select d Green
+tweb press Enter --mod shift
+tweb wait --selector "#result" --timeout 5000
+tweb errors                      # console error만
+tweb eval "location.pathname"
+tweb tab new https://localhost:5173
+```
+
+기본 출력은 사람이 읽는 요약이고 `--json`으로 원본을 받습니다. pane이 하나면 `--pane`은 생략합니다.
+
+`snapshot`은 role·accessible name·value·CSS selector·화면 좌표를 함께 돌려주므로 agent가 확인한
+요소를 그대로 test code의 selector로 옮길 수 있습니다. `console`/`errors`는 page가 시작될 때부터
+누적된 buffer를 읽으므로, 문제가 발생한 뒤에 물어봐도 늦지 않습니다.
+
+MCP client에는 stdio server로 등록합니다.
+
+```json
+{ "mcpServers": { "tweb": { "command": "tweb", "args": ["mcp"] } } }
+```
+
+현재 agent socket은 Electron engine에서 제공합니다. Tauri engine은 사용자 조작 경로만 지원합니다.
 
 ## Browser engine과 frame policy
 

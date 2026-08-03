@@ -48,3 +48,21 @@ test("synthetic pointer events are scaled by the zoom factor", () => {
     );
   }
 });
+
+test("agent bridge exposes snapshot, act and query to the socket", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  for (const method of ["snapshot", "act", "navigate", "eval", "wait", "console", "errors", "screenshot"]) {
+    assert.match(main, new RegExp(`case "${method}"`), `main is missing agent method ${method}`);
+  }
+  assert.match(electron, /function agentSnapshot\(params = \{\}\)/);
+  assert.match(electron, /function agentAct\(params\)/);
+  assert.match(electron, /ipcRenderer\.on\("tweb-agent-request"/);
+  // Refs are hint labels so the agent and the human name the same element.
+  assert.match(electron, /const labels = hintLabels\(targets\.length\);\s*\n\s*agentTargets = new Map/);
+});
+
+test("agent socket refuses a path longer than sun_path", () => {
+  const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
+  assert.match(server, /Buffer\.byteLength\(target\) > 100/);
+  assert.match(server, /agent-\$\{pane\.replace/);
+});

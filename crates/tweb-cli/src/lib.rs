@@ -3,10 +3,13 @@
 //! DESIGN.md 섹션 4.1. subcommand가 항상 동작보다 먼저, target selector는 뒤.
 //! `tweb snapshot --pane %3`. 전역 selector와 subcommand별 selector를 섞지 않는다.
 
+pub mod agent;
 pub mod doctor;
+pub mod mcp;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde_json::json;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum BrowserEngineArg {
@@ -98,57 +101,183 @@ pub enum Command {
         #[arg(short = 'H')]
         horizontal: bool,
     },
+    /// automation 가능한 browser pane 목록.
+    Panes {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// resolve된 browser page 이동.
     Navigate {
         url: String,
-        #[arg(long)]
-        pane: Option<i32>,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// history 뒤로.
+    Back {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// history 앞으로.
+    Forward {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// page reload.
+    Reload {
+        #[command(flatten)]
+        agent: AgentOptions,
     },
     /// browser page 상태.
     Status {
-        #[arg(long)]
-        pane: Option<i32>,
+        #[command(flatten)]
+        agent: AgentOptions,
     },
-    /// browser page 제어 snapshot (agent automation용).
+    /// 상호작용 가능한 요소 snapshot. ref는 `f` hint label과 같다.
     Snapshot {
+        /// link/heading/text까지 포함한 읽기용 snapshot.
         #[arg(long)]
-        pane: Option<i32>,
-        #[arg(long)]
-        pretty: bool,
+        text: bool,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// ref로 CSS selector 조회 (snapshot 없이 단건).
+    Query {
+        selector: String,
+        #[command(flatten)]
+        agent: AgentOptions,
     },
     /// element click.
     Click {
-        #[arg(long)]
-        pane: Option<i32>,
-        /// semantic ref (예: d1-n13).
+        /// snapshot이 부여한 ref (예: a, sd).
         r#ref: String,
+        #[command(flatten)]
+        agent: AgentOptions,
     },
-    /// element fill.
+    /// element hover.
+    Hover {
+        r#ref: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// input/textarea/contenteditable 값 설정.
     Fill {
-        #[arg(long)]
-        pane: Option<i32>,
         r#ref: String,
         value: String,
+        #[command(flatten)]
+        agent: AgentOptions,
     },
-    /// key press.
+    /// focus된 element에 text 입력.
+    Type {
+        text: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// key press (예: Enter, Tab, Escape).
     Press {
-        #[arg(long)]
-        pane: Option<i32>,
         key: String,
+        /// modifier (shift, control, alt, meta). 반복 가능.
+        #[arg(long = "mod")]
+        modifiers: Vec<String>,
+        #[command(flatten)]
+        agent: AgentOptions,
     },
-    /// page resize.
-    Resize {
+    /// select option 선택.
+    Select {
+        r#ref: String,
+        value: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// checkbox/radio 체크.
+    Check {
+        r#ref: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// checkbox 해제.
+    Uncheck {
+        r#ref: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// element text 읽기.
+    Text {
+        r#ref: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// element outer HTML 읽기.
+    Html {
+        r#ref: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// page에서 JavaScript 실행.
+    Eval {
+        script: String,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// 조건 충족까지 대기.
+    Wait {
+        /// CSS selector 등장 대기.
         #[arg(long)]
-        pane: Option<i32>,
-        width: u32,
-        height: u32,
+        selector: Option<String>,
+        /// 본문 text 등장 대기.
+        #[arg(long)]
+        text: Option<String>,
+        /// URL 부분 일치 대기.
+        #[arg(long)]
+        url: Option<String>,
+        /// 로딩 완료 대기.
+        #[arg(long)]
+        load: bool,
+        /// 고정 시간 대기 (ms).
+        #[arg(long)]
+        ms: Option<u64>,
+        #[arg(long, default_value_t = 10000)]
+        timeout: u64,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// console 기록.
+    Console {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// 읽은 뒤 버퍼 비우기.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// console error만.
+    Errors {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// tab 목록.
+    Tabs {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// tab 전환·생성·닫기.
+    Tab {
+        #[command(subcommand)]
+        action: TabAction,
     },
     /// screenshot.
     Screenshot {
-        #[arg(long)]
-        pane: Option<i32>,
-        #[arg(long)]
-        send_to: Option<i32>,
+        /// 저장 경로. 없으면 base64 PNG를 출력한다.
+        path: Option<String>,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// agent용 MCP server (stdio).
+    Mcp {
+        #[command(flatten)]
+        agent: AgentOptions,
     },
     /// resource 조회·전달·materialize.
     Resource {
@@ -174,6 +303,40 @@ pub enum Command {
         browser: BrowserOptions,
         #[arg(long)]
         page: String,
+    },
+}
+
+/// Shared options for every command that drives a running browser pane.
+#[derive(Args, Clone, Debug)]
+pub struct AgentOptions {
+    /// 대상 tmux pane (예: %3). 생략하면 실행 중인 유일한 pane.
+    #[arg(long, global = true)]
+    pub pane: Option<String>,
+
+    /// 사람이 읽는 요약 대신 원본 JSON 출력.
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TabAction {
+    /// index로 tab 전환.
+    Switch {
+        index: usize,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// 새 tab.
+    New {
+        url: Option<String>,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// tab 닫기.
+    Close {
+        index: Option<usize>,
+        #[command(flatten)]
+        agent: AgentOptions,
     },
 }
 
@@ -242,12 +405,95 @@ pub async fn run() -> Result<()> {
         Command::Doctor => {
             doctor::run().await;
         }
-        _ => {
-            println!("tweb: command not yet implemented");
+        Command::Panes { agent } => agent::list_panes(agent.json)?,
+        Command::Mcp { agent } => mcp::serve(agent.pane.as_deref())?,
+        Command::Tab { action } => {
+            let (method, params, agent) = match action {
+                TabAction::Switch { index, agent } => ("tab", json!({ "index": index }), agent),
+                TabAction::New { url, agent } => ("tab-new", json!({ "url": url }), agent),
+                TabAction::Close { index, agent } => {
+                    ("tab-close", json!({ "index": index }), agent)
+                }
+            };
+            agent::run(agent.pane.as_deref(), method, params, agent.json)?;
+        }
+        other => {
+            let (method, params, agent) = agent_call(other)?;
+            agent::run(agent.pane.as_deref(), method, params, agent.json)?;
         }
     }
 
     Ok(())
+}
+
+/// Map a page-driving subcommand onto its JSON-RPC method and params.
+fn agent_call(command: Command) -> Result<(&'static str, serde_json::Value, AgentOptions)> {
+    let act = |r#ref: String, action: &str, value: Option<String>| json!({ "ref": r#ref, "action": action, "value": value });
+    Ok(match command {
+        Command::Navigate { url, agent } => ("navigate", json!({ "url": url }), agent),
+        Command::Back { agent } => ("back", json!({}), agent),
+        Command::Forward { agent } => ("forward", json!({}), agent),
+        Command::Reload { agent } => ("reload", json!({}), agent),
+        Command::Status { agent } => ("status", json!({}), agent),
+        Command::Snapshot { text, agent } => (
+            "snapshot",
+            json!({ "mode": if text { "text" } else { "interactive" } }),
+            agent,
+        ),
+        Command::Query { selector, agent } => ("query", json!({ "selector": selector }), agent),
+        Command::Click { r#ref, agent } => ("act", act(r#ref, "click", None), agent),
+        Command::Hover { r#ref, agent } => ("act", act(r#ref, "hover", None), agent),
+        Command::Fill {
+            r#ref,
+            value,
+            agent,
+        } => ("act", act(r#ref, "fill", Some(value)), agent),
+        Command::Select {
+            r#ref,
+            value,
+            agent,
+        } => ("act", act(r#ref, "select", Some(value)), agent),
+        Command::Check { r#ref, agent } => ("act", act(r#ref, "check", None), agent),
+        Command::Uncheck { r#ref, agent } => ("act", act(r#ref, "uncheck", None), agent),
+        Command::Text { r#ref, agent } => ("act", act(r#ref, "text", None), agent),
+        Command::Html { r#ref, agent } => ("act", act(r#ref, "html", None), agent),
+        Command::Type { text, agent } => ("type", json!({ "text": text }), agent),
+        Command::Press {
+            key,
+            modifiers,
+            agent,
+        } => (
+            "press",
+            json!({ "key": key, "modifiers": modifiers }),
+            agent,
+        ),
+        Command::Eval { script, agent } => ("eval", json!({ "script": script }), agent),
+        Command::Screenshot { path, agent } => ("screenshot", json!({ "path": path }), agent),
+        Command::Console {
+            limit,
+            clear,
+            agent,
+        } => ("console", json!({ "limit": limit, "clear": clear }), agent),
+        Command::Errors { limit, agent } => ("errors", json!({ "limit": limit }), agent),
+        Command::Tabs { agent } => ("tabs", json!({}), agent),
+        Command::Wait {
+            selector,
+            text,
+            url,
+            load,
+            ms,
+            timeout,
+            agent,
+        } => (
+            "wait",
+            json!({
+                "selector": selector, "text": text, "url": url,
+                "load": load, "ms": ms, "timeout": timeout,
+            }),
+            agent,
+        ),
+        other => anyhow::bail!("command not yet implemented: {other:?}"),
+    })
 }
 
 /// 현재 pane에서 tweb-pane 실행.

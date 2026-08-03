@@ -715,6 +715,215 @@ const { ipcRenderer } = require("electron");
     });
   }
 
+  // --- agent bridge ---
+  //
+  // Agents drive the very page the user is watching, so refs reuse the labels
+  // the `f` hint overlay paints. `@a` for the agent is the badge the human sees
+  // as "a", which makes hand-off in either direction free of translation.
+  let agentTargets = new Map();
+
+  const agentInputRoles = {
+    checkbox: "checkbox", radio: "radio", button: "button", submit: "button",
+    reset: "button", image: "button", range: "slider", file: "file",
+    search: "searchbox", email: "textbox", password: "textbox", url: "textbox",
+  };
+
+  function agentRole(element, item) {
+    if (item?.mediaControl) return `media-${item.mediaControl}`;
+    const explicit = element.getAttribute?.("role");
+    if (explicit) return explicit;
+    switch (element.localName) {
+      case "a": return element.hasAttribute("href") ? "link" : "generic";
+      case "button": case "summary": return "button";
+      case "select": return "combobox";
+      case "textarea": return "textbox";
+      case "video": case "audio": case "canvas": return element.localName;
+      case "input":
+        return agentInputRoles[(element.getAttribute("type") || "text").toLowerCase()] || "textbox";
+      default:
+        return element.isContentEditable ? "textbox" : "generic";
+    }
+  }
+
+  function agentName(element, item) {
+    if (item?.mediaControl) return mediaControlPresentation[item.mediaControl]?.label || item.mediaControl;
+    const labelledBy = (element.getAttribute?.("aria-labelledby") || "")
+      .split(/\s+/).filter(Boolean)
+      .map((id) => document.getElementById(id)?.innerText || "")
+      .join(" ").trim();
+    const forLabel = element.id
+      ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)?.innerText
+      : element.closest?.("label")?.innerText;
+    const candidates = [
+      element.getAttribute?.("aria-label"),
+      labelledBy,
+      element.getAttribute?.("alt"),
+      element.getAttribute?.("placeholder"),
+      forLabel,
+      element.localName === "input" && /^(button|submit|reset)$/i.test(element.type) ? element.value : "",
+      element.innerText,
+      element.getAttribute?.("title"),
+      element.getAttribute?.("name"),
+    ];
+    const name = candidates.find((value) => typeof value === "string" && value.trim());
+    return (name || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  }
+
+  function agentValue(element) {
+    if (element instanceof HTMLSelectElement) return element.value;
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      return element.type === "password" ? "" : element.value;
+    }
+    return element.isContentEditable ? (element.innerText || "").slice(0, 200) : undefined;
+  }
+
+  function agentState(element) {
+    const state = {};
+    if (element.disabled) state.disabled = true;
+    if (element instanceof HTMLInputElement && /^(checkbox|radio)$/.test(element.type)) {
+      state.checked = element.checked;
+    }
+    for (const attribute of ["aria-expanded", "aria-selected", "aria-checked", "aria-current"]) {
+      const value = element.getAttribute?.(attribute);
+      if (value) state[attribute.replace("aria-", "")] = value;
+    }
+    if (element === activeElement()) state.focused = true;
+    return state;
+  }
+
+  function agentNode(item, ref) {
+    const element = item.element;
+    const state = agentState(element);
+    return {
+      ref,
+      role: agentRole(element, item),
+      name: agentName(element, item),
+      tag: element.localName,
+      value: agentValue(element),
+      href: element.getAttribute?.("href") || undefined,
+      selector: cssSelector(element),
+      rect: {
+        x: Math.round(item.rect.left), y: Math.round(item.rect.top),
+        width: Math.round(item.rect.width), height: Math.round(item.rect.height),
+      },
+      state: Object.keys(state).length ? state : undefined,
+    };
+  }
+
+  function agentSnapshot(params = {}) {
+    const targets = params.mode === "text" ? visualTargets() : interactiveTargets();
+    const labels = hintLabels(targets.length);
+    agentTargets = new Map(targets.map((target, index) => [labels[index], target]));
+    const nodes = targets.map((target, index) => {
+      const node = agentNode(target, labels[index]);
+      if (params.mode === "text") node.text = (target.element.innerText || "").replace(/\s+/g, " ").trim().slice(0, 400);
+      return node;
+    });
+    return {
+      url: location.href,
+      title: document.title,
+      viewport: { width: innerWidth, height: innerHeight, scrollX: Math.round(scrollX), scrollY: Math.round(scrollY) },
+      nodes,
+    };
+  }
+
+  function agentResolve(ref) {
+    const item = agentTargets.get(ref);
+    if (!item) throw new Error(`unknown ref @${ref} — run snapshot first`);
+    if (!item.element.isConnected) throw new Error(`ref @${ref} is stale — re-run snapshot`);
+    return item;
+  }
+
+  // React and other frameworks track the value through the prototype setter, so
+  // assigning `element.value` directly leaves their state machine behind.
+  function agentSetValue(element, value) {
+    const prototype = Object.getPrototypeOf(element);
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (setter) setter.call(element, value);
+    else element.value = value;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function agentAct(params) {
+    const { ref, action, value } = params;
+    const item = agentResolve(ref);
+    const element = item.element;
+    switch (action) {
+      case "click":
+      case "hover":
+        element.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+        // Trusted input must come from the main process; hand back the point.
+        return { [action]: hintClickPoint(item) };
+      case "fill":
+        element.focus({ preventScroll: true });
+        if (element.isContentEditable) {
+          element.textContent = value ?? "";
+          element.dispatchEvent(new InputEvent("input", { bubbles: true }));
+        } else {
+          agentSetValue(element, value ?? "");
+        }
+        return { value: agentValue(element) };
+      case "focus":
+        element.focus({ preventScroll: true });
+        return { focused: true };
+      case "select": {
+        if (!(element instanceof HTMLSelectElement)) throw new Error(`@${ref} is not a <select>`);
+        const option = [...element.options].find((candidate) =>
+          candidate.value === value || candidate.label === value || candidate.text === value);
+        if (!option) throw new Error(`option ${JSON.stringify(value)} not found in @${ref}`);
+        element.value = option.value;
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+        return { value: element.value };
+      }
+      case "check":
+      case "uncheck": {
+        if (!(element instanceof HTMLInputElement)) throw new Error(`@${ref} is not checkable`);
+        const want = action === "check";
+        if (element.checked === want) return { checked: want };
+        return { click: hintClickPoint(item) };
+      }
+      case "scrollto":
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        return { scrolled: true };
+      case "text":
+        return { text: (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim() };
+      case "html":
+        return { html: element.outerHTML };
+      case "attr":
+        return { [value]: element.getAttribute(value) };
+      case "describe":
+        return { node: agentNode(item, ref) };
+      default:
+        throw new Error(`unknown action ${JSON.stringify(action)}`);
+    }
+  }
+
+  function agentQuery(params) {
+    const element = document.querySelector(params.selector);
+    if (!element) throw new Error(`no element matches ${JSON.stringify(params.selector)}`);
+    const rect = visibleRect(element);
+    if (!rect) throw new Error(`${JSON.stringify(params.selector)} is not visible`);
+    const item = { element, rect };
+    const ref = `q${agentTargets.size}`;
+    agentTargets.set(ref, item);
+    return { node: agentNode(item, ref) };
+  }
+
+  function agentDispatch(request) {
+    switch (request.method) {
+      case "snapshot": return agentSnapshot(request.params || {});
+      case "act": return agentAct(request.params || {});
+      case "query": return agentQuery(request.params || {});
+      case "info": return {
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        viewport: { width: innerWidth, height: innerHeight, scrollX: Math.round(scrollX), scrollY: Math.round(scrollY) },
+      };
+      default: throw new Error(`unknown agent method ${JSON.stringify(request.method)}`);
+    }
+  }
 
   const shortcutHelpSections = [
     ["이동", [
@@ -1497,6 +1706,16 @@ const { ipcRenderer } = require("electron");
 
   ipcRenderer.on("tweb-tabs", (_event, model) => {
     renderTabList(model);
+  });
+
+  // Only the top frame answers agent requests; subframe refs would collide.
+  ipcRenderer.on("tweb-agent-request", (_event, request) => {
+    if (!topFrame || !request || typeof request.id !== "number") return;
+    try {
+      ipcRenderer.send("tweb-agent-response", { id: request.id, result: agentDispatch(request) });
+    } catch (error) {
+      ipcRenderer.send("tweb-agent-response", { id: request.id, error: String(error?.message || error) });
+    }
   });
 
   ipcRenderer.on("tweb-frame-mode", (_event, state) => {
