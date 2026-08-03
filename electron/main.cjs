@@ -46,6 +46,8 @@ let originalPaneTitle = null;
 const tabFrames = new Map();
 const tabZoomFactors = new Map();
 const tabSessionUrls = new Map();
+const navigationHistory = [];
+let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
 let windowSessionPath = null;
 let windowSessionSaveTimer = null;
@@ -1078,6 +1080,32 @@ function normalizeOmniboxInput(input) {
   return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
 }
 
+function recordNavigationHistory(url, title = "") {
+  if (typeof url !== "string" || !url || url === "about:blank" || url.startsWith("tweb-action:")) return;
+  const existing = navigationHistory.findIndex((entry) => entry.url === url);
+  if (existing >= 0) navigationHistory.splice(existing, 1);
+  navigationHistory.unshift({ url, title: String(title || url), recency: ++navigationSerial });
+  if (navigationHistory.length > 200) navigationHistory.length = 200;
+}
+
+function omniboxModel() {
+  const tabEntries = tabs.flatMap((candidate, index) => {
+    if (candidate.isDestroyed()) return [];
+    const url = tabSessionUrls.get(candidate) || candidate.webContents.getURL() || "about:blank";
+    return [{
+      kind: "tab",
+      index,
+      url,
+      title: candidate.webContents.getTitle() || url,
+      recency: navigationSerial + tabs.length - index,
+    }];
+  });
+  return {
+    current: win && !win.isDestroyed() ? tabSessionUrls.get(win) || win.webContents.getURL() || "" : "",
+    entries: [...tabEntries, ...navigationHistory.map((entry) => ({ ...entry, kind: "history" }))],
+  };
+}
+
 function handleNativeShortcut(tab, action, value) {
   if (!browserShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
   if (process.env.TWEB_DEBUG) console.error(`tweb: native shortcut ${action}`);
@@ -1100,6 +1128,9 @@ function handleNativeShortcut(tab, action, value) {
           url: candidate.webContents.getURL() || "about:blank",
         })),
       });
+      break;
+    case "omnibox-model":
+      sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
       break;
     case "activate-tab":
       if (Number.isInteger(value) && value >= 0 && value < tabs.length) activateTab(value);
@@ -1372,6 +1403,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   const recordNavigation = (url) => {
     if (showingLoadError || typeof url !== "string" || !url) return;
     tabSessionUrls.set(tab, url);
+    recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
   };
   contents.on("did-navigate", (_event, url) => recordNavigation(url));
@@ -1396,6 +1428,8 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     }
   });
   tab.on("page-title-updated", (_event, title) => {
+    const url = tabSessionUrls.get(tab) || contents.getURL();
+    recordNavigationHistory(url, title);
     if (tab === win) updatePaneTitle();
     if (process.env.TWEB_DEBUG) console.error(`tweb: title ${title}`);
   });

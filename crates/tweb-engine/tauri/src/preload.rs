@@ -24,6 +24,16 @@ pub(crate) fn bridge_script() -> (String, String) {
       group.push(listener);
       listeners.set(channel, group);
     }},
+    once(channel, listener) {{
+      const wrapper = (...args) => {{
+        const group = listeners.get(channel) || [];
+        listeners.set(channel, group.filter(candidate => candidate !== wrapper));
+        listener(...args);
+      }};
+      const group = listeners.get(channel) || [];
+      group.push(wrapper);
+      listeners.set(channel, group);
+    }},
   }};
   Object.defineProperty(window, '__twebReceive', {{
     configurable: true,
@@ -66,8 +76,13 @@ mod tests {
         assert!(script.contains("native-click"));
         assert!(script.contains("performMediaControl"));
         assert!(script.contains("media.requestFullscreen"));
-        assert!(script.contains("__tweb_open_hints__"));
-        assert!(script.contains("event.source !== parent"));
+        assert!(script.contains("top.location.origin === location.origin"));
+        assert!(script.contains("const shortcutFrame = topFrame || sameOriginFrame"));
+        assert!(script.contains("fuzzyScore"));
+        assert!(script.contains("omnibox-model"));
+        assert!(script.contains("if (!shortcutsEnabled || !shortcutFrame) return"));
+        assert!(!script.contains("frameSurface"));
+        assert!(!script.contains("__tweb_open_hints__"));
         assert!(script.contains("tweb-action://"));
         assert!(script.contains("nonce=${++requestSerial}"));
         assert!(script.contains("__tweb_caret__"));

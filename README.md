@@ -109,8 +109,8 @@ macOS 또는 Ghostty 자체가 PTY보다 먼저 소비하는 application shortcu
 | `gi` | 첫 번째 입력 요소에 focus |
 | `H` / `L` | history 뒤로 / 앞으로 |
 | `J` / `K` | 이전 / 다음 browser tab |
-| `t`, `O` | 새 탭 omnibox 열기 |
-| `o` | 현재 탭 omnibox 열기 |
+| `t`, `O` | 새 탭 fuzzy omnibox 열기 (열린 탭·최근 방문 기록) |
+| `o` | 현재 탭 fuzzy omnibox 열기 (열린 탭·최근 방문 기록) |
 | `x` / `X` | 현재 tab 닫기 / 최근 닫은 tab 복원 |
 | `r` | 새로고침 |
 | `zi` / `zo` / `zz` | 확대 / 축소 / 기본 배율 복원 |
@@ -120,7 +120,7 @@ Visual의 text 대상을 선택하거나 normal mode에서 `V`로 페이지 전�
 
 Inspect에서 대상을 선택한 뒤 `y`는 CSS selector, `h`는 outer HTML, `t`는 text를 복사하고 `d`는 DevTools를 엽니다. Electron은 detached Chromium DevTools에서 해당 요소를 바로 선택하고, Tauri는 Safari Web Inspector를 연 뒤 가능한 경우에만 요소 선택을 시도합니다.
 
-`f` hint는 일반 link/button뿐 아니라 ARIA role, `jsaction`, `contenteditable`, pointer cursor와 delegated click 영역, open shadow DOM의 상호작용 요소도 탐색합니다. iframe은 바깥 hint를 선택한 뒤 frame 내부 hint를 한 번 더 선택하며, native media control은 재생·음소거·전체화면·메뉴 위치에 각각 hint를 표시합니다.
+`f` hint는 일반 link/button뿐 아니라 ARIA role, `jsaction`, `contenteditable`, pointer cursor와 delegated click 영역, open shadow DOM의 상호작용 요소도 탐색합니다. native media control은 재생·음소거·전체화면·메뉴 위치에 각각 hint를 표시합니다. cross-origin iframe과 광고 frame은 focus 고착을 피하기 위해 바깥 frame 자체를 hint 대상으로 만들지 않습니다.
 
 입력이 완전히 멈춘 경우 `Ctrl-Shift-;`로 현재 tmux client만 안전하게 detach한 뒤 `tmux attach`하면 됩니다. tmux server와 다른 client는 유지됩니다. TWeb은 tmux 내부에서 tmux가 추적하는 `modifyOtherKeys`를 사용하며 실행 중 `pane_key_mode=Ext 2`, 종료 후 `VT10x`로 복원됩니다. Ghostty에만 Kitty keyboard mode가 남고 tmux는 `VT10x`인 protocol 불일치가 기존 입력 고착의 원인이었습니다.
 

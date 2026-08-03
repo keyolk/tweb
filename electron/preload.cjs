@@ -2,6 +2,15 @@ const { ipcRenderer } = require("electron");
 
 {
   const topFrame = window.top === window;
+  let sameOriginFrame = topFrame;
+  if (!topFrame) {
+    try {
+      sameOriginFrame = top.location.origin === location.origin;
+    } catch (_) {
+      sameOriginFrame = false;
+    }
+  }
+  const shortcutFrame = topFrame || sameOriginFrame;
   let shortcutsEnabled = true;
   let pendingG = false;
   let pendingGTimer = null;
@@ -343,7 +352,7 @@ const { ipcRenderer } = require("electron");
 
   const interactiveSelector = [
     "a[href]", "button", "input:not([type=hidden])", "textarea", "select", "summary", "label[for]",
-    "iframe", "audio", "video", "canvas", "[contenteditable=true]", "[onclick]",
+    "audio", "video", "canvas", "[contenteditable=true]", "[onclick]",
     "[jsaction]:not([jsaction=''])", "[aria-haspopup]", "[aria-controls]",
     "[role=button]", "[role=link]", "[role=menuitem]", "[role=menuitemcheckbox]", "[role=menuitemradio]",
     "[role=option]", "[role=tab]", "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=treeitem]",
@@ -441,9 +450,8 @@ const { ipcRenderer } = require("electron");
     const media = semantic.filter((element) => element.matches("video,audio"));
     const elements = semantic.filter((element) => !element.matches("video,audio"));
     const targets = uniqueVisibleTargets(hitTestTargets(elements), (element) => ({
-      frameSurface: element instanceof HTMLIFrameElement,
       nativeSurface: element instanceof HTMLCanvasElement,
-    })).filter((item) => !item.element.matches("video,audio"));
+    })).filter((item) => !item.element.matches("video,audio,iframe"));
     return [...targets, ...media.flatMap(mediaControlTargets)]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
@@ -583,11 +591,7 @@ const { ipcRenderer } = require("electron");
       const link = item.element.closest("a[href]");
       if (newTab && link?.href) send("new-tab", link.href);
       else if (performMediaControl(item)) {}
-      else if (item.frameSurface) {
-        item.element.focus({ preventScroll: true });
-        item.element.contentWindow?.focus();
-        item.element.contentWindow?.postMessage({ type: "__tweb_open_hints__", newTab }, "*");
-      } else if (item.nativeSurface || item.nativePoint) {
+      else if (item.nativeSurface || item.nativePoint) {
         send("native-click", item.nativePoint || {
           x: item.rect.left + item.rect.width / 2,
           y: item.rect.top + item.rect.height / 2,
@@ -712,39 +716,122 @@ const { ipcRenderer } = require("electron");
     if (restoreMode) normalMode();
   }
 
+  function fuzzyScore(query, candidate) {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return 0;
+    const haystack = candidate.toLowerCase();
+    const direct = haystack.indexOf(needle);
+    if (direct >= 0) return 1000 - direct * 3 - (haystack.length - needle.length) * 0.02;
+    let score = 0;
+    let cursor = 0;
+    let previous = -2;
+    for (const character of needle) {
+      const found = haystack.indexOf(character, cursor);
+      if (found < 0) return -Infinity;
+      score += found === previous + 1 ? 12 : 4;
+      score -= Math.max(0, found - cursor) * 0.15;
+      previous = found;
+      cursor = found + 1;
+    }
+    return score - haystack.length * 0.01;
+  }
+
   function showPrompt(newTab) {
     cancelTransient(false);
     const host = document.createElement("div");
     host.id = "__tweb_omnibox__";
     host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
     const shadow = host.attachShadow({ mode: "open" });
+    const box = document.createElement("div");
+    box.style.cssText = "box-sizing:border-box;width:min(760px,calc(100vw - 32px));margin:14px auto;border:2px solid #f6a723;border-radius:8px;background:#202124;box-shadow:0 8px 28px #000a;overflow:hidden;pointer-events:auto";
     const input = document.createElement("input");
     input.type = "text";
     input.autocomplete = "off";
     input.spellcheck = false;
     input.placeholder = newTab ? "새 탭에서 URL 또는 검색어 열기" : "URL 또는 검색어 열기";
-    input.style.cssText = [
-      "display:block", "box-sizing:border-box", "width:min(760px,calc(100vw - 32px))", "margin:14px auto",
-      "padding:10px 13px", "border:2px solid #f6a723", "border-radius:7px", "outline:0",
-      "background:#202124", "color:#f8f9fa", "box-shadow:0 8px 28px #000a",
-      "font:16px/1.3 system-ui,-apple-system,sans-serif", "pointer-events:auto",
-    ].join(";");
+    input.style.cssText = "display:block;box-sizing:border-box;width:100%;padding:10px 13px;border:0;border-bottom:1px solid #5f6368;outline:0;background:#202124;color:#f8f9fa;font:16px/1.3 system-ui,-apple-system,sans-serif";
+    const list = document.createElement("div");
+    list.setAttribute("role", "listbox");
+    list.style.cssText = "display:none;max-height:min(420px,60vh);overflow:auto;padding:4px";
+    let model = { current: location.href, entries: [] };
+    let matches = [];
+    let selected = 0;
+
+    const render = () => {
+      const query = input.value.trim();
+      const deduped = new Map();
+      for (const entry of model.entries || []) {
+        if (!entry?.url || deduped.has(entry.url)) continue;
+        const score = fuzzyScore(query, `${entry.title || ""} ${entry.url}`);
+        if (!query || Number.isFinite(score)) deduped.set(entry.url, { ...entry, score });
+      }
+      matches = [...deduped.values()]
+        .sort((left, right) => query ? right.score - left.score : (right.recency || 0) - (left.recency || 0))
+        .slice(0, 10);
+      if (selected >= 0) selected = Math.min(selected, Math.max(0, matches.length - 1));
+      list.replaceChildren();
+      list.style.display = matches.length ? "block" : "none";
+      matches.forEach((entry, index) => {
+        const row = document.createElement("div");
+        row.setAttribute("role", "option");
+        row.style.cssText = `padding:7px 9px;border-radius:5px;background:${index === selected ? "#3c4043" : "transparent"};color:#e8eaed;cursor:pointer`;
+        const title = document.createElement("div");
+        title.textContent = entry.title || entry.url;
+        title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:13px/1.35 system-ui,-apple-system,sans-serif";
+        const detail = document.createElement("div");
+        detail.textContent = `${entry.kind === "tab" ? "TAB  " : ""}${entry.url}`;
+        detail.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6;font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
+        row.append(title, detail);
+        row.onmousedown = (event) => {
+          event.preventDefault();
+          selected = index;
+          input.value = entry.url;
+          submit();
+        };
+        list.append(row);
+      });
+      setMode("omnibox", matches.length ? `${selected >= 0 ? selected + 1 : "-"}/${matches.length}` : "");
+    };
+    const submit = () => {
+      const entry = matches[selected];
+      const value = entry?.url || input.value.trim();
+      if (!value) return;
+      cancelPrompt();
+      if (!newTab && entry?.kind === "tab" && Number.isInteger(entry.index)) send("activate-tab", entry.index);
+      else send(newTab ? "new-tab" : "navigate", value);
+    };
+    input.addEventListener("input", () => { selected = -1; render(); });
     input.addEventListener("keydown", (event) => {
       event.stopPropagation();
       if (event.code === "Escape") {
         event.preventDefault();
         cancelPrompt();
+      } else if (["ArrowDown", "Tab"].includes(event.code) && !event.shiftKey || event.ctrlKey && event.key.toLowerCase() === "j") {
+        event.preventDefault();
+        if (matches.length) selected = selected < 0 ? 0 : (selected + 1) % matches.length;
+        render();
+      } else if (event.code === "ArrowUp" || event.code === "Tab" && event.shiftKey || event.ctrlKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (matches.length) selected = selected < 0 ? matches.length - 1 : (selected - 1 + matches.length) % matches.length;
+        render();
       } else if (event.code === "Enter") {
         event.preventDefault();
-        const value = input.value.trim();
-        cancelPrompt();
-        send(newTab ? "new-tab" : "navigate", value);
+        submit();
       }
     });
-    shadow.append(input);
+    box.append(input, list);
+    shadow.append(box);
     document.documentElement.append(host);
     promptHost = host;
     setMode("omnibox");
+    ipcRenderer.once("tweb-omnibox", (_event, nextModel) => {
+      if (promptHost !== host) return;
+      model = nextModel || model;
+      input.value = newTab ? "" : model.current || "";
+      if (!newTab) input.select();
+      render();
+    });
+    send("omnibox-model");
     requestAnimationFrame(() => input.focus());
   }
 
@@ -1180,7 +1267,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function handleNormalKey(event) {
-    if (!shortcutsEnabled) return;
+    if (!shortcutsEnabled || !shortcutFrame) return;
     const key = physicalKey(event);
 
     // Escape is handled before defaultPrevented/isComposing/editable checks so one
@@ -1272,11 +1359,6 @@ const { ipcRenderer } = require("electron");
     }
   }
 
-  addEventListener("message", (event) => {
-    if (topFrame || event.source !== parent || event.data?.type !== "__tweb_open_hints__" || !shortcutsEnabled) return;
-    startHints(Boolean(event.data.newTab));
-  });
-
   ipcRenderer.on("tweb-shortcuts-enabled", (_event, enabled) => {
     shortcutsEnabled = Boolean(enabled);
     const root = document.documentElement;
@@ -1311,7 +1393,7 @@ const { ipcRenderer } = require("electron");
   });
 
   ipcRenderer.on("tweb-terminal-text", (_event, text) => {
-    if (!shortcutsEnabled || typeof text !== "string" || [...text].length !== 1) return;
+    if (!shortcutsEnabled || !shortcutFrame || typeof text !== "string" || [...text].length !== 1) return;
     const mapped = koreanLangmap.get(text);
     if (!mapped || eventIsEditable({ composedPath: () => [] })) return;
     // Only the frame that owns focus handles terminal text. The main frame
@@ -1335,7 +1417,7 @@ const { ipcRenderer } = require("electron");
     if (!payload || typeof payload.key !== "string") return;
     const active = activeElement() || document.body;
     const editable = isEditable(active);
-    const mapped = shortcutsEnabled && !editable ? koreanLangmap.get(payload.key) || payload.key : payload.key;
+    const mapped = shortcutsEnabled && shortcutFrame && !editable ? koreanLangmap.get(payload.key) || payload.key : payload.key;
     let prevented = false;
     let stopped = false;
     const event = {
@@ -1385,8 +1467,10 @@ const { ipcRenderer } = require("electron");
 
   const initializeDocument = () => {
     document.documentElement.dataset.twebInputMode = shortcutsEnabled ? "shortcuts" : "passthrough";
-    ensureIndicator();
-    normalMode();
+    if (shortcutFrame) {
+      ensureIndicator();
+      normalMode();
+    }
   };
   if (document.documentElement) initializeDocument();
   else addEventListener("DOMContentLoaded", initializeDocument, { once: true });

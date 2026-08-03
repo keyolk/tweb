@@ -30,6 +30,12 @@ struct Tab {
     title: String,
 }
 
+struct HistoryEntry {
+    url: String,
+    title: String,
+    recency: u64,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct SavedTab {
     url: String,
@@ -48,8 +54,27 @@ struct Tabs {
     values: Vec<Tab>,
     active: usize,
     closed: Vec<String>,
+    history: Vec<HistoryEntry>,
     serial: u64,
+    history_serial: u64,
     shortcuts_enabled: bool,
+}
+
+fn record_navigation_history(tabs: &mut Tabs, url: &str, title: &str) {
+    if url.is_empty() || url == "about:blank" || url.starts_with("tweb-action:") {
+        return;
+    }
+    tabs.history.retain(|entry| entry.url != url);
+    tabs.history_serial += 1;
+    tabs.history.insert(
+        0,
+        HistoryEntry {
+            url: url.to_string(),
+            title: if title.trim().is_empty() { url } else { title }.to_string(),
+            recency: tabs.history_serial,
+        },
+    );
+    tabs.history.truncate(200);
 }
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -176,7 +201,9 @@ impl BrowserRuntime {
                 values: Vec::new(),
                 active: 0,
                 closed: Vec::new(),
+                history: Vec::new(),
                 serial: 0,
+                history_serial: 0,
                 shortcuts_enabled: true,
             }),
             mouse: Mutex::new(MouseState::default()),
@@ -421,6 +448,7 @@ impl BrowserRuntime {
             "previous-tab" => self.cycle_tab(-1),
             "next-tab" => self.cycle_tab(1),
             "list-tabs" => self.send_tab_list(),
+            "omnibox-model" => self.send_omnibox_model(),
             "activate-tab" => {
                 if let Some(index) = action.value.as_u64() {
                     self.activate_tab(index as usize);
@@ -697,8 +725,16 @@ impl BrowserRuntime {
             eprintln!("tweb: page-meta {title:?} from {label}");
         }
         if let Ok(mut tabs) = self.tabs.lock() {
-            if let Some(tab) = tabs.values.iter_mut().find(|tab| tab.label == label) {
-                tab.title = title.to_string();
+            let history = tabs
+                .values
+                .iter_mut()
+                .find(|tab| tab.label == label)
+                .map(|tab| {
+                    tab.title = title.to_string();
+                    (tab.url.clone(), tab.title.clone())
+                });
+            if let Some((url, title)) = history {
+                record_navigation_history(&mut tabs, &url, &title);
             }
         }
         self.sync_title();
@@ -707,10 +743,18 @@ impl BrowserRuntime {
     fn page_loaded(&self, label: &str, url: &str) {
         let mut update = false;
         if let Ok(mut tabs) = self.tabs.lock() {
-            if let Some(tab) = tabs.values.iter_mut().find(|tab| tab.label == label) {
-                tab.url = url.to_string();
-                tab.title = url.to_string();
-                set_native_zoom(&tab.window, tab.zoom);
+            let history = tabs
+                .values
+                .iter_mut()
+                .find(|tab| tab.label == label)
+                .map(|tab| {
+                    tab.url = url.to_string();
+                    tab.title = url.to_string();
+                    set_native_zoom(&tab.window, tab.zoom);
+                    (tab.url.clone(), tab.title.clone())
+                });
+            if let Some((url, title)) = history {
+                record_navigation_history(&mut tabs, &url, &title);
                 update = true;
             }
         }
@@ -766,6 +810,42 @@ impl BrowserRuntime {
         });
         if let Some(model) = model {
             self.emit_active("tweb-tabs", &model);
+        }
+    }
+
+    fn send_omnibox_model(&self) {
+        let model = self.tabs.lock().ok().map(|tabs| {
+            let current = tabs
+                .values
+                .get(tabs.active)
+                .map_or("", |tab| tab.url.as_str());
+            let tab_recency = tabs.history_serial + tabs.values.len() as u64;
+            let entries = tabs
+                .values
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| {
+                    json!({
+                        "kind": "tab",
+                        "index": index,
+                        "url": tab.url,
+                        "title": tab.title,
+                        "recency": tab_recency.saturating_sub(index as u64),
+                    })
+                })
+                .chain(tabs.history.iter().map(|entry| {
+                    json!({
+                        "kind": "history",
+                        "url": entry.url,
+                        "title": entry.title,
+                        "recency": entry.recency,
+                    })
+                }))
+                .collect::<Vec<_>>();
+            json!({ "current": current, "entries": entries })
+        });
+        if let Some(model) = model {
+            self.emit_active("tweb-omnibox", &model);
         }
     }
 
