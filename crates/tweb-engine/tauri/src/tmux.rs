@@ -253,47 +253,56 @@ fn root_binding(key: &str) -> Option<String> {
     tmux_output(&["list-keys", "-T", "root", key])
 }
 
-fn configure_root_toggle_binding() {
-    let binding = root_binding("User110").unwrap_or_default();
-    let legacy = binding.contains("@tweb_browser") && binding.contains("35 30 30 31");
-    let neutral =
-        binding.contains("send-keys -H 1b 5b 35 30 30 31 7e") && !binding.contains("@tweb_browser");
-    if legacy {
-        for (key, signatures) in [
-            ("User112", &["detach-client"][..]),
-            ("User113", &["send-keys -H", "35 30 30 32"][..]),
-            ("User114", &["send-keys -H", "35 30 30 33"][..]),
-            ("User115", &["send-keys -H", "35 30 30 34"][..]),
-            ("User116", &["send-keys -H", "35 30 30 37"][..]),
-        ] {
-            let current = root_binding(key).unwrap_or_default();
-            if signatures
-                .iter()
-                .all(|signature| current.contains(signature))
-            {
-                let _ = tmux_status(&["unbind-key", "-T", "root", key]);
-            }
+fn ensure_root_binding(key: &str, action: &[&str], signatures: &[&str]) {
+    let current = root_binding(key).unwrap_or_default();
+    if !current.is_empty() {
+        if !signatures
+            .iter()
+            .all(|signature| current.contains(signature))
+            && std::env::var_os("TWEB_DEBUG").is_some()
+        {
+            eprintln!("tweb: preserving custom root {key} binding");
         }
+        return;
     }
-    if binding.is_empty() || legacy {
-        let _ = tmux_status(&[
-            "bind-key",
-            "-T",
-            "root",
-            "User110",
+    let mut args = vec!["bind-key", "-T", "root", key];
+    args.extend(action.iter().copied());
+    let _ = tmux_status(&args);
+}
+
+fn configure_root_toggle_binding() {
+    let toggle = root_binding("User110").unwrap_or_default();
+    let legacy = toggle.contains("@tweb_browser") && toggle.contains("35 30 30 31");
+    if legacy {
+        let _ = tmux_status(&["unbind-key", "-T", "root", "User110"]);
+    }
+
+    for (key, digits) in [
+        ("User110", ["35", "30", "30", "31"]),
+        ("User111", ["35", "30", "30", "39"]),
+        ("User113", ["35", "30", "30", "32"]),
+        ("User114", ["35", "30", "30", "33"]),
+        ("User115", ["35", "30", "30", "34"]),
+        ("User116", ["35", "30", "30", "37"]),
+    ] {
+        let action = [
             "send-keys",
             "-H",
             "1b",
             "5b",
-            "35",
-            "30",
-            "30",
-            "31",
+            digits[0],
+            digits[1],
+            digits[2],
+            digits[3],
             "7e",
-        ]);
-    } else if !neutral && std::env::var_os("TWEB_DEBUG").is_some() {
-        eprintln!("tweb: preserving custom root User110 binding; Ctrl-; toggle may be unavailable");
+        ];
+        let signature = format!(
+            "send-keys -H 1b 5b {} {} {} {} 7e",
+            digits[0], digits[1], digits[2], digits[3]
+        );
+        ensure_root_binding(key, &action, &[&signature]);
     }
+    ensure_root_binding("User112", &["detach-client"], &["detach-client"]);
 }
 
 fn sanitize_title(value: &str) -> String {

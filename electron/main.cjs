@@ -197,40 +197,50 @@ function tmuxRootBinding(key) {
   }
 }
 
+function ensureTmuxRootBinding(key, args, isManaged, replaceManaged = false) {
+  const current = tmuxRootBinding(key);
+  if (current && (!replaceManaged || !isManaged(current))) {
+    if (!isManaged(current) && process.env.TWEB_DEBUG) {
+      console.error(`tweb: preserving custom root ${key} binding`);
+    }
+    return;
+  }
+  try {
+    execFileSync("tmux", ["bind-key", "-T", "root", key, ...args], { timeout: 1000, stdio: "ignore" });
+  } catch (error) {}
+}
+
 function configureTmuxRootBindings() {
-  // User110은 Ghostty의 Ctrl-; private sequence다. root에서는 sequence만 pane에
-  // 전달하고, engine이 현재 client table을 기록한 뒤 tweb-pass로 전환한다.
+  const privateKey = (key, digits, replaceManaged = false) => {
+    const hex = digits.split("").map((digit) => digit.charCodeAt(0).toString(16));
+    ensureTmuxRootBinding(
+      key,
+      ["send-keys", "-H", "1b", "5b", ...hex, "7e"],
+      (binding) => binding.includes(`send-keys -H 1b 5b ${hex.join(" ")} 7e`),
+      replaceManaged,
+    );
+  };
+
+  // User110은 Ghostty의 Ctrl-; private sequence다. 이전 TWeb의 binding은
+  // client table까지 바꿨지만, 이제 engine만 table 전환과 복원을 담당한다.
   const toggle = tmuxRootBinding("User110");
   const legacyToggle = toggle.includes("@tweb_browser") && toggle.includes("35 30 30 31");
-  const neutralToggle = toggle.includes("send-keys -H 1b 5b 35 30 30 31 7e")
-    && !toggle.includes("@tweb_browser");
   if (legacyToggle) {
-    const legacyBindings = new Map([
-      ["User112", ["detach-client"]],
-      ["User113", ["send-keys -H", "35 30 30 32"]],
-      ["User114", ["send-keys -H", "35 30 30 33"]],
-      ["User115", ["send-keys -H", "35 30 30 34"]],
-      ["User116", ["send-keys -H", "35 30 30 37"]],
-    ]);
-    for (const [key, signatures] of legacyBindings) {
-      const binding = tmuxRootBinding(key);
-      if (!signatures.every((signature) => binding.includes(signature))) continue;
-      try {
-        execFileSync("tmux", ["unbind-key", "-T", "root", key], { timeout: 1000, stdio: "ignore" });
-      } catch (error) {}
-    }
-  }
-  if (!toggle || legacyToggle) {
     try {
-      execFileSync(
-        "tmux",
-        ["bind-key", "-T", "root", "User110", "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e"],
-        { timeout: 1000, stdio: "ignore" }
-      );
+      execFileSync("tmux", ["unbind-key", "-T", "root", "User110"], { timeout: 1000, stdio: "ignore" });
     } catch (error) {}
-  } else if (!neutralToggle && process.env.TWEB_DEBUG) {
-    console.error("tweb: preserving custom root User110 binding; Ctrl-; toggle may be unavailable");
   }
+  privateKey("User110", "5001");
+  privateKey("User111", "5009");
+  privateKey("User113", "5002");
+  privateKey("User114", "5003");
+  privateKey("User115", "5004");
+  privateKey("User116", "5007");
+  ensureTmuxRootBinding(
+    "User112",
+    ["detach-client"],
+    (binding) => binding.includes("detach-client"),
+  );
 }
 
 function ensureTmuxPassthroughTable() {
