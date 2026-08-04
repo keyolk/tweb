@@ -83,6 +83,8 @@ mod tests {
         assert!(script.contains("document.exitFullscreen"));
         assert!(script.contains("dismissPageOverlay"));
         assert!(script.contains("native-escape"));
+        assert!(script.contains("scrollableTargets"));
+        assert!(script.contains("case \"s\": startScrollPicker()"));
         assert!(script.contains("hintClickPoint"));
         assert!(script.contains("topViewportPoint"));
         assert!(script.contains("else send(\"native-click\", hintClickPoint(item))"));
@@ -103,8 +105,8 @@ mod tests {
         assert!(script.contains("moveTextControlCaret"));
         assert!(script.contains("requestImplicitSubmit"));
         assert!(script.contains("singleLineTextarea"));
-        assert!(script.contains("scrollBy({ left: -90"));
-        assert!(script.contains("scrollBy({ left: 90"));
+        assert!(script.contains("scrollSurfaceBy(-90, 0)"));
+        assert!(script.contains("scrollSurfaceBy(90, 0)"));
         assert!(script.contains(&token));
     }
 }

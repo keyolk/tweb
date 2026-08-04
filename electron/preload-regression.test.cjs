@@ -27,10 +27,17 @@ function assertPreload(source) {
   // what stops any previous loop.
   assert.match(source, /mediaHoverTimer = setInterval\(\(\) => nudgeMediaPointer\(points\), 700\)/);
   assert.match(source, /pickerState = null;\s*\n\s*stopMediaHover\(\);/);
-  const startHints = source.slice(source.indexOf("function startHints(newTab)"));
+  // The function body ends at the first closing brace back at two-space indent.
+  const hintsAt = source.indexOf("function startHints(newTab)");
+  const startHints = source.slice(hintsAt, source.indexOf("\n  }\n", hintsAt));
   assert.ok(
     startHints.indexOf("startMediaHoverLoop(points)") > startHints.indexOf("startPicker("),
     "the hover loop must start after startPicker, or cancelTransient kills it"
+  );
+  // Deferring the first draw makes `f` feel dead and invites a second press.
+  assert.ok(
+    startHints.indexOf("collect();") < startHints.indexOf("setTimeout("),
+    "hints must be drawn before waiting on the control bar"
   );
   // Synthetic control targets are for UA shadow-DOM controls only.
   assert.match(source, /if \(!media\.controls \|\| rect\.width < 160/);
@@ -46,7 +53,7 @@ function assertPreload(source) {
   // In shortcuts mode the page only ever sees synthetic keys, which sites that
   // gate on isTrusted ignore, so dismissing a panel needs a real Escape from the
   // engine — delivered while the field still has focus, blurring only after.
-  assert.match(source, /case "Escape": handled = dismissPageOverlay\(\); break;/);
+  assert.match(source, /handled = dismissPageOverlay\(\);/);
   assert.match(source, /function dismissPageOverlay\(\)/);
   assert.match(source, /send\("native-escape"\)/);
   assert.match(source, /if \(key === "Escape" && passThroughEscape\)/);
@@ -105,6 +112,16 @@ test("switching tabs replaces the image instead of deleting it", () => {
   const activateTab = main.slice(main.indexOf("function activateTab(index)"),
     main.indexOf("function cycleTab(direction)"));
   assert.doesNotMatch(activateTab, /a=d,d=I/, "activateTab must not clear the image");
+});
+
+test("scroll keys can target a picked inner surface", () => {
+  assert.match(electron, /function scrollableTargets\(\)/);
+  assert.match(electron, /case "s": startScrollPicker\(\); break;/);
+  for (const key of ["h", "j", "k", "l"]) {
+    assert.match(electron, new RegExp(`case "${key}": scrollSurfaceBy\\(`),
+      `${key} must scroll the picked surface`);
+  }
+  assert.doesNotMatch(electron, /case "j": scrollBy\(/);
 });
 
 test("agent socket refuses a path longer than sun_path", () => {

@@ -143,6 +143,7 @@ macOS 또는 Ghostty 자체가 PTY보다 먼저 소비하는 application shortcu
 | `v` / `V` | visual picker로 대상 선택 / 페이지 전체 text를 Visual selection으로 열기 |
 | `b` | 열린 browser tab 목록 (`j`/`k`, `1`–`9`, `Enter`, `Esc`) |
 | `I` | inspect picker: 요소 정보·selector 확인 |
+| `s` | 스크롤할 내부 영역 선택 (`Esc`로 페이지 복귀) |
 | `h` / `l` | 왼쪽 / 오른쪽으로 스크롤 |
 | `j` / `k` | 아래 / 위로 스크롤 |
 | `d` / `u` | 반 페이지 아래 / 위로 스크롤 |

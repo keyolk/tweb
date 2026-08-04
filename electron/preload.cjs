@@ -17,6 +17,7 @@ const { ipcRenderer } = require("electron");
   let mediaHoverNudge = 0;
   let passThroughEscape = false;
   let passThroughEscapeTimer = null;
+  let scrollTarget = null;
   let pendingG = false;
   let pendingGTimer = null;
   let pendingZ = false;
@@ -271,7 +272,7 @@ const { ipcRenderer } = require("electron");
     if (!shortcutsEnabled) setMode("passthrough");
     else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
-    else setMode("normal");
+    else setMode("normal", scrollSurface() ? "scroll" : "");
   }
 
   const koreanLangmap = new Map(Object.entries({
@@ -496,6 +497,59 @@ const { ipcRenderer } = require("electron");
         : null;
       return { kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text", link, image };
     }).filter((item) => item.kind !== "text" || item.element.innerText?.trim());
+  }
+
+  // Comment panels, sidebars and chat logs scroll independently of the page and
+  // only react to a wheel while the pointer is over them, so `j`/`k` on the
+  // document does nothing. Let the user pick which surface the scroll keys drive.
+  function scrollableTargets() {
+    const scrollable = collectRoots()
+      .flatMap((root) => [...root.querySelectorAll("*")])
+      .filter((element) => {
+        if (element.id?.startsWith("__tweb_")) return false;
+        const overflow = getComputedStyle(element);
+        if (!/auto|scroll|overlay/.test(`${overflow.overflowY} ${overflow.overflowX}`)) return false;
+        return element.scrollHeight > element.clientHeight + 8
+          || element.scrollWidth > element.clientWidth + 8;
+      })
+      .slice(0, 200);
+    return uniqueVisibleTargets(scrollable)
+      .filter((item) => item.rect.width >= 80 && item.rect.height >= 80);
+  }
+
+  function scrollSurface() {
+    if (scrollTarget?.isConnected && visibleRect(scrollTarget)) return scrollTarget;
+    scrollTarget = null;
+    return null;
+  }
+
+  function scrollSurfaceBy(left, top) {
+    const target = scrollSurface();
+    if (target) target.scrollBy({ left, top, behavior: "instant" });
+    else scrollBy({ left, top, behavior: "instant" });
+  }
+
+  function scrollSurfaceTo(top) {
+    const target = scrollSurface();
+    if (target) target.scrollTo({ top, behavior: "instant" });
+    else scrollTo({ top, behavior: "instant" });
+  }
+
+  function scrollSurfaceHeight() {
+    return scrollSurface()?.clientHeight || innerHeight;
+  }
+
+  function scrollSurfaceEnd() {
+    return scrollSurface()?.scrollHeight ?? document.documentElement.scrollHeight;
+  }
+
+  function startScrollPicker() {
+    startPicker(scrollableTargets(), "scroll", (item) => {
+      scrollTarget = item.element;
+      // Some panels also gate their wheel handling on hover, so move the pointer.
+      send("native-hover", hintClickPoint(item));
+      normalMode();
+    });
   }
 
   function inspectTargets() {
@@ -752,27 +806,31 @@ const { ipcRenderer } = require("electron");
 
   function startHints(newTab) {
     const points = mediaHoverPoints();
+    const onPick = (item) => {
+      const link = item.element.closest("a[href]");
+      if (newTab && link?.href) send("new-tab", link.href);
+      else if (performMediaControl(item)) {}
+      else send("native-click", hintClickPoint(item));
+      normalMode();
+    };
     const collect = () => {
-      startPicker(interactiveTargets(), "hint", (item) => {
-        const link = item.element.closest("a[href]");
-        if (newTab && link?.href) send("new-tab", link.href);
-        else if (performMediaControl(item)) {}
-        else send("native-click", hintClickPoint(item));
-        normalMode();
-      });
+      startPicker(interactiveTargets(), "hint", onPick);
       // Start the loop only now: startPicker cancels transient state first, and
       // that cancellation is what stops a previously running hover loop.
       startMediaHoverLoop(points);
     };
-    // Give a revealed control bar a frame or two to animate in before the hint
-    // pass reads the DOM, otherwise its buttons are still zero-sized.
-    if (points.length) {
-      nudgeMediaPointer(points);
-      setMode("hint", "…");
-      setTimeout(collect, 220);
-    } else {
+
+    if (points.length) nudgeMediaPointer(points);
+    // Draw hints immediately — waiting on the control bar to animate in makes `f`
+    // feel unresponsive and invites a second press. A revealed bar adds targets a
+    // moment later, so re-collect once, and only while nothing has been typed.
+    collect();
+    if (points.length === 0) return;
+    setTimeout(() => {
+      if (!pickerState || pickerState.mode !== "hint" || pickerState.typed) return;
+      if (interactiveTargets().length === pickerState.items.length) return;
       collect();
-    }
+    }, 220);
   }
 
   // --- agent bridge ---
@@ -999,6 +1057,7 @@ const { ipcRenderer } = require("electron");
       ["J · K", "이전 · 다음 탭"],
       ["x · X", "탭 닫기 · 최근 탭 복원"],
       ["r · gi", "새로고침 · 첫 입력 요소 focus"],
+      ["s", "스크롤할 내부 영역 선택 (Esc로 페이지 복귀)"],
     ]],
     ["검색과 선택", [
       ["/ · n · N", "검색 · 다음 · 이전 결과"],
@@ -1730,7 +1789,7 @@ const { ipcRenderer } = require("electron");
 
     if (pendingG) {
       resetPendingG();
-      if (key === "g") scrollTo({ top: 0, behavior: "instant" });
+      if (key === "g") scrollSurfaceTo(0);
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
       else return;
       event.preventDefault();
@@ -1762,13 +1821,14 @@ const { ipcRenderer } = require("electron");
       case "/": showSearch(); break;
       case "n": if (lastSearch) send("find", { query: lastSearch, forward: true, findNext: true }); else handled = false; break;
       case "N": if (lastSearch) send("find", { query: lastSearch, forward: false, findNext: true }); else handled = false; break;
-      case "h": scrollBy({ left: -90, behavior: "instant" }); break;
-      case "j": scrollBy({ top: 90, behavior: "instant" }); break;
-      case "k": scrollBy({ top: -90, behavior: "instant" }); break;
-      case "l": scrollBy({ left: 90, behavior: "instant" }); break;
-      case "d": scrollBy({ top: innerHeight * 0.5, behavior: "instant" }); break;
-      case "u": scrollBy({ top: -innerHeight * 0.5, behavior: "instant" }); break;
-      case "G": scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" }); break;
+      case "h": scrollSurfaceBy(-90, 0); break;
+      case "j": scrollSurfaceBy(0, 90); break;
+      case "k": scrollSurfaceBy(0, -90); break;
+      case "l": scrollSurfaceBy(90, 0); break;
+      case "d": scrollSurfaceBy(0, scrollSurfaceHeight() * 0.5); break;
+      case "u": scrollSurfaceBy(0, -scrollSurfaceHeight() * 0.5); break;
+      case "s": startScrollPicker(); break;
+      case "G": scrollSurfaceTo(scrollSurfaceEnd()); break;
       case "g": pendingG = true; pendingGTimer = setTimeout(resetPendingG, 800); setMode("normal", "g"); break;
       case "z": pendingZ = true; pendingZTimer = setTimeout(resetPendingZ, 800); setMode("normal", "z"); break;
       case "H": send("history-back"); break;
@@ -1781,7 +1841,15 @@ const { ipcRenderer } = require("electron");
       case "x": send("close-tab"); break;
       case "X": send("restore-tab"); break;
       case "r": send("reload"); break;
-      case "Escape": handled = dismissPageOverlay(); break;
+      case "Escape":
+        // Release a picked scroll surface before bothering the page.
+        if (scrollSurface()) {
+          scrollTarget = null;
+          normalMode();
+        } else {
+          handled = dismissPageOverlay();
+        }
+        break;
       default: handled = false;
     }
     if (handled) {
