@@ -1488,11 +1488,60 @@
     return fallback;
   }
 
+  // `c`는 text 대상에서만 쓸 수 있었다: link나 image를 고르면 selection 자체가 없어
+  // caret으로 내려갈 방법이 없었다. 그 자리에서 가장 가까운 text 위치를 caret으로 잡는다.
+  function firstTextNode(root) {
+    if (!root || root.nodeType !== Node.ELEMENT_NODE) return null;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => (node.nodeValue.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+    });
+    return walker.nextNode();
+  }
+
+  function caretRangeFor(item) {
+    const text = firstTextNode(item.element);
+    if (text) {
+      const range = document.createRange();
+      range.setStart(text, 0);
+      range.setEnd(text, 0);
+      return range;
+    }
+    // An image carries no text of its own, so probe around it: the nearest caret
+    // position is next to it, and the motions can walk from there.
+    const rect = item.rect;
+    const probes = [
+      [rect.left + 1, rect.top + 1],
+      [rect.left + rect.width / 2, rect.top + rect.height / 2],
+      [rect.left, Math.min(innerHeight - 1, rect.top + rect.height + 4)],
+      [rect.left, Math.max(0, rect.top - 4)],
+    ];
+    for (const [x, y] of probes) {
+      const probe = document.caretRangeFromPoint?.(x, y);
+      if (probe && !ownId(probe.startContainer?.parentElement).startsWith("__tweb_")) return probe;
+    }
+    return null;
+  }
+
   // Collapsing to the start, not the end: the point of going back to a caret is
   // to pick a new place to start the selection from.
   function enterCaret() {
     const selection = getSelection();
-    if (!visualState?.selectionMade || !selection?.rangeCount) return;
+    if (!visualState || !selection) return;
+    if (!visualState.selectionMade) {
+      const range = caretRangeFor(visualState);
+      if (!range) {
+        flash("caret 위치 없음");
+        return;
+      }
+      selection.removeAllRanges();
+      selection.addRange(range);
+      visualState.selectionMade = true;
+      visualState.blockRect = visualState.rect;
+      visualState.caret = true;
+      updateVisualSelection();
+      return;
+    }
+    if (!selection.rangeCount) return;
     const range = selection.getRangeAt(0);
     // Keep the block the hint picked outlined so the caret has visible context.
     visualState.blockRect = range.getBoundingClientRect();
@@ -1611,14 +1660,16 @@
   function copyVisual(smart = true) {
     if (!visualState) return;
     const item = visualState;
-    if (smart && item.kind === "image") {
+    // A caret is a text cursor: `y` there means the text, never the image bitmap
+    // or the link URL that a smart copy would reach for.
+    if (smart && !item.caret && item.kind === "image") {
       send("copy-image", {
         x: Math.max(0, Math.floor(item.rect.left)),
         y: Math.max(0, Math.floor(item.rect.top)),
         width: Math.max(1, Math.ceil(item.rect.width)),
         height: Math.max(1, Math.ceil(item.rect.height)),
       });
-    } else if (smart && item.kind === "link" && item.link?.href) {
+    } else if (smart && !item.caret && item.kind === "link" && item.link?.href) {
       send("copy-text", item.link.href);
     } else {
       // A caret selects nothing, so `y` there copies the block it sits in — the
@@ -1638,7 +1689,7 @@
     event.stopImmediatePropagation();
     if (key === "Escape") cancelVisual();
     else if (moveVisualSelection(key)) return true;
-    else if (key === "c" && visualState.selectionMade && !visualState.caret) enterCaret();
+    else if (key === "c" && !visualState.caret) enterCaret();
     else if (key === "v" && visualState.caret) selectFromCaret();
     else if (key === "y") copyVisual(true);
     else if (key === "Y") copyVisual(false);

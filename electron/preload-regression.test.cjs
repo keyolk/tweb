@@ -165,7 +165,7 @@ test("visual mode drops to a caret and selects from it", () => {
   assert.match(electron, /function selectFromCaret\(\)/);
   const handler = electron.slice(electron.indexOf("function handleVisualKey(event, key)"),
     electron.indexOf("function cssSelector(element)"));
-  assert.match(handler, /key === "c" && visualState\.selectionMade && !visualState\.caret/);
+  assert.match(handler, /key === "c" && !visualState\.caret/);
   assert.match(handler, /key === "v" && visualState\.caret/);
 
   const motions = electron.slice(electron.indexOf("function moveVisualSelection(key)"),
@@ -217,6 +217,49 @@ test("id reads survive a form whose control is named id", () => {
     const outside = source.replace(/function ownId\(element\) \{[^}]*\}/, "");
     const raw = outside.match(/(?<![\w.])element\.id(?![\w(])/g) || [];
     assert.deepEqual(raw, [], `${name} still reads element.id directly`);
+  }
+});
+
+// A picked image or link has no selection, so `c` had nothing to collapse and did
+// nothing at all — the caret was unreachable from anything but a text target.
+test("c reaches a caret from a target that carries no text", () => {
+  assert.match(electron, /function caretRangeFor\(item\)/);
+  const reach = electron.slice(electron.indexOf("function caretRangeFor(item)"),
+    electron.indexOf("function selectFromCaret()"));
+  assert.match(reach, /firstTextNode\(item\.element\)/);
+  // An image carries no text of its own; the caret comes from around it.
+  assert.match(reach, /caretRangeFromPoint/);
+  assert.doesNotMatch(electron,
+    /key === "c" && visualState\.selectionMade/);
+  // In caret mode `y` means the text, not the bitmap or the href.
+  assert.match(electron, /smart && !item\.caret && item\.kind === "image"/);
+  assert.match(electron, /smart && !item\.caret && item\.kind === "link"/);
+});
+
+// Twice now a helper was called before it existed, and the preload only fails at
+// run time: the whole mode silently stops working.
+test("every function the preload calls is defined in it", () => {
+  // CSS text carries function-looking tokens that are not calls.
+  const cssFunctions = new Set(["calc", "clamp", "minmax", "repeat", "rgba", "rgb", "scale",
+    "translate", "var", "url", "type", "value", "attr", "linear", "cubic"]);
+  const builtins = new Set(["require", "setTimeout", "clearTimeout", "setInterval",
+    "clearInterval", "parseInt", "parseFloat", "getComputedStyle", "getSelection",
+    "addEventListener", "removeEventListener", "queueMicrotask", "requestAnimationFrame",
+    "cancelAnimationFrame", "scrollBy", "scrollTo", "isNaN", "isFinite", "structuredClone",
+    "fetch", "btoa", "atob", "encodeURIComponent", "decodeURIComponent", "setImmediate",
+    "matchMedia", "postMessage", "reportError", "blur", "focus"]);
+  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
+    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+    const defined = new Set([...source.matchAll(/function ([A-Za-z_$][\w$]*)\s*\(/g)]
+      .map((found) => found[1]));
+    for (const found of source.matchAll(/(?:const|let|var) ([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g)) {
+      defined.add(found[1]);
+    }
+    const called = new Set([...source.matchAll(/(?<![\w.$])([a-z][A-Za-z0-9_$]{3,})\(/g)]
+      .map((found) => found[1]));
+    const missing = [...called].filter((call) => !defined.has(call) && !builtins.has(call)
+      && !cssFunctions.has(call) && !source.includes(`.${call}(`));
+    assert.deepEqual(missing, [], `${name} calls functions it does not define`);
   }
 });
 
