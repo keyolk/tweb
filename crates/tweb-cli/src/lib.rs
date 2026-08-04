@@ -41,22 +41,6 @@ impl BrowserOptions {
         self.adaptive_frame_rate || !self.no_adaptive_frame_rate
     }
 
-    fn append_pane_args(&self, command: &mut std::process::Command) {
-        command
-            .arg("--engine")
-            .arg(match self.engine {
-                BrowserEngineArg::Electron => "electron",
-                BrowserEngineArg::Tauri => "tauri",
-            })
-            .arg("--frame-rate")
-            .arg(self.frame_rate.to_string());
-        command.arg(if self.adaptive() {
-            "--adaptive-frame-rate"
-        } else {
-            "--no-adaptive-frame-rate"
-        });
-    }
-
     fn shell_args(&self) -> String {
         let mut value = format!(
             "--engine {} --frame-rate {}",
@@ -301,8 +285,10 @@ pub enum Command {
     PaneInternal {
         #[command(flatten)]
         browser: BrowserOptions,
+        /// resolve된 page id. 지정하면 URL 대신 사용한다.
         #[arg(long)]
-        page: String,
+        page: Option<String>,
+        url: Option<String>,
     },
 }
 
@@ -388,7 +374,7 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Command::Open { browser, url } => {
-            // URL 미지정은 tweb-pane까지 보존해 tmux window session을 복원한다.
+            // URL 미지정은 pane frontend까지 보존해 tmux window session을 복원한다.
             run_pane(url.as_deref(), &browser).await?;
         }
         Command::Split {
@@ -399,8 +385,9 @@ pub async fn run() -> Result<()> {
             // tmux split-window에서도 URL 미지정을 보존한다.
             split_and_run_pane(url.as_deref(), &browser, horizontal).await?;
         }
-        Command::PaneInternal { browser, page } => {
-            run_pane(Some(&page), &browser).await?;
+        Command::PaneInternal { browser, page, url } => {
+            // URL이 없으면 tmux window session을 복원한다.
+            run_pane(page.as_deref().or(url.as_deref()), &browser).await?;
         }
         Command::Doctor => {
             doctor::run().await;
@@ -496,30 +483,36 @@ fn agent_call(command: Command) -> Result<(&'static str, serde_json::Value, Agen
     })
 }
 
-/// 현재 pane에서 tweb-pane 실행.
+/// 현재 pane에서 browser frontend 실행.
+///
+/// `tweb`은 하나의 multi-call executable이므로 pane frontend를 별도 binary로
+/// spawn하지 않고 같은 process에서 직접 돌린다. 그래야 CLI와 frontend 사이에
+/// version skew가 생기지 않는다 (DESIGN.md 4.1).
 async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
-    let pane_bin = find_pane_binary()?;
-    let mut cmd = std::process::Command::new(&pane_bin);
-    browser.append_pane_args(&mut cmd);
-    if let Some(url) = url {
-        cmd.arg(url);
-    }
-    set_engine_env(&mut cmd, browser.engine);
-    let status = cmd.status()?;
-    if !status.success() {
-        anyhow::bail!("tweb-pane exited with {:?}", status);
-    }
-    Ok(())
+    set_engine_env_vars(browser.engine);
+    // URL 미지정은 tmux window session 복원 요청이다.
+    let options = tweb_pane::PaneOptions {
+        engine: match browser.engine {
+            BrowserEngineArg::Electron => tweb_pane::BrowserEngine::Electron,
+            BrowserEngineArg::Tauri => tweb_pane::BrowserEngine::Tauri,
+        },
+        frame_rate: browser.frame_rate,
+        adaptive_frame_rate: browser.adaptive(),
+        restore_session: url.is_none(),
+    };
+    tweb_pane::run_with_options(url.unwrap_or("about:blank"), options).await
 }
 
-/// tmux split-window로 pane 만들고 tweb-pane 실행.
+/// tmux split-window로 pane 만들고 그 안에서 `tweb __pane` 실행.
 async fn split_and_run_pane(
     url: Option<&str>,
     browser: &BrowserOptions,
     _horizontal: bool,
 ) -> Result<()> {
-    let pane_bin = find_pane_binary()?;
-    let pane_bin_str = pane_bin.to_string_lossy().to_string();
+    // 같은 executable을 internal subcommand로 다시 부른다. 별도 binary를 찾지
+    // 않으므로 split pane이 이 CLI와 다른 build를 실행할 수 없다.
+    let executable = std::env::current_exe().context("cannot resolve the running tweb binary")?;
+    let pane_bin_str = executable.to_string_lossy().to_string();
 
     // 선택한 engine binary를 split pane에 명시적으로 전달한다.
     let mut env_str = String::new();
@@ -555,7 +548,7 @@ async fn split_and_run_pane(
         .map(|value| format!(" {}", shell_quote(value)))
         .unwrap_or_default();
     let pane_command = format!(
-        "{}{} {}{}",
+        "{}{} __pane {}{}",
         env_str,
         shell_quote(&pane_bin_str),
         browser.shell_args(),
@@ -571,34 +564,7 @@ async fn split_and_run_pane(
     Ok(())
 }
 
-/// tweb-pane binary 경로 찾기.
-fn find_pane_binary() -> Result<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("TWEB_PANE") {
-        return Ok(std::path::PathBuf::from(path));
-    }
-    for candidate in [
-        "target/release/tweb-pane",
-        "../target/release/tweb-pane",
-        "target/debug/tweb-pane",
-        "../target/debug/tweb-pane",
-    ] {
-        let path = std::path::PathBuf::from(candidate);
-        if path.exists() {
-            return Ok(path.canonicalize().unwrap_or(path));
-        }
-    }
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            let sibling = directory.join("tweb-pane");
-            if sibling.exists() {
-                return Ok(sibling);
-            }
-        }
-    }
-    which::which("tweb-pane").context("tweb-pane binary not found")
-}
-
-/// Tauri binary 경로 찾기 (tweb-pane에 환경 변수로 전달용).
+/// Tauri engine binary 경로 찾기 (환경 변수로 전달).
 fn find_tauri_binary() -> Option<std::path::PathBuf> {
     if let Ok(path) = std::env::var("TWEB_TAURI") {
         return Some(std::path::PathBuf::from(path));
@@ -648,23 +614,22 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// 선택한 engine의 실행 경로를 환경 변수로 설정한다.
-fn set_engine_env(cmd: &mut std::process::Command, engine: BrowserEngineArg) {
+/// 선택한 engine의 실행 경로를 이 process의 환경 변수로 설정한다.
+/// pane frontend가 같은 process에서 돌므로 자식에게 넘길 필요가 없다.
+fn set_engine_env_vars(engine: BrowserEngineArg) {
+    // Safety: CLI startup은 아직 single-threaded이고 pane frontend가
+    // engine을 찾기 전에 실행된다.
     if matches!(engine, BrowserEngineArg::Tauri) {
         if let Some(path) = find_tauri_binary() {
-            cmd.env("TWEB_TAURI", path);
+            std::env::set_var("TWEB_TAURI", path);
         }
         return;
     }
     if let Some(path) = find_electron_binary() {
-        cmd.env("TWEB_ELECTRON", &path);
+        std::env::set_var("TWEB_ELECTRON", &path);
         // app dir (package.json이 있는 디렉토리)도 전달.
-        let app_dir = path
-            .ancestors()
-            .find(|p| p.join("package.json").exists())
-            .map(|p| p.to_path_buf());
-        if let Some(dir) = app_dir {
-            cmd.env("TWEB_ELECTRON_DIR", dir);
+        if let Some(dir) = path.ancestors().find(|p| p.join("package.json").exists()) {
+            std::env::set_var("TWEB_ELECTRON_DIR", dir);
         }
     }
 }

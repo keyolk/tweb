@@ -12,5 +12,10 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(tweb_cli::run())
+    let result = rt.block_on(tweb_cli::run());
+    // The pane frontend now runs in this process, and `tokio::io::stdin()`'s
+    // blocking read does not always end on task abort. Pane cleanup already
+    // happened, so cap shutdown rather than linger after the browser exits.
+    rt.shutdown_timeout(std::time::Duration::from_millis(100));
+    result
 }

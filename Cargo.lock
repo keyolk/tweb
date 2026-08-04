@@ -3687,6 +3687,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tweb-core",
+ "tweb-pane",
  "which",
 ]
 

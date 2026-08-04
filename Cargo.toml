@@ -45,3 +45,4 @@ tweb-native = { path = "crates/tweb-native" }
 tweb-transport = { path = "crates/tweb-transport" }
 tweb-platform = { path = "crates/tweb-platform" }
 tweb-agent = { path = "crates/tweb-agent" }
+tweb-pane = { path = "crates/tweb-pane" }

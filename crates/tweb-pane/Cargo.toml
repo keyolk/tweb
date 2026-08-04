@@ -9,10 +9,6 @@ authors.workspace = true
 name = "tweb_pane"
 path = "src/lib.rs"
 
-[[bin]]
-name = "tweb-pane"
-path = "src/main.rs"
-
 [dependencies]
 tweb-core.workspace = true
 tweb-transport.workspace = true
