@@ -236,6 +236,23 @@ test("c reaches a caret from a target that carries no text", () => {
   assert.match(electron, /smart && !item\.caret && item\.kind === "link"/);
 });
 
+// Chromium paints nothing until a page commits. On google.com that was 5.5s of a
+// pane showing nothing at all — and once the pane ran in the alternate screen,
+// "nothing" meant a black rectangle rather than the user's old shell output.
+test("the first tab shows something before the real page commits", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /function placeholderPage\(target\)/);
+  const open = main.slice(main.indexOf("const load = () => {"),
+    main.indexOf("function placeholderPage(target)"));
+  assert.match(open, /tabs\.length === 1 && url !== "about:blank"/,
+    "the placeholder is not limited to the first tab");
+  // A later tab has the previous page on screen to hold, and about:blank is
+  // already immediate.
+  assert.match(open, /once\("did-finish-load", load\)/);
+  // If the placeholder itself fails there still has to be a navigation.
+  assert.match(open, /loadURL\(placeholderPage\(url\)\)\.catch\(load\)/);
+});
+
 // The image sits below the terminal's text now, which put Chromium's own stderr
 // chatter on top of the page.
 test("engine stderr stays off the pane and in the log buffer", () => {

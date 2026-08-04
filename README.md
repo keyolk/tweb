@@ -174,6 +174,11 @@ IME 조합(한글 등)은 terminal emulator가 자기 layer에 그립니다. Kit
 있으면 terminal cursor를 web caret 위치로 옮기고, 없으면 숨깁니다. 어떤 terminal이 그 cell을 불투명하게
 그린다면 `TWEB_IMAGE_Z=0`으로 예전 layering으로 돌아갈 수 있습니다.
 
+첫 tab은 실제 page가 commit되기 전까지 placeholder를 띄웁니다. Chromium은 page가 commit될 때까지
+아무것도 paint하지 않는데 실제 site는 그게 수 초 걸립니다 — google.com에서 5.5초를 쟀습니다. placeholder는
+0.5초 안에 commit되고, 그 뒤로는 paint holding이 실제 page가 준비될 때까지 그 화면을 유지합니다. 두 번째
+이후 tab은 이전 page가 화면에 남아 있으므로 해당되지 않습니다.
+
 pane frontend는 alternate screen에서 돕니다. `tweb open`은 사용자가 쓰던 pane 안에서 시작하므로 그
 pane에 남아 있던 shell prompt와 출력이 image 아래로 비쳐 보이기 때문이고, 종료하면 원래 화면이 그대로
 돌아옵니다.

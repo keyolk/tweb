@@ -846,6 +846,10 @@ function browserWindowOptions(vp = lastViewport || queryViewportSize()) {
     enableLargerThanScreen: true,
     webPreferences: {
       offscreen: { deviceScaleFactor: renderScaleFactor() },
+      // The window is hidden by design — that is how the pane keeps it off the
+      // screen — and Chromium throttles a hidden window's timers and rendering as
+      // if it were a background tab. The pane *is* the foreground here.
+      backgroundThrottling: false,
       preload: path.join(__dirname, "preload.cjs"),
       devTools: false,
       nodeIntegration: false,
@@ -2032,12 +2036,43 @@ function createTab(
     activate,
     initialZoomFactor
   );
-  // did-fail-load owns user-visible failures. loadURL also rejects for a normal
-  // client-side redirect with ERR_ABORTED, which must not replace the new page.
-  void tab.loadURL(url).catch((error) => {
-    if (debugLogging) console.error(`tweb: navigation superseded ${url}: ${error.message}`);
-  });
+  const load = () => {
+    // did-fail-load owns user-visible failures. loadURL also rejects for a normal
+    // client-side redirect with ERR_ABORTED, which must not replace the new page.
+    void tab.loadURL(url).catch((error) => {
+      if (debugLogging) console.error(`tweb: navigation superseded ${url}: ${error.message}`);
+    });
+  };
+  // Chromium paints nothing until a page commits, and a real site takes seconds:
+  // measured on google.com, the first frame arrived 5.5s in, and until then the
+  // pane was simply black. A placeholder commits in about half of one second, and
+  // paint holding keeps it up while the real page loads. Only the first tab needs
+  // it — any later one has the previous page on screen to hold.
+  if (tabs.length === 1 && url !== "about:blank") {
+    tab.webContents.once("did-finish-load", load);
+    void tab.loadURL(placeholderPage(url)).catch(load);
+  } else {
+    load();
+  }
   return tab;
+}
+
+// Deliberately plain: it exists to put *something* on the pane within the first
+// half second, not to be looked at.
+function placeholderPage(target) {
+  let host = target;
+  try {
+    host = new URL(target).host || target;
+  } catch (error) {
+    void error;
+  }
+  const escaped = String(host).replace(/[&<>]/g, (char) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[char]);
+  return `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html>
+<meta charset="utf-8"><title>${escaped}</title>
+<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace">
+${escaped} 여는 중…</body>`)}`;
 }
 
 function applyViewport(vp, origin = tmuxOrigin) {
