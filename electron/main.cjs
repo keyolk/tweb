@@ -599,6 +599,12 @@ function markInteractionActivity() {
   }, 700);
 }
 
+// A shrinking pane cannot be repainted by replacement alone: the new image is
+// smaller than the placement already on screen, so the remainder keeps covering
+// whatever tmux put there — typically the pane that just appeared below. Deleting
+// is deferred to the moment the replacement goes out so the pane is never bare.
+let pendingImageDelete = false;
+
 function sendFrameNow(image, generation) {
   if (!terminalVisible || generation !== viewportGeneration || !image || image.isEmpty()) return;
   const viewport = lastViewport;
@@ -609,6 +615,10 @@ function sendFrameNow(image, generation) {
     // PNG 생성 후 base64 변환과 terminal write는 worker에 맡긴다. stdout
     // backpressure가 생겨도 Electron main thread와 keyboard input은 멈추지 않는다.
     const png = image.toPNG();
+    if (pendingImageDelete) {
+      pendingImageDelete = false;
+      writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
+    }
     const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`;
     queueGfxFrame(png, header, generation);
     lastFrameSentAt = Date.now();
@@ -1922,6 +1932,7 @@ function createTab(
 
 function applyViewport(vp, origin = tmuxOrigin) {
   if (!vp) return;
+  const previous = lastViewport;
   const viewportChanged = !lastViewport ||
     lastViewport.cols !== vp.cols || lastViewport.rows !== vp.rows ||
     lastViewport.width !== vp.width || lastViewport.height !== vp.height;
@@ -1938,10 +1949,15 @@ function applyViewport(vp, origin = tmuxOrigin) {
   pendingGfxFrame = null;
   tabFrames.clear();
   // Moving the pane leaves a placement at the old anchor that the next frame
-  // will not cover, so that case still needs a delete. A plain size change does
-  // not: the next frame reuses the image id and replaces it in place, whereas
+  // will not cover, so that case needs a delete right away. Growing does not:
+  // the next frame reuses the image id and replaces it in place, whereas
   // deleting would bare the terminal until it arrives and read as a flicker.
+  // Shrinking cannot be covered by replacement either, but there the delete can
+  // wait until the replacement is actually on its way out.
   if (originChanged) writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
+  else if (previous && (vp.cols < previous.cols || vp.rows < previous.rows)) {
+    pendingImageDelete = true;
+  }
   tmuxOrigin = origin;
   paneCells = { cols: vp.cols, rows: vp.rows };
   lastViewport = vp;
