@@ -257,8 +257,9 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     };
     command
         .stdin(Stdio::piped())
+        // stdout is the Kitty graphics channel and has to stay.
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(engine_stderr())
         .env("TWEB_FRONTEND_PID", std::process::id().to_string())
         .env("TWEB_IMAGE_ID", image_id.to_string())
         .env(
@@ -497,6 +498,27 @@ fn electron_executable() -> Result<std::path::PathBuf> {
                 .join(", ")
         )
     })
+}
+
+/// engine stderr 목적지.
+///
+/// Chromium은 자기 진단을 stderr로 쓴다. pane image가 terminal text **아래**에
+/// 그려지게 된 뒤로 그 줄들이 page 위에 그대로 보이기 때문에 화면으로 내보낼 수 없다.
+/// agent가 실제로 필요한 것은 engine이 메모리에 들고 있는 `engine-log`이므로, stderr는
+/// 파일로 보낸다 — 시작 자체가 실패하는 경우를 그래도 진단할 수 있어야 한다.
+fn engine_stderr() -> Stdio {
+    if std::env::var("TWEB_DEBUG").is_ok() {
+        return Stdio::inherit();
+    }
+    let name = std::env::var("TMUX_PANE")
+        .map(|pane| pane.trim_start_matches('%').to_string())
+        .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+    let directory = engine_app::cache_root().join("logs");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return Stdio::null();
+    }
+    std::fs::File::create(directory.join(format!("engine-{name}.log")))
+        .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
 /// Electron binary 경로와 app directory 찾기.

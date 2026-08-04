@@ -236,6 +236,26 @@ test("c reaches a caret from a target that carries no text", () => {
   assert.match(electron, /smart && !item\.caret && item\.kind === "link"/);
 });
 
+// The image sits below the terminal's text now, which put Chromium's own stderr
+// chatter on top of the page.
+test("engine stderr stays off the pane and in the log buffer", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // Recording must not depend on TWEB_DEBUG: engine-log was empty exactly when
+  // someone was debugging a pane that had not been launched with it.
+  assert.match(main, /const debugLogging = true;/);
+  assert.doesNotMatch(main, /process\.env\.TWEB_DEBUG/);
+  // The buffer is installed before anything can log into it.
+  assert.ok(main.indexOf("const engineLog = []") < main.indexOf("function queueFrame("),
+    "the log buffer is installed after the first thing that logs");
+
+  const pane = fs.readFileSync(path.join(__dirname, "..", "crates", "tweb-pane", "src", "lib.rs"), "utf8");
+  assert.match(pane, /\.stderr\(engine_stderr\(\)\)/);
+  const stderr = pane.slice(pane.indexOf("fn engine_stderr()"), pane.indexOf("/// Electron binary 경로"));
+  // stdout is the graphics channel; only stderr may be redirected.
+  assert.match(stderr, /TWEB_DEBUG.*is_ok\(\)/s, "TWEB_DEBUG no longer keeps stderr inherited");
+  assert.match(stderr, /engine-\{name\}\.log/, "engine stderr is not kept anywhere");
+});
+
 // The shortcut runtime lives in an isolated world, so an agent could not see the
 // mode it was in, what a picker was showing, or what the collectors would find.
 test("the shortcut runtime reports its own state to an agent", () => {

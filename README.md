@@ -174,6 +174,11 @@ IME 조합(한글 등)은 terminal emulator가 자기 layer에 그립니다. Kit
 있으면 terminal cursor를 web caret 위치로 옮기고, 없으면 숨깁니다. 어떤 terminal이 그 cell을 불투명하게
 그린다면 `TWEB_IMAGE_Z=0`으로 예전 layering으로 돌아갈 수 있습니다.
 
+image가 text 아래로 내려간 대가로, 예전에는 image에 가려 보이지 않던 Chromium 자신의 stderr 출력이 page
+위에 드러납니다. 그래서 engine stderr는 `~/.cache/tweb/logs/engine-<pane>.log`로 보냅니다. 진단 줄은
+언제나 engine 안의 ring buffer에도 쌓이므로 `tweb engine-log`로 읽으면 되고, `TWEB_DEBUG=1`을 주면
+stderr를 그대로 물려받아 terminal로도 흘립니다.
+
 한글 2벌식 layout에서도 physical key와 자모 `langmap`을 사용하므로 normal/hint/visual/inspect 명령은 영문 layout과 동일하게 동작합니다. 입력 요소가 focus된 `E` mode에서는 한글을 변환하지 않고 그대로 입력합니다.
 
 IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중인 글자는 **terminal cursor 위치**에 그려집니다. TWeb은 입력 요소에 focus가 있는 동안 terminal cursor를 web caret이 있는 cell로 옮기고 표시하므로, 조합 과정이 입력 위치에 나타납니다. terminal cursor를 그리는 것은 emulator이므로 글꼴과 색은 page가 아니라 terminal 설정을 따릅니다.

@@ -115,6 +115,23 @@ let lastFrameSentAt = 0;
 // paints those cells opaque.
 const configuredImageZ = Number.parseInt(process.env.TWEB_IMAGE_Z || "", 10);
 const imageZ = Number.isSafeInteger(configuredImageZ) ? configuredImageZ : -1;
+// stderr belongs to the pane, so the `resize generation=` / `frame generation=`
+// lines an agent needs were only reachable by running a separate harness with the
+// output redirected. Keep the last of them addressable over the socket instead.
+const engineLog = [];
+// The diagnostic lines used to be gated on TWEB_DEBUG, which meant `engine-log`
+// was empty exactly when someone was debugging a pane they had not launched with
+// it. Now that engine stderr goes to a file rather than over the page, they can
+// always be recorded; TWEB_DEBUG only decides whether stderr is inherited.
+const debugLogging = true;
+const writeError = console.error.bind(console);
+console.error = (...args) => {
+  const line = args.map((part) => (typeof part === "string" ? part : String(part))).join(" ");
+  engineLog.push({ at: Date.now(), line });
+  if (engineLog.length > 400) engineLog.shift();
+  writeError(...args);
+};
+
 const configuredImageId = Number.parseInt(process.env.TWEB_IMAGE_ID || "", 10);
 const imageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
   ? configuredImageId
@@ -187,7 +204,7 @@ function deleteImageFromClientTty(tty) {
     fd = openSync(tty, "w");
     writeSync(fd, rawKittyDelete());
   } catch (error) {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: client tty delete failed ${tty}: ${error.message}`);
+    if (debugLogging) console.error(`tweb: client tty delete failed ${tty}: ${error.message}`);
   } finally {
     if (fd !== undefined) {
       try { closeSync(fd); } catch (e) {}
@@ -219,7 +236,7 @@ function tmuxRootBinding(key) {
 function ensureTmuxRootBinding(key, args, isManaged, replaceManaged = false) {
   const current = tmuxRootBinding(key);
   if (current && (!replaceManaged || !isManaged(current))) {
-    if (!isManaged(current) && process.env.TWEB_DEBUG) {
+    if (!isManaged(current) && debugLogging) {
       console.error(`tweb: preserving custom root ${key} binding`);
     }
     return;
@@ -311,7 +328,7 @@ function ensureTmuxPassthroughTable() {
     try {
       execFileSync("tmux", args, { timeout: 1000, stdio: "ignore" });
     } catch (error) {
-      if (process.env.TWEB_DEBUG) {
+      if (debugLogging) {
         console.error(`tweb: passthrough command failed: ${error.message}`);
       }
     }
@@ -346,7 +363,7 @@ function switchTmuxClientTable(tty, table) {
     );
     return true;
   } catch (error) {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: client table switch failed ${tty}: ${error.message}`);
+    if (debugLogging) console.error(`tweb: client table switch failed ${tty}: ${error.message}`);
     return false;
   }
 }
@@ -360,7 +377,7 @@ function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
     if (browserShortcutsEnabled || !state || state.paneId !== paneId) {
       if (state) switchTmuxClientTable(tty, originalTable);
       passthroughClientTables.delete(tty);
-      if (process.env.TWEB_DEBUG) {
+      if (debugLogging) {
         console.error(`tweb: passthrough client restore ${tty} ${state?.paneId || "detached"} -> ${originalTable}`);
       }
     }
@@ -372,7 +389,7 @@ function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
     const originalTable = state.keyTable === passthroughTable ? "root" : state.keyTable;
     if (switchTmuxClientTable(tty, passthroughTable)) {
       passthroughClientTables.set(tty, originalTable || "root");
-      if (process.env.TWEB_DEBUG) {
+      if (debugLogging) {
         console.error(`tweb: passthrough client arm ${tty} ${state.paneId} from ${originalTable || "root"}`);
       }
     }
@@ -427,7 +444,7 @@ function initializeTmuxVisibility() {
       terminalVisible = initial.size > 0;
     }
   } catch (error) {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: visibility init failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
   }
   syncTmuxVisibility();
   const timer = setInterval(syncTmuxVisibility, 150);
@@ -462,7 +479,7 @@ function syncTmuxVisibility() {
       reconcileTmuxPassthrough();
       if (wasVisible !== terminalVisible) {
         updatePaintingState();
-        if (process.env.TWEB_DEBUG) {
+        if (debugLogging) {
           console.error(`tweb: visibility ${terminalVisible ? "visible" : "hidden"}`);
         }
       }
@@ -563,9 +580,9 @@ function requestTrackedKeyboardModeRestore() {
     // Electron may be reparented while Chromium starts, so process.ppid is not
     // a stable frontend identity. Rust passes its PID explicitly.
     process.kill(frontendPid, "SIGUSR1");
-    if (process.env.TWEB_DEBUG) console.error(`tweb: keyboard mode restore requested ${frontendPid}`);
+    if (debugLogging) console.error(`tweb: keyboard mode restore requested ${frontendPid}`);
   } catch (error) {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: keyboard mode restore request failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: keyboard mode restore request failed: ${error.message}`);
   }
 }
 
@@ -590,7 +607,7 @@ function applyActiveFrameRate(rate) {
   activeFrameRate = next;
   frameIntervalMs = Math.ceil(1000 / activeFrameRate);
   if (win && !win.isDestroyed() && terminalVisible) win.webContents.setFrameRate(activeFrameRate);
-  if (process.env.TWEB_DEBUG) console.error(`tweb: frame rate ${activeFrameRate}fps`);
+  if (debugLogging) console.error(`tweb: frame rate ${activeFrameRate}fps`);
 }
 
 function markInteractionActivity() {
@@ -675,7 +692,7 @@ function queueFrame(tab, image, immediate = false) {
   const size = image?.getSize();
   const expected = viewport && renderedFrameSize(viewport);
   if (!expected || !size || size.width !== expected.width || size.height !== expected.height) {
-    if (process.env.TWEB_DEBUG) {
+    if (debugLogging) {
       console.error(`tweb: frame dropped got=${size?.width}x${size?.height}`
         + ` want=${expected?.width}x${expected?.height}`);
     }
@@ -695,7 +712,7 @@ function repaintActiveTab() {
   const frame = tabFrames.get(win);
   if (frame && frame.generation === viewportGeneration && !frame.image.isEmpty()) {
     queueFrame(win, frame.image, true);
-    if (process.env.TWEB_DEBUG) console.error("tweb: visibility repaint");
+    if (debugLogging) console.error("tweb: visibility repaint");
     return;
   }
   win.webContents.invalidate();
@@ -861,7 +878,7 @@ function readWindowSession() {
       : 0;
     return { tabs: restoredTabs, activeIndex };
   } catch (error) {
-    if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+    if (error.code !== "ENOENT" && debugLogging) {
       console.error(`tweb: window session restore failed: ${error.message}`);
     }
     return null;
@@ -889,7 +906,7 @@ function writeWindowSession() {
     renameSync(temporaryPath, windowSessionPath);
   } catch (error) {
     try { unlinkSync(temporaryPath); } catch {}
-    if (process.env.TWEB_DEBUG) console.error(`tweb: window session save failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
   }
 }
 
@@ -907,7 +924,7 @@ function notify(message) {
   if (process.env.TMUX && process.env.TMUX_PANE) {
     execFile("tmux", ["display-message", "-t", process.env.TMUX_PANE, message], () => {});
   }
-  if (process.env.TWEB_DEBUG) console.error(`tweb: ${message}`);
+  if (debugLogging) console.error(`tweb: ${message}`);
 }
 
 function updatePaneTitle() {
@@ -1020,7 +1037,7 @@ function installPageEnhancements(tab = win) {
       updateCaret();
     }
   })()`, true).catch((error) => {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: page enhancements failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: page enhancements failed: ${error.message}`);
   });
 }
 
@@ -1067,7 +1084,7 @@ function sendToTabFrames(tab, channel, ...args) {
       if (!liveKeys.has(key)) readyKeys.delete(key);
     }
   } catch (error) {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: frame broadcast failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: frame broadcast failed: ${error.message}`);
   }
 }
 
@@ -1084,13 +1101,13 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
     // simply stop working until focus happened to return to the main frame.
     if (frame && !shortcutFrameKeys(tab).has(frameKey(frame))) frame = contents.mainFrame;
     const deliverable = frame && readyFrameKeys(tab).has(frameKey(frame));
-    if (process.env.TWEB_DEBUG && !deliverable) {
+    if (debugLogging && !deliverable) {
       console.error(`tweb: dropped ${channel}; shortcut frames=${shortcutFrameKeys(tab).size}`
         + ` ready=${readyFrameKeys(tab).size}`);
     }
     if (deliverable) frame.send(channel, ...args);
   } catch (error) {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: focused frame send failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: focused frame send failed: ${error.message}`);
   }
 }
 
@@ -1108,7 +1125,7 @@ function toggleBrowserShortcuts() {
   if (!browserShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
   reconcileTmuxPassthrough();
   updatePaneTitle();
-  if (process.env.TWEB_DEBUG) {
+  if (debugLogging) {
     console.error(`tweb: input mode ${browserShortcutsEnabled ? "shortcuts" : "passthrough"}`);
   }
   notify(browserShortcutsEnabled ? "browser shortcuts ON" : "web passthrough ON");
@@ -1139,7 +1156,7 @@ function activateTab(index) {
   win.webContents.invalidate();
   updatePaneTitle();
   scheduleWindowSessionSave();
-  if (process.env.TWEB_DEBUG) console.error(`tweb: tab active ${tabLabel(win, normalized)}`);
+  if (debugLogging) console.error(`tweb: tab active ${tabLabel(win, normalized)}`);
 }
 
 function cycleTab(direction) {
@@ -1209,7 +1226,7 @@ function recordNavigationHistory(url, title = "") {
     mkdirSync(path.dirname(historyPath()), { recursive: true });
     appendFileSync(historyPath(), line, { encoding: "utf8", mode: 0o600 });
   } catch (error) {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: history append failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: history append failed: ${error.message}`);
   }
 }
 
@@ -1219,7 +1236,7 @@ function readGlobalHistory(limit = historyLimit) {
   try {
     lines = readFileSync(historyPath(), "utf8").split("\n");
   } catch (error) {
-    if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+    if (error.code !== "ENOENT" && debugLogging) {
       console.error(`tweb: history read failed: ${error.message}`);
     }
     // Fall back to what this process has seen.
@@ -1250,7 +1267,7 @@ function compactHistory(keep = 600) {
     writeFileSync(temporary, `${lines.slice(-keep).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temporary, historyPath());
   } catch (error) {
-    if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+    if (error.code !== "ENOENT" && debugLogging) {
       console.error(`tweb: history compaction failed: ${error.message}`);
     }
   }
@@ -1293,7 +1310,7 @@ function tabListModel() {
 
 function handleNativeShortcut(tab, action, value) {
   if (!browserShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
-  if (process.env.TWEB_DEBUG) console.error(`tweb: native shortcut ${action}`);
+  if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
   switch (action) {
     case "history-back":
@@ -1361,7 +1378,7 @@ function handleNativeShortcut(tab, action, value) {
           void contents.capturePage(rect).then((image) => {
             if (!image.isEmpty()) clipboard.writeImage(nativeImage.createFromBuffer(image.toPNG()));
           }).catch((error) => {
-            if (process.env.TWEB_DEBUG) console.error(`tweb: image copy failed: ${error.message}`);
+            if (debugLogging) console.error(`tweb: image copy failed: ${error.message}`);
           });
         }, 0);
       }
@@ -1493,18 +1510,6 @@ function agentPageRequest(method, params, timeoutMs = 10000) {
     sendToFocusedTabFrame(tab, "tweb-agent-request", { id, method, params });
   });
 }
-
-// stderr belongs to the pane, so the `resize generation=` / `frame generation=`
-// lines an agent needs were only reachable by running a separate harness with the
-// output redirected. Keep the last of them addressable over the socket instead.
-const engineLog = [];
-const writeError = console.error.bind(console);
-console.error = (...args) => {
-  const line = args.map((part) => (typeof part === "string" ? part : String(part))).join(" ");
-  engineLog.push({ at: Date.now(), line });
-  if (engineLog.length > 400) engineLog.shift();
-  writeError(...args);
-};
 
 function agentDiagnostics() {
   const tab = win && !win.isDestroyed() ? win : null;
@@ -1850,9 +1855,9 @@ function showBrowserContextMenu(tab, inputParams) {
     menu.style.left = Math.max(4, Math.min(model.x, innerWidth - rect.width - 4)) + 'px';
     menu.style.top = Math.max(4, Math.min(model.y, innerHeight - rect.height - 4)) + 'px';
   })()`, true).then(() => {
-    if (process.env.TWEB_DEBUG) console.error("tweb: context menu shown");
+    if (debugLogging) console.error("tweb: context menu shown");
   }).catch((error) => {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: context menu failed: ${error.message}`);
+    if (debugLogging) console.error(`tweb: context menu failed: ${error.message}`);
   });
 }
 
@@ -1895,7 +1900,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     if (loggedFrameGeneration !== viewportGeneration && !image.isEmpty()
       && size.width === expected?.width && size.height === expected?.height) {
       loggedFrameGeneration = viewportGeneration;
-      if (process.env.TWEB_DEBUG) {
+      if (debugLogging) {
         const vp = lastViewport || queryViewportSize();
         console.error(
           `tweb: frame generation=${viewportGeneration} ${size.width}x${size.height}, `
@@ -1923,7 +1928,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     if (browserShortcutsEnabled) showBrowserContextMenu(tab, params);
   });
   contents.on("media-started-playing", () => {
-    if (process.env.TWEB_DEBUG) {
+    if (debugLogging) {
       setTimeout(() => {
         if (!contents.isDestroyed()) {
           console.error(`tweb: media playing audible=${contents.isCurrentlyAudible()} muted=${contents.audioMuted}`);
@@ -1932,7 +1937,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     }
   });
   contents.on("media-paused", () => {
-    if (process.env.TWEB_DEBUG) console.error("tweb: media paused");
+    if (debugLogging) console.error("tweb: media paused");
   });
   contents.on("found-in-page", (_event, result) => {
     sendToTabFrames(tab, "tweb-find-result", result);
@@ -1958,11 +1963,11 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     contents.invalidate();
     if (!initialZoomApplied) {
       initialZoomApplied = true;
-      if (process.env.TWEB_DEBUG) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
+      if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
     }
     installPageEnhancements(tab);
     sendToTabFrames(tab, "tweb-shortcuts-enabled", browserShortcutsEnabled);
-    if (process.env.TWEB_DEBUG) {
+    if (debugLogging) {
       console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
     }
   });
@@ -1970,7 +1975,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     const url = tabSessionUrls.get(tab) || contents.getURL();
     recordNavigationHistory(url, title);
     if (tab === win) updatePaneTitle();
-    if (process.env.TWEB_DEBUG) console.error(`tweb: title ${title}`);
+    if (debugLogging) console.error(`tweb: title ${title}`);
   });
   contents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
     if (!isMainFrame || code === -3 || showingLoadError) return;
@@ -2012,7 +2017,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
 
   if (activate) activateTab(index);
   else scheduleWindowSessionSave();
-  if (process.env.TWEB_DEBUG) console.error(`tweb: tab opened ${index + 1} ${url}`);
+  if (debugLogging) console.error(`tweb: tab opened ${index + 1} ${url}`);
   return tab;
 }
 
@@ -2030,7 +2035,7 @@ function createTab(
   // did-fail-load owns user-visible failures. loadURL also rejects for a normal
   // client-side redirect with ERR_ABORTED, which must not replace the new page.
   void tab.loadURL(url).catch((error) => {
-    if (process.env.TWEB_DEBUG) console.error(`tweb: navigation superseded ${url}: ${error.message}`);
+    if (debugLogging) console.error(`tweb: navigation superseded ${url}: ${error.message}`);
   });
   return tab;
 }
@@ -2063,7 +2068,7 @@ function applyViewport(vp, origin = tmuxOrigin) {
   paneCells = { cols: vp.cols, rows: vp.rows };
   lastViewport = vp;
   const logical = logicalContentSize(vp);
-  if (process.env.TWEB_DEBUG) {
+  if (debugLogging) {
     const anchor = tmuxOrigin ? `${tmuxOrigin.left},${tmuxOrigin.top}` : "none";
     console.error(
       `tweb: resize generation=${viewportGeneration} cells=${vp.cols}x${vp.rows} `
@@ -2098,7 +2103,7 @@ function createWindow(url) {
     createTab(tab.url, false, tab.zoom);
   }
   activateTab(session.activeIndex);
-  if (process.env.TWEB_DEBUG) {
+  if (debugLogging) {
     console.error(`tweb: restored ${session.tabs.length} tabs for tmux window`);
   }
   return win;
@@ -2159,7 +2164,7 @@ function setBrowserZoom(action) {
   contents.setZoomFactor(next);
   contents.invalidate();
   scheduleWindowSessionSave();
-  if (process.env.TWEB_DEBUG) console.error(`tweb: zoom ${next.toFixed(3)}`);
+  if (debugLogging) console.error(`tweb: zoom ${next.toFixed(3)}`);
 }
 
 function hasZoomModifier(modifiers) {
@@ -2232,7 +2237,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
     // Opening one here as well replaced that menu with a coordinates-only one,
     // losing every entry that depends on the target.
   }
-  if (process.env.TWEB_DEBUG && type !== "mouseMove") {
+  if (debugLogging && type !== "mouseMove") {
     console.error(`tweb: ${type} ${button} ${x},${y}`);
   }
 }
@@ -2406,7 +2411,7 @@ function dispatchText(buffer) {
 }
 
 function dispatchPrivateShortcut(code) {
-  if (process.env.TWEB_DEBUG) console.error(`tweb: private key ${code}`);
+  if (debugLogging) console.error(`tweb: private key ${code}`);
   if (code === 5001) {
     toggleBrowserShortcuts();
     return;
@@ -2618,7 +2623,7 @@ app.whenReady().then(() => {
   agentServer = startAgentServer({
     dispatch: handleAgentCommand,
     log: (message) => {
-      if (process.env.TWEB_DEBUG) console.error(`tweb: ${message}`);
+      if (debugLogging) console.error(`tweb: ${message}`);
     },
   });
   // Chromium startup may reset the terminal modified-key mode after the Rust
@@ -2634,7 +2639,7 @@ app.whenReady().then(() => {
 function cleanupFrameFiles() {
   for (const filePath of [frameFilePath, `${frameFilePath}.tmp`]) {
     try { unlinkSync(filePath); } catch (error) {
-      if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+      if (error.code !== "ENOENT" && debugLogging) {
         console.error(`tweb: frame file cleanup failed ${filePath}: ${error.message}`);
       }
     }
@@ -2669,7 +2674,7 @@ app.on("before-quit", () => {
   pendingGfxFrame = null;
   void gfxWorker.terminate();
   cleanupFrameFiles();
-  if (process.env.TWEB_DEBUG && droppedGfxFrames > 0) {
+  if (debugLogging && droppedGfxFrames > 0) {
     console.error(`tweb: dropped ${droppedGfxFrames} superseded graphics frames`);
   }
   for (const tab of tabs) {
