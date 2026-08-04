@@ -250,6 +250,15 @@ test("engine stderr stays off the pane and in the log buffer", () => {
 
   const pane = fs.readFileSync(path.join(__dirname, "..", "crates", "tweb-pane", "src", "lib.rs"), "utf8");
   assert.match(pane, /\.stderr\(engine_stderr\(\)\)/);
+  // `tweb open` starts inside a pane the user was already using, and its leftover
+  // shell output shows through the page now that the image is below the text.
+  // terminal_setup existed for this and was never called by anything.
+  assert.match(pane, /let _screen_guard = terminal::ScreenGuard::enter\(\);/,
+    "the pane never enters the alternate screen");
+  const term = fs.readFileSync(
+    path.join(__dirname, "..", "crates", "tweb-pane", "src", "terminal.rs"), "utf8");
+  assert.match(term, /impl Drop for ScreenGuard/, "the user's screen is never restored");
+  assert.match(term, /\\x1b\[\?1049h/);
   const stderr = pane.slice(pane.indexOf("fn engine_stderr()"), pane.indexOf("/// Electron binary 경로"));
   // stdout is the graphics channel; only stderr may be redirected.
   assert.match(stderr, /TWEB_DEBUG.*is_ok\(\)/s, "TWEB_DEBUG no longer keeps stderr inherited");

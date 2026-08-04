@@ -174,6 +174,10 @@ IME 조합(한글 등)은 terminal emulator가 자기 layer에 그립니다. Kit
 있으면 terminal cursor를 web caret 위치로 옮기고, 없으면 숨깁니다. 어떤 terminal이 그 cell을 불투명하게
 그린다면 `TWEB_IMAGE_Z=0`으로 예전 layering으로 돌아갈 수 있습니다.
 
+pane frontend는 alternate screen에서 돕니다. `tweb open`은 사용자가 쓰던 pane 안에서 시작하므로 그
+pane에 남아 있던 shell prompt와 출력이 image 아래로 비쳐 보이기 때문이고, 종료하면 원래 화면이 그대로
+돌아옵니다.
+
 image가 text 아래로 내려간 대가로, 예전에는 image에 가려 보이지 않던 Chromium 자신의 stderr 출력이 page
 위에 드러납니다. 그래서 engine stderr는 `~/.cache/tweb/logs/engine-<pane>.log`로 보냅니다. 진단 줄은
 언제나 engine 안의 ring buffer에도 쌓이므로 `tweb engine-log`로 읽으면 되고, `TWEB_DEBUG=1`을 주면

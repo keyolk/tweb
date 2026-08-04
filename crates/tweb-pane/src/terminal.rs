@@ -317,6 +317,27 @@ impl Drop for InputModeGuard {
 
 /// terminal mode 설정 (cliweb output.ts 방식).
 /// alternate screen, mouse SGR pixel, auto wrap, clear.
+/// alternate screen.
+///
+/// `tweb open`은 사용자가 쓰던 pane 안에서 시작한다. 그 pane에 남아 있던 shell prompt와
+/// 출력은 page image가 text **위**에 있는 동안에는 가려졌지만, image가 아래로 내려간
+/// 뒤로는 page를 뚫고 보인다. alternate screen에 들어가면 빈 화면에서 시작하고, 나갈 때
+/// 사용자의 화면이 그대로 돌아온다.
+pub struct ScreenGuard;
+
+impl ScreenGuard {
+    pub fn enter() -> Self {
+        terminal_setup();
+        Self
+    }
+}
+
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        terminal_cleanup();
+    }
+}
+
 pub fn terminal_setup() {
     let stdout = io::stdout();
     let mut lock = stdout.lock();

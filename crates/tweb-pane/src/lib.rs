@@ -214,6 +214,10 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     // raw terminal mode와 browser 입력(mouse/Kitty keyboard) 활성화.
     let _raw_guard = terminal::RawModeGuard::enter()?;
     let _input_guard = terminal::InputModeGuard::enter();
+    // Declared after the others so it is dropped first: the screen has to still be
+    // ours when the image is deleted, or the placement outlives the screen it was
+    // put on.
+    let _screen_guard = terminal::ScreenGuard::enter();
 
     // Engine process spawn. stdin은 resize/raw input control channel이고,
     // stdout은 engine이 Kitty graphics를 terminal에 직접 쓰도록 상속한다.
