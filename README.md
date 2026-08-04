@@ -101,9 +101,20 @@ tweb wait --selector "#result" --timeout 5000
 tweb errors                      # console error만
 tweb eval "location.pathname"
 tweb tab new https://localhost:5173
+tweb diag                        # pane geometry·zoom·frame·input 상태
+tweb engine-log --limit 40       # engine debug 줄 (resize·frame 회계)
 ```
 
-기본 출력은 사람이 읽는 요약이고 `--json`으로 원본을 받습니다. pane이 하나면 `--pane`은 생략합니다.
+기본 출력은 사람이 읽는 요약이고 `--json`으로 원본을 받습니다. `--pane`은 생략할 수 있습니다 — pane이
+하나면 그것을, 여러 개면 **같은 tmux window의 pane**을 씁니다. 다른 window의 browser까지 후보에 넣지
+않으므로, window마다 browser를 띄워 두고도 매번 pane id를 조회할 필요가 없습니다.
+
+문제가 page가 아니라 pane 쪽일 때는 `diag`를 봅니다. pane cell/pixel 크기, window content size,
+zoom, 마지막 frame 크기와 기대 크기, frame rate, input mode를 한 번에 돌려주므로 "resize를 따라가지
+못한다"처럼 화면에서만 보이는 증상을 수치로 확인할 수 있습니다 — frame 크기가 기대 크기와 다르면 그
+frame들은 버려지고 있습니다. `engine-log`는 그 판단의 근거가 되는 engine 줄(`resize generation=…`,
+`frame dropped got=… want=…`)을 돌려줍니다. 원래 pane의 stderr로만 나가던 것이라, 예전에는 관찰하려면
+별도 harness로 pane을 다시 띄워야 했습니다.
 
 `snapshot`은 role·accessible name·value·CSS selector·화면 좌표를 함께 돌려주므로 agent가 확인한
 요소를 그대로 test code의 selector로 옮길 수 있습니다. `console`/`errors`는 page가 시작될 때부터

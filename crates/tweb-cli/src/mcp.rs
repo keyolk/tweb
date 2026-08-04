@@ -31,6 +31,29 @@ const REF_FIELD: (&str, &str, &str, bool) = (
 
 const TOOLS: &[Tool] = &[
     Tool {
+        name: "tweb_diag",
+        method: "diag",
+        description: "Report the pane's geometry, window size, zoom, frame state and \
+                      input mode. Use it when the pane looks wrong rather than the \
+                      page: a frame size that disagrees with the pane means frames \
+                      are being dropped.",
+        fields: &[],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_engine_log",
+        method: "engine-log",
+        description: "Recent engine debug lines (resize and frame accounting). These \
+                      otherwise only reach the pane's stderr.",
+        fields: &[(
+            "limit",
+            "integer",
+            "How many lines to return (default 60).",
+            false,
+        )],
+        fixed: &[],
+    },
+    Tool {
         name: "tweb_snapshot",
         method: "snapshot",
         description: "List the interactive elements of the visible page with refs. \
@@ -313,6 +336,21 @@ pub fn serve(pane: Option<&str>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A pane that stopped following its size is invisible from the page, so an
+    /// agent needs the engine's own view of it.
+    #[test]
+    fn the_surface_exposes_pane_diagnostics() {
+        let names: Vec<&str> = super::TOOLS.iter().map(|tool| tool.name).collect();
+        assert!(
+            names.contains(&"tweb_diag"),
+            "tweb_diag is missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"tweb_engine_log"),
+            "tweb_engine_log is missing: {names:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

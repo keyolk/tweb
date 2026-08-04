@@ -278,6 +278,18 @@ pub enum Command {
         #[command(subcommand)]
         action: ChromeAction,
     },
+    /// 실행 중인 pane의 geometry·zoom·frame·input 상태.
+    Diag {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// engine debug log (TWEB_DEBUG 줄) 조회.
+    EngineLog {
+        #[arg(long, default_value_t = 60)]
+        limit: usize,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// terminal/tmux/GPU/extension capability 진단.
     Doctor,
     /// internal: pane frontend (tmux가 실행, 문서화된 automation API가 아님).
@@ -422,6 +434,8 @@ fn agent_call(command: Command) -> Result<(&'static str, serde_json::Value, Agen
         Command::Forward { agent } => ("forward", json!({}), agent),
         Command::Reload { agent } => ("reload", json!({}), agent),
         Command::Status { agent } => ("status", json!({}), agent),
+        Command::Diag { agent } => ("diag", json!({}), agent),
+        Command::EngineLog { limit, agent } => ("engine-log", json!({ "limit": limit }), agent),
         Command::Snapshot { text, agent } => (
             "snapshot",
             json!({ "mode": if text { "text" } else { "interactive" } }),

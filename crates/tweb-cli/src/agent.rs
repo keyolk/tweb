@@ -29,6 +29,45 @@ pub fn runtime_dir() -> PathBuf {
     std::env::temp_dir().join(format!("tweb-{}", unsafe { getuid() }))
 }
 
+/// Pane ids sharing a tmux window with us, nearest first (ours, then the rest in
+/// layout order).
+///
+/// Without this, a second browser pane anywhere — another window, another session
+/// — made `--pane` mandatory, so every call had to be preceded by a `panes`
+/// lookup. `list-panes -a` is used rather than `display-message` because the
+/// latter needs an attached client and fails outright without one.
+pub fn panes_in_our_window() -> Vec<String> {
+    let Ok(ours) = std::env::var("TMUX_PANE") else {
+        return Vec::new();
+    };
+    let Ok(output) = std::process::Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_id} #{window_id}"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let rows: Vec<(&str, &str)> = listing
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(pane, window)| (pane.trim(), window.trim()))
+        .collect();
+    let Some(window) = rows
+        .iter()
+        .find(|(pane, _)| *pane == ours)
+        .map(|(_, window)| *window)
+    else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter(|(_, candidate)| *candidate == window)
+        .map(|(pane, _)| (*pane).to_string())
+        .collect()
+}
+
 /// Sockets that currently accept connections.
 pub fn discover_sockets() -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(runtime_dir())
@@ -73,13 +112,30 @@ pub fn resolve_socket(pane: Option<&str>) -> Result<PathBuf> {
         ),
         1 => Ok(sockets.into_iter().next().expect("checked length")),
         _ => {
-            let names = sockets
+            let names: Vec<String> = sockets
                 .iter()
                 .filter_map(|path| path.file_stem()?.to_str())
                 .map(|stem| stem.trim_start_matches("agent-").to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("multiple browser panes are running ({names}); pass --pane")
+                .collect();
+            // Panes in other windows are almost never what a caller in this window
+            // means, so they do not count towards the ambiguity.
+            let nearby = panes_in_our_window();
+            let ours: Vec<&String> = names
+                .iter()
+                .filter(|name| nearby.iter().any(|pane| pane == *name))
+                .collect();
+            if let [only] = ours[..] {
+                return Ok(runtime_dir().join(format!("agent-{only}.sock")));
+            }
+            let listed = if ours.is_empty() {
+                names.join(", ")
+            } else {
+                ours.iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            bail!("multiple browser panes are running ({listed}); pass --pane")
         }
     }
 }
@@ -304,4 +360,19 @@ pub fn list_panes(as_json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Outside tmux there is no window to scope to, and the lookup must not shell
+    /// out or panic — resolution just falls back to the ambiguity error.
+    #[test]
+    fn scoping_needs_a_tmux_pane() {
+        let saved = std::env::var("TMUX_PANE").ok();
+        std::env::remove_var("TMUX_PANE");
+        assert!(super::panes_in_our_window().is_empty());
+        if let Some(value) = saved {
+            std::env::set_var("TMUX_PANE", value);
+        }
+    }
 }

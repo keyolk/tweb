@@ -1483,6 +1483,61 @@ function agentPageRequest(method, params, timeoutMs = 10000) {
   });
 }
 
+// stderr belongs to the pane, so the `resize generation=` / `frame generation=`
+// lines an agent needs were only reachable by running a separate harness with the
+// output redirected. Keep the last of them addressable over the socket instead.
+const engineLog = [];
+const writeError = console.error.bind(console);
+console.error = (...args) => {
+  const line = args.map((part) => (typeof part === "string" ? part : String(part))).join(" ");
+  engineLog.push({ at: Date.now(), line });
+  if (engineLog.length > 400) engineLog.shift();
+  writeError(...args);
+};
+
+function agentDiagnostics() {
+  const tab = win && !win.isDestroyed() ? win : null;
+  const size = tab ? tab.getContentSize() : null;
+  const frame = tab ? tabFrames.get(tab)?.image?.getSize() : null;
+  return {
+    pane: process.env.TMUX_PANE || null,
+    pid: process.pid,
+    engineApp: __dirname,
+    pane_geometry: {
+      cells: paneCells,
+      pixels: lastViewport ? { width: lastViewport.width, height: lastViewport.height } : null,
+      origin: tmuxOrigin,
+      logical: lastViewport ? logicalContentSize(lastViewport) : null,
+      scaleFactor: renderScaleFactor(),
+    },
+    window: {
+      contentSize: size ? { width: size[0], height: size[1] } : null,
+      zoomFactor: tab ? tab.webContents.getZoomFactor() : null,
+      defaultZoomFactor,
+      visible: tab ? tab.isVisible() : null,
+    },
+    frames: {
+      generation: viewportGeneration,
+      lastSentMsAgo: lastFrameSentAt ? Date.now() - lastFrameSentAt : null,
+      lastSize: frame ? { width: frame.width, height: frame.height } : null,
+      // A frame whose size does not match the pane is dropped, which is what a
+      // pane that stopped following a resize looks like.
+      expected: lastViewport ? renderedFrameSize(lastViewport) : null,
+      rate: activeFrameRate,
+      adaptive: adaptiveFrameRate,
+      droppedByBackpressure: droppedGfxFrames,
+      imageId,
+    },
+    input: {
+      shortcutsEnabled: browserShortcutsEnabled,
+      pageInsertMode,
+      terminalVisible,
+      shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
+    },
+    tabs: { active: activeTabIndex, count: tabs.length },
+  };
+}
+
 function agentContents() {
   if (!win || win.isDestroyed()) throw new Error("no active tab");
   return win.webContents;
@@ -1561,6 +1616,12 @@ async function handleAgentCommand(method, params) {
     case "info":
     case "query":
       return agentPageRequest(method, params);
+    case "diag":
+      return agentDiagnostics();
+    case "engine-log": {
+      const limit = Number.isInteger(params?.limit) ? Math.max(1, Math.min(400, params.limit)) : 60;
+      return { lines: engineLog.slice(-limit) };
+    }
     case "act": {
       const result = await agentPageRequest("act", params);
       if (result.click) {
