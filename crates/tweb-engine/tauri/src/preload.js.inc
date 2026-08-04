@@ -815,6 +815,33 @@
     });
   }
 
+  // Autocomplete panels and popovers close on an outside click, not on blur, and
+  // TWeb swallows the Escape that would otherwise reach the page. So a second
+  // Escape clicks a spot with nothing interactive under it — the same gesture a
+  // mouse user makes to dismiss them.
+  function outsideClickPoint() {
+    const inset = 6;
+    const columns = [inset, Math.round(innerWidth / 2), innerWidth - inset];
+    const rows = [innerHeight - inset, Math.round(innerHeight / 2), inset];
+    for (const y of rows) {
+      for (const x of columns) {
+        const element = document.elementFromPoint(x, y);
+        if (!element || element.id?.startsWith("__tweb_")) continue;
+        if (isEditable(element) || clickableAncestor(element)) continue;
+        return { x, y };
+      }
+    }
+    return null;
+  }
+
+  function dismissPageOverlay() {
+    const point = outsideClickPoint();
+    if (!point) return false;
+    activeElement()?.blur?.();
+    send("native-click", topViewportPoint(point));
+    return true;
+  }
+
   function startHints(newTab) {
     const points = mediaHoverPoints();
     const collect = () => {
@@ -1623,6 +1650,7 @@
       case "x": send("close-tab"); break;
       case "X": send("restore-tab"); break;
       case "r": send("reload"); break;
+      case "Escape": handled = dismissPageOverlay(); break;
       default: handled = false;
     }
     if (handled) {

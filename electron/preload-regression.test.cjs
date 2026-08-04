@@ -42,6 +42,12 @@ function assertPreload(source) {
   assert.match(source, /if \(insertMode\) \{\s*\n\s*if \(key !== "Escape"\) return;/);
   assert.match(source, /if \(key === "Escape" && document\.fullscreenElement\)/);
   assert.match(source, /!editable && !insertMode/);
+
+  // Blur alone leaves a site's suggestion panel up, so a normal-mode Escape
+  // clicks somewhere inert to trigger the page's own outside-click dismissal.
+  assert.match(source, /case "Escape": handled = dismissPageOverlay\(\); break;/);
+  assert.match(source, /function outsideClickPoint\(\)/);
+  assert.match(source, /if \(isEditable\(element\) \|\| clickableAncestor\(element\)\) continue;/);
 }
 
 test("Electron preload maps Korean normal keys and uses trusted hint clicks", () => {

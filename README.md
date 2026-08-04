@@ -118,7 +118,7 @@ Electron과 Tauri 모두 열린 tab URL, active tab, tab별 zoom을 tmux window 
 
 `Ctrl-;`로 다음 두 mode를 전환합니다.
 
-- **Shortcuts ON**: 입력 요소에 focus가 없을 때 Vimium-style normal mode와 TWeb browser shortcut이 동작합니다. 입력 중에는 normal-mode 키를 가로채지 않으며 `Esc`로 focus를 해제할 수 있습니다.
+- **Shortcuts ON**: 입력 요소에 focus가 없을 때 Vimium-style normal mode와 TWeb browser shortcut이 동작합니다. 입력 중에는 normal-mode 키를 가로채지 않으며 `Esc`로 focus를 해제할 수 있습니다. 검색창 자동완성처럼 focus를 잃어도 남아 있는 panel은 `Esc`를 한 번 더 눌러 닫습니다. TWeb이 `Esc`를 소비해 페이지가 받지 못하므로, 비어 있는 지점을 대신 click해 사이트의 outside-click 처리를 그대로 사용합니다.
 - **Web passthrough ON**: TWeb shortcut을 모두 끄고, 현재 TWeb pane을 보고 있는 tmux client만 client-local `tweb-pass` table로 전환합니다. tmux prefix/root binding을 우회하고 키·modifier·mouse를 page에 전달합니다. 다른 tmux client와 일반 pane의 key table은 바뀌지 않습니다.
 
 Web passthrough 상태에서도 `Ctrl-;`만 escape hatch로 사용해 Shortcuts mode로 돌아옵니다. `Ctrl-C`도 웹에 전달되므로 TWeb을 종료하려면 먼저 `Ctrl-;`로 Shortcuts mode에 돌아온 뒤 `Ctrl-C`를 누릅니다. TWeb pane을 떠나거나 프로세스가 종료되면 해당 client의 이전 tmux key table을 복원합니다.
@@ -156,7 +156,8 @@ macOS 또는 Ghostty 자체가 PTY보다 먼저 소비하는 application shortcu
 | `r` | 새로고침 |
 | `zi` / `zo` / `zz` | 확대 / 축소 / 기본 배율 복원 |
 | `i` | insert mode: 페이지 자체 단축키 사용 (`Esc`로 복귀) |
-| `Esc` | hint/search/visual/inspect/omnibox 취소 · 전체화면 해제 |
+| `Esc` | hint/search/visual/inspect/omnibox 취소 · 입력 focus 해제 · 전체화면 해제 |
+| `Esc` (normal) | 사이트 자동완성·popup을 outside click으로 닫기 |
 
 Visual의 text 대상을 선택하거나 normal mode에서 `V`로 페이지 전체 text를 선택한 뒤 `h`/`l`은 문자, `b`/`w`/`e`는 단어, `k`/`j`는 줄, `0`/`$`는 줄 경계 단위로 active edge를 조정하고 `o`는 조정할 selection endpoint를 바꿉니다. 조정한 범위에서 `y`/`Y`는 선택 text를 복사합니다. image/link/editable 대상에서는 기존처럼 `y`는 smart copy(image bitmap, link URL, text/value), `Y`는 표시 text, `u`는 link URL, `o`/`O`는 현재/새 tab에서 link 열기, `p`는 editable 대상에 clipboard 붙여넣기, `d`는 DevTools inspect를 실행합니다.
 

@@ -81,6 +81,7 @@ mod tests {
         assert!(script.contains("performMediaControl"));
         assert!(script.contains("enterInsertMode"));
         assert!(script.contains("document.exitFullscreen"));
+        assert!(script.contains("dismissPageOverlay"));
         assert!(script.contains("hintClickPoint"));
         assert!(script.contains("topViewportPoint"));
         assert!(script.contains("else send(\"native-click\", hintClickPoint(item))"));
