@@ -606,6 +606,14 @@ fn find_electron_binary() -> Option<std::path::PathBuf> {
             return Some(p.canonicalize().unwrap_or(p));
         }
     }
+    // An installed tweb runs from outside the workspace, so the relative
+    // candidates above never match; the engine sits next to the binary instead.
+    if let Some(binary) = tweb_pane::installed_electron_dir()
+        .as_deref()
+        .and_then(tweb_pane::electron_binary_in)
+    {
+        return Some(binary);
+    }
     which::which("electron").ok()
 }
 

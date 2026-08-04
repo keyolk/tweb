@@ -409,6 +409,33 @@ fn find_tauri() -> Result<std::path::PathBuf> {
         .context("Tauri engine binary not found; build tweb-tauri or set TWEB_TAURI")
 }
 
+/// `make install`이 놓는 위치: binary가 `<prefix>/bin/tweb`이면 engine app은
+/// `<prefix>/libexec/tweb/electron`에 있다. 설치본은 workspace 안에서 돌지 않으므로
+/// current_exe 기준 상대 경로 말고는 app directory를 찾을 단서가 없다.
+pub fn installed_electron_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.parent()?.join("libexec/tweb/electron");
+    if dir.join("package.json").exists() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 주어진 app directory 안의 Electron 실행 파일.
+pub fn electron_binary_in(app_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    for relative in [
+        "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+        "node_modules/.bin/electron",
+    ] {
+        let candidate = app_dir.join(relative);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Electron binary 경로와 app directory 찾기.
 /// 반환: (electron binary path, electron app dir with package.json)
 fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
@@ -445,7 +472,13 @@ fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
             }
         }
     }
-    // 3. cwd 기준 상대 경로.
+    // 3. `make install`이 놓은 위치.
+    if let Some(app_dir) = installed_electron_dir() {
+        if let Some(binary) = electron_binary_in(&app_dir) {
+            return Ok((binary, app_dir));
+        }
+    }
+    // 4. cwd 기준 상대 경로.
     let candidates: &[(&str, &str)] = &[
         (
             "electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
@@ -467,7 +500,7 @@ fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
             }
         }
     }
-    // 4. global electron.
+    // 5. global electron.
     let bin = which::which("electron")
         .context("electron binary not found. set TWEB_ELECTRON or install in electron/")?;
     let app_dir =

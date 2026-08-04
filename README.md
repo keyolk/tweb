@@ -20,6 +20,19 @@ Ghostty / Kitty
 - **Chrome profile bootstrap**: extension, bookmark, 일반 site state를 policy-aware하게 가져옵니다.
 - **Managed Chrome boundary**: Okta Device Trust와 enterprise-managed Chrome이 필요한 URL은 실제 Google Chrome으로 handoff합니다.
 
+## 설치
+
+```sh
+make install              # ~/.local/bin/tweb + ~/.local/libexec/tweb/electron
+make install PREFIX=/usr/local
+make uninstall
+```
+
+Electron engine은 실행 시점에 `main.cjs`/`preload.cjs`와 자기 `node_modules`를 읽으므로
+binary 혼자로는 동작하지 않습니다. `install`은 app directory를
+`$PREFIX/libexec/tweb/electron`에 통째로 놓고(약 310MB), `tweb`은 자기 위치 기준으로 그
+경로를 찾습니다 — workspace 밖에서도 동작합니다.
+
 ## 명령
 
 공식 executable은 `tweb`입니다. `twb`는 선택적 alias입니다.
