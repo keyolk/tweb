@@ -1898,8 +1898,11 @@ function applyViewport(vp, origin = tmuxOrigin) {
   pendingFrame = null;
   pendingGfxFrame = null;
   tabFrames.clear();
-  // 이전 origin에 남은 placement를 먼저 지운 뒤 새 frame의 anchor를 교체한다.
-  writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
+  // Moving the pane leaves a placement at the old anchor that the next frame
+  // will not cover, so that case still needs a delete. A plain size change does
+  // not: the next frame reuses the image id and replaces it in place, whereas
+  // deleting would bare the terminal until it arrives and read as a flicker.
+  if (originChanged) writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
   tmuxOrigin = origin;
   paneCells = { cols: vp.cols, rows: vp.rows };
   lastViewport = vp;

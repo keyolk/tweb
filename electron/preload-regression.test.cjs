@@ -114,6 +114,16 @@ test("switching tabs replaces the image instead of deleting it", () => {
   assert.doesNotMatch(activateTab, /a=d,d=I/, "activateTab must not clear the image");
 });
 
+// Same hazard as the tab switch: a delete with no frame behind it shows the
+// terminal. Only a moved pane leaves a placement the next frame cannot cover.
+test("a pure resize replaces the image instead of deleting it", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const applyViewport = main.slice(main.indexOf("function applyViewport(vp, origin"),
+    main.indexOf("function createWindow(url)"));
+  assert.match(applyViewport, /if \(originChanged\) writeGfx\(`a=d,d=I/);
+  assert.doesNotMatch(applyViewport, /^ {2}writeGfx\(`a=d,d=I/m);
+});
+
 test("the terminal caret follows the focused field for IME composition", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /function moveTerminalCaret\(point\)/);
