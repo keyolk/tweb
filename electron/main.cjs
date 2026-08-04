@@ -8,6 +8,7 @@
 
 const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen } = require("electron");
 const {
+  appendFileSync,
   closeSync,
   mkdirSync,
   openSync,
@@ -1118,15 +1119,89 @@ function normalizeOmniboxInput(input) {
   return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
 }
 
+// History is shared by every pane and survives restarts, so the omnibox offers
+// what the user visited anywhere — not just what this process happened to see.
+// Append-only keeps concurrent panes from clobbering each other's writes.
+const historyLimit = 200;
+let lastHistoryAppend = { url: "", title: "" };
+
+function historyPath() {
+  return path.join(app.getPath("userData"), "history.jsonl");
+}
+
 function recordNavigationHistory(url, title = "") {
   if (typeof url !== "string" || !url || url === "about:blank" || url.startsWith("tweb-action:")) return;
   const existing = navigationHistory.findIndex((entry) => entry.url === url);
   if (existing >= 0) navigationHistory.splice(existing, 1);
   navigationHistory.unshift({ url, title: String(title || url), recency: ++navigationSerial });
-  if (navigationHistory.length > 200) navigationHistory.length = 200;
+  if (navigationHistory.length > historyLimit) navigationHistory.length = historyLimit;
+
+  // Pages retitle themselves constantly (counters, players, SPA routes). Append
+  // once per visit, plus once more when a real title replaces the placeholder.
+  const entryTitle = String(title || url);
+  const repeat = url === lastHistoryAppend.url;
+  const titleArrived = repeat
+    && entryTitle !== lastHistoryAppend.title
+    && lastHistoryAppend.title === lastHistoryAppend.url;
+  if (repeat && !titleArrived) return;
+  lastHistoryAppend = { url, title: entryTitle };
+
+  try {
+    const line = `${JSON.stringify({ url, title: entryTitle, at: Date.now() })}\n`;
+    mkdirSync(path.dirname(historyPath()), { recursive: true });
+    appendFileSync(historyPath(), line, { encoding: "utf8", mode: 0o600 });
+  } catch (error) {
+    if (process.env.TWEB_DEBUG) console.error(`tweb: history append failed: ${error.message}`);
+  }
+}
+
+/// Most recent first, one entry per URL.
+function readGlobalHistory(limit = historyLimit) {
+  let lines;
+  try {
+    lines = readFileSync(historyPath(), "utf8").split("\n");
+  } catch (error) {
+    if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+      console.error(`tweb: history read failed: ${error.message}`);
+    }
+    // Fall back to what this process has seen.
+    return navigationHistory.map((entry) => ({ url: entry.url, title: entry.title }));
+  }
+  const seen = new Map();
+  for (let index = lines.length - 1; index >= 0 && seen.size < limit; index -= 1) {
+    const line = lines[index].trim();
+    if (!line) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.url && !seen.has(entry.url)) {
+        seen.set(entry.url, { url: entry.url, title: entry.title || entry.url });
+      }
+    } catch (_) {
+      // A torn line from a concurrent append; skip it.
+    }
+  }
+  return [...seen.values()];
+}
+
+// Rewrite atomically so a pane reading mid-compaction still sees a whole file.
+function compactHistory(keep = 600) {
+  try {
+    const lines = readFileSync(historyPath(), "utf8").split("\n").filter((line) => line.trim());
+    if (lines.length <= keep * 3) return;
+    const temporary = `${historyPath()}.${process.pid}.tmp`;
+    writeFileSync(temporary, `${lines.slice(-keep).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporary, historyPath());
+  } catch (error) {
+    if (error.code !== "ENOENT" && process.env.TWEB_DEBUG) {
+      console.error(`tweb: history compaction failed: ${error.message}`);
+    }
+  }
 }
 
 function omniboxModel() {
+  const history = readGlobalHistory();
+  // Open tabs always outrank history entries.
+  const base = history.length;
   const tabEntries = tabs.flatMap((candidate, index) => {
     if (candidate.isDestroyed()) return [];
     const url = tabSessionUrls.get(candidate) || candidate.webContents.getURL() || "about:blank";
@@ -1135,12 +1210,15 @@ function omniboxModel() {
       index,
       url,
       title: candidate.webContents.getTitle() || url,
-      recency: navigationSerial + tabs.length - index,
+      recency: base + tabs.length - index,
     }];
   });
   return {
     current: win && !win.isDestroyed() ? tabSessionUrls.get(win) || win.webContents.getURL() || "" : "",
-    entries: [...tabEntries, ...navigationHistory.map((entry) => ({ ...entry, kind: "history" }))],
+    entries: [
+      ...tabEntries,
+      ...history.map((entry, index) => ({ ...entry, kind: "history", recency: base - index })),
+    ],
   };
 }
 
@@ -2354,6 +2432,7 @@ app.whenReady().then(() => {
     setImmediate(initializeTmuxVisibility);
   }
   markInteractionActivity();
+  compactHistory();
   agentServer = startAgentServer({
     dispatch: handleAgentCommand,
     log: (message) => {

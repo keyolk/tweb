@@ -153,6 +153,17 @@ test("shortcut keys fall back to a frame that can handle them", () => {
   assert.match(electron, /ipcRenderer\.send\("tweb-preload-ready", \{ shortcutFrame \}\)/);
 });
 
+// The omnibox should offer what the user visited in any pane, not just here.
+test("history is shared through a file", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /function historyPath\(\)/);
+  assert.match(main, /appendFileSync\(historyPath\(\)/);
+  assert.match(main, /function readGlobalHistory\(/);
+  assert.match(main, /const history = readGlobalHistory\(\);/);
+  // Append-only, so concurrent panes cannot clobber each other.
+  assert.doesNotMatch(main, /writeFileSync\(historyPath\(\)/);
+});
+
 test("agent socket refuses a path longer than sun_path", () => {
   const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
   assert.match(server, /Buffer\.byteLength\(target\) > 100/);

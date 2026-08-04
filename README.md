@@ -155,8 +155,8 @@ IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중
 | `gi` | 첫 번째 입력 요소에 focus |
 | `H` / `L` | history 뒤로 / 앞으로 |
 | `J` / `K` | 이전 / 다음 browser tab |
-| `t`, `O` | 새 탭 fuzzy omnibox 열기 (열린 탭·최근 방문 기록) |
-| `o` | 현재 탭 fuzzy omnibox 열기 (열린 탭·최근 방문 기록) |
+| `t`, `O` | 새 탭 fuzzy omnibox 열기 (열린 탭·전체 방문 기록) |
+| `o` | 현재 탭 fuzzy omnibox 열기 (현재 URL이 채워진 상태로 시작) |
 | `x` / `X` | 현재 tab 닫기 / 최근 닫은 tab 복원 |
 | `r` | 새로고침 |
 | `zi` / `zo` / `zz` | 확대 / 축소 / 기본 배율 복원 |
@@ -167,6 +167,8 @@ IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중
 Visual의 text 대상을 선택하거나 normal mode에서 `V`로 페이지 전체 text를 선택한 뒤 `h`/`l`은 문자, `b`/`w`/`e`는 단어, `k`/`j`는 줄, `0`/`$`는 줄 경계 단위로 active edge를 조정하고 `o`는 조정할 selection endpoint를 바꿉니다. 조정한 범위에서 `y`/`Y`는 선택 text를 복사합니다. image/link/editable 대상에서는 기존처럼 `y`는 smart copy(image bitmap, link URL, text/value), `Y`는 표시 text, `u`는 link URL, `o`/`O`는 현재/새 tab에서 link 열기, `p`는 editable 대상에 clipboard 붙여넣기, `d`는 DevTools inspect를 실행합니다.
 
 Inspect에서 대상을 선택한 뒤 `y`는 CSS selector, `h`는 outer HTML, `t`는 text를 복사하고 `d`는 DevTools를 엽니다. Electron은 detached Chromium DevTools에서 해당 요소를 바로 선택하고, Tauri는 Safari Web Inspector를 연 뒤 가능한 경우에만 요소 선택을 시도합니다.
+
+omnibox의 방문 기록은 profile 단위 파일에 append되므로 pane과 재시작을 가로질러 공유됩니다. `o`는 현재 URL을 미리 채우므로 그 URL로 필터링된 상태로 열리고, 빈 목록에서 시작하려면 `t`/`O`를 사용합니다.
 
 `f` hint는 일반 link/button뿐 아니라 ARIA role, `jsaction`, `contenteditable`, pointer cursor와 delegated click 영역, open shadow DOM의 상호작용 요소도 탐색합니다. 선택한 대상에는 짧은 outline/ripple feedback을 남깁니다. cross-origin iframe과 광고 frame은 focus 고착을 피하기 위해 바깥 frame 자체를 hint 대상으로 만들지 않습니다.
 
