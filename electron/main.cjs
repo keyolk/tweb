@@ -1039,7 +1039,16 @@ function activateTab(index) {
   activeTabIndex = normalized;
   win = tabs[normalized];
   mouseClicks.reset();
-  writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
+  // Zoom is shared per origin in Chromium, so a sibling tab on the same host can
+  // have moved it. Only the active tab is ever painted, so restoring this tab's
+  // own factor on activation is what makes zoom look per-tab.
+  const zoomFactor = tabZoomFactors.get(win) ?? defaultZoomFactor;
+  if (!win.isDestroyed() && win.webContents.getZoomFactor() !== zoomFactor) {
+    win.webContents.setZoomFactor(zoomFactor);
+  }
+  // Do not delete the current image first: the next frame reuses the same image
+  // id and replaces it in place. Deleting would uncover the bare terminal until
+  // the new tab paints, which reads as a flicker on every switch.
   updatePaintingState();
   win.webContents.invalidate();
   updatePaneTitle();
@@ -1824,7 +1833,9 @@ function logicalMousePoint(rawX, rawY) {
 function setBrowserZoom(action) {
   if (!win) return;
   const contents = win.webContents;
-  const current = contents.getZoomFactor();
+  // Chromium keeps zoom per origin, so getZoomFactor() reports whatever another
+  // tab on the same host last set. Step from this tab's own remembered value.
+  const current = tabZoomFactors.get(win) ?? contents.getZoomFactor();
   const next = action === "reset"
     ? defaultZoomFactor
     : Math.min(2, Math.max(0.5, current * (action === "in" ? 1.2 : 1 / 1.2)));

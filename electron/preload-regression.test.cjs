@@ -99,6 +99,14 @@ test("agent bridge exposes snapshot, act and query to the socket", () => {
   assert.match(electron, /const labels = hintLabels\(targets\.length\);\s*\n\s*agentTargets = new Map/);
 });
 
+// Deleting the image before the new tab paints uncovers the terminal behind it.
+test("switching tabs replaces the image instead of deleting it", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const activateTab = main.slice(main.indexOf("function activateTab(index)"),
+    main.indexOf("function cycleTab(direction)"));
+  assert.doesNotMatch(activateTab, /a=d,d=I/, "activateTab must not clear the image");
+});
+
 test("agent socket refuses a path longer than sun_path", () => {
   const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
   assert.match(server, /Buffer\.byteLength\(target\) > 100/);
