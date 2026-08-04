@@ -24,8 +24,8 @@ function assertPreload(source) {
   // retargets at the boundary and would otherwise miss delegated surfaces.
   const hitTest = source.slice(source.indexOf("function hitTestTargets(semantic)"),
     source.indexOf("const mediaControlPresentation"));
-  assert.match(hitTest, /const bounds = host instanceof Element \? visibleRect\(host\) : null;/);
-  assert.match(hitTest, /if \(bounds && \(x < bounds\.left \|\| x > bounds\.right/);
+  assert.match(hitTest, /const bounds = isElement\(host\) \? visibleRect\(host\) : null;/);
+  assert.match(hitTest, /if \(bounds && \(ourX < bounds\.left \|\| ourX > bounds\.right/);
   assert.match(hitTest, /root\.elementsFromPoint\(x, y\)/);
 
   // Hints must land on the controls a site actually draws, so the pointer is
@@ -185,7 +185,7 @@ test("the caret starts inside the part of the selection that is on screen", () =
   assert.match(electron, /function visibleSelectionStart\(range\)/);
   const start = electron.slice(electron.indexOf("function visibleSelectionStart(range)"),
     electron.indexOf("function enterCaret()"));
-  assert.match(start, /getBoundingClientRect\(\)\.top >= 0\) return fallback/);
+  assert.match(start, /getBoundingClientRect\(\)\.top \+ shift\.y >= 0\) return fallback/);
   assert.match(start, /caretRangeFromPoint/);
 
   // Scrolling follows the end that moved, not the whole selection.
@@ -234,6 +234,33 @@ test("c reaches a caret from a target that carries no text", () => {
   // In caret mode `y` means the text, not the bitmap or the href.
   assert.match(electron, /smart && !item\.caret && item\.kind === "image"/);
   assert.match(electron, /smart && !item\.caret && item\.kind === "link"/);
+});
+
+// A page whose content is proxied through an iframe offered nothing to hint,
+// scroll or select unless focus happened to be inside the frame.
+test("collectors reach into a same-origin frame", () => {
+  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
+    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+    const roots = source.slice(source.indexOf("function collectRoots()"),
+      source.indexOf("function uniqueVisibleTargets("));
+    assert.match(roots, /sameOriginFrameDocument\(element\)/, `${name} skips frame documents`);
+    // Constructors do not cross realms, so the tag name is what identifies a frame.
+    assert.match(roots, /element\.localName !== "iframe"/, `${name} tests iframes by constructor`);
+    assert.match(roots, /frameOffsets\.set\(inner/, `${name} forgets the frame offset`);
+
+    // Every element check on the collection path has to survive another realm.
+    assert.doesNotMatch(source, /instanceof (?:Element|HTML[A-Za-z]*Element)\b/,
+      `${name} still uses a realm-bound instanceof`);
+    assert.match(source, /function isElement\(node\)/, `${name} is missing isElement`);
+
+    // Selection is per document; the parent's would stay empty for a frame target.
+    assert.match(source, /function visualSelection\(\)/, `${name} is missing visualSelection`);
+
+    // A frame scrolls as a document, not through an overflow container.
+    const scroll = source.slice(source.indexOf("function scrollableTargets()"),
+      source.indexOf("function scrollSurface()"));
+    assert.match(scroll, /root\.scrollingElement/, `${name} cannot scroll a frame`);
+  }
 });
 
 // Twice now a helper was called before it existed, and the preload only fails at

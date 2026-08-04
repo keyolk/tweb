@@ -59,10 +59,10 @@ const { ipcRenderer } = require("electron");
   }
 
   function isEditable(element) {
-    if (!(element instanceof Element)) return false;
+    if (!(isElement(element))) return false;
     if (element.isContentEditable) return true;
-    if (element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) return true;
-    if (element instanceof HTMLInputElement) {
+    if (isTag(element, "textarea") || isTag(element, "select")) return true;
+    if (isTag(element, "input")) {
       return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(element.type);
     }
     return false;
@@ -80,11 +80,11 @@ const { ipcRenderer } = require("electron");
 
   function requestImplicitSubmit(element) {
     const form = element?.form || element?.closest?.("form");
-    if (form instanceof HTMLFormElement) {
+    if (isTag(form, "form")) {
       const submitters = [...form.elements].filter((candidate) => {
         if (candidate.disabled) return false;
-        if (candidate instanceof HTMLButtonElement) return candidate.type === "submit";
-        return candidate instanceof HTMLInputElement && ["submit", "image"].includes(candidate.type);
+        if (isTag(candidate, "button")) return candidate.type === "submit";
+        return isTag(candidate, "input") && ["submit", "image"].includes(candidate.type);
       });
       const submitter = submitters.find((candidate) => {
         const rect = candidate.getBoundingClientRect();
@@ -98,7 +98,7 @@ const { ipcRenderer } = require("electron");
     const submitter = container?.querySelector?.(
       'button[type="submit"]:not(:disabled),input[type="submit"]:not(:disabled),input[type="image"]:not(:disabled),button[aria-label*="Search" i]:not(:disabled),button[aria-label*="검색"]:not(:disabled)'
     );
-    if (submitter instanceof HTMLElement) {
+    if (isElement(submitter)) {
       submitter.click();
       return true;
     }
@@ -106,7 +106,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function singleLineTextarea(element) {
-    if (!(element instanceof HTMLTextAreaElement)) return false;
+    if (!(isTag(element, "textarea"))) return false;
     const role = (element.getAttribute("role") || "").toLowerCase();
     const enterKeyHint = (element.enterKeyHint || element.getAttribute("enterkeyhint") || "").toLowerCase();
     return element.rows <= 1
@@ -131,15 +131,15 @@ const { ipcRenderer } = require("electron");
     if (key === "ArrowLeft") return previousCharacter(value, position);
     if (key === "ArrowRight") return nextCharacter(value, position);
     if (key === "Home") {
-      return element instanceof HTMLTextAreaElement ? value.lastIndexOf("\n", position - 1) + 1 : 0;
+      return isTag(element, "textarea") ? value.lastIndexOf("\n", position - 1) + 1 : 0;
     }
     if (key === "End") {
-      if (!(element instanceof HTMLTextAreaElement)) return value.length;
+      if (!(isTag(element, "textarea"))) return value.length;
       const end = value.indexOf("\n", position);
       return end < 0 ? value.length : end;
     }
     if (key === "ArrowUp" || key === "ArrowDown") {
-      if (!(element instanceof HTMLTextAreaElement)) return key === "ArrowUp" ? 0 : value.length;
+      if (!(isTag(element, "textarea"))) return key === "ArrowUp" ? 0 : value.length;
       const lineStart = value.lastIndexOf("\n", position - 1) + 1;
       const column = position - lineStart;
       if (key === "ArrowUp") {
@@ -157,7 +157,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function moveTextControlCaret(element, key, extend) {
-    if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
+    if (!(isTag(element, "input") || isTag(element, "textarea"))
       || element.selectionStart === null || element.selectionEnd === null) return false;
     const start = element.selectionStart;
     const end = element.selectionEnd;
@@ -196,7 +196,7 @@ const { ipcRenderer } = require("electron");
   function performKeyDefault(active, payload, editable) {
     const key = { Up: "ArrowUp", Down: "ArrowDown", Left: "ArrowLeft", Right: "ArrowRight" }[payload.key] || payload.key;
     if (key === "Enter") {
-      if (active instanceof HTMLTextAreaElement) {
+      if (isTag(active, "textarea")) {
         if (!payload.shiftKey && singleLineTextarea(active) && requestImplicitSubmit(active)) return;
         document.execCommand("insertText", false, "\n");
         return;
@@ -205,12 +205,12 @@ const { ipcRenderer } = require("electron");
         document.execCommand("insertLineBreak", false, null);
         return;
       }
-      if (active instanceof HTMLButtonElement
-        || active instanceof HTMLInputElement && ["button", "submit", "image", "reset"].includes(active.type)) {
+      if (isTag(active, "button")
+        || isTag(active, "input") && ["button", "submit", "image", "reset"].includes(active.type)) {
         active.click();
         return;
       }
-      if (active instanceof HTMLInputElement) requestImplicitSubmit(active);
+      if (isTag(active, "input")) requestImplicitSubmit(active);
       return;
     }
     if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(key)) {
@@ -223,7 +223,7 @@ const { ipcRenderer } = require("electron");
       return;
     }
     if (key === "PageUp" || key === "PageDown") {
-      if (active instanceof HTMLTextAreaElement && active.scrollHeight > active.clientHeight) {
+      if (isTag(active, "textarea") && active.scrollHeight > active.clientHeight) {
         active.scrollBy({ top: (key === "PageUp" ? -1 : 1) * active.clientHeight * 0.9, behavior: "instant" });
       } else {
         scrollBy({ top: (key === "PageUp" ? -1 : 1) * innerHeight * 0.9, behavior: "instant" });
@@ -332,22 +332,80 @@ const { ipcRenderer } = require("electron");
     return commandKey(keys[event.code] || event.key, event.shiftKey);
   }
 
+  // Elements inside a frame belong to that frame's realm, so `instanceof` against
+  // our own constructors answers false for every one of them — which silently
+  // dropped every frame target. Node types and tag names cross realms; constructors
+  // do not.
+  function isElement(node) {
+    return node?.nodeType === Node.ELEMENT_NODE;
+  }
+
+  function isTag(node, ...names) {
+    return isElement(node) && names.includes(node.localName);
+  }
+
+  // Where each same-origin iframe document sits in our viewport. Rects inside a
+  // frame are measured against that frame, so everything that leaves a collector
+  // has to be shifted by this — otherwise a hint lands at the wrong place, or is
+  // discarded as off-screen.
+  const frameOffsets = new WeakMap();
+
+  function ownerView(element) {
+    return element?.ownerDocument?.defaultView || window;
+  }
+
+  function frameOffset(node) {
+    const document_ = node?.nodeType === Node.DOCUMENT_NODE ? node : node?.ownerDocument;
+    return frameOffsets.get(document_) || { x: 0, y: 0 };
+  }
+
   function visibleRect(element) {
-    const style = getComputedStyle(element);
+    const style = ownerView(element).getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return null;
+    const offset = frameOffset(element);
     for (const rect of element.getClientRects()) {
       if (rect.width < 3 || rect.height < 3) continue;
-      if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= innerWidth || rect.top >= innerHeight) continue;
-      return rect;
+      const left = rect.left + offset.x;
+      const top = rect.top + offset.y;
+      const right = rect.right + offset.x;
+      const bottom = rect.bottom + offset.y;
+      if (right <= 0 || bottom <= 0 || left >= innerWidth || top >= innerHeight) continue;
+      return { left, top, right, bottom, width: rect.width, height: rect.height,
+               x: left, y: top };
     }
     return null;
   }
 
+  function sameOriginFrameDocument(frame) {
+    try {
+      const inner = frame.contentDocument;
+      return inner?.documentElement ? inner : null;
+    } catch (_) {
+      // Cross-origin: that frame has its own preload and collects for itself.
+      return null;
+    }
+  }
+
+  // Frames are an implementation detail of the page, not of what the user sees, so
+  // a same-origin iframe's document is just another root to collect from. Without
+  // this, a page whose content is entirely proxied through an iframe offered
+  // nothing to hint, scroll or select unless focus happened to be inside it.
   function collectRoots() {
     const roots = [document];
     for (let index = 0; index < roots.length; index += 1) {
-      for (const element of roots[index].querySelectorAll("*")) {
+      const root = roots[index];
+      const base = frameOffset(root.nodeType === Node.DOCUMENT_NODE ? root : root.host);
+      for (const element of root.querySelectorAll("*")) {
         if (element.shadowRoot) roots.push(element.shadowRoot);
+        // Tag name, not a constructor check: a frame's own elements come from its
+        // realm, where our constructors do not apply.
+        if (element.localName !== "iframe" && element.localName !== "frame") continue;
+        const inner = sameOriginFrameDocument(element);
+        if (!inner || roots.includes(inner)) continue;
+        const box = element.getBoundingClientRect();
+        if (box.width < 8 || box.height < 8) continue;
+        frameOffsets.set(inner, { x: base.x + box.left, y: base.y + box.top });
+        roots.push(inner);
       }
     }
     return roots;
@@ -358,7 +416,7 @@ const { ipcRenderer } = require("electron");
     const occupied = new Set();
     const targets = [];
     for (const element of elements) {
-      if (!(element instanceof Element) || seen.has(element) || element.matches(":disabled,[aria-disabled=true],[inert]")) continue;
+      if (!(isElement(element)) || seen.has(element) || element.matches(":disabled,[aria-disabled=true],[inert]")) continue;
       const rect = visibleRect(element);
       if (!rect) continue;
       if (rect.width > innerWidth * 0.98 && rect.height > innerHeight * 0.8) continue;
@@ -389,7 +447,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function hasPointerIntent(element) {
-    if (!(element instanceof Element) || ownId(element).startsWith("__tweb_")) return false;
+    if (!(isElement(element)) || ownId(element).startsWith("__tweb_")) return false;
     const style = getComputedStyle(element);
     if (style.pointerEvents === "none") return false;
     if (element.matches(interactiveSelector) || typeof element.onclick === "function") return true;
@@ -397,12 +455,12 @@ const { ipcRenderer } = require("electron");
     if (style.cursor !== "pointer") return false;
     const root = element.getRootNode();
     const parent = element.parentElement || root instanceof ShadowRoot && root.host || null;
-    return !(parent instanceof Element) || getComputedStyle(parent).cursor !== "pointer";
+    return !(isElement(parent)) || getComputedStyle(parent).cursor !== "pointer";
   }
 
   function clickableAncestor(element) {
     let current = element;
-    while (current instanceof Element) {
+    while (isElement(current)) {
       if (hasPointerIntent(current)) return current;
       const root = current.getRootNode();
       current = current.parentElement || root instanceof ShadowRoot && root.host || null;
@@ -434,13 +492,18 @@ const { ipcRenderer } = require("electron");
     // so a root only sees the points its host actually covers.
     const probes = points.slice(0, 600);
     for (const root of collectRoots()) {
-      const host = root === document ? null : root.host;
-      const bounds = host instanceof Element ? visibleRect(host) : null;
+      const host = root === document ? null : (root.host || root.defaultView?.frameElement);
+      const bounds = isElement(host) ? visibleRect(host) : null;
       if (host && !bounds) continue;
-      for (const [x, y] of probes) {
-        if (bounds && (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom)) {
+      // A frame document measures points against itself, so ours have to come back
+      // out of our coordinates before probing it.
+      const offset = frameOffset(root);
+      for (const [ourX, ourY] of probes) {
+        if (bounds && (ourX < bounds.left || ourX > bounds.right || ourY < bounds.top || ourY > bounds.bottom)) {
           continue;
         }
+        const x = ourX - offset.x;
+        const y = ourY - offset.y;
         const hits = typeof root.elementsFromPoint === "function" ? root.elementsFromPoint(x, y) : [];
         const target = hits.map(clickableAncestor).find(Boolean);
         if (target) found.add(target);
@@ -473,7 +536,7 @@ const { ipcRenderer } = require("electron");
       }];
     }
     const y = rect.bottom - Math.min(50, Math.max(28, rect.height * 0.14));
-    const controls = media instanceof HTMLVideoElement
+    const controls = isTag(media, "video")
       ? [
         [26, "play"],
         [Math.max(58, rect.width - 122), "mute"],
@@ -516,7 +579,7 @@ const { ipcRenderer } = require("electron");
       ...pointerIntentTargets(roots),
     ];
     const targets = uniqueVisibleTargets(hitTestTargets(elements), (element) => ({
-      nativeSurface: element instanceof HTMLCanvasElement,
+      nativeSurface: isTag(element, "canvas"),
     })).filter((item) => !item.element.matches("video,audio,iframe"));
     return [...targets, ...media.flatMap(mediaControlTargets)]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
@@ -541,16 +604,26 @@ const { ipcRenderer } = require("electron");
   // only react to a wheel while the pointer is over them, so `j`/`k` on the
   // document does nothing. Let the user pick which surface the scroll keys drive.
   function scrollableTargets() {
-    const scrollable = collectRoots()
+    const roots = collectRoots();
+    const scrollable = roots
       .flatMap((root) => [...root.querySelectorAll("*")])
       .filter((element) => {
         if (ownId(element).startsWith("__tweb_")) return false;
-        const overflow = getComputedStyle(element);
+        const overflow = ownerView(element).getComputedStyle(element);
         if (!/auto|scroll|overlay/.test(`${overflow.overflowY} ${overflow.overflowX}`)) return false;
         return element.scrollHeight > element.clientHeight + 8
           || element.scrollWidth > element.clientWidth + 8;
       })
       .slice(0, 200);
+
+    // A frame scrolls as a document rather than through an overflow container, so
+    // its scrolling element never matches the filter above — and on a page that is
+    // one big proxied iframe that leaves nothing to scroll at all.
+    for (const root of roots) {
+      if (root.nodeType !== Node.DOCUMENT_NODE || root === document) continue;
+      const scroller = root.scrollingElement;
+      if (scroller && scroller.scrollHeight > scroller.clientHeight + 8) scrollable.push(scroller);
+    }
 
     // Not uniqueVisibleTargets: it drops anything covering the viewport, which
     // is exactly what an app shell's scroller looks like, and it dedupes by
@@ -565,10 +638,12 @@ const { ipcRenderer } = require("electron");
       targets.push({ element, rect });
     }
     // Innermost first: that is usually the one under discussion.
-    return targets.sort((left, right) =>
-      right.element.compareDocumentPosition(left.element) & Node.DOCUMENT_POSITION_CONTAINED_BY
-        ? -1
-        : left.rect.top - right.rect.top || left.rect.left - right.rect.left);
+    return targets.sort((left, right) => {
+      const related = left.element.ownerDocument === right.element.ownerDocument
+        && right.element.compareDocumentPosition(left.element) & Node.DOCUMENT_POSITION_CONTAINED_BY;
+      if (related) return -1;
+      return left.rect.top - right.rect.top || left.rect.left - right.rect.left;
+    });
   }
 
   function scrollSurface() {
@@ -803,7 +878,7 @@ const { ipcRenderer } = require("electron");
 
   function performMediaControl(item) {
     const media = item.element;
-    if (!(media instanceof HTMLMediaElement)) return false;
+    if (!(isTag(media, "video", "audio"))) return false;
     if (item.mediaControl === "play") {
       if (media.paused) void media.play().catch(() => {});
       else media.pause();
@@ -828,7 +903,7 @@ const { ipcRenderer } = require("electron");
     try {
       while (frameWindow !== frameWindow.top) {
         const frame = frameWindow.frameElement;
-        if (!(frame instanceof Element)) break;
+        if (!(isElement(frame))) break;
         const rect = frame.getBoundingClientRect();
         x += rect.left;
         y += rect.top;
@@ -859,7 +934,7 @@ const { ipcRenderer } = require("electron");
 
   function caretPoint() {
     const element = activeElement();
-    if (!isEditable(element) || element instanceof HTMLSelectElement) return null;
+    if (!isEditable(element) || isTag(element, "select")) return null;
     const box = element.getBoundingClientRect();
     if (!box.width || !box.height || box.bottom <= 0 || box.top >= innerHeight) return null;
 
@@ -870,13 +945,13 @@ const { ipcRenderer } = require("electron");
       || (parseFloat(computed.fontSize) || 13) * 1.25);
 
     try {
-      if (element instanceof HTMLInputElement) {
+      if (isTag(element, "input")) {
         caretCanvas = caretCanvas || document.createElement("canvas").getContext("2d");
         caretCanvas.font = computed.font || `${computed.fontSize} ${computed.fontFamily}`;
         const before = element.value.slice(0, element.selectionStart ?? element.value.length);
         x += caretCanvas.measureText(before).width - element.scrollLeft;
         y = box.top + Math.max(1, (box.height - height) / 2);
-      } else if (element instanceof HTMLTextAreaElement) {
+      } else if (isTag(element, "textarea")) {
         // Measure with a mirror: a textarea gives no caret rect of its own.
         const mirror = document.createElement("div");
         mirror.style.cssText = "position:fixed;visibility:hidden;white-space:pre-wrap;"
@@ -1032,8 +1107,8 @@ const { ipcRenderer } = require("electron");
   }
 
   function agentValue(element) {
-    if (element instanceof HTMLSelectElement) return element.value;
-    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+    if (isTag(element, "select")) return element.value;
+    if (isTag(element, "input") || isTag(element, "textarea")) {
       return element.type === "password" ? "" : element.value;
     }
     return element.isContentEditable ? (element.innerText || "").slice(0, 200) : undefined;
@@ -1042,7 +1117,7 @@ const { ipcRenderer } = require("electron");
   function agentState(element) {
     const state = {};
     if (element.disabled) state.disabled = true;
-    if (element instanceof HTMLInputElement && /^(checkbox|radio)$/.test(element.type)) {
+    if (isTag(element, "input") && /^(checkbox|radio)$/.test(element.type)) {
       state.checked = element.checked;
     }
     for (const attribute of ["aria-expanded", "aria-selected", "aria-checked", "aria-current"]) {
@@ -1130,7 +1205,7 @@ const { ipcRenderer } = require("electron");
         element.focus({ preventScroll: true });
         return { focused: true };
       case "select": {
-        if (!(element instanceof HTMLSelectElement)) throw new Error(`@${ref} is not a <select>`);
+        if (!(isTag(element, "select"))) throw new Error(`@${ref} is not a <select>`);
         const option = [...element.options].find((candidate) =>
           candidate.value === value || candidate.label === value || candidate.text === value);
         if (!option) throw new Error(`option ${JSON.stringify(value)} not found in @${ref}`);
@@ -1140,7 +1215,7 @@ const { ipcRenderer } = require("electron");
       }
       case "check":
       case "uncheck": {
-        if (!(element instanceof HTMLInputElement)) throw new Error(`@${ref} is not checkable`);
+        if (!(isTag(element, "input"))) throw new Error(`@${ref} is not checkable`);
         const want = action === "check";
         if (element.checked === want) return { checked: want };
         return { click: hintClickPoint(item) };
@@ -1627,6 +1702,16 @@ const { ipcRenderer } = require("electron");
     return rect.height || rect.width ? rect : null;
   }
 
+  // Selection is per document, so a target inside a frame has to be selected
+  // through that frame's own selection — the parent's would silently stay empty.
+  function visualDocument() {
+    return visualState?.element?.ownerDocument || document;
+  }
+
+  function visualSelection() {
+    return (visualDocument().defaultView || window).getSelection();
+  }
+
   // Motions can now leave the block they started in, so a selection that runs off
   // the viewport has to be followed.
   function scrollSelectionIntoView(selection) {
@@ -1665,7 +1750,7 @@ const { ipcRenderer } = require("electron");
 
   function updateVisualSelection() {
     if (!visualState?.selectionMade) return;
-    const selection = getSelection();
+    const selection = visualSelection();
     if (!selection?.rangeCount) return;
     const rect = selection.getRangeAt(0).getBoundingClientRect();
     if (visualState.caret) {
@@ -1691,10 +1776,14 @@ const { ipcRenderer } = require("electron");
   // what is actually on screen instead, which is still inside the selection.
   function visibleSelectionStart(range) {
     const fallback = { node: range.startContainer, offset: range.startOffset };
-    if (range.getBoundingClientRect().top >= 0) return fallback;
-    if (typeof document.caretRangeFromPoint !== "function") return fallback;
+    const owner = range.startContainer?.ownerDocument || document;
+    // Both the range and the probe belong to the target's document, and a frame
+    // measures points against itself — so shift out of our coordinates first.
+    const shift = frameOffset(owner);
+    if (range.getBoundingClientRect().top + shift.y >= 0) return fallback;
+    if (typeof owner.caretRangeFromPoint !== "function") return fallback;
     for (const y of [8, 40, 80, 140]) {
-      const probe = document.caretRangeFromPoint(8, y);
+      const probe = owner.caretRangeFromPoint(8 - shift.x, y - shift.y);
       const node = probe?.startContainer;
       if (node && range.intersectsNode?.(node)) return { node, offset: probe.startOffset };
     }
@@ -1705,7 +1794,7 @@ const { ipcRenderer } = require("electron");
   // caret으로 내려갈 방법이 없었다. 그 자리에서 가장 가까운 text 위치를 caret으로 잡는다.
   function firstTextNode(root) {
     if (!root || root.nodeType !== Node.ELEMENT_NODE) return null;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (node) => (node.nodeValue.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
     });
     return walker.nextNode();
@@ -1714,7 +1803,7 @@ const { ipcRenderer } = require("electron");
   function caretRangeFor(item) {
     const text = firstTextNode(item.element);
     if (text) {
-      const range = document.createRange();
+      const range = item.element.ownerDocument.createRange();
       range.setStart(text, 0);
       range.setEnd(text, 0);
       return range;
@@ -1728,8 +1817,9 @@ const { ipcRenderer } = require("electron");
       [rect.left, Math.min(innerHeight - 1, rect.top + rect.height + 4)],
       [rect.left, Math.max(0, rect.top - 4)],
     ];
+    const shift = frameOffset(item.element);
     for (const [x, y] of probes) {
-      const probe = document.caretRangeFromPoint?.(x, y);
+      const probe = item.element.ownerDocument.caretRangeFromPoint?.(x - shift.x, y - shift.y);
       if (probe && !ownId(probe.startContainer?.parentElement).startsWith("__tweb_")) return probe;
     }
     return null;
@@ -1738,7 +1828,7 @@ const { ipcRenderer } = require("electron");
   // Collapsing to the start, not the end: the point of going back to a caret is
   // to pick a new place to start the selection from.
   function enterCaret() {
-    const selection = getSelection();
+    const selection = visualSelection();
     if (!visualState || !selection) return;
     if (!visualState.selectionMade) {
       const range = caretRangeFor(visualState);
@@ -1774,7 +1864,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function moveVisualSelection(key) {
-    const selection = getSelection();
+    const selection = visualSelection();
     if (!visualState?.selectionMade || !selection?.rangeCount || typeof selection.modify !== "function") return false;
     if (key === "o") {
       const anchorNode = selection.anchorNode;
@@ -1831,7 +1921,7 @@ const { ipcRenderer } = require("electron");
     if (!visualState) return;
     removeCaretBar();
     visualState.outline.remove();
-    if (visualState.selectionMade) getSelection()?.removeAllRanges();
+    if (visualState.selectionMade) visualSelection()?.removeAllRanges();
     visualState = null;
     if (restoreMode) normalMode();
   }
@@ -1840,9 +1930,9 @@ const { ipcRenderer } = require("electron");
     const outline = makeOutline(item.rect, "#fdd663");
     let selectionMade = false;
     if (item.kind === "text") {
-      const range = document.createRange();
+      const range = item.element.ownerDocument.createRange();
       range.selectNodeContents(item.element);
-      const selection = getSelection();
+      const selection = (item.element.ownerDocument.defaultView || window).getSelection();
       selection.removeAllRanges();
       selection.addRange(range);
       selectionMade = true;
@@ -1887,7 +1977,7 @@ const { ipcRenderer } = require("electron");
     } else {
       // A caret selects nothing, so `y` there copies the block it sits in — the
       // same thing `v` then `y` has always done.
-      const selectedText = item.selectionMade ? getSelection()?.toString() || "" : "";
+      const selectedText = item.selectionMade ? visualSelection()?.toString() || "" : "";
       const text = selectedText || (typeof item.element.value === "string" ? item.element.value
         : item.element.innerText?.trim() || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
       if (text) send("copy-text", text);
@@ -2212,10 +2302,10 @@ const { ipcRenderer } = require("electron");
   });
 
   ipcRenderer.on("tweb-select-all", () => {
-    if (topFrame && document.activeElement instanceof HTMLIFrameElement) return;
+    if (topFrame && isTag(document.activeElement, "iframe", "frame")) return;
     if (!topFrame && !document.hasFocus()) return;
     const active = activeElement();
-    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+    if (isTag(active, "input") || isTag(active, "textarea")) {
       active.select();
     } else {
       document.execCommand("selectAll");
@@ -2246,7 +2336,7 @@ const { ipcRenderer } = require("electron");
     if (!mapped || eventIsEditable({ composedPath: () => [] })) return;
     // Only the frame that owns focus handles terminal text. The main frame
     // yields when an iframe is focused; background subframes ignore it.
-    if (topFrame && document.activeElement instanceof HTMLIFrameElement) return;
+    if (topFrame && isTag(document.activeElement, "iframe", "frame")) return;
     if (!topFrame && !document.hasFocus()) return;
     handleNormalKey({
       key: mapped,
