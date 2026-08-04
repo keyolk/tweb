@@ -327,14 +327,19 @@ pub struct ScreenGuard;
 
 impl ScreenGuard {
     pub fn enter() -> Self {
-        terminal_setup();
+        // Escape hatch for comparing against the pre-alternate-screen behaviour.
+        if std::env::var("TWEB_NO_ALT_SCREEN").is_err() {
+            terminal_setup();
+        }
         Self
     }
 }
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
-        terminal_cleanup();
+        if std::env::var("TWEB_NO_ALT_SCREEN").is_err() {
+            terminal_cleanup();
+        }
     }
 }
 

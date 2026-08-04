@@ -2061,7 +2061,7 @@ function createTab(
   // pane was simply black. A placeholder commits in about half of one second, and
   // paint holding keeps it up while the real page loads. Only the first tab needs
   // it — any later one has the previous page on screen to hold.
-  if (tabs.length === 1 && url !== "about:blank") {
+  if (tabs.length === 1 && url !== "about:blank" && !process.env.TWEB_NO_PLACEHOLDER) {
     tab.webContents.once("did-finish-load", load);
     void tab.loadURL(placeholderPage(url)).catch(load);
   } else {
