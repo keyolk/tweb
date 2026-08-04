@@ -35,6 +35,13 @@ function assertPreload(source) {
   // Synthetic control targets are for UA shadow-DOM controls only.
   assert.match(source, /if \(!media\.controls \|\| rect\.width < 160/);
 
+  // Insert mode pauses TWeb keys for a page's own shortcuts; Escape comes back
+  // and also leaves fullscreen, which an offscreen window never does by itself.
+  assert.match(source, /function enterInsertMode\(\)/);
+  assert.match(source, /case "i": enterInsertMode\(\); break;/);
+  assert.match(source, /if \(insertMode\) \{\s*\n\s*if \(key !== "Escape"\) return;/);
+  assert.match(source, /if \(key === "Escape" && document\.fullscreenElement\)/);
+  assert.match(source, /!editable && !insertMode/);
 }
 
 test("Electron preload maps Korean normal keys and uses trusted hint clicks", () => {

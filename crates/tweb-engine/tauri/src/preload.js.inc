@@ -11,6 +11,7 @@
   }
   const shortcutFrame = topFrame || sameOriginFrame;
   let shortcutsEnabled = true;
+  let insertMode = false;
   let mediaHoverTimer = null;
   let mediaHoverNudge = 0;
   let pendingG = false;
@@ -270,6 +271,7 @@
 
   function normalMode() {
     if (!shortcutsEnabled) setMode("passthrough");
+    else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
     else setMode("normal");
   }
@@ -866,9 +868,10 @@
       ["Ctrl + / - / 0", "browser zoom"],
       ["Ctrl-Tab / PgUp / PgDn", "browser tab 전환"],
       ["Ctrl-W", "현재 browser tab 닫기"],
+      ["i", "insert mode — 페이지 자체 단축키 사용, Esc로 복귀"],
       ["Ctrl-;", "Shortcuts ↔ web passthrough"],
       ["Ctrl-C", "Shortcuts mode에서 TWeb 종료"],
-      ["Esc", "현재 mode 또는 입력 focus 해제"],
+      ["Esc", "현재 mode · 전체화면 · 입력 focus 해제"],
     ]],
   ];
 
@@ -1495,6 +1498,22 @@
     if (restoreMode) normalMode();
   }
 
+  // `Ctrl-;` flips the whole tmux/browser input plumbing, which is the right tool
+  // for a long session inside a web app. Insert mode is the cheap counterpart:
+  // a page-local pause of TWeb's own keys so a site's shortcuts (j/k on a feed,
+  // f on a player) work, with Escape to come straight back.
+  function enterInsertMode() {
+    insertMode = true;
+    cancelTransient(false);
+    setMode("insert", "Esc");
+  }
+
+  function leaveInsertMode() {
+    if (!insertMode) return;
+    insertMode = false;
+    normalMode();
+  }
+
   function hasTransientMode() {
     return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || helpHost || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
@@ -1509,6 +1528,25 @@
       event.preventDefault();
       event.stopImmediatePropagation();
       cancelTransient();
+      return;
+    }
+
+    // Insert mode hands every key to the page so its own shortcuts work; Escape
+    // is the one key TWeb keeps, otherwise there would be no way back.
+    if (insertMode) {
+      if (key !== "Escape") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      leaveInsertMode();
+      return;
+    }
+
+    // An offscreen window never gets Chromium's own fullscreen Escape handling,
+    // so the page would stay fullscreen until a click or a resize broke it.
+    if (key === "Escape" && document.fullscreenElement) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void document.exitFullscreen?.();
       return;
     }
 
@@ -1556,6 +1594,7 @@
     let handled = true;
     switch (key) {
       case "?": showHelp(); break;
+      case "i": enterInsertMode(); break;
       case "f": startHints(false); break;
       case "F": startHints(true); break;
       case "v": startVisual(); break;
@@ -1596,6 +1635,9 @@
     shortcutsEnabled = Boolean(enabled);
     const root = document.documentElement;
     if (root) root.dataset.twebInputMode = shortcutsEnabled ? "shortcuts" : "passthrough";
+    // The global toggle supersedes the page-local one; leaving both on would
+    // make Escape mean two different things.
+    insertMode = false;
     if (!shortcutsEnabled) cancelTransient(false);
     normalMode();
   });
@@ -1626,7 +1668,7 @@
   });
 
   ipcRenderer.on("tweb-terminal-text", (_event, text) => {
-    if (!shortcutsEnabled || !shortcutFrame || typeof text !== "string" || [...text].length !== 1) return;
+    if (!shortcutsEnabled || insertMode || !shortcutFrame || typeof text !== "string" || [...text].length !== 1) return;
     const mapped = commandKey(text);
     if (!mapped || eventIsEditable({ composedPath: () => [] })) return;
     // Only the frame that owns focus handles terminal text. The main frame
@@ -1675,7 +1717,9 @@
       if (!payload || typeof payload.key !== "string") return;
       const active = activeElement() || document.body;
       const editable = isEditable(active);
-      const mapped = shortcutsEnabled && shortcutFrame && !editable
+      // Insert mode must not rewrite Korean keys to their Latin command letters —
+      // the page is receiving them as text, not as TWeb commands.
+      const mapped = shortcutsEnabled && shortcutFrame && !editable && !insertMode
         ? commandKey(payload.key, Boolean(payload.shiftKey))
         : payload.key;
       let prevented = false;
