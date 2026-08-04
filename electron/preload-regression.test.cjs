@@ -17,6 +17,24 @@ function assertPreload(source) {
   assert.match(source, /else send\("native-click", hintClickPoint\(item\)\)/);
   assert.match(source, /const rect = visibleRect\(item\.element\) \|\| item\.rect/);
   assert.doesNotMatch(source, /item\.element\.click\(\)/);
+
+  // Hints must land on the controls a site actually draws, so the pointer is
+  // parked over the video first and no lookalike overlay is painted.
+  assert.match(source, /function mediaHoverPoints\(\)/);
+  assert.doesNotMatch(source, /renderMediaControlOverlays/);
+  // Players fade their controls once the pointer stops, so the loop has to keep
+  // nudging — and it must start after startPicker's cancelTransient, which is
+  // what stops any previous loop.
+  assert.match(source, /mediaHoverTimer = setInterval\(\(\) => nudgeMediaPointer\(points\), 700\)/);
+  assert.match(source, /pickerState = null;\s*\n\s*stopMediaHover\(\);/);
+  const startHints = source.slice(source.indexOf("function startHints(newTab)"));
+  assert.ok(
+    startHints.indexOf("startMediaHoverLoop(points)") > startHints.indexOf("startPicker("),
+    "the hover loop must start after startPicker, or cancelTransient kills it"
+  );
+  // Synthetic control targets are for UA shadow-DOM controls only.
+  assert.match(source, /if \(!media\.controls \|\| rect\.width < 160/);
+
 }
 
 test("Electron preload maps Korean normal keys and uses trusted hint clicks", () => {

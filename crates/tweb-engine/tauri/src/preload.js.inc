@@ -11,6 +11,8 @@
   }
   const shortcutFrame = topFrame || sameOriginFrame;
   let shortcutsEnabled = true;
+  let mediaHoverTimer = null;
+  let mediaHoverNudge = 0;
   let pendingG = false;
   let pendingGTimer = null;
   let pendingZ = false;
@@ -507,16 +509,21 @@
   }
 
   const mediaControlPresentation = {
-    play: { glyph: "▶", label: "재생/일시정지" },
-    mute: { glyph: "◕", label: "음소거" },
-    fullscreen: { glyph: "⛶", label: "전체화면" },
-    menu: { glyph: "⋮", label: "메뉴" },
+    play: { label: "재생/일시정지" },
+    mute: { label: "음소거" },
+    fullscreen: { label: "전체화면" },
+    menu: { label: "메뉴" },
   };
 
+  // Sites that ship their own control bar (YouTube and friends) expose real
+  // buttons, and `revealMediaControls` makes them visible before hints are
+  // collected, so they get ordinary hints that sit on the controls the user
+  // actually sees. Only the UA shadow-DOM controls are unreachable from script
+  // and still need synthetic targets at their known offsets.
   function mediaControlTargets(media) {
     const rect = visibleRect(media);
     if (!rect) return [];
-    if (rect.width < 160 || rect.height < 70 || !(media instanceof HTMLVideoElement) && !media.controls) {
+    if (!media.controls || rect.width < 160 || rect.height < 70) {
       return [{
         element: media,
         rect,
@@ -601,6 +608,7 @@
   function cancelPicker(restoreMode = true) {
     pickerState?.host.remove();
     pickerState = null;
+    stopMediaHover();
     if (restoreMode) normalMode();
   }
 
@@ -637,44 +645,56 @@
     setTimeout(() => host.remove(), 380);
   }
 
-  function renderMediaControlOverlays(shadow, targets) {
-    const groups = new Map();
-    for (const target of targets) {
-      if (!target.mediaControl || !target.mediaRect) continue;
-      const group = groups.get(target.element) || { rect: target.mediaRect, targets: [] };
-      group.targets.push(target);
-      groups.set(target.element, group);
-    }
-    for (const [media, group] of groups) {
-      const { rect } = group;
-      const frame = document.createElement("div");
-      frame.style.cssText = [
-        "position:fixed", `left:${rect.left}px`, `top:${rect.top}px`, `width:${rect.width}px`, `height:${rect.height}px`,
-        "box-sizing:border-box", "border:2px solid #ffd75f", "border-radius:5px", "box-shadow:inset 0 0 0 1px #0008",
-      ].join(";");
-      const bar = document.createElement("div");
-      const barHeight = Math.min(58, Math.max(38, rect.height * .18));
-      bar.style.cssText = [
-        "position:fixed", `left:${rect.left}px`, `top:${rect.bottom - barHeight}px`, `width:${rect.width}px`, `height:${barHeight}px`,
-        "box-sizing:border-box", "background:linear-gradient(transparent,#000e 48%)", "border-radius:0 0 5px 5px",
-      ].join(";");
-      shadow.append(frame, bar);
-      for (const target of group.targets) {
-        const presentation = mediaControlPresentation[target.mediaControl];
-        const control = document.createElement("div");
-        control.textContent = presentation?.glyph || "•";
-        control.title = presentation?.label || target.mediaControl;
-        control.style.cssText = [
-          "position:fixed", `left:${target.nativePoint.x - 13}px`, `top:${target.nativePoint.y - 13}px`, "width:26px", "height:26px",
-          "display:grid", "place-items:center", "border:1px solid #fff8", "border-radius:50%", "background:#111d", "color:#fff",
-          "box-shadow:0 1px 5px #000", "font:700 15px/1 system-ui,sans-serif",
-        ].join(";");
-        shadow.append(control);
+  // A video's control bar is hover-gated, so hints collected on an idle page
+  // would miss it entirely. Park the pointer over the largest video: the site
+  // then paints its own controls, and the hints land on the very buttons the
+  // user sees rather than on a lookalike overlay of ours.
+  function mediaHoverPoints() {
+    const videos = [...document.querySelectorAll("video")]
+      .map((media) => ({ media, rect: visibleRect(media) }))
+      .filter((item) => item.rect && item.rect.width >= 160 && item.rect.height >= 70);
+    videos.sort((left, right) =>
+      right.rect.width * right.rect.height - left.rect.width * left.rect.height);
+    return videos.map(({ media, rect }) => ({
+      media,
+      // Aim low in the frame: that is where control bars live, and it keeps the
+      // pointer off click-to-pause surfaces in the middle.
+      point: { x: rect.left + rect.width / 2, y: rect.bottom - Math.min(40, rect.height * 0.1) },
+    }));
+  }
+
+  // Players hide their controls a few seconds after the pointer stops moving,
+  // which would leave hint badges floating over an empty frame. Keep nudging
+  // until the picker closes.
+  function startMediaHoverLoop(points) {
+    stopMediaHover();
+    if (points.length) mediaHoverTimer = setInterval(() => nudgeMediaPointer(points), 700);
+  }
+
+  function nudgeMediaPointer(points) {
+    // A pointer that never moves reads as idle, so alternate by a pixel.
+    mediaHoverNudge = mediaHoverNudge ? 0 : 1;
+    for (const { media, point } of points) {
+      const moved = { x: point.x + mediaHoverNudge, y: point.y };
+      for (const type of ["mouseover", "mousemove"]) {
+        media.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, clientX: moved.x, clientY: moved.y,
+        }));
       }
-      const hoverPoint = group.targets.find((target) => target.mediaControl === "play")?.nativePoint;
-      if (hoverPoint) send("native-hover", hoverPoint);
-      media.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: hoverPoint?.x, clientY: hoverPoint?.y }));
     }
+    // There is only one cursor: it goes to the largest video.
+    const [primary] = points;
+    if (primary) {
+      send("native-hover", topViewportPoint({
+        x: primary.point.x + mediaHoverNudge,
+        y: primary.point.y,
+      }));
+    }
+  }
+
+  function stopMediaHover() {
+    if (mediaHoverTimer) clearInterval(mediaHoverTimer);
+    mediaHoverTimer = null;
   }
 
   function startPicker(targets, mode, onPick) {
@@ -689,7 +709,6 @@
     host.id = "__tweb_picker__";
     host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
     const shadow = host.attachShadow({ mode: "open" });
-    renderMediaControlOverlays(shadow, targets);
     const items = targets.map((target, index) => {
       const badge = document.createElement("span");
       const badgeLeft = target.mediaControl ? target.nativePoint.x - 10 : target.rect.left;
@@ -795,15 +814,29 @@
   }
 
   function startHints(newTab) {
-    startPicker(interactiveTargets(), "hint", (item) => {
-      const link = item.element.closest("a[href]");
-      if (newTab && link?.href) send("new-tab", link.href);
-      else if (performMediaControl(item)) {}
-      else send("native-click", hintClickPoint(item));
-      normalMode();
-    });
+    const points = mediaHoverPoints();
+    const collect = () => {
+      startPicker(interactiveTargets(), "hint", (item) => {
+        const link = item.element.closest("a[href]");
+        if (newTab && link?.href) send("new-tab", link.href);
+        else if (performMediaControl(item)) {}
+        else send("native-click", hintClickPoint(item));
+        normalMode();
+      });
+      // Start the loop only now: startPicker cancels transient state first, and
+      // that cancellation is what stops a previously running hover loop.
+      startMediaHoverLoop(points);
+    };
+    // Give a revealed control bar a frame or two to animate in before the hint
+    // pass reads the DOM, otherwise its buttons are still zero-sized.
+    if (points.length) {
+      nudgeMediaPointer(points);
+      setMode("hint", "…");
+      setTimeout(collect, 220);
+    } else {
+      collect();
+    }
   }
-
 
   const shortcutHelpSections = [
     ["이동", [

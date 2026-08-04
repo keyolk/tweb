@@ -76,7 +76,8 @@ mod tests {
         assert!(script.contains("native-click"));
         assert!(script.contains("native-hover"));
         assert!(script.contains("showHintFeedback"));
-        assert!(script.contains("renderMediaControlOverlays"));
+        assert!(script.contains("mediaHoverPoints"));
+        assert!(script.contains("startMediaHoverLoop"));
         assert!(script.contains("performMediaControl"));
         assert!(script.contains("hintClickPoint"));
         assert!(script.contains("topViewportPoint"));
