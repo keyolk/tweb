@@ -179,11 +179,28 @@ test("visual mode drops to a caret and selects from it", () => {
   assert.match(motions, /if \(visualState\.caret\) \{\n\s+selection\.modify\("move"/);
 });
 
+// `V` selects the whole document, whose start is scrolled far off; collapsing
+// there put the caret out of sight and dragged the page to the top with it.
+test("the caret starts inside the part of the selection that is on screen", () => {
+  assert.match(electron, /function visibleSelectionStart\(range\)/);
+  const start = electron.slice(electron.indexOf("function visibleSelectionStart(range)"),
+    electron.indexOf("function enterCaret()"));
+  assert.match(start, /getBoundingClientRect\(\)\.top >= 0\) return fallback/);
+  assert.match(start, /caretRangeFromPoint/);
+
+  // Scrolling follows the end that moved, not the whole selection.
+  const scroll = electron.slice(electron.indexOf("function scrollSelectionIntoView(selection)"),
+    electron.indexOf("function updateCaretBar(rect)"));
+  assert.match(scroll, /pageSelection && !visualState\.caret\) return;/);
+  assert.match(scroll, /const rect = focusRect\(selection\);/);
+});
+
 test("the caret mode keys are mirrored into the Tauri preload", () => {
   const tauri = fs.readFileSync(
     path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8");
   for (const marker of ["function enterCaret()", "function selectFromCaret()",
-    'key === "v" && visualState.caret', '"}": ["forward", "paragraph"]']) {
+    'key === "v" && visualState.caret', '"}": ["forward", "paragraph"]',
+    "function visibleSelectionStart(range)", "function focusRect(selection)"]) {
     assert.ok(tauri.includes(marker), `Tauri preload is missing ${marker}`);
   }
   // That engine has no caret reporting, so the mirror must not call into it.

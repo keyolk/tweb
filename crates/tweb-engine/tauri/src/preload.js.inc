@@ -1381,14 +1381,56 @@
     outline.style.height = `${rect.height}px`;
   }
 
+  // The end that just moved, as a rect. Following the whole selection instead
+  // would drag the page to the far end of it — a page-wide selection would snap
+  // straight to the top the moment `V` made it.
+  function focusRect(selection) {
+    if (!selection.focusNode) return null;
+    const probe = document.createRange();
+    try {
+      probe.setStart(selection.focusNode, selection.focusOffset);
+      probe.setEnd(selection.focusNode, selection.focusOffset);
+    } catch (error) {
+      return null;
+    }
+    const rect = probe.getBoundingClientRect();
+    return rect.height || rect.width ? rect : null;
+  }
+
   // Motions can now leave the block they started in, so a selection that runs off
   // the viewport has to be followed.
-  function scrollSelectionIntoView(rect) {
+  function scrollSelectionIntoView(selection) {
+    // `V` selects the page; there is no "the selection" to bring into view, and
+    // the caret is the only thing worth following once it exists.
+    if (visualState?.pageSelection && !visualState.caret) return;
+    const rect = focusRect(selection);
+    if (!rect) return;
     const margin = 40;
     let top = 0;
     if (rect.top < margin) top = rect.top - margin;
     else if (rect.bottom > innerHeight - margin) top = rect.bottom - (innerHeight - margin);
     if (top) scrollBy({ top, behavior: "instant" });
+  }
+
+  // A collapsed range has no width, so the caret needs its own filled bar; the
+  // block outline stays put, otherwise `c` reads as "the selection vanished".
+  function updateCaretBar(rect) {
+    if (!visualState.caretBar) {
+      const bar = document.createElement("div");
+      bar.style.cssText = ["position:fixed", "width:2px", "background:#fdd663",
+        "box-shadow:0 0 0 1px rgba(0,0,0,.55)", "z-index:2147483646", "pointer-events:none"].join(";");
+      document.documentElement.append(bar);
+      visualState.caretBar = bar;
+    }
+    const bar = visualState.caretBar;
+    bar.style.left = `${rect.left}px`;
+    bar.style.top = `${rect.top}px`;
+    bar.style.height = `${rect.height || 16}px`;
+  }
+
+  function removeCaretBar() {
+    visualState?.caretBar?.remove();
+    if (visualState) visualState.caretBar = null;
   }
 
   function updateVisualSelection() {
@@ -1397,12 +1439,10 @@
     if (!selection?.rangeCount) return;
     const rect = selection.getRangeAt(0).getBoundingClientRect();
     if (visualState.caret) {
-      // A collapsed range has no width, so outline a caret-wide sliver instead —
-      // otherwise there is nothing on screen saying where the cursor sits.
-      updateOutline(visualState.outline,
-        { left: rect.left, top: rect.top, width: 2, height: rect.height || 16 });
+      updateCaretBar(rect);
       setMode("visual", "caret v·h·j·k·l·w·b·e·{·}");
     } else {
+      removeCaretBar();
       if (visualState.pageSelection) {
         updateOutline(visualState.outline, { left: 1, top: 1, width: innerWidth - 2, height: innerHeight - 2 });
       } else if (rect.width || rect.height) {
@@ -1410,9 +1450,25 @@
       }
       setMode("visual", `text ${selection.toString().length} y·c·o·h·j·k·l·w·b·e`);
     }
-    scrollSelectionIntoView(rect);
+    scrollSelectionIntoView(selection);
     // The Electron preload also parks the terminal cursor on the caret here; this
     // engine has no caret reporting.
+  }
+
+  // The caret starts where the selection starts — except when that point is
+  // scrolled off, as it is for `V`'s whole-page selection: collapsing there would
+  // put the caret out of sight and yank the page to the top. Start at the top of
+  // what is actually on screen instead, which is still inside the selection.
+  function visibleSelectionStart(range) {
+    const fallback = { node: range.startContainer, offset: range.startOffset };
+    if (range.getBoundingClientRect().top >= 0) return fallback;
+    if (typeof document.caretRangeFromPoint !== "function") return fallback;
+    for (const y of [8, 40, 80, 140]) {
+      const probe = document.caretRangeFromPoint(8, y);
+      const node = probe?.startContainer;
+      if (node && range.intersectsNode?.(node)) return { node, offset: probe.startOffset };
+    }
+    return fallback;
   }
 
   // Collapsing to the start, not the end: the point of going back to a caret is
@@ -1421,8 +1477,12 @@
     const selection = getSelection();
     if (!visualState?.selectionMade || !selection?.rangeCount) return;
     const range = selection.getRangeAt(0);
-    selection.collapse(range.startContainer, range.startOffset);
+    // Keep the block the hint picked outlined so the caret has visible context.
+    visualState.blockRect = range.getBoundingClientRect();
+    const start = visibleSelectionStart(range);
+    selection.collapse(start.node, start.offset);
     visualState.caret = true;
+    if (!visualState.pageSelection) updateOutline(visualState.outline, visualState.blockRect);
     updateVisualSelection();
   }
 
@@ -1490,6 +1550,7 @@
 
   function cancelVisual(restoreMode = true) {
     if (!visualState) return;
+    removeCaretBar();
     visualState.outline.remove();
     if (visualState.selectionMade) getSelection()?.removeAllRanges();
     visualState = null;
