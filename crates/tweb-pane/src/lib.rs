@@ -220,6 +220,8 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     let mut command = match options.engine {
         BrowserEngine::Electron => {
             let (electron_path, electron_dir) = find_electron()?;
+            tracing::debug!(path = %electron_path.display(), dir = %electron_dir.display(),
+                "resolved electron engine");
             let mut command = Command::new(&electron_path);
             command
                 .arg(".")
@@ -275,6 +277,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
 
     let child_stdin = child.stdin.take();
     let child_id = child.id();
+    tracing::debug!(pid = ?child_id, "browser engine spawned");
 
     // Engine stdin은 terminal 입력과 섞지 않고 resize/raw input control message에 사용한다.
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();

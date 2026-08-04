@@ -489,7 +489,9 @@ fn agent_call(command: Command) -> Result<(&'static str, serde_json::Value, Agen
 /// spawn하지 않고 같은 process에서 직접 돌린다. 그래야 CLI와 frontend 사이에
 /// version skew가 생기지 않는다 (DESIGN.md 4.1).
 async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
-    set_engine_env_vars(browser.engine);
+    // engine 경로는 frontend가 직접 찾는다. CLI가 추측해서 넘기면 binary와 app
+    // directory가 어긋날 수 있고 (node_modules/electron에도 package.json이 있다)
+    // 같은 process이므로 넘길 이유도 없다.
     // URL 미지정은 tmux window session 복원 요청이다.
     let options = tweb_pane::PaneOptions {
         engine: match browser.engine {
@@ -523,10 +525,7 @@ async fn split_and_run_pane(
                     "TWEB_ELECTRON={} ",
                     shell_quote(&path.to_string_lossy())
                 ));
-                if let Some(directory) = path
-                    .ancestors()
-                    .find(|ancestor| ancestor.join("package.json").exists())
-                {
+                if let Some(directory) = electron_app_dir(&path) {
                     env_str.push_str(&format!(
                         "TWEB_ELECTRON_DIR={} ",
                         shell_quote(&directory.to_string_lossy())
@@ -610,26 +609,44 @@ fn find_electron_binary() -> Option<std::path::PathBuf> {
     which::which("electron").ok()
 }
 
+/// Electron이 `.`으로 로드할 app directory.
+///
+/// `node_modules/electron`에도 package.json이 있어서 단순히 가장 가까운
+/// package.json을 고르면 Electron package 자체를 app으로 실행하게 되고,
+/// 화면에 아무것도 뜨지 않는다. node_modules 안쪽은 건너뛴다.
+fn electron_app_dir(binary: &std::path::Path) -> Option<std::path::PathBuf> {
+    binary
+        .ancestors()
+        .filter(|ancestor| {
+            !ancestor
+                .components()
+                .any(|part| part.as_os_str() == "node_modules")
+        })
+        .find(|ancestor| ancestor.join("package.json").exists())
+        .map(std::path::Path::to_path_buf)
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// 선택한 engine의 실행 경로를 이 process의 환경 변수로 설정한다.
-/// pane frontend가 같은 process에서 돌므로 자식에게 넘길 필요가 없다.
-fn set_engine_env_vars(engine: BrowserEngineArg) {
-    // Safety: CLI startup은 아직 single-threaded이고 pane frontend가
-    // engine을 찾기 전에 실행된다.
-    if matches!(engine, BrowserEngineArg::Tauri) {
-        if let Some(path) = find_tauri_binary() {
-            std::env::set_var("TWEB_TAURI", path);
-        }
-        return;
-    }
-    if let Some(path) = find_electron_binary() {
-        std::env::set_var("TWEB_ELECTRON", &path);
-        // app dir (package.json이 있는 디렉토리)도 전달.
-        if let Some(dir) = path.ancestors().find(|p| p.join("package.json").exists()) {
-            std::env::set_var("TWEB_ELECTRON_DIR", dir);
-        }
+#[cfg(test)]
+mod tests {
+    use super::electron_app_dir;
+
+    /// The bug this guards: picking `node_modules/electron` as the app directory
+    /// makes Electron load itself instead of TWeb, and the pane stays blank.
+    #[test]
+    fn app_dir_skips_the_electron_package() {
+        let root = std::env::temp_dir().join(format!("tweb-appdir-{}", std::process::id()));
+        let package = root.join("electron/node_modules/electron");
+        let binary = package.join("dist/Electron.app/Contents/MacOS");
+        std::fs::create_dir_all(&binary).expect("temp tree");
+        std::fs::write(root.join("electron/package.json"), "{}").expect("app manifest");
+        std::fs::write(package.join("package.json"), "{}").expect("package manifest");
+
+        let found = electron_app_dir(&binary.join("Electron"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(root.join("electron")));
     }
 }
