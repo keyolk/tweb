@@ -120,8 +120,47 @@ fn parse_pane_placement(pane: &str, listing: &str) -> Option<(u16, u16, u32, u32
     None
 }
 
+fn parse_pane_geometry(value: &str) -> Option<WindowGeometry> {
+    let mut fields = value.split_whitespace();
+    let cols = fields.next()?.parse::<u16>().ok()?;
+    let rows = fields.next()?.parse::<u16>().ok()?;
+    let left = fields.next()?.parse::<u32>().ok()?;
+    let top = fields.next()?.parse::<u32>().ok()?;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let (width, height) = fields
+        .next()
+        .zip(fields.next())
+        .and_then(|(w, h)| pixel_size_from_cells(cols, rows, &format!("{w} {h}")))
+        .unwrap_or((0, 0));
+    Some(WindowGeometry {
+        size: WindowSize {
+            cols,
+            rows,
+            width,
+            height,
+        },
+        origin: Some((left, top)),
+    })
+}
+
 fn query_tmux_window_geometry() -> Option<WindowGeometry> {
     let pane = std::env::var("TMUX_PANE").ok()?;
+
+    // Every tmux call costs ~9ms, and this runs on the resize path where the pane
+    // shows the terminal until the new geometry reaches the engine — so ask for
+    // placement and cell size together and settle for one round trip.
+    if let Some(geometry) = tmux_query(
+        &pane,
+        "#{pane_width} #{pane_height} #{pane_left} #{pane_top} \
+         #{client_cell_width} #{client_cell_height}",
+    )
+    .as_deref()
+    .and_then(parse_pane_geometry)
+    {
+        return Some(geometry);
+    }
 
     // `display-message` resolves against a target client and fails outright when
     // none is attached — which used to cost us the pane origin as well, leaving a
@@ -396,7 +435,7 @@ pub fn query_cell_size() -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pane_placement, pixel_size_from_cells};
+    use super::{parse_pane_geometry, parse_pane_placement, pixel_size_from_cells};
 
     /// The pane's own row picks out its placement; a sibling's must not.
     #[test]
@@ -405,6 +444,23 @@ mod tests {
         assert_eq!(parse_pane_placement("%1", listing), Some((180, 17, 0, 6)));
         assert_eq!(parse_pane_placement("%2", listing), Some((90, 17, 181, 6)));
         assert_eq!(parse_pane_placement("%9", listing), None);
+    }
+
+    #[test]
+    fn reads_placement_and_cell_size_from_one_query() {
+        let geometry = parse_pane_geometry("166 35 108 0 7 14").expect("geometry");
+        assert_eq!(geometry.origin, Some((108, 0)));
+        assert_eq!((geometry.size.cols, geometry.size.rows), (166, 35));
+        assert_eq!((geometry.size.width, geometry.size.height), (1162, 490));
+    }
+
+    #[test]
+    fn keeps_the_origin_when_tmux_reports_no_cell_size() {
+        // Pixel size then has to come from the ioctl, but losing the origin would
+        // leave a moved pane drawing at its old anchor.
+        let geometry = parse_pane_geometry("166 35 108 4").expect("geometry");
+        assert_eq!(geometry.origin, Some((108, 4)));
+        assert_eq!((geometry.size.width, geometry.size.height), (0, 0));
     }
 
     #[test]

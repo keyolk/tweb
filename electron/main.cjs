@@ -599,11 +599,39 @@ function markInteractionActivity() {
   }, 700);
 }
 
-// A shrinking pane cannot be repainted by replacement alone: the new image is
-// smaller than the placement already on screen, so the remainder keeps covering
-// whatever tmux put there — typically the pane that just appeared below. Deleting
-// is deferred to the moment the replacement goes out so the pane is never bare.
+// A placement the next frame will not fully cover has to be deleted, but the
+// delete is paired with the replacement so the pane is never left bare: on its
+// own it would bare the terminal for as long as the frame takes to arrive.
 let pendingImageDelete = false;
+// The terminal holds the last image we transferred under `imageId`, which lets a
+// resize re-place it without sending the pixels again.
+let imageTransferred = false;
+
+// `d=i` drops the placements but keeps the image data, so it can be re-placed.
+function deletePlacement() {
+  pendingImageDelete = false;
+  writeGfx(`a=d,d=i,i=${imageId},q=2`, "");
+}
+
+// Chromium needs a moment to repaint at a new size, and tmux has already redrawn
+// the pane underneath — so a resize would show the bare terminal until the frame
+// lands. Re-placing the image the terminal already has covers the pane at once:
+// it is a few dozen bytes, so unlike a frame it never waits behind the encoder.
+// The accurate frame replaces it as soon as it arrives.
+function replacePlacement() {
+  if (!imageTransferred) return;
+  if (pendingImageDelete) deletePlacement();
+  writeGfx(`a=p,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows},q=2`, "");
+}
+
+function transferFrame(png, generation) {
+  if (pendingImageDelete) deletePlacement();
+  // c=/r= make the terminal scale the image into the pane's cell box, so a frame
+  // whose pixel size no longer matches still covers exactly the pane.
+  const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`;
+  queueGfxFrame(png, header, generation);
+  lastFrameSentAt = Date.now();
+}
 
 function sendFrameNow(image, generation) {
   if (!terminalVisible || generation !== viewportGeneration || !image || image.isEmpty()) return;
@@ -615,13 +643,8 @@ function sendFrameNow(image, generation) {
     // PNG 생성 후 base64 변환과 terminal write는 worker에 맡긴다. stdout
     // backpressure가 생겨도 Electron main thread와 keyboard input은 멈추지 않는다.
     const png = image.toPNG();
-    if (pendingImageDelete) {
-      pendingImageDelete = false;
-      writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
-    }
-    const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`;
-    queueGfxFrame(png, header, generation);
-    lastFrameSentAt = Date.now();
+    imageTransferred = true;
+    transferFrame(png, generation);
   } catch (error) {
     console.error(`tweb: frame encode failed: ${error.message}`);
   }
@@ -1948,16 +1971,12 @@ function applyViewport(vp, origin = tmuxOrigin) {
   pendingFrame = null;
   pendingGfxFrame = null;
   tabFrames.clear();
-  // Moving the pane leaves a placement at the old anchor that the next frame
-  // will not cover, so that case needs a delete right away. Growing does not:
-  // the next frame reuses the image id and replaces it in place, whereas
-  // deleting would bare the terminal until it arrives and read as a flicker.
-  // Shrinking cannot be covered by replacement either, but there the delete can
-  // wait until the replacement is actually on its way out.
-  if (originChanged) writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
-  else if (previous && (vp.cols < previous.cols || vp.rows < previous.rows)) {
-    pendingImageDelete = true;
-  }
+  // A moved pane leaves a placement at the old anchor, and a shrunk one leaves
+  // the rows it gave up still covered — usually hiding the pane that just
+  // appeared there. Neither is fixed by replacement, so both need a delete;
+  // growing is, so it gets none. The delete rides along with the next transfer.
+  const shrank = previous && (vp.cols < previous.cols || vp.rows < previous.rows);
+  if (originChanged || shrank) pendingImageDelete = true;
   tmuxOrigin = origin;
   paneCells = { cols: vp.cols, rows: vp.rows };
   lastViewport = vp;
@@ -1982,6 +2001,7 @@ function applyViewport(vp, origin = tmuxOrigin) {
     }
   }
   win?.webContents.invalidate();
+  if (terminalVisible) replacePlacement();
 }
 
 function createWindow(url) {

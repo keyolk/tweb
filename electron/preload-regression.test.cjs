@@ -140,13 +140,21 @@ test("overlays ask for a paint instead of waiting for the frame clock", () => {
 });
 
 // Same hazard as the tab switch: a delete with no frame behind it shows the
-// terminal. Only a moved pane leaves a placement the next frame cannot cover.
-test("a pure resize replaces the image instead of deleting it", () => {
+// terminal, so a resize never deletes on its own — it re-places the image the
+// terminal already holds, and any delete rides along with that.
+test("a resize re-places the existing image instead of baring the pane", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const applyViewport = main.slice(main.indexOf("function applyViewport(vp, origin"),
     main.indexOf("function createWindow(url)"));
-  assert.match(applyViewport, /if \(originChanged\) writeGfx\(`a=d,d=I/);
-  assert.doesNotMatch(applyViewport, /^ {2}writeGfx\(`a=d,d=I/m);
+  assert.match(applyViewport, /if \(terminalVisible\) replacePlacement\(\);/);
+  assert.doesNotMatch(applyViewport, /writeGfx/);
+  // A moved or shrunk pane leaves a placement the next frame cannot cover.
+  assert.match(applyViewport, /if \(originChanged \|\| shrank\) pendingImageDelete = true;/);
+  // `d=I` frees the pixels, which would leave nothing to re-place.
+  const replace = main.slice(main.indexOf("function deletePlacement()"),
+    main.indexOf("function transferFrame("));
+  assert.match(replace, /a=d,d=i,i=\$\{imageId\}/);
+  assert.match(replace, /a=p,i=\$\{imageId\}/);
 });
 
 test("the terminal caret follows the focused field for IME composition", () => {
