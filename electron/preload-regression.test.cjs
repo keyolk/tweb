@@ -236,6 +236,34 @@ test("c reaches a caret from a target that carries no text", () => {
   assert.match(electron, /smart && !item\.caret && item\.kind === "link"/);
 });
 
+// Picking a scroll surface used to be a one-way door: the surface was dropped the
+// moment it was used, and there was no candidate standing for the page.
+test("a picked scroll surface survives use and can be left", () => {
+  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
+    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+    const surface = source.slice(source.indexOf("function scrollSurface()"),
+      source.indexOf("function scrollSurfaceBy("));
+    // A scrolled document root sits above the viewport, so visibility is the wrong
+    // test — it is what dropped the surface.
+    assert.doesNotMatch(surface, /visibleRect/, `${name} still gates the surface on visibility`);
+    assert.match(surface, /scrollsAtAll\(scrollTarget\)/, `${name} does not check it still scrolls`);
+
+    const targets = source.slice(source.indexOf("function scrollableTargets()"),
+      source.indexOf("function scrollSurface()"));
+    assert.match(targets, /page: true/, `${name} offers no page candidate`);
+    assert.match(targets, /if \(scrollTarget\) targets\.unshift\(entry\)/,
+      `${name} does not put the way out first`);
+    assert.match(source, /scrollTarget = item\.page \? null : item\.element;/,
+      `${name} does not release the surface when the page is picked`);
+    // Escape is the other way out.
+    assert.match(source, /if \(scrollSurface\(\)\) \{\n\s+scrollTarget = null;/,
+      `${name} does not release the surface on Escape`);
+    // The state is invisible without this: the indicator said nothing was picked.
+    assert.match(source, /scrollSurface\(\) \? "⇅ 내부 · Esc" : ""/,
+      `${name} does not show a picked surface`);
+  }
+});
+
 // A page whose content is proxied through an iframe offered nothing to hint,
 // scroll or select unless focus happened to be inside the frame.
 test("collectors reach into a same-origin frame", () => {

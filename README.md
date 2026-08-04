@@ -165,7 +165,7 @@ IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중
 | `v` / `V` | visual picker로 대상 선택 / 페이지 전체 text를 Visual selection으로 열기 (visual 안에서 `c`는 caret mode, caret에서 `v`는 그 지점부터 선택) |
 | `b` | 열린 browser tab 목록 (`j`/`k`, `1`–`9`, `Enter`, `x` 닫기, `Esc`) |
 | `I` | inspect picker: 요소 정보·selector 확인 |
-| `s` | 스크롤할 내부 영역 선택 (`Esc`로 페이지 복귀) |
+| `s` | 스크롤할 내부 영역 선택 — 내부 영역이 잡혀 있으면 mode indicator에 `⇅`가 붙고, `Esc` 또는 `s`의 첫 후보(page)로 복귀합니다 |
 | `h` / `l` | 왼쪽 / 오른쪽으로 스크롤 |
 | `j` / `k` | 아래 / 위로 스크롤 |
 | `d` / `u` | 반 페이지 아래 / 위로 스크롤 |

@@ -279,7 +279,7 @@ const { ipcRenderer } = require("electron");
     if (!shortcutsEnabled) setMode("passthrough");
     else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
-    else setMode("normal", scrollSurface() ? "scroll" : "");
+    else setMode("normal", scrollSurface() ? "⇅ 내부 · Esc" : "");
   }
 
   const koreanLangmap = new Map(Object.entries({
@@ -611,8 +611,7 @@ const { ipcRenderer } = require("electron");
         if (ownId(element).startsWith("__tweb_")) return false;
         const overflow = ownerView(element).getComputedStyle(element);
         if (!/auto|scroll|overlay/.test(`${overflow.overflowY} ${overflow.overflowX}`)) return false;
-        return element.scrollHeight > element.clientHeight + 8
-          || element.scrollWidth > element.clientWidth + 8;
+        return scrollsAtAll(element);
       })
       .slice(0, 200);
 
@@ -637,8 +636,21 @@ const { ipcRenderer } = require("electron");
       seen.add(element);
       targets.push({ element, rect });
     }
+    // Without the page in the list there is no way back once an inner surface is
+    // picked — and on a page whose content is one big frame, the only candidate
+    // would be that frame forever.
+    const page = document.scrollingElement;
+    if (page && (scrollTarget || scrollsAtAll(page))) {
+      const entry = { element: page, page: true,
+                      rect: { left: 2, top: 2, right: 40, bottom: 20, width: 38, height: 18, x: 2, y: 2 } };
+      // Picked something already? Then getting back out is the likely intent.
+      if (scrollTarget) targets.unshift(entry);
+      else targets.push(entry);
+    }
+
     // Innermost first: that is usually the one under discussion.
     return targets.sort((left, right) => {
+      if (left.page !== right.page) return left.page ? (scrollTarget ? -1 : 1) : (scrollTarget ? 1 : -1);
       const related = left.element.ownerDocument === right.element.ownerDocument
         && right.element.compareDocumentPosition(left.element) & Node.DOCUMENT_POSITION_CONTAINED_BY;
       if (related) return -1;
@@ -646,8 +658,17 @@ const { ipcRenderer } = require("electron");
     });
   }
 
+  function scrollsAtAll(element) {
+    return element.scrollHeight > element.clientHeight + 8
+      || element.scrollWidth > element.clientWidth + 8;
+  }
+
   function scrollSurface() {
-    if (scrollTarget?.isConnected && visibleRect(scrollTarget)) return scrollTarget;
+    // Visibility is the wrong test here: a scrolled document root — which is what
+    // a frame offers — has its box above the viewport, so requiring a visible rect
+    // dropped the surface the moment it was used, leaving the keys on the page and
+    // the indicator claiming nothing was picked. What matters is that it scrolls.
+    if (scrollTarget?.isConnected && scrollsAtAll(scrollTarget)) return scrollTarget;
     scrollTarget = null;
     return null;
   }
@@ -674,7 +695,8 @@ const { ipcRenderer } = require("electron");
 
   function startScrollPicker() {
     startPicker(scrollableTargets(), "scroll", (item) => {
-      scrollTarget = item.element;
+      // The page entry means "no inner surface", which is what null already is.
+      scrollTarget = item.page ? null : item.element;
       // Some panels also gate their wheel handling on hover, so move the pointer.
       send("native-hover", hintClickPoint(item));
       normalMode();
@@ -1276,7 +1298,7 @@ const { ipcRenderer } = require("electron");
       ["J · K", "이전 · 다음 탭"],
       ["x · X", "탭 닫기 · 최근 탭 복원"],
       ["r · gi", "새로고침 · 첫 입력 요소 focus"],
-      ["s", "스크롤할 내부 영역 선택 (Esc로 페이지 복귀)"],
+      ["s", "스크롤할 내부 영역 선택 (Esc 또는 s에서 page로 복귀)"],
     ]],
     ["검색과 선택", [
       ["/ · n · N", "검색 · 다음 · 이전 결과"],
