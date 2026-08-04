@@ -106,6 +106,15 @@ const configuredDeviceScaleFactor = Number.parseFloat(process.env.TWEB_DEVICE_SC
 let pendingFrame = null;
 let pendingFrameTimer = null;
 let lastFrameSentAt = 0;
+// A Kitty placement with z >= 0 covers the terminal's own text — including the
+// cell the terminal paints IME preedit into, and the cursor we park on the web
+// caret for it. So a composing Korean syllable was drawn behind the page and never
+// seen. Below the text the page still shows through: the cells tmux fills a pane
+// with carry the default background, which the terminal leaves see-through.
+// Measured in Ghostty; `TWEB_IMAGE_Z=0` restores the old layering if some terminal
+// paints those cells opaque.
+const configuredImageZ = Number.parseInt(process.env.TWEB_IMAGE_Z || "", 10);
+const imageZ = Number.isSafeInteger(configuredImageZ) ? configuredImageZ : -1;
 const configuredImageId = Number.parseInt(process.env.TWEB_IMAGE_ID || "", 10);
 const imageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
   ? configuredImageId
@@ -621,14 +630,16 @@ function deletePlacement() {
 function replacePlacement() {
   if (!imageTransferred) return;
   if (pendingImageDelete) deletePlacement();
-  writeGfx(`a=p,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows},q=2`, "");
+  writeGfx(`a=p,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
+    + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2", "");
 }
 
 function transferFrame(png, generation) {
   if (pendingImageDelete) deletePlacement();
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
   // whose pixel size no longer matches still covers exactly the pane.
-  const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`;
+  const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
+    + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(png, header, generation);
   lastFrameSentAt = Date.now();
 }

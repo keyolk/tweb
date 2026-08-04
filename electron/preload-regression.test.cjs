@@ -342,6 +342,12 @@ test("the terminal caret follows the focused field for IME composition", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /function moveTerminalCaret\(point\)/);
   assert.match(main, /case "caret":/);
+  // Parking the cursor is pointless if the image covers it: the terminal paints
+  // preedit and the cursor in the same layer, and z >= 0 hides both.
+  assert.match(main, /const imageZ = Number\.isSafeInteger\(configuredImageZ\) \? configuredImageZ : -1;/);
+  assert.match(main, /imageZ === 0 \? "" : `,z=\$\{imageZ\}`/);
+  // No caret to follow means no cursor on top of the page.
+  assert.match(main, /caretCell = null;\n\s+try \{ writeSync\(1, CSI\("\?25l"\)\);/);
   assert.match(electron, /function caretPoint\(\)/);
   assert.match(electron, /send\("caret",/);
 });

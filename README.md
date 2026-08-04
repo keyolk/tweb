@@ -168,6 +168,12 @@ macOS 또는 Ghostty 자체가 PTY보다 먼저 소비하는 application shortcu
 
 화면 우하단에 현재 mode를 한 글자로 표시합니다: `N` normal, `E` editable/insert, `H` hint, `/` search, `V` visual, `I` inspect, `T` tab 목록, `O` omnibox, `?` shortcut 도움말, `P` web passthrough. 대상 수나 선택 종류처럼 필요한 정보만 옆에 짧게 붙습니다.
 
+IME 조합(한글 등)은 terminal emulator가 자기 layer에 그립니다. Kitty placement를 text 위(`z >= 0`)에
+두면 그 layer가 page image에 가려져 조합 중 음절이 보이지 않으므로, image는 text **아래**(`z=-1`)에
+둡니다 — pane을 채우는 tmux의 기본 배경 cell은 통과되므로 page는 그대로 보입니다. 입력 요소에 focus가
+있으면 terminal cursor를 web caret 위치로 옮기고, 없으면 숨깁니다. 어떤 terminal이 그 cell을 불투명하게
+그린다면 `TWEB_IMAGE_Z=0`으로 예전 layering으로 돌아갈 수 있습니다.
+
 한글 2벌식 layout에서도 physical key와 자모 `langmap`을 사용하므로 normal/hint/visual/inspect 명령은 영문 layout과 동일하게 동작합니다. 입력 요소가 focus된 `E` mode에서는 한글을 변환하지 않고 그대로 입력합니다.
 
 IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중인 글자는 **terminal cursor 위치**에 그려집니다. TWeb은 입력 요소에 focus가 있는 동안 terminal cursor를 web caret이 있는 cell로 옮기고 표시하므로, 조합 과정이 입력 위치에 나타납니다. terminal cursor를 그리는 것은 emulator이므로 글꼴과 색은 page가 아니라 terminal 설정을 따릅니다.
