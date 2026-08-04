@@ -207,6 +207,19 @@ test("the caret mode keys are mirrored into the Tauri preload", () => {
   assert.doesNotMatch(tauri, /reportCaret\(\)/);
 });
 
+// One form named its control "id" and the whole hint pass died on it: `form.id`
+// answered with that input, and `.startsWith` on an element throws.
+test("id reads survive a form whose control is named id", () => {
+  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
+    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+    assert.match(source, /function ownId\(element\) \{/, `${name} is missing ownId`);
+    // Any raw `.id` read outside ownId itself is the bug coming back.
+    const outside = source.replace(/function ownId\(element\) \{[^}]*\}/, "");
+    const raw = outside.match(/(?<![\w.])element\.id(?![\w(])/g) || [];
+    assert.deepEqual(raw, [], `${name} still reads element.id directly`);
+  }
+});
+
 test("the terminal caret follows the focused field for IME composition", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /function moveTerminalCaret\(point\)/);

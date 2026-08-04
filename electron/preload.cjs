@@ -380,8 +380,16 @@ const { ipcRenderer } = require("electron");
     "[tabindex]:not([tabindex='-1'])",
   ].join(",");
 
+  // `<form>` exposes its controls as own properties, so a form containing
+  // `<input name="id">` answers `form.id` with that input rather than a string.
+  // Every id read has to survive that: one such form used to throw and take the
+  // whole hint pass down with it.
+  function ownId(element) {
+    return typeof element?.id === "string" ? element.id : "";
+  }
+
   function hasPointerIntent(element) {
-    if (!(element instanceof Element) || element.id.startsWith("__tweb_")) return false;
+    if (!(element instanceof Element) || ownId(element).startsWith("__tweb_")) return false;
     const style = getComputedStyle(element);
     if (style.pointerEvents === "none") return false;
     if (element.matches(interactiveSelector) || typeof element.onclick === "function") return true;
@@ -496,7 +504,7 @@ const { ipcRenderer } = require("electron");
   function pointerIntentTargets(roots) {
     return roots
       .flatMap((root) => [...root.querySelectorAll("*")])
-      .filter((element) => !element.id?.startsWith("__tweb_") && hasPointerIntent(element));
+      .filter((element) => !ownId(element).startsWith("__tweb_") && hasPointerIntent(element));
   }
 
   function interactiveTargets() {
@@ -536,7 +544,7 @@ const { ipcRenderer } = require("electron");
     const scrollable = collectRoots()
       .flatMap((root) => [...root.querySelectorAll("*")])
       .filter((element) => {
-        if (element.id?.startsWith("__tweb_")) return false;
+        if (ownId(element).startsWith("__tweb_")) return false;
         const overflow = getComputedStyle(element);
         if (!/auto|scroll|overlay/.test(`${overflow.overflowY} ${overflow.overflowX}`)) return false;
         return element.scrollHeight > element.clientHeight + 8
@@ -602,7 +610,7 @@ const { ipcRenderer } = require("electron");
     const excluded = new Set(["html", "head", "body", "style", "script", "link", "meta"]);
     const elements = collectRoots()
       .flatMap((root) => [...root.querySelectorAll("*")])
-      .filter((element) => !excluded.has(element.localName) && !element.id.startsWith("__tweb_"));
+      .filter((element) => !excluded.has(element.localName) && !ownId(element).startsWith("__tweb_"));
     return uniqueVisibleTargets(elements).slice(0, 300);
   }
 
@@ -996,8 +1004,8 @@ const { ipcRenderer } = require("electron");
       .split(/\s+/).filter(Boolean)
       .map((id) => document.getElementById(id)?.innerText || "")
       .join(" ").trim();
-    const forLabel = element.id
-      ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)?.innerText
+    const forLabel = ownId(element)
+      ? document.querySelector(`label[for="${CSS.escape(ownId(element))}"]`)?.innerText
       : element.closest?.("label")?.innerText;
     const candidates = [
       element.getAttribute?.("aria-label"),
@@ -1860,7 +1868,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function cssSelector(element) {
-    if (element.id) return `#${CSS.escape(element.id)}`;
+    if (ownId(element)) return `#${CSS.escape(ownId(element))}`;
     const parts = [];
     let current = element;
     while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.documentElement) {
