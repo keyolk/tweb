@@ -114,6 +114,14 @@ test("switching tabs replaces the image instead of deleting it", () => {
   assert.doesNotMatch(activateTab, /a=d,d=I/, "activateTab must not clear the image");
 });
 
+test("the terminal caret follows the focused field for IME composition", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /function moveTerminalCaret\(point\)/);
+  assert.match(main, /case "caret":/);
+  assert.match(electron, /function caretPoint\(\)/);
+  assert.match(electron, /send\("caret",/);
+});
+
 test("scroll keys can target a picked inner surface", () => {
   assert.match(electron, /function scrollableTargets\(\)/);
   assert.match(electron, /case "s": startScrollPicker\(\); break;/);

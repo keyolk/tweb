@@ -782,6 +782,85 @@ const { ipcRenderer } = require("electron");
     });
   }
 
+  // --- caret reporting ---
+  //
+  // Korean (and any IME) composition happens in the terminal emulator, which
+  // paints the in-progress syllable at the *terminal* cursor. That cursor sits
+  // at the pane origin, so the composition appears in the wrong place — and
+  // under the browser image. Report where the web caret is and let the main
+  // process park the terminal cursor there.
+  let caretCanvas = null;
+  let lastCaretReport = "";
+
+  function caretPoint() {
+    const element = activeElement();
+    if (!isEditable(element) || element instanceof HTMLSelectElement) return null;
+    const box = element.getBoundingClientRect();
+    if (!box.width || !box.height || box.bottom <= 0 || box.top >= innerHeight) return null;
+
+    const computed = getComputedStyle(element);
+    let x = box.left + (parseFloat(computed.paddingLeft) || 0) + 1;
+    let y = box.top + (parseFloat(computed.paddingTop) || 0) + 1;
+    let height = Math.max(12, parseFloat(computed.lineHeight)
+      || (parseFloat(computed.fontSize) || 13) * 1.25);
+
+    try {
+      if (element instanceof HTMLInputElement) {
+        caretCanvas = caretCanvas || document.createElement("canvas").getContext("2d");
+        caretCanvas.font = computed.font || `${computed.fontSize} ${computed.fontFamily}`;
+        const before = element.value.slice(0, element.selectionStart ?? element.value.length);
+        x += caretCanvas.measureText(before).width - element.scrollLeft;
+        y = box.top + Math.max(1, (box.height - height) / 2);
+      } else if (element instanceof HTMLTextAreaElement) {
+        // Measure with a mirror: a textarea gives no caret rect of its own.
+        const mirror = document.createElement("div");
+        mirror.style.cssText = "position:fixed;visibility:hidden;white-space:pre-wrap;"
+          + `overflow-wrap:break-word;top:${box.top}px;left:${box.left}px`;
+        for (const property of ["font", "letterSpacing", "lineHeight", "padding", "border", "boxSizing", "width"]) {
+          mirror.style[property] = computed[property];
+        }
+        mirror.textContent = element.value.slice(0, element.selectionStart ?? 0);
+        const marker = document.createElement("span");
+        marker.textContent = "​";
+        mirror.append(marker);
+        document.documentElement.append(mirror);
+        const markerBox = marker.getBoundingClientRect();
+        x = markerBox.left - element.scrollLeft;
+        y = markerBox.top - element.scrollTop;
+        mirror.remove();
+      } else if (element.isContentEditable) {
+        const selection = getSelection();
+        if (selection?.rangeCount) {
+          const range = selection.getRangeAt(0).cloneRange();
+          range.collapse(true);
+          const rangeBox = range.getBoundingClientRect();
+          if (rangeBox.left || rangeBox.top) {
+            x = rangeBox.left;
+            y = rangeBox.top;
+            height = rangeBox.height || height;
+          }
+        }
+      }
+    } catch (_) {
+      // Fall back to the element's own origin.
+    }
+    return {
+      x: Math.max(0, Math.min(innerWidth - 1, x)),
+      y: Math.max(0, Math.min(innerHeight - 1, y)),
+      height,
+    };
+  }
+
+  function reportCaret() {
+    if (!topFrame && !document.hasFocus()) return;
+    const caret = caretPoint();
+    const point = caret ? topViewportPoint(caret) : null;
+    const report = point ? `${Math.round(point.x)},${Math.round(point.y)},${Math.round(caret.height)}` : "";
+    if (report === lastCaretReport) return;
+    lastCaretReport = report;
+    send("caret", point ? { ...point, height: caret.height } : null);
+  }
+
   // Suggestion panels and popovers close on Escape, but in shortcuts mode every
   // key reaches the page as a synthetic event, and sites like Google ignore
   // untrusted input. Ask the main process for a real Escape instead. Clicking an
@@ -1971,10 +2050,17 @@ const { ipcRenderer } = require("electron");
   addEventListener("keydown", handleNormalKey, true);
   addEventListener("focusin", (event) => {
     if (shortcutsEnabled && isEditable(event.target) && !searchState && !promptHost) setMode("insert");
+    reportCaret();
   }, true);
   addEventListener("focusout", () => requestAnimationFrame(() => {
     if (!hasTransientMode()) normalMode();
+    reportCaret();
   }), true);
+  for (const event of ["input", "keyup", "click", "selectionchange"]) {
+    document.addEventListener(event, reportCaret, true);
+  }
+  document.addEventListener("scroll", reportCaret, true);
+  addEventListener("resize", reportCaret);
   addEventListener("blur", () => {
     cancelPicker(false);
     resetPendingG();
@@ -1986,6 +2072,7 @@ const { ipcRenderer } = require("electron");
     if (shortcutFrame) {
       ensureIndicator();
       normalMode();
+      reportCaret();
     }
   };
   if (document.documentElement) initializeDocument();

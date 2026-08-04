@@ -1191,6 +1191,9 @@ function handleNativeShortcut(tab, action, value) {
     case "paste":
       contents.paste();
       break;
+    case "caret":
+      moveTerminalCaret(value);
+      break;
     // In shortcuts mode keys reach the page as synthetic events, which sites
     // that gate on isTrusted ignore. A page-level Escape has to be real.
     case "native-escape":
@@ -1445,6 +1448,39 @@ async function handleAgentCommand(method, params) {
       };
     default:
       throw new Error(`unknown method ${JSON.stringify(method)}`);
+  }
+}
+
+// IME composition is the terminal emulator's job, and it paints the pending
+// syllable at the terminal cursor. That cursor sits wherever we last left it —
+// the pane origin — so Korean input composes off in a corner instead of at the
+// field. Park the cursor on the cell holding the web caret and show it only
+// while a field is focused.
+let caretCell = null;
+
+function moveTerminalCaret(point) {
+  const vp = lastViewport;
+  if (!point || !vp || !win || win.isDestroyed()) {
+    if (caretCell) {
+      caretCell = null;
+      try { writeSync(1, CSI("?25l")); } catch (error) { void error; }
+    }
+    return;
+  }
+  const logical = logicalContentSize(vp);
+  const zoom = win.webContents.getZoomFactor() || 1;
+  const cellWidth = logical.width / Math.max(1, paneCells.cols);
+  const cellHeight = logical.height / Math.max(1, paneCells.rows);
+  const col = Math.min(paneCells.cols, Math.max(1, Math.floor(point.x * zoom / cellWidth) + 1));
+  // Aim at the caret's baseline cell rather than its top edge.
+  const bottom = (point.y + (point.height || 0) * 0.5) * zoom;
+  const row = Math.min(paneCells.rows, Math.max(1, Math.floor(bottom / cellHeight) + 1));
+  if (caretCell && caretCell.row === row && caretCell.col === col) return;
+  caretCell = { row, col };
+  try {
+    writeSync(1, `${CSI(`${row};${col}H`)}${CSI("?25h")}`);
+  } catch (error) {
+    void error;
   }
 }
 
