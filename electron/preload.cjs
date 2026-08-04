@@ -951,8 +951,115 @@ const { ipcRenderer } = require("electron");
   // at the pane origin, so the composition appears in the wrong place — and
   // under the browser image. Report where the web caret is and let the main
   // process park the terminal cursor there.
+  //
+  // Two renderers cannot be aligned: the terminal draws preedit in its own font on
+  // the cell grid, the page draws text in its font at arbitrary offsets, and we
+  // never learn the preedit text (it is not sent over the pty) so we cannot draw it
+  // ourselves. Give it a place of its own instead — a surface snapped to the cell grid
+  // just past the caret, with the terminal cursor parked on its first cell. The
+  // composition then lands inside the surface, never on top of page glyphs, and reads
+  // as the terminal surface it is.
   let caretCanvas = null;
   let lastCaretReport = "";
+  let cellMetrics = null;
+  let imeSlotHost = null;
+  let imeSlotBox = null;
+  let imeSlotKey = "";
+
+  function ensureImeSlot() {
+    if (imeSlotHost?.isConnected) return;
+    const host = document.createElement("div");
+    host.id = "__tweb_ime__";
+    host.style.cssText = "position:fixed;left:0;top:0;z-index:2147483644;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "closed" });
+    const box = document.createElement("div");
+    // No border or shadow: this should read as a little clearing in the input's
+    // own surface, not as a second UI component sitting on top of it.
+    box.style.cssText = ["position:fixed", "box-sizing:border-box", "border-radius:2px",
+      "background:transparent", "backdrop-filter:blur(1.5px)"].join(";");
+    shadow.append(box);
+    document.documentElement.append(host);
+    imeSlotHost = host;
+    imeSlotBox = box;
+  }
+
+  function removeImeSlot() {
+    imeSlotHost?.remove();
+    imeSlotHost = null;
+    imeSlotBox = null;
+  }
+
+  function imeSurfaceColor() {
+    let element = activeElement();
+    while (isElement(element)) {
+      const values = getComputedStyle(element).backgroundColor.match(/[\d.]+/g)?.map(Number) || [];
+      const alpha = values.length > 3 ? values[3] : 1;
+      if (values.length >= 3 && alpha > 0.05) {
+        // Reuse the input surface's hue but leave enough transparency that gradients
+        // and subtle texture still continue through the composition clearing.
+        return `rgba(${Math.round(values[0])},${Math.round(values[1])},${Math.round(values[2])},.76)`;
+      }
+      const root = element.getRootNode();
+      element = element.parentElement || (root instanceof ShadowRoot ? root.host : null);
+    }
+    return matchMedia("(prefers-color-scheme: dark)").matches
+      ? "rgba(24,24,27,.72)"
+      : "rgba(255,255,255,.72)";
+  }
+
+  // Where composition should appear, in cell-grid coordinates: the page image fills
+  // the pane's cell box exactly, so CSS (0,0) is the grid origin.
+  function imeSlotRect(caret) {
+    const cell = cellMetrics;
+    if (!cell || !(cell.width > 0) || !(cell.height > 0) || !topFrame) return null;
+    const columns = Math.max(1, cell.columns || 3);
+    const width = Math.min(columns * cell.width, innerWidth);
+    // Past the caret, never on it: the character before the caret keeps its pixels.
+    let left = Math.ceil(caret.x / cell.width) * cell.width;
+    // The cell whose middle is nearest the caret's — page line boxes are routinely
+    // taller than a cell, and picking by top edge drifts a row on those.
+    const middle = caret.y + (caret.height || cell.height) / 2;
+    const lastRow = Math.max(0, Math.floor((innerHeight - cell.height) / cell.height) * cell.height);
+    let top = Math.min(lastRow,
+      Math.max(0, Math.round((middle - cell.height / 2) / cell.height) * cell.height));
+    let wrapped = false;
+    if (left + width > innerWidth) {
+      // Never move the slot backward over text on the caret's line. Prefer the next
+      // terminal row; at the bottom edge use the previous one instead.
+      top = top + cell.height <= lastRow ? top + cell.height : Math.max(0, top - cell.height);
+      left = 0;
+      wrapped = true;
+    }
+    // On the caret's row, draw over the union of the cell and page line box so the
+    // surface does not hang below the text it belongs to. A wrapped surface is deliberately
+    // separate and stays exactly one cell high.
+    const lineTop = wrapped ? top : Math.min(top, caret.y);
+    const lineBottom = wrapped ? top + cell.height
+      : Math.max(top + cell.height, caret.y + (caret.height || cell.height));
+    return { left, top, width, height: cell.height, lineTop, lineBottom };
+  }
+
+  function updateImeSlot(rect) {
+    const surface = rect ? imeSurfaceColor() : "";
+    const key = rect ? `${rect.left},${rect.lineTop},${rect.width},${rect.lineBottom},${surface}` : "";
+    if (key === imeSlotKey && Boolean(rect) === Boolean(imeSlotHost?.isConnected)) return;
+    imeSlotKey = key;
+    if (!rect) {
+      removeImeSlot();
+    } else {
+      ensureImeSlot();
+      // Match the reserved cells exactly. Extra padding would turn the translucent
+      // clearing back into a visible surface and could cover the preceding page glyph.
+      imeSlotBox.style.left = `${rect.left}px`;
+      imeSlotBox.style.top = `${rect.lineTop}px`;
+      imeSlotBox.style.width = `${rect.width}px`;
+      imeSlotBox.style.height = `${rect.lineBottom - rect.lineTop}px`;
+      imeSlotBox.style.background = surface;
+    }
+    // The frame clock may have dropped to its idle rate, and a surface that appears
+    // a quarter second after the caret moved reads as lag.
+    paintNow();
+  }
 
   function caretPoint() {
     const element = activeElement();
@@ -1016,11 +1123,22 @@ const { ipcRenderer } = require("electron");
   function reportCaret() {
     if (!topFrame && !document.hasFocus()) return;
     const caret = caretPoint();
-    const point = caret ? topViewportPoint(caret) : null;
-    const report = point ? `${Math.round(point.x)},${Math.round(point.y)},${Math.round(caret.height)}` : "";
+    let point = caret ? topViewportPoint(caret) : null;
+    let height = caret?.height;
+    // A subframe cannot draw the surface in the top document, so it reports the raw
+    // caret and the top frame's own report wins as soon as focus moves there.
+    const slot = point ? imeSlotRect({ ...point, height }) : null;
+    if (slot) {
+      point = { x: slot.left, y: slot.top };
+      height = slot.height;
+      updateImeSlot(slot);
+    } else {
+      updateImeSlot(null);
+    }
+    const report = point ? `${Math.round(point.x)},${Math.round(point.y)},${Math.round(height)}` : "";
     if (report === lastCaretReport) return;
     lastCaretReport = report;
-    send("caret", point ? { ...point, height: caret.height } : null);
+    send("caret", point ? { ...point, height } : null);
   }
 
   // Suggestion panels and popovers close on Escape, but in shortcuts mode every
@@ -2344,6 +2462,19 @@ const { ipcRenderer } = require("electron");
     normalMode();
   });
 
+  // Cell size in CSS pixels. Only main knows it — it owns the pane geometry and the
+  // zoom factor — and it changes on every resize and zoom step.
+  ipcRenderer.on("tweb-cell-metrics", (_event, metrics) => {
+    const next = metrics && metrics.width > 0 && metrics.height > 0 ? metrics : null;
+    const same = Boolean(next) === Boolean(cellMetrics) && (!next || (next.width === cellMetrics.width
+      && next.height === cellMetrics.height && next.columns === cellMetrics.columns));
+    cellMetrics = next;
+    if (same) return;
+    // The surface moved even though the caret did not, so the deduped report has to go.
+    lastCaretReport = "";
+    reportCaret();
+  });
+
   ipcRenderer.on("tweb-find-result", (_event, result) => {
     if (!searchState) return;
     searchState.result.textContent = result?.matches ? `${result.activeMatchOrdinal}/${result.matches}` : "0/0";
@@ -2448,7 +2579,12 @@ const { ipcRenderer } = require("electron");
     if (shortcutsEnabled && isEditable(event.target) && !searchState && !promptHost) setMode("insert");
     reportCaret();
   }, true);
-  addEventListener("focusout", () => requestAnimationFrame(() => {
+  addEventListener("focusout", () => queueMicrotask(() => {
+    // BrowserWindow stays hidden for offscreen painting. Once its focused input
+    // blurs, Chromium may stop servicing requestAnimationFrame altogether, which
+    // used to leave both the IME surface and terminal cursor behind indefinitely.
+    // A microtask still runs after the complete focus transition (including the
+    // matching focusin), without depending on a visible frame clock.
     if (!hasTransientMode()) normalMode();
     reportCaret();
   }), true);

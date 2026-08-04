@@ -190,11 +190,11 @@ stderr를 그대로 물려받아 terminal로도 흘립니다.
 
 한글 2벌식 layout에서도 physical key와 자모 `langmap`을 사용하므로 normal/hint/visual/inspect 명령은 영문 layout과 동일하게 동작합니다. 입력 요소가 focus된 `E` mode에서는 한글을 변환하지 않고 그대로 입력합니다.
 
-IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중인 글자는 **terminal cursor 위치**에 그려집니다. TWeb은 입력 요소에 focus가 있는 동안 terminal cursor를 web caret이 있는 cell로 옮기고 표시하므로, 조합 과정이 입력 위치에 나타납니다.
+IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중인 글자는 **terminal cursor 위치**에 그려집니다. Terminal과 page는 서로 다른 font와 좌표계를 쓰고 preedit text도 PTY로 전달되지 않으므로, 둘을 같은 glyph처럼 정확히 겹쳐 그릴 수는 없습니다. 대신 TWeb은 web caret 바로 다음 cell부터 기본 3-cell짜리 조합 영역을 예약하고 terminal cursor를 그 첫 cell에 둡니다. 이 영역은 입력 요소에서 가장 가까운 불투명 배경색을 찾아 반투명하게 사용하며 boundary나 shadow를 그리지 않으므로, page text를 가리는 별도 box보다 입력창의 자연스러운 여백처럼 보입니다. 폭은 `TWEB_IME_SLOT_CELLS`로 바꿀 수 있습니다.
 
-cursor는 block이 아니라 bar(`DECSCUSR 6`)로 요청합니다. block은 자기 cell을 덮어 page의 입력 cursor와 그 옆 글자를 가립니다. 놓을 cell은 caret의 **baseline**으로 고르고(cell 높이의 78% 지점), column은 가장 가까운 cell 경계로 맞춥니다 — cell 중심으로 고르면 한 cell보다 높은 page text에서 조합 음절이 한 줄 위로 떠 보입니다. caret 보고는 CSS pixel 기준으로 중복 제거되므로, zoom과 pane resize 뒤에는 마지막 보고로 cell을 다시 계산합니다(안 하면 실측 3행·2열까지 밀렸습니다).
+cursor는 block이 아니라 bar(`DECSCUSR 6`)로 요청합니다. block은 자기 cell을 덮어 page의 입력 cursor와 그 옆 글자를 가립니다. 조합 영역은 cell 경계에 맞추고, 행은 caret과 가장 가까운 cell을 사용합니다. 오른쪽 공간이 부족하면 같은 줄의 앞 글자를 덮지 않고 인접 terminal 행으로 피합니다. cell 크기는 pane geometry와 browser zoom에서 계산하므로 zoom, pane resize, tab 전환 뒤에도 영역과 cursor 위치를 다시 맞춥니다.
 
-terminal cursor와 조합 preview를 그리는 것은 emulator이므로 글꼴 크기와 색은 page가 아니라 terminal 설정을 따릅니다. page text보다 크거나 작아 보이는 것은 이 때문이며, cell 격자에 맞추는 이상 위치도 최대 반 cell까지 어긋납니다.
+terminal cursor와 조합 preview를 그리는 것은 emulator이므로 글꼴 크기와 색은 page가 아니라 terminal 설정을 따릅니다. page font와 완전히 같아지지는 않지만, 조합 preview가 기존 page glyph 위에 직접 겹치지는 않습니다. 입력 focus가 사라지면 조합 영역과 terminal cursor도 함께 제거됩니다.
 
 ### Shortcuts mode 키
 

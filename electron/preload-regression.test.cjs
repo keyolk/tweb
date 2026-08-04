@@ -407,11 +407,62 @@ test("the terminal caret follows the focused field for IME composition", () => {
   // The report is deduped on CSS pixels, so zoom and resize have to re-derive the
   // cell themselves — measured 3 rows / 2 columns of drift without this.
   assert.match(main, /function reparkTerminalCaret\(\)/);
-  assert.match(main, /if \(terminalVisible\) replacePlacement\(\);\n\s+reparkTerminalCaret\(\);/);
+  const viewportTail = main.slice(main.indexOf("function applyViewport(vp, origin"),
+    main.indexOf("function createWindow(url)"));
+  assert.match(viewportTail, /if \(terminalVisible\) replacePlacement\(\);[\s\S]{0,120}reparkTerminalCaret\(\);/);
   const zoomStep = main.slice(main.indexOf("function setBrowserZoom(action)"));
   assert.match(zoomStep.slice(0, zoomStep.indexOf("\n}")), /reparkTerminalCaret\(\);/);
   assert.match(electron, /function caretPoint\(\)/);
   assert.match(electron, /send\("caret",/);
+});
+
+// The terminal and the page cannot be aligned — different fonts, one on a cell
+// grid — and the preedit text never reaches us, so we cannot draw it ourselves.
+// Give it a cell-aligned surface of its own instead of letting it land on page text.
+test("composition gets a cell-aligned surface past the caret", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // Only main can measure a cell: it owns the pane geometry and the zoom factor.
+  assert.match(main, /function cellMetrics\(\)/);
+  assert.match(main, /width: logical\.width \/ Math\.max\(1, paneCells\.cols\) \/ zoom/);
+  assert.match(main, /sendToTabFrames\(tab, "tweb-cell-metrics", cellMetrics\(\)\)/);
+  // Cell size changes with both of those, and the page cannot see either change.
+  const viewport = main.slice(main.indexOf("function applyViewport(vp, origin"),
+    main.indexOf("function createWindow(url)"));
+  assert.match(viewport, /broadcastCellMetrics\(\);/);
+  const zoomStep = main.slice(main.indexOf("function setBrowserZoom(action)"));
+  assert.match(zoomStep.slice(0, zoomStep.indexOf("\n}")), /broadcastCellMetrics\(\);/);
+  assert.match(electron, /ipcRenderer\.on\("tweb-cell-metrics"/);
+  assert.match(electron, /function imeSlotRect\(caret\)/);
+  // Past the caret, so the character before it keeps its pixels. The backdrop
+  // starts on that exact boundary rather than expanding back over the glyph.
+  assert.match(electron, /let left = Math\.ceil\(caret\.x \/ cell\.width\) \* cell\.width;/);
+  assert.match(electron, /imeSlotBox\.style\.left = `\$\{rect\.left\}px`;/);
+  // The clearing borrows the nearest opaque input/container background and has no
+  // boundary chrome of its own, so it blends into both light and dark pages.
+  assert.match(electron, /function imeSurfaceColor\(\)/);
+  assert.match(electron, /getComputedStyle\(element\)\.backgroundColor/);
+  const slotStyle = electron.slice(electron.indexOf("function ensureImeSlot()"),
+    electron.indexOf("function removeImeSlot()"));
+  assert.doesNotMatch(slotStyle, /outline:/);
+  assert.doesNotMatch(slotStyle, /box-shadow:/);
+  assert.match(slotStyle, /backdrop-filter:blur\(1\.5px\)/);
+  assert.match(electron, /imeSlotBox\.style\.background = surface;/);
+  // At the right edge, wrap to another terminal row instead of moving backward
+  // over text on the caret's line.
+  assert.match(electron, /top = top \+ cell\.height <= lastRow \? top \+ cell\.height : Math\.max\(0, top - cell\.height\);/);
+  assert.match(electron, /left = 0;/);
+  // The reported point is the surface's own cell, which is what the cursor parks on.
+  assert.match(electron, /point = \{ x: slot\.left, y: slot\.top \};/);
+  // A new cell size moves the surface without the caret moving, and the report is
+  // deduped on the reported point.
+  assert.match(electron, /lastCaretReport = "";\n\s+reportCaret\(\);/);
+  // Hidden offscreen windows may stop servicing rAF after blur. Cleanup must not
+  // depend on another painted frame or the surface and terminal cursor stick around.
+  assert.match(electron, /addEventListener\("focusout", \(\) => queueMicrotask\(\(\) => \{/);
+  // Same-origin frames share one terminal cursor; a late report from the frame
+  // that just lost focus must not overwrite the new focused frame's report.
+  assert.match(main, /handleNativeShortcut\(tab, message\.action, message\.value, event\.senderFrame\)/);
+  assert.match(main, /frameKey\(sourceFrame\) !== frameKey\(focused\)/);
 });
 
 test("scroll keys can target a picked inner surface", () => {

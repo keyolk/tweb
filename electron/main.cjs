@@ -1173,6 +1173,8 @@ function activateTab(index) {
   if (!win.isDestroyed() && win.webContents.getZoomFactor() !== zoomFactor) {
     win.webContents.setZoomFactor(zoomFactor);
   }
+  // Cell size in CSS pixels depends on the zoom just restored.
+  broadcastCellMetrics();
   // Do not delete the current image first: the next frame reuses the same image
   // id and replaces it in place. Deleting would uncover the bare terminal until
   // the new tab paints, which reads as a flicker on every switch.
@@ -1332,7 +1334,7 @@ function tabListModel() {
   };
 }
 
-function handleNativeShortcut(tab, action, value) {
+function handleNativeShortcut(tab, action, value, sourceFrame = null) {
   if (!browserShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
@@ -1410,9 +1412,16 @@ function handleNativeShortcut(tab, action, value) {
     case "paste":
       contents.paste();
       break;
-    case "caret":
+    case "caret": {
+      // Every same-origin frame runs this preload. A frame that just lost focus can
+      // report after the new focused frame and otherwise move the shared terminal
+      // cursor back to stale coordinates (or hide it). Only the frame Chromium says
+      // owns focus may control the one terminal cursor.
+      const focused = contents.focusedFrame;
+      if (sourceFrame && focused && frameKey(sourceFrame) !== frameKey(focused)) break;
       moveTerminalCaret(value);
       break;
+    }
     case "insert-mode":
       pageInsertMode = Boolean(value);
       break;
@@ -1468,13 +1477,14 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-enabled", browserShortcutsEnabled);
+  if (tab === win) event.reply("tweb-cell-metrics", cellMetrics());
 });
 
 ipcMain.on("tweb-shortcut", (event, message) => {
   if (!message || typeof message.action !== "string") return;
   const tab = tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
   if (!tab) return;
-  handleNativeShortcut(tab, message.action, message.value);
+  handleNativeShortcut(tab, message.action, message.value, event.senderFrame);
 });
 
 // --- agent bridge ---
@@ -1769,6 +1779,32 @@ function unparkTerminalCaret() {
   try { writeSync(1, `${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
 }
 
+// The page draws the IME composition surface on the cell grid, which only main can measure: the
+// image fills the pane's cell box exactly, so a cell is the logical content size
+// over the cell count — in CSS pixels once the zoom factor is divided out.
+const configuredImeSlotCells = Number.parseInt(process.env.TWEB_IME_SLOT_CELLS || "", 10);
+// A Korean preedit is one syllable, which is two cells wide; the third is slack.
+// Longer preedits (Japanese, pinyin) want a wider surface — hence the override.
+const imeSlotCells = Number.isSafeInteger(configuredImeSlotCells) && configuredImeSlotCells > 0
+  ? configuredImeSlotCells
+  : 3;
+
+function cellMetrics() {
+  if (!lastViewport || !win || win.isDestroyed()) return null;
+  const logical = logicalContentSize(lastViewport);
+  const zoom = win.webContents.getZoomFactor() || 1;
+  return {
+    width: logical.width / Math.max(1, paneCells.cols) / zoom,
+    height: logical.height / Math.max(1, paneCells.rows) / zoom,
+    columns: imeSlotCells,
+  };
+}
+
+function broadcastCellMetrics(tab = win) {
+  if (!tab || tab.isDestroyed() || tab !== win) return;
+  sendToTabFrames(tab, "tweb-cell-metrics", cellMetrics());
+}
+
 // The page reports the caret in CSS pixels and dedupes on them, so a zoom step or
 // a pane resize moves the cell under a caret that never "moved" — and the report
 // that would correct it never comes. Recompute from the last one instead.
@@ -2012,7 +2048,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     contents.setZoomFactor(zoomFactor);
     contents.invalidate();
     // Autofocused fields report their caret before this zoom lands.
-    if (tab === win) reparkTerminalCaret();
+    if (tab === win) {
+      broadcastCellMetrics(tab);
+      reparkTerminalCaret();
+    }
     if (!initialZoomApplied) {
       initialZoomApplied = true;
       if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
@@ -2172,6 +2211,7 @@ function applyViewport(vp, origin = tmuxOrigin) {
   }
   win?.webContents.invalidate();
   if (terminalVisible) replacePlacement();
+  broadcastCellMetrics();
   reparkTerminalCaret();
 }
 
@@ -2247,6 +2287,7 @@ function setBrowserZoom(action) {
   tabZoomFactors.set(win, next);
   contents.setZoomFactor(next);
   contents.invalidate();
+  broadcastCellMetrics();
   reparkTerminalCaret();
   scheduleWindowSessionSave();
   if (debugLogging) console.error(`tweb: zoom ${next.toFixed(3)}`);
