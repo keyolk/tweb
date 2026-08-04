@@ -23,15 +23,20 @@ Ghostty / Kitty
 ## 설치
 
 ```sh
-make install              # ~/.local/bin/tweb + ~/.local/libexec/tweb/electron
+make install              # ~/.local/bin/tweb
 make install PREFIX=/usr/local
 make uninstall
 ```
 
-Electron engine은 실행 시점에 `main.cjs`/`preload.cjs`와 자기 `node_modules`를 읽으므로
-binary 혼자로는 동작하지 않습니다. `install`은 app directory를
-`$PREFIX/libexec/tweb/electron`에 통째로 놓고(약 310MB), `tweb`은 자기 위치 기준으로 그
-경로를 찾습니다 — workspace 밖에서도 동작합니다.
+설치되는 것은 binary뿐입니다. Electron app 코드(`main.cjs`/`preload.cjs` 등 198KB)는
+binary에 들어 있고 처음 실행할 때 `~/.cache/tweb/app-<hash>`에 풉니다. directory 이름이
+내용 hash라서 binary와 preload가 어긋날 수 없습니다.
+
+Electron **runtime**은 295MB라 binary에 넣지 않습니다. 없으면 첫 실행 때 한 번 받아
+(`~/.cache/tweb/electron-<version>`, `SHASUMS256.txt`로 검증) 이후에는 cache에서 씁니다.
+workspace 안에서 돌 때는 `electron/node_modules`를, 시스템에 `electron`이 있으면 그것을
+먼저 씁니다. 자동 설치를 막으려면 `TWEB_NO_AUTO_INSTALL=1`을, 직접 지정하려면
+`TWEB_ELECTRON=<binary>`를 씁니다. cache 위치는 `TWEB_CACHE_DIR`로 바꿉니다.
 
 ## 명령
 

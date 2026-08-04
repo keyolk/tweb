@@ -4,10 +4,6 @@ CARGO ?= cargo
 BUN ?= bun
 URL ?= about:blank
 PREFIX ?= $(HOME)/.local
-# The Electron runtime reads main.cjs/preload.cjs and its own node_modules at run
-# time, so `tweb` needs the whole app directory beside it. It looks for the app at
-# `<prefix>/libexec/tweb/electron` — keep the two in step.
-LIBEXEC := $(PREFIX)/libexec/tweb
 
 .DEFAULT_GOAL := help
 
@@ -56,18 +52,17 @@ run: build ## Electron engine으로 TWeb 실행 (URL=...)
 run-tauri: build ## Tauri engine으로 TWeb 실행 (URL=...)
 	./target/debug/tweb open --engine tauri "$(URL)"
 
-install: release deps ## tweb과 Electron app을 PREFIX에 설치 (기본 ~/.local)
-	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(LIBEXEC)"
+# app 코드는 binary에 들어 있고 (198KB) Electron runtime은 첫 실행 때 한 번 받는다
+# (295MB — binary에 넣을 크기가 아니다). 그래서 설치할 것은 binary뿐이다.
+install: release ## tweb을 PREFIX에 설치 (기본 ~/.local)
+	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 0755 target/release/tweb "$(DESTDIR)$(PREFIX)/bin/tweb"
 	@test ! -f target/release/tweb-tauri \
 		|| install -m 0755 target/release/tweb-tauri "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
-	rm -rf "$(DESTDIR)$(LIBEXEC)/electron"
-	cp -R electron "$(DESTDIR)$(LIBEXEC)/electron"
-	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb (engine in $(DESTDIR)$(LIBEXEC)/electron)"
+	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb"
 
-uninstall: ## install이 놓은 파일 제거
+uninstall: ## install이 놓은 파일 제거 (cache는 그대로 둔다)
 	rm -f "$(DESTDIR)$(PREFIX)/bin/tweb" "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
-	rm -rf "$(DESTDIR)$(LIBEXEC)"
 
 clean: ## Rust build output 제거
 	$(CARGO) clean

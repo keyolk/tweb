@@ -11,6 +11,7 @@
 //! - pane kill → Electron 종료, image delete
 
 pub mod display;
+mod engine_app;
 pub mod input;
 pub mod resize;
 pub mod terminal;
@@ -409,26 +410,25 @@ fn find_tauri() -> Result<std::path::PathBuf> {
         .context("Tauri engine binary not found; build tweb-tauri or set TWEB_TAURI")
 }
 
-/// `make install`이 놓는 위치: binary가 `<prefix>/bin/tweb`이면 engine app은
+/// `make install`이 놓는 위치: binary가 `<prefix>/bin/tweb`이면 Electron runtime은
 /// `<prefix>/libexec/tweb/electron`에 있다. 설치본은 workspace 안에서 돌지 않으므로
-/// current_exe 기준 상대 경로 말고는 app directory를 찾을 단서가 없다.
+/// current_exe 기준 상대 경로 말고는 찾을 단서가 없다.
 pub fn installed_electron_dir() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.parent()?.join("libexec/tweb/electron");
-    if dir.join("package.json").exists() {
-        Some(dir)
-    } else {
-        None
-    }
+    dir.is_dir().then_some(dir)
 }
 
-/// 주어진 app directory 안의 Electron 실행 파일.
-pub fn electron_binary_in(app_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+/// 주어진 directory 안의 Electron 실행 파일.
+pub fn electron_binary_in(directory: &std::path::Path) -> Option<std::path::PathBuf> {
     for relative in [
         "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
         "node_modules/.bin/electron",
+        // 1회성 설치가 풀어놓는 모양: node_modules 없이 dist만 온다.
+        "dist/Electron.app/Contents/MacOS/Electron",
+        "Electron.app/Contents/MacOS/Electron",
     ] {
-        let candidate = app_dir.join(relative);
+        let candidate = directory.join(relative);
         if candidate.exists() {
             return Some(candidate);
         }
@@ -436,88 +436,73 @@ pub fn electron_binary_in(app_dir: &std::path::Path) -> Option<std::path::PathBu
     None
 }
 
+/// workspace를 실행 중일 때의 `electron/` 후보들.
+fn workspace_electron_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        // target/release/tweb → target/release → target → workspace root.
+        if let Some(target) = exe.parent().and_then(|p| p.parent()) {
+            let root = target.parent().unwrap_or(target);
+            dirs.push(root.join("electron"));
+        }
+    }
+    dirs.push(std::path::PathBuf::from("electron"));
+    dirs.push(std::path::PathBuf::from("../electron"));
+    dirs
+}
+
+/// Electron이 `.`으로 로드할 app directory.
+///
+/// workspace 안에서 돌고 있으면 그 `electron/`을 쓴다 — 고친 preload가 rebuild 없이 바로
+/// 반영되어야 개발이 된다. 그 밖에서는 binary에 담긴 app을 cache에 푼다.
+fn electron_app_directory() -> Result<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("TWEB_ELECTRON_DIR") {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    for candidate in workspace_electron_dirs() {
+        if candidate.join("main.cjs").exists() && candidate.join("package.json").exists() {
+            return Ok(candidate);
+        }
+    }
+    engine_app::extracted_app_dir()
+}
+
+/// Electron 실행 파일 찾기. app 코드는 binary에 담겨 있으므로 이것만 밖에서 온다.
+fn electron_executable() -> Result<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("TWEB_ELECTRON") {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    let mut searched = Vec::new();
+    for directory in workspace_electron_dirs()
+        .into_iter()
+        .chain(installed_electron_dir())
+        .chain(std::iter::once(engine_app::runtime_dir()))
+    {
+        if let Some(binary) = electron_binary_in(&directory) {
+            return Ok(binary);
+        }
+        searched.push(directory);
+    }
+    if let Ok(binary) = which::which("electron") {
+        return Ok(binary);
+    }
+    // 어디에도 없으면 한 번 설치한다. 295MB를 binary에 넣지 않는 대신 필요할 때 가져온다.
+    engine_app::install_runtime().with_context(|| {
+        format!(
+            "Electron runtime을 찾을 수 없고 설치도 실패했습니다. 확인한 위치: {}",
+            searched
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// Electron binary 경로와 app directory 찾기.
 /// 반환: (electron binary path, electron app dir with package.json)
 fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    // 1. 환경 변수 TWEB_ELECTRON (binary path) + TWEB_ELECTRON_DIR (app dir).
-    if let Ok(p) = std::env::var("TWEB_ELECTRON") {
-        let binary = std::path::PathBuf::from(&p);
-        let app_dir = std::env::var("TWEB_ELECTRON_DIR")
-            .map(std::path::PathBuf::from)
-            .ok()
-            .or_else(|| find_electron_app_dir(&binary))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        return Ok((binary, app_dir));
-    }
-    // 2. current_exe() 기준으로 workspace root 추정.
-    // binary가 target/debug/tweb-pane이면 workspace root는 두 단계 위.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(ws_root) = exe.parent().and_then(|p| p.parent()) {
-            // ws_root = target/debug → target → workspace root.
-            // exe.parent() = target/debug, .parent() = target, .parent() = workspace root.
-            let ws_root = ws_root.parent().unwrap_or(ws_root);
-            let electron_bin = ws_root
-                .join("electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron");
-            let electron_dir = ws_root.join("electron");
-            if electron_bin.exists() && electron_dir.join("package.json").exists() {
-                return Ok((electron_bin, electron_dir));
-            }
-            // cwd 기준도 시도.
-            let cwd_bin = std::path::PathBuf::from(
-                "electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
-            );
-            let cwd_dir = std::path::PathBuf::from("electron");
-            if cwd_bin.exists() && cwd_dir.join("package.json").exists() {
-                return Ok((cwd_bin, cwd_dir));
-            }
-        }
-    }
-    // 3. `make install`이 놓은 위치.
-    if let Some(app_dir) = installed_electron_dir() {
-        if let Some(binary) = electron_binary_in(&app_dir) {
-            return Ok((binary, app_dir));
-        }
-    }
-    // 4. cwd 기준 상대 경로.
-    let candidates: &[(&str, &str)] = &[
-        (
-            "electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
-            "electron",
-        ),
-        (
-            "../electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
-            "../electron",
-        ),
-        ("electron/node_modules/.bin/electron", "electron"),
-        ("../electron/node_modules/.bin/electron", "../electron"),
-    ];
-    for (bin, dir) in candidates {
-        let bin_path = std::path::PathBuf::from(bin);
-        if bin_path.exists() {
-            let app_dir = std::path::PathBuf::from(dir);
-            if app_dir.join("package.json").exists() {
-                return Ok((bin_path, app_dir));
-            }
-        }
-    }
-    // 5. global electron.
-    let bin = which::which("electron")
-        .context("electron binary not found. set TWEB_ELECTRON or install in electron/")?;
-    let app_dir =
-        find_electron_app_dir(&bin).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    Ok((bin, app_dir))
-}
-
-/// binary path에서 package.json이 있는 electron app dir 추정.
-fn find_electron_app_dir(binary: &std::path::Path) -> Option<std::path::PathBuf> {
-    // binary path에서 "electron/" 디렉토리를 찾아 위로 올라감.
-    let mut current = binary.parent()?;
-    loop {
-        if current.join("package.json").exists() {
-            return Some(current.to_path_buf());
-        }
-        current = current.parent()?;
-    }
+    Ok((electron_executable()?, electron_app_directory()?))
 }
 
 #[cfg(test)]
