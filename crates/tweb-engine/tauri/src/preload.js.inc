@@ -976,7 +976,8 @@
     ["검색과 선택", [
       ["/ · n · N", "검색 · 다음 · 이전 결과"],
       ["v · V", "visual picker · 페이지 전체 선택"],
-      ["h/l · b/w/e · j/k · 0/$", "visual 선택 범위 조정"],
+      ["h/l · b/w/e · j/k · 0/$ · {/}", "visual 선택 범위 조정 (블록 밖까지)"],
+      ["c · v", "caret로 내려가 시작점 옮기기 · 그 지점부터 선택"],
       ["y · Y · u", "smart copy · text copy · URL copy"],
       ["o/O · p · d", "링크 열기 · 붙여넣기 · inspect"],
       ["I", "inspect picker"],
@@ -1380,17 +1381,57 @@
     outline.style.height = `${rect.height}px`;
   }
 
+  // Motions can now leave the block they started in, so a selection that runs off
+  // the viewport has to be followed.
+  function scrollSelectionIntoView(rect) {
+    const margin = 40;
+    let top = 0;
+    if (rect.top < margin) top = rect.top - margin;
+    else if (rect.bottom > innerHeight - margin) top = rect.bottom - (innerHeight - margin);
+    if (top) scrollBy({ top, behavior: "instant" });
+  }
+
   function updateVisualSelection() {
     if (!visualState?.selectionMade) return;
     const selection = getSelection();
     if (!selection?.rangeCount) return;
     const rect = selection.getRangeAt(0).getBoundingClientRect();
-    if (visualState.pageSelection) {
-      updateOutline(visualState.outline, { left: 1, top: 1, width: innerWidth - 2, height: innerHeight - 2 });
-    } else if (rect.width || rect.height) {
-      updateOutline(visualState.outline, rect);
+    if (visualState.caret) {
+      // A collapsed range has no width, so outline a caret-wide sliver instead —
+      // otherwise there is nothing on screen saying where the cursor sits.
+      updateOutline(visualState.outline,
+        { left: rect.left, top: rect.top, width: 2, height: rect.height || 16 });
+      setMode("visual", "caret v·h·j·k·l·w·b·e·{·}");
+    } else {
+      if (visualState.pageSelection) {
+        updateOutline(visualState.outline, { left: 1, top: 1, width: innerWidth - 2, height: innerHeight - 2 });
+      } else if (rect.width || rect.height) {
+        updateOutline(visualState.outline, rect);
+      }
+      setMode("visual", `text ${selection.toString().length} y·c·o·h·j·k·l·w·b·e`);
     }
-    setMode("visual", `text ${selection.toString().length} h·j·k·l·w·e·b·o`);
+    scrollSelectionIntoView(rect);
+    // The Electron preload also parks the terminal cursor on the caret here; this
+    // engine has no caret reporting.
+  }
+
+  // Collapsing to the start, not the end: the point of going back to a caret is
+  // to pick a new place to start the selection from.
+  function enterCaret() {
+    const selection = getSelection();
+    if (!visualState?.selectionMade || !selection?.rangeCount) return;
+    const range = selection.getRangeAt(0);
+    selection.collapse(range.startContainer, range.startOffset);
+    visualState.caret = true;
+    updateVisualSelection();
+  }
+
+  // The caret is already the selection's anchor, so extending from here needs
+  // nothing but a mode change.
+  function selectFromCaret() {
+    if (!visualState?.caret) return;
+    visualState.caret = false;
+    updateVisualSelection();
   }
 
   function moveVisualSelection(key) {
@@ -1416,9 +1457,18 @@
       j: ["forward", "line"],
       "0": ["backward", "lineboundary"],
       "$": ["forward", "lineboundary"],
+      // The block the hint picked is rarely the whole of what one wants to copy,
+      // so motions are free to leave it; these two step whole blocks at a time.
+      "{": ["backward", "paragraph"],
+      "}": ["forward", "paragraph"],
     };
     const motion = motions[key];
     if (!motion) return false;
+    if (visualState.caret) {
+      selection.modify("move", motion[0], motion[1]);
+      updateVisualSelection();
+      return true;
+    }
     const anchorNode = selection.anchorNode;
     const anchorOffset = selection.anchorOffset;
     const focusNode = selection.focusNode;
@@ -1427,14 +1477,13 @@
     selection.modify("move", motion[0], motion[1]);
     const nextFocusNode = selection.focusNode;
     const nextFocusOffset = selection.focusOffset;
-    const target = visualState.element;
-    if (nextFocusNode !== target && !target.contains(nextFocusNode)) {
-      selection.collapse(anchorNode, anchorOffset);
-      selection.extend(focusNode, focusOffset);
-      return true;
-    }
     selection.collapse(anchorNode, anchorOffset);
-    selection.extend(nextFocusNode, nextFocusOffset);
+    try {
+      selection.extend(nextFocusNode, nextFocusOffset);
+    } catch (error) {
+      // Extending across a shadow boundary throws; keep the selection we had.
+      selection.extend(focusNode, focusOffset);
+    }
     updateVisualSelection();
     return true;
   }
@@ -1494,8 +1543,10 @@
     } else if (smart && item.kind === "link" && item.link?.href) {
       send("copy-text", item.link.href);
     } else {
+      // A caret selects nothing, so `y` there copies the block it sits in — the
+      // same thing `v` then `y` has always done.
       const selectedText = item.selectionMade ? getSelection()?.toString() || "" : "";
-      const text = item.selectionMade ? selectedText : (typeof item.element.value === "string" ? item.element.value
+      const text = selectedText || (typeof item.element.value === "string" ? item.element.value
         : item.element.innerText?.trim() || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
       if (text) send("copy-text", text);
     }
@@ -1509,6 +1560,8 @@
     event.stopImmediatePropagation();
     if (key === "Escape") cancelVisual();
     else if (moveVisualSelection(key)) return true;
+    else if (key === "c" && visualState.selectionMade && !visualState.caret) enterCaret();
+    else if (key === "v" && visualState.caret) selectFromCaret();
     else if (key === "y") copyVisual(true);
     else if (key === "Y") copyVisual(false);
     else if (key === "u" && visualState.link?.href) {

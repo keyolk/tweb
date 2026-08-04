@@ -157,6 +157,39 @@ test("a resize re-places the existing image instead of baring the pane", () => {
   assert.match(replace, /a=p,i=\$\{imageId\}/);
 });
 
+// The block a hint can pick is rarely exactly what one wants to copy, so `v` has
+// to lead somewhere: a caret to move the start to, and motions free to leave the
+// block.
+test("visual mode drops to a caret and selects from it", () => {
+  assert.match(electron, /function enterCaret\(\)/);
+  assert.match(electron, /function selectFromCaret\(\)/);
+  const handler = electron.slice(electron.indexOf("function handleVisualKey(event, key)"),
+    electron.indexOf("function cssSelector(element)"));
+  assert.match(handler, /key === "c" && visualState\.selectionMade && !visualState\.caret/);
+  assert.match(handler, /key === "v" && visualState\.caret/);
+
+  const motions = electron.slice(electron.indexOf("function moveVisualSelection(key)"),
+    electron.indexOf("function cancelVisual("));
+  // Paragraph motions are what reach the next block at all.
+  assert.match(motions, /"\{": \["backward", "paragraph"\]/);
+  assert.match(motions, /"\}": \["forward", "paragraph"\]/);
+  // The old guard snapped the focus back whenever a motion left the picked block.
+  assert.doesNotMatch(motions, /!target\.contains\(nextFocusNode\)/);
+  // A caret moves; it must never extend.
+  assert.match(motions, /if \(visualState\.caret\) \{\n\s+selection\.modify\("move"/);
+});
+
+test("the caret mode keys are mirrored into the Tauri preload", () => {
+  const tauri = fs.readFileSync(
+    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8");
+  for (const marker of ["function enterCaret()", "function selectFromCaret()",
+    'key === "v" && visualState.caret', '"}": ["forward", "paragraph"]']) {
+    assert.ok(tauri.includes(marker), `Tauri preload is missing ${marker}`);
+  }
+  // That engine has no caret reporting, so the mirror must not call into it.
+  assert.doesNotMatch(tauri, /reportCaret\(\)/);
+});
+
 test("the terminal caret follows the focused field for IME composition", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /function moveTerminalCaret\(point\)/);
