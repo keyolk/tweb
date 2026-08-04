@@ -118,7 +118,7 @@ Electron과 Tauri 모두 열린 tab URL, active tab, tab별 zoom을 tmux window 
 
 `Ctrl-;`로 다음 두 mode를 전환합니다.
 
-- **Shortcuts ON**: 입력 요소에 focus가 없을 때 Vimium-style normal mode와 TWeb browser shortcut이 동작합니다. 입력 중에는 normal-mode 키를 가로채지 않으며 `Esc`로 focus를 해제할 수 있습니다. 검색창 자동완성처럼 focus를 잃어도 남아 있는 panel은 `Esc`를 한 번 더 눌러 닫습니다. TWeb이 `Esc`를 소비해 페이지가 받지 못하므로, 비어 있는 지점을 대신 click해 사이트의 outside-click 처리를 그대로 사용합니다.
+- **Shortcuts ON**: 입력 요소에 focus가 없을 때 Vimium-style normal mode와 TWeb browser shortcut이 동작합니다. 입력 중에는 normal-mode 키를 가로채지 않으며 `Esc`로 focus를 해제할 수 있습니다. 이때 `Esc`는 engine이 만든 실제 key event로 페이지에 먼저 전달되므로 검색창 자동완성 같은 panel이 함께 닫히고, 페이지가 처리한 뒤에 focus가 해제됩니다. Shortcuts mode의 다른 키는 페이지에 synthetic event로 전달되며, `isTrusted`를 확인하는 사이트는 이를 무시할 수 있습니다.
 - **Web passthrough ON**: TWeb shortcut을 모두 끄고, 현재 TWeb pane을 보고 있는 tmux client만 client-local `tweb-pass` table로 전환합니다. tmux prefix/root binding을 우회하고 키·modifier·mouse를 page에 전달합니다. 다른 tmux client와 일반 pane의 key table은 바뀌지 않습니다.
 
 Web passthrough 상태에서도 `Ctrl-;`만 escape hatch로 사용해 Shortcuts mode로 돌아옵니다. `Ctrl-C`도 웹에 전달되므로 TWeb을 종료하려면 먼저 `Ctrl-;`로 Shortcuts mode에 돌아온 뒤 `Ctrl-C`를 누릅니다. TWeb pane을 떠나거나 프로세스가 종료되면 해당 client의 이전 tmux key table을 복원합니다.

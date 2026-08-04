@@ -1182,6 +1182,11 @@ function handleNativeShortcut(tab, action, value) {
     case "paste":
       contents.paste();
       break;
+    // In shortcuts mode keys reach the page as synthetic events, which sites
+    // that gate on isTrusted ignore. A page-level Escape has to be real.
+    case "native-escape":
+      dispatchNativeKey(contents, "Escape", "", [], 1);
+      break;
     case "native-hover":
       if ([value?.x, value?.y].every(Number.isFinite)) {
         const { x, y } = pageToWindowPoint(contents, value);

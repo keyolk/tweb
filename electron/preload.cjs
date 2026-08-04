@@ -15,6 +15,8 @@ const { ipcRenderer } = require("electron");
   let insertMode = false;
   let mediaHoverTimer = null;
   let mediaHoverNudge = 0;
+  let passThroughEscape = false;
+  let passThroughEscapeTimer = null;
   let pendingG = false;
   let pendingGTimer = null;
   let pendingZ = false;
@@ -726,30 +728,25 @@ const { ipcRenderer } = require("electron");
     });
   }
 
-  // Autocomplete panels and popovers close on an outside click, not on blur, and
-  // TWeb swallows the Escape that would otherwise reach the page. So a second
-  // Escape clicks a spot with nothing interactive under it — the same gesture a
-  // mouse user makes to dismiss them.
-  function outsideClickPoint() {
-    const inset = 6;
-    const columns = [inset, Math.round(innerWidth / 2), innerWidth - inset];
-    const rows = [innerHeight - inset, Math.round(innerHeight / 2), inset];
-    for (const y of rows) {
-      for (const x of columns) {
-        const element = document.elementFromPoint(x, y);
-        if (!element || element.id?.startsWith("__tweb_")) continue;
-        if (isEditable(element) || clickableAncestor(element)) continue;
-        return { x, y };
-      }
-    }
-    return null;
-  }
-
+  // Suggestion panels and popovers close on Escape, but in shortcuts mode every
+  // key reaches the page as a synthetic event, and sites like Google ignore
+  // untrusted input. Ask the main process for a real Escape instead. Clicking an
+  // inert spot was the other option, but pages built on delegated handlers
+  // (jsaction and friends) have no inert spot to click.
+  // Focus must still be on the field when the page sees Escape — that is the
+  // state a suggestion panel closes from — so the blur happens afterwards.
   function dismissPageOverlay() {
-    const point = outsideClickPoint();
-    if (!point) return false;
-    activeElement()?.blur?.();
-    send("native-click", topViewportPoint(point));
+    passThroughEscape = true;
+    clearTimeout(passThroughEscapeTimer);
+    // If the engine never delivers the key — an engine without a native-escape
+    // handler, or a dropped event — still release focus so Escape is not a no-op.
+    passThroughEscapeTimer = setTimeout(() => {
+      if (!passThroughEscape) return;
+      passThroughEscape = false;
+      activeElement()?.blur?.();
+      normalMode();
+    }, 500);
+    send("native-escape");
     return true;
   }
 
@@ -1670,6 +1667,18 @@ const { ipcRenderer } = require("electron");
     if (!shortcutsEnabled || !shortcutFrame) return;
     const key = physicalKey(event);
 
+    // The Escape we asked the main process to deliver belongs to the page. Let
+    // it run, then take focus back so the next key is a TWeb command again.
+    if (key === "Escape" && passThroughEscape) {
+      passThroughEscape = false;
+      clearTimeout(passThroughEscapeTimer);
+      setTimeout(() => {
+        activeElement()?.blur?.();
+        normalMode();
+      }, 0);
+      return;
+    }
+
     // Escape is handled before defaultPrevented/isComposing/editable checks so one
     // physical press always cancels the current TWeb mode.
     if (key === "Escape" && hasTransientMode()) {
@@ -1710,8 +1719,9 @@ const { ipcRenderer } = require("electron");
       if (key === "Escape") {
         event.preventDefault();
         event.stopImmediatePropagation();
-        document.activeElement?.blur();
-        normalMode();
+        // Hand the page a real Escape first: a suggestion panel closes from the
+        // focused field, and blurring first would make the key meaningless.
+        dismissPageOverlay();
       } else {
         setMode("insert");
       }

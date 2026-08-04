@@ -43,11 +43,18 @@ function assertPreload(source) {
   assert.match(source, /if \(key === "Escape" && document\.fullscreenElement\)/);
   assert.match(source, /!editable && !insertMode/);
 
-  // Blur alone leaves a site's suggestion panel up, so a normal-mode Escape
-  // clicks somewhere inert to trigger the page's own outside-click dismissal.
+  // In shortcuts mode the page only ever sees synthetic keys, which sites that
+  // gate on isTrusted ignore, so dismissing a panel needs a real Escape from the
+  // engine — delivered while the field still has focus, blurring only after.
   assert.match(source, /case "Escape": handled = dismissPageOverlay\(\); break;/);
-  assert.match(source, /function outsideClickPoint\(\)/);
-  assert.match(source, /if \(isEditable\(element\) \|\| clickableAncestor\(element\)\) continue;/);
+  assert.match(source, /function dismissPageOverlay\(\)/);
+  assert.match(source, /send\("native-escape"\)/);
+  assert.match(source, /if \(key === "Escape" && passThroughEscape\)/);
+  assert.doesNotMatch(source, /outsideClickPoint/);
+  const dismiss = source.slice(source.indexOf("function dismissPageOverlay()"),
+    source.indexOf("function startHints(newTab)"));
+  assert.doesNotMatch(dismiss, /blur\(\)[\s\S]*send\("native-escape"\)/,
+    "blurring before the page sees Escape makes the key meaningless");
 }
 
 test("Electron preload maps Korean normal keys and uses trusted hint clicks", () => {
