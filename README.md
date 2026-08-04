@@ -123,7 +123,7 @@ Electron과 Tauri 모두 열린 tab URL, active tab, tab별 zoom을 tmux window 
 
 Web passthrough 상태에서도 `Ctrl-;`만 escape hatch로 사용해 Shortcuts mode로 돌아옵니다. `Ctrl-C`도 웹에 전달되므로 TWeb을 종료하려면 먼저 `Ctrl-;`로 Shortcuts mode에 돌아온 뒤 `Ctrl-C`를 누릅니다. TWeb pane을 떠나거나 프로세스가 종료되면 해당 client의 이전 tmux key table을 복원합니다.
 
-`Ctrl-;`는 tmux key table까지 바꾸므로 web app에 오래 머무를 때 적합합니다. 페이지 자체 단축키(피드의 `j`/`k`, player의 `f`)를 잠깐 쓰려면 normal mode에서 `i`로 **insert mode**에 들어갑니다. TWeb은 `Esc`만 남기고 나머지 키를 모두 페이지에 넘기며, 한글 키도 command 문자로 변환하지 않습니다. `Esc`로 즉시 normal mode로 돌아오고 tmux 설정은 건드리지 않습니다.
+`Ctrl-;`는 tmux key table까지 바꾸므로 web app에 오래 머무를 때 적합합니다. 페이지 자체 단축키(피드의 `j`/`k`, player의 `m`)를 잠깐 쓰려면 normal mode에서 `i`로 **insert mode**에 들어갑니다. `Esc`를 제외한 모든 키가 engine이 만든 실제 key event로 페이지에 전달되므로 `isTrusted`를 확인하는 사이트의 단축키도 동작하고, 한글 키도 command 문자로 변환하지 않습니다. `Esc`로 즉시 normal mode로 돌아오며 tmux 설정은 건드리지 않습니다.
 
 macOS 또는 Ghostty 자체가 PTY보다 먼저 소비하는 application shortcut은 웹에 전달할 수 없습니다. 예를 들어 기본 `Cmd-T`, `Cmd-W`, `Cmd-+`는 Ghostty 동작이 우선합니다. 반면 terminal에 도달하는 일반 키, Ctrl/Alt/Shift 조합, navigation key와 mouse event는 passthrough 대상입니다.
 

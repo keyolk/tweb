@@ -54,6 +54,8 @@ let windowSessionPath = null;
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let agentServer = null;
+// Mirrors the preload's insert mode so key dispatch knows to go native.
+let pageInsertMode = false;
 // Electron logs an ipcNative error when frame.send races preload setup or navigation.
 // A frame opts in only after its preload has installed all IPC listeners.
 const readyFrameKeysByTab = new WeakMap();
@@ -1019,6 +1021,8 @@ function broadcastShortcutMode() {
 
 function toggleBrowserShortcuts() {
   browserShortcutsEnabled = !browserShortcutsEnabled;
+  // The preload drops insert mode on this signal; keep the mirror in step.
+  pageInsertMode = false;
   broadcastShortcutMode();
   if (!browserShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
   reconcileTmuxPassthrough();
@@ -1039,6 +1043,7 @@ function activateTab(index) {
   activeTabIndex = normalized;
   win = tabs[normalized];
   mouseClicks.reset();
+  pageInsertMode = false;
   // Zoom is shared per origin in Chromium, so a sibling tab on the same host can
   // have moved it. Only the active tab is ever painted, so restoring this tab's
   // own factor on activation is what makes zoom look per-tab.
@@ -1194,6 +1199,9 @@ function handleNativeShortcut(tab, action, value) {
     case "caret":
       moveTerminalCaret(value);
       break;
+    case "insert-mode":
+      pageInsertMode = Boolean(value);
+      break;
     // In shortcuts mode keys reach the page as synthetic events, which sites
     // that gate on isTrusted ignore. A page-level Escape has to be real.
     case "native-escape":
@@ -1233,6 +1241,8 @@ ipcMain.on("tweb-preload-ready", (event) => {
   const tab = BrowserWindow.fromWebContents(event.sender);
   const frame = event.senderFrame;
   if (!tab || !frame || frame.isDestroyed() || frame.detached) return;
+  // A fresh document starts in normal mode, so the mirror has to follow.
+  if (frame === tab.webContents.mainFrame) pageInsertMode = false;
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-enabled", browserShortcutsEnabled);
 });
@@ -2038,7 +2048,11 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
         ? key
         : ""
     : "";
-  if (!browserShortcutsEnabled) {
+  // Passthrough and insert mode both hand the page real keys. Anything routed
+  // through the renderer arrives untrusted, and sites gate their shortcuts on
+  // that. Escape still reaches TWeb: the preload's capture listener sees the
+  // native key first and leaves insert mode.
+  if (!browserShortcutsEnabled || pageInsertMode) {
     dispatchNativeKey(win.webContents, key, text, modifiers, eventKind);
     return;
   }

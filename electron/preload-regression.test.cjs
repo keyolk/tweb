@@ -132,6 +132,18 @@ test("scroll keys can target a picked inner surface", () => {
   assert.doesNotMatch(electron, /case "j": scrollBy\(/);
 });
 
+// A site's own shortcuts (m to mute, j/k on a feed) check isTrusted, so insert
+// mode has to bypass the renderer round-trip that makes keys synthetic.
+test("insert mode delivers native keys to the page", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /if \(!browserShortcutsEnabled \|\| pageInsertMode\) \{/);
+  assert.match(main, /case "insert-mode":/);
+  assert.match(electron, /send\("insert-mode", true\)/);
+  assert.match(electron, /send\("insert-mode", false\)/);
+  // The mirror must reset wherever the preload's own flag would.
+  assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) pageInsertMode = false;/);
+});
+
 test("agent socket refuses a path longer than sun_path", () => {
   const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
   assert.match(server, /Buffer\.byteLength\(target\) > 100/);

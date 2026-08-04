@@ -1788,12 +1788,17 @@ const { ipcRenderer } = require("electron");
   function enterInsertMode() {
     insertMode = true;
     cancelTransient(false);
+    // Tell the main process to deliver keys natively. A page's own shortcuts
+    // (m to mute, j/k on a feed) ignore synthetic events, so routing them
+    // through the renderer would make insert mode look like it does nothing.
+    send("insert-mode", true);
     setMode("insert", "Esc");
   }
 
   function leaveInsertMode() {
     if (!insertMode) return;
     insertMode = false;
+    send("insert-mode", false);
     normalMode();
   }
 
