@@ -116,6 +116,12 @@ frame들은 버려지고 있습니다. `engine-log`는 그 판단의 근거가 �
 `frame dropped got=… want=…`)을 돌려줍니다. 원래 pane의 stderr로만 나가던 것이라, 예전에는 관찰하려면
 별도 harness로 pane을 다시 띄워야 했습니다.
 
+`diag`의 `page`는 shortcut runtime 자신의 상태입니다 — 현재 mode와 detail, 열려 있는 picker의 종류·후보
+수·입력 중인 label, visual/caret 상태, 잡혀 있는 scroll surface(어느 frame인지 포함), 그리고 `f`/`s`/`v`가
+지금 찾아낼 대상 수입니다. preload는 isolated world에서 돌아 `eval`로 볼 수 없으므로 이 경로가 유일한
+창구입니다. 예를 들어 `targets.frames`가 1인데 `visual`이 0이면, frame은 인식했지만 그 안에서 고를 것이
+없다는 뜻입니다.
+
 `snapshot`은 role·accessible name·value·CSS selector·화면 좌표를 함께 돌려주므로 agent가 확인한
 요소를 그대로 test code의 selector로 옮길 수 있습니다. `console`/`errors`는 page가 시작될 때부터
 누적된 buffer를 읽으므로, 문제가 발생한 뒤에 물어봐도 늦지 않습니다.

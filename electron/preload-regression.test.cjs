@@ -236,6 +236,26 @@ test("c reaches a caret from a target that carries no text", () => {
   assert.match(electron, /smart && !item\.caret && item\.kind === "link"/);
 });
 
+// The shortcut runtime lives in an isolated world, so an agent could not see the
+// mode it was in, what a picker was showing, or what the collectors would find.
+test("the shortcut runtime reports its own state to an agent", () => {
+  assert.match(electron, /case "page-diag":/);
+  const diag = electron.slice(electron.indexOf('case "page-diag":'),
+    electron.indexOf("const shortcutHelpSections"));
+  for (const field of ["mode", "picker", "visual", "scrollSurface", "activeElement", "targets"]) {
+    assert.ok(diag.includes(`${field}:`), `page-diag omits ${field}`);
+  }
+  // Counting what the collectors find is the point: a frame that contributes
+  // nothing shows up as zero here rather than as an empty screen.
+  assert.match(diag, /scrollable: scrollableTargets\(\)\.length/);
+  assert.match(diag, /visual: visualTargets\(\)\.length/);
+
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // A page that cannot answer must not fail the whole diagnostic.
+  assert.match(main, /page = await agentPageRequest\("page-diag"/);
+  assert.match(main, /page = \{ error: String\(error\?\.message \|\| error\) \};/);
+});
+
 // Picking a scroll surface used to be a one-way door: the surface was dropped the
 // moment it was used, and there was no candidate standing for the page.
 test("a picked scroll surface survives use and can be left", () => {

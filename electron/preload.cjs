@@ -1280,6 +1280,33 @@ const { ipcRenderer } = require("electron");
         readyState: document.readyState,
         viewport: { width: innerWidth, height: innerHeight, scrollX: Math.round(scrollX), scrollY: Math.round(scrollY) },
       };
+      // The shortcut runtime lives in an isolated world, so none of this is
+      // reachable through `eval` — which left the mode an agent could not see and
+      // a hint count it could only infer from the overlay.
+      case "page-diag": {
+        const surface = scrollSurface();
+        const active = activeElement();
+        return {
+          mode: document.documentElement?.dataset.twebMode || null,
+          detail: document.documentElement?.dataset.twebModeDetail || "",
+          shortcutsEnabled,
+          insertMode,
+          picker: pickerState ? { mode: pickerState.mode, items: pickerState.items.length, typed: pickerState.typed } : null,
+          visual: visualState ? { kind: visualState.kind, caret: Boolean(visualState.caret) } : null,
+          scrollSurface: surface
+            ? { tag: surface.localName, id: ownId(surface) || null, inFrame: surface.ownerDocument !== document,
+                scrollTop: Math.round(surface.scrollTop) }
+            : null,
+          activeElement: active ? { tag: active.localName, id: ownId(active) || null, editable: isEditable(active) } : null,
+          // What `f`, `s` and `v` would find right now, frames included.
+          targets: {
+            roots: collectRoots().length,
+            frames: collectRoots().filter((root) => root.nodeType === Node.DOCUMENT_NODE).length - 1,
+            scrollable: scrollableTargets().length,
+            visual: visualTargets().length,
+          },
+        };
+      }
       default: throw new Error(`unknown agent method ${JSON.stringify(request.method)}`);
     }
   }

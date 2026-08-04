@@ -1616,8 +1616,18 @@ async function handleAgentCommand(method, params) {
     case "info":
     case "query":
       return agentPageRequest(method, params);
-    case "diag":
-      return agentDiagnostics();
+    case "diag": {
+      const engine = agentDiagnostics();
+      // The shortcut runtime's own state is only reachable through the preload.
+      // A page that cannot answer is worth reporting, not worth failing over.
+      let page = null;
+      try {
+        page = await agentPageRequest("page-diag", {}, 3000);
+      } catch (error) {
+        page = { error: String(error?.message || error) };
+      }
+      return { ...engine, page };
+    }
     case "engine-log": {
       const limit = Number.isInteger(params?.limit) ? Math.max(1, Math.min(400, params.limit)) : 60;
       return { lines: engineLog.slice(-limit) };
