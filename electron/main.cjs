@@ -597,6 +597,10 @@ function terminalCleanup() {
     // image delete만 수행.
     writeGfx(`a=d,d=I,i=${imageId}`, "");
   } catch (e) {}
+  // caret parking이 cursor shape를 bar로 바꿔 두므로 terminal 기본값으로 돌려준다.
+  try {
+    writeSync(1, CSI("0 q"));
+  } catch (e) {}
 }
 
 // --- frame 전송 ---
@@ -1159,6 +1163,9 @@ function activateTab(index) {
   win = tabs[normalized];
   mouseClicks.reset();
   pageInsertMode = false;
+  // The other tab's caret says nothing about this one, and its preload only
+  // reports on focus — which switching tabs does not fire.
+  moveTerminalCaret(null);
   // Zoom is shared per origin in Chromium, so a sibling tab on the same host can
   // have moved it. Only the active tab is ever painted, so restoring this tab's
   // own factor on activation is what makes zoom look per-tab.
@@ -1566,6 +1573,9 @@ function agentDiagnostics() {
       pageInsertMode,
       terminalVisible,
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
+      // Where IME preedit will land. Comparing cell against point is the only way
+      // to tell "caret parked on the wrong line" from "page never reported one".
+      caret: { cell: caretCell, point: lastCaretPoint },
     },
     tabs: { active: activeTabIndex, count: tabs.length },
   };
@@ -1742,28 +1752,51 @@ async function handleAgentCommand(method, params) {
 // field. Park the cursor on the cell holding the web caret and show it only
 // while a field is focused.
 let caretCell = null;
+let lastCaretPoint = null;
+// A block cursor covers the cell it sits on, so the parked cursor hid the page's
+// own caret and the character next to it. Ask for a steady bar (DECSCUSR 6): it
+// draws on the cell's left edge, which is where a text caret belongs anyway.
+const CARET_BAR = CSI("6 q");
+const CARET_SHAPE_RESET = CSI("0 q");
+// Where a fixed-width font puts its baseline inside the cell. The terminal paints
+// preedit on that baseline, so the row has to be picked by baseline — matching
+// cell *centres* floated a composing syllable a row above tall page text.
+const CARET_BASELINE = 0.78;
+
+function unparkTerminalCaret() {
+  caretCell = null;
+  lastCaretPoint = null;
+  try { writeSync(1, `${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
+}
+
+// The page reports the caret in CSS pixels and dedupes on them, so a zoom step or
+// a pane resize moves the cell under a caret that never "moved" — and the report
+// that would correct it never comes. Recompute from the last one instead.
+function reparkTerminalCaret() {
+  if (lastCaretPoint) moveTerminalCaret(lastCaretPoint);
+}
 
 function moveTerminalCaret(point) {
   const vp = lastViewport;
   if (!point || !vp || !win || win.isDestroyed()) {
-    if (caretCell) {
-      caretCell = null;
-      try { writeSync(1, CSI("?25l")); } catch (error) { void error; }
-    }
+    if (caretCell) unparkTerminalCaret();
     return;
   }
   const logical = logicalContentSize(vp);
   const zoom = win.webContents.getZoomFactor() || 1;
   const cellWidth = logical.width / Math.max(1, paneCells.cols);
   const cellHeight = logical.height / Math.max(1, paneCells.rows);
-  const col = Math.min(paneCells.cols, Math.max(1, Math.floor(point.x * zoom / cellWidth) + 1));
-  // Aim at the caret's baseline cell rather than its top edge.
-  const bottom = (point.y + (point.height || 0) * 0.5) * zoom;
-  const row = Math.min(paneCells.rows, Math.max(1, Math.floor(bottom / cellHeight) + 1));
+  // Nearest cell edge, not the containing cell: a bar on the left edge is off by
+  // at most half a cell that way instead of a whole one.
+  const col = Math.min(paneCells.cols, Math.max(1, Math.round(point.x * zoom / cellWidth) + 1));
+  const baseline = (point.y + (point.height || 0) * CARET_BASELINE) * zoom;
+  const row = Math.min(paneCells.rows,
+    Math.max(1, Math.round(baseline / cellHeight - CARET_BASELINE) + 1));
+  lastCaretPoint = { x: point.x, y: point.y, height: point.height || 0 };
   if (caretCell && caretCell.row === row && caretCell.col === col) return;
   caretCell = { row, col };
   try {
-    writeSync(1, `${CSI(`${row};${col}H`)}${CSI("?25h")}`);
+    writeSync(1, `${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
   } catch (error) {
     void error;
   }
@@ -1978,6 +2011,8 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
     contents.setZoomFactor(zoomFactor);
     contents.invalidate();
+    // Autofocused fields report their caret before this zoom lands.
+    if (tab === win) reparkTerminalCaret();
     if (!initialZoomApplied) {
       initialZoomApplied = true;
       if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
@@ -2137,6 +2172,7 @@ function applyViewport(vp, origin = tmuxOrigin) {
   }
   win?.webContents.invalidate();
   if (terminalVisible) replacePlacement();
+  reparkTerminalCaret();
 }
 
 function createWindow(url) {
@@ -2211,6 +2247,7 @@ function setBrowserZoom(action) {
   tabZoomFactors.set(win, next);
   contents.setZoomFactor(next);
   contents.invalidate();
+  reparkTerminalCaret();
   scheduleWindowSessionSave();
   if (debugLogging) console.error(`tweb: zoom ${next.toFixed(3)}`);
 }

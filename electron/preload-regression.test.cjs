@@ -392,8 +392,24 @@ test("the terminal caret follows the focused field for IME composition", () => {
   // preedit and the cursor in the same layer, and z >= 0 hides both.
   assert.match(main, /const imageZ = Number\.isSafeInteger\(configuredImageZ\) \? configuredImageZ : -1;/);
   assert.match(main, /imageZ === 0 \? "" : `,z=\$\{imageZ\}`/);
-  // No caret to follow means no cursor on top of the page.
-  assert.match(main, /caretCell = null;\n\s+try \{ writeSync\(1, CSI\("\?25l"\)\);/);
+  // No caret to follow means no cursor on top of the page, and the shape we
+  // borrowed goes back — otherwise the shell inherits a bar cursor.
+  assert.match(main, /function unparkTerminalCaret\(\)[\s\S]*?CSI\("\?25l"\)\}\$\{CARET_SHAPE_RESET\}/);
+  assert.match(main, /function terminalCleanup\(\)[\s\S]*?writeSync\(1, CSI\("0 q"\)\)/);
+  // A block cursor sits on the character and hides the page's own caret.
+  assert.match(main, /const CARET_BAR = CSI\("6 q"\);/);
+  assert.match(main, /\$\{CARET_BAR\}/);
+  // Preedit is painted on the cell's text baseline, so the row is chosen by
+  // baseline; picking the cell that contains the caret's centre put a composing
+  // syllable a line above page text taller than one cell.
+  assert.match(main, /Math\.round\(baseline \/ cellHeight - CARET_BASELINE\) \+ 1/);
+  assert.match(main, /Math\.round\(point\.x \* zoom \/ cellWidth\) \+ 1/);
+  // The report is deduped on CSS pixels, so zoom and resize have to re-derive the
+  // cell themselves — measured 3 rows / 2 columns of drift without this.
+  assert.match(main, /function reparkTerminalCaret\(\)/);
+  assert.match(main, /if \(terminalVisible\) replacePlacement\(\);\n\s+reparkTerminalCaret\(\);/);
+  const zoomStep = main.slice(main.indexOf("function setBrowserZoom(action)"));
+  assert.match(zoomStep.slice(0, zoomStep.indexOf("\n}")), /reparkTerminalCaret\(\);/);
   assert.match(electron, /function caretPoint\(\)/);
   assert.match(electron, /send\("caret",/);
 });
