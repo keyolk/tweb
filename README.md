@@ -125,6 +125,8 @@ Web passthrough 상태에서도 `Ctrl-;`만 escape hatch로 사용해 Shortcuts 
 
 `Ctrl-;`는 tmux key table까지 바꾸므로 web app에 오래 머무를 때 적합합니다. 페이지 자체 단축키(피드의 `j`/`k`, player의 `m`)를 잠깐 쓰려면 normal mode에서 `i`로 **insert mode**에 들어갑니다. `Esc`를 제외한 모든 키가 engine이 만든 실제 key event로 페이지에 전달되므로 `isTrusted`를 확인하는 사이트의 단축키도 동작하고, 한글 키도 command 문자로 변환하지 않습니다. `Esc`로 즉시 normal mode로 돌아오며 tmux 설정은 건드리지 않습니다.
 
+focus가 cross-origin iframe(광고·embed)에 들어가면 그 frame의 preload는 shortcut을 처리하지 않습니다. TWeb은 shortcut을 처리할 수 있는 frame을 추적해 그런 경우 main frame으로 키를 보내므로, iframe을 클릭한 뒤에도 `?`나 `f`가 계속 동작합니다.
+
 macOS 또는 Ghostty 자체가 PTY보다 먼저 소비하는 application shortcut은 웹에 전달할 수 없습니다. 예를 들어 기본 `Cmd-T`, `Cmd-W`, `Cmd-+`는 Ghostty 동작이 우선합니다. 반면 terminal에 도달하는 일반 키, Ctrl/Alt/Shift 조합, navigation key와 mouse event는 passthrough 대상입니다.
 
 ### Mode indicator

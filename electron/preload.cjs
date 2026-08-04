@@ -2085,5 +2085,8 @@ const { ipcRenderer } = require("electron");
 
   // Register only after every listener above is installed. Main then targets
   // this frame for IPC broadcasts without racing preload initialization.
-  ipcRenderer.send("tweb-preload-ready");
+  // Report whether this frame can run TWeb shortcuts. A cross-origin subframe
+  // cannot, and main needs to know so it does not hand keys to a frame that
+  // will silently drop them.
+  ipcRenderer.send("tweb-preload-ready", { shortcutFrame });
 }

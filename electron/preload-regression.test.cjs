@@ -144,6 +144,15 @@ test("insert mode delivers native keys to the page", () => {
   assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) pageInsertMode = false;/);
 });
 
+// Clicking an ad or embed moves focus into a cross-origin subframe whose preload
+// ignores shortcuts; without a fall-back every key silently disappears.
+test("shortcut keys fall back to a frame that can handle them", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /function shortcutFrameKeys\(tab\)/);
+  assert.match(main, /if \(frame && !shortcutFrameKeys\(tab\)\.has\(frameKey\(frame\)\)\) frame = contents\.mainFrame;/);
+  assert.match(electron, /ipcRenderer\.send\("tweb-preload-ready", \{ shortcutFrame \}\)/);
+});
+
 test("agent socket refuses a path longer than sun_path", () => {
   const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
   assert.match(server, /Buffer\.byteLength\(target\) > 100/);

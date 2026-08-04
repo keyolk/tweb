@@ -978,6 +978,19 @@ function readyFrameKeys(tab) {
   return keys;
 }
 
+// Frames whose preload actually handles shortcuts. Cross-origin subframes load
+// the preload but bail out of every handler, so keys sent there disappear.
+const shortcutFrameKeysByTab = new WeakMap();
+
+function shortcutFrameKeys(tab) {
+  let keys = shortcutFrameKeysByTab.get(tab);
+  if (!keys) {
+    keys = new Set();
+    shortcutFrameKeysByTab.set(tab, keys);
+  }
+  return keys;
+}
+
 function sendToTabFrames(tab, channel, ...args) {
   if (!tab || tab.isDestroyed()) return;
   const readyKeys = readyFrameKeys(tab);
@@ -1004,10 +1017,19 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
   try {
     const contents = tab.webContents;
     const focused = contents.focusedFrame;
-    const frame = focused && !focused.isDestroyed() && !focused.detached
+    let frame = focused && !focused.isDestroyed() && !focused.detached
       ? focused
       : contents.mainFrame;
-    if (frame && readyFrameKeys(tab).has(frameKey(frame))) frame.send(channel, ...args);
+    // Clicking an ad or embed moves focus into a cross-origin subframe, whose
+    // preload ignores every shortcut. Without this fall-back the keys would
+    // simply stop working until focus happened to return to the main frame.
+    if (frame && !shortcutFrameKeys(tab).has(frameKey(frame))) frame = contents.mainFrame;
+    const deliverable = frame && readyFrameKeys(tab).has(frameKey(frame));
+    if (process.env.TWEB_DEBUG && !deliverable) {
+      console.error(`tweb: dropped ${channel}; shortcut frames=${shortcutFrameKeys(tab).size}`
+        + ` ready=${readyFrameKeys(tab).size}`);
+    }
+    if (deliverable) frame.send(channel, ...args);
   } catch (error) {
     if (process.env.TWEB_DEBUG) console.error(`tweb: focused frame send failed: ${error.message}`);
   }
@@ -1237,12 +1259,15 @@ function handleNativeShortcut(tab, action, value) {
   }
 }
 
-ipcMain.on("tweb-preload-ready", (event) => {
+ipcMain.on("tweb-preload-ready", (event, info) => {
   const tab = BrowserWindow.fromWebContents(event.sender);
   const frame = event.senderFrame;
   if (!tab || !frame || frame.isDestroyed() || frame.detached) return;
   // A fresh document starts in normal mode, so the mirror has to follow.
   if (frame === tab.webContents.mainFrame) pageInsertMode = false;
+  const key = frameKey(frame);
+  if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
+  else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-enabled", browserShortcutsEnabled);
 });
