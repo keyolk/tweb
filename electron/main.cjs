@@ -621,6 +621,14 @@ function markInteractionActivity() {
   if (frameIdleTimer) clearTimeout(frameIdleTimer);
   frameIdleTimer = setTimeout(() => {
     frameIdleTimer = null;
+    // Dropping the rate while a page is still loading stops offscreen painting
+    // almost entirely: measured on google.com, the page committed at 1.4s and the
+    // next frame did not go out until 5.4s. Stay at the active rate until the load
+    // settles — that is precisely when the screen is changing anyway.
+    if (win && !win.isDestroyed() && win.webContents.isLoading()) {
+      markInteractionActivity();
+      return;
+    }
     applyActiveFrameRate(idleFrameRate);
   }, 700);
 }
@@ -628,6 +636,7 @@ function markInteractionActivity() {
 // A placement the next frame will not fully cover has to be deleted, but the
 // delete is paired with the replacement so the pane is never left bare: on its
 // own it would bare the terminal for as long as the frame takes to arrive.
+let framesSentCount = 0;
 let pendingImageDelete = false;
 // The terminal holds the last image we transferred under `imageId`, which lets a
 // resize re-place it without sending the pixels again.
@@ -658,6 +667,10 @@ function transferFrame(png, generation) {
   const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(png, header, generation);
+  // Only the first few: enough to see when a page actually reached the pane, which
+  // is what separates "the engine is behind" from "the site is slow", and quiet
+  // after that.
+  if (framesSentCount < 12) console.error(`tweb: frame sent #${++framesSentCount}`);
   lastFrameSentAt = Date.now();
 }
 
