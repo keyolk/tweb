@@ -31,8 +31,11 @@ pub struct WindowGeometry {
 /// 현재 pane geometry를 조회한다. tmux 안에서는 크기와 origin을 한 번에 읽어
 /// resize 중 값의 race를 피하고, PTY 크기가 그대로인 pane 이동도 감지한다.
 pub fn window_geometry() -> Option<WindowGeometry> {
-    if let Some(geometry) = query_tmux_window_geometry() {
-        return Some(geometry);
+    let tmux = query_tmux_window_geometry();
+    if let Some(geometry) = tmux {
+        if geometry.size.width > 0 && geometry.size.height > 0 {
+            return Some(geometry);
+        }
     }
 
     let fd = io::stdin().as_raw_fd();
@@ -44,7 +47,9 @@ pub fn window_geometry() -> Option<WindowGeometry> {
         return None;
     }
 
+    let origin = tmux.and_then(|geometry| geometry.origin);
     Some(WindowGeometry {
+        origin,
         size: WindowSize {
             cols: size.ws_col,
             rows: size.ws_row,
@@ -59,7 +64,6 @@ pub fn window_geometry() -> Option<WindowGeometry> {
                 size.ws_row.saturating_mul(16)
             },
         },
-        origin: None,
     })
 }
 
@@ -67,56 +71,97 @@ pub fn window_size() -> Option<WindowSize> {
     window_geometry().map(|geometry| geometry.size)
 }
 
-fn parse_tmux_window_geometry(value: &str) -> Option<WindowGeometry> {
-    let mut fields = value.split_whitespace();
-    let cols = fields.next()?.parse::<u16>().ok()?;
-    let rows = fields.next()?.parse::<u16>().ok()?;
-    let cell_width = fields.next()?.parse::<f64>().ok()?;
-    let cell_height = fields.next()?.parse::<f64>().ok()?;
-    let left = fields.next()?.parse::<u32>().ok()?;
-    let top = fields.next()?.parse::<u32>().ok()?;
-    if fields.next().is_some()
-        || cols == 0
-        || rows == 0
-        || !cell_width.is_finite()
-        || !cell_height.is_finite()
-        || cell_width <= 0.0
-        || cell_height <= 0.0
-    {
+fn tmux_query(pane: &str, format: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, format])
+        .output()
+        .ok()?;
+    if !output.status.success() {
         return None;
     }
-    let width = (f64::from(cols) * cell_width).round();
-    let height = (f64::from(rows) * cell_height).round();
-    if width < 1.0 || height < 1.0 || width > f64::from(u16::MAX) || height > f64::from(u16::MAX) {
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
         return None;
     }
-    Some(WindowGeometry {
-        size: WindowSize {
-            cols,
-            rows,
-            width: width as u16,
-            height: height as u16,
-        },
-        origin: Some((left, top)),
-    })
+    Some(value)
 }
 
-fn query_tmux_window_geometry() -> Option<WindowGeometry> {
-    let pane = std::env::var("TMUX_PANE").ok()?;
+fn tmux_pane_placement(pane: &str) -> Option<(u16, u16, u32, u32)> {
     let output = std::process::Command::new("tmux")
         .args([
-            "display-message",
-            "-p",
-            "-t",
-            &pane,
-            "#{pane_width} #{pane_height} #{client_cell_width} #{client_cell_height} #{pane_left} #{pane_top}",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{pane_width} #{pane_height} #{pane_left} #{pane_top}",
         ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    parse_tmux_window_geometry(&String::from_utf8_lossy(&output.stdout))
+    parse_pane_placement(pane, &String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_pane_placement(pane: &str, listing: &str) -> Option<(u16, u16, u32, u32)> {
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some(pane) {
+            continue;
+        }
+        let cols = fields.next()?.parse::<u16>().ok()?;
+        let rows = fields.next()?.parse::<u16>().ok()?;
+        let left = fields.next()?.parse::<u32>().ok()?;
+        let top = fields.next()?.parse::<u32>().ok()?;
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        return Some((cols, rows, left, top));
+    }
+    None
+}
+
+fn query_tmux_window_geometry() -> Option<WindowGeometry> {
+    let pane = std::env::var("TMUX_PANE").ok()?;
+
+    // `display-message` resolves against a target client and fails outright when
+    // none is attached — which used to cost us the pane origin as well, leaving a
+    // moved pane drawing at its old anchor. `list-panes` needs no client.
+    let (cols, rows, left, top) = tmux_pane_placement(&pane)?;
+
+    let cells = tmux_query(&pane, "#{client_cell_width} #{client_cell_height}");
+    let (width, height) = cells
+        .and_then(|value| pixel_size_from_cells(cols, rows, &value))
+        .unwrap_or((0, 0));
+
+    Some(WindowGeometry {
+        size: WindowSize {
+            cols,
+            rows,
+            width,
+            height,
+        },
+        origin: Some((left, top)),
+    })
+}
+
+fn pixel_size_from_cells(cols: u16, rows: u16, value: &str) -> Option<(u16, u16)> {
+    let mut fields = value.split_whitespace();
+    let cell_width = fields.next()?.parse::<f64>().ok()?;
+    let cell_height = fields.next()?.parse::<f64>().ok()?;
+    let width = (f64::from(cols) * cell_width).round();
+    let height = (f64::from(rows) * cell_height).round();
+    if !cell_width.is_finite()
+        || !cell_height.is_finite()
+        || cell_width <= 0.0
+        || cell_height <= 0.0
+        || width < 1.0
+        || height < 1.0
+        || width > f64::from(u16::MAX)
+        || height > f64::from(u16::MAX)
+    {
+        return None;
+    }
+    Some((width as u16, height as u16))
 }
 
 /// tmux client 기준 pane 좌상단 cell 좌표를 반환한다.
@@ -351,44 +396,31 @@ pub fn query_cell_size() -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tmux_window_geometry, WindowGeometry, WindowSize};
+    use super::{parse_pane_placement, pixel_size_from_cells};
 
+    /// The pane's own row picks out its placement; a sibling's must not.
     #[test]
-    fn parses_fractional_tmux_cell_size_and_origin() {
-        assert_eq!(
-            parse_tmux_window_geometry("145 83 7.5 12 102 4\n"),
-            Some(WindowGeometry {
-                size: WindowSize {
-                    cols: 145,
-                    rows: 83,
-                    width: 1088,
-                    height: 996,
-                },
-                origin: Some((102, 4)),
-            })
-        );
+    fn reads_this_panes_placement_from_the_listing() {
+        let listing = "%0 180 5 0 0\n%1 180 17 0 6\n%2 90 17 181 6\n";
+        assert_eq!(parse_pane_placement("%1", listing), Some((180, 17, 0, 6)));
+        assert_eq!(parse_pane_placement("%2", listing), Some((90, 17, 181, 6)));
+        assert_eq!(parse_pane_placement("%9", listing), None);
     }
 
     #[test]
-    fn parses_integer_tmux_cell_size_and_origin() {
-        assert_eq!(
-            parse_tmux_window_geometry("160 40 6 12 0 42"),
-            Some(WindowGeometry {
-                size: WindowSize {
-                    cols: 160,
-                    rows: 40,
-                    width: 960,
-                    height: 480,
-                },
-                origin: Some((0, 42)),
-            })
-        );
+    fn scales_cells_to_pixels() {
+        assert_eq!(pixel_size_from_cells(145, 83, "7.5 12"), Some((1088, 996)));
+        assert_eq!(pixel_size_from_cells(160, 40, "6 12"), Some((960, 480)));
     }
 
+    /// A detached or pixel-unaware client reports no usable cell size. The pane
+    /// origin must survive that, so the caller falls back to the PTY for pixels
+    /// instead of discarding the whole reading — without the origin a moved pane
+    /// keeps drawing at its old anchor.
     #[test]
-    fn rejects_invalid_tmux_window_geometry() {
-        assert_eq!(parse_tmux_window_geometry("0 40 7.5 12 0 0"), None);
-        assert_eq!(parse_tmux_window_geometry("80 24 nan 12 0 0"), None);
-        assert_eq!(parse_tmux_window_geometry("80 24 7.5 12"), None);
+    fn refuses_unusable_cell_sizes() {
+        for value in ["nan 12", "0 0", "-1 12", "12"] {
+            assert_eq!(pixel_size_from_cells(80, 24, value), None, "{value}");
+        }
     }
 }

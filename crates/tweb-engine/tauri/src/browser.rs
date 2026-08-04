@@ -467,6 +467,15 @@ impl BrowserRuntime {
                 let _ = window.eval("getSelection()?.removeAllRanges()");
             }),
             "copy-text" => copy_text(action.value.as_str().unwrap_or_default()),
+            // The engine tracks the address the tab settled on; a subframe only
+            // knows its own, and a cross-origin one cannot read the top frame's.
+            "copy-url" => {
+                if let Ok(tabs) = self.tabs.lock() {
+                    if let Some(tab) = tabs.values.get(tabs.active) {
+                        copy_text(&tab.url);
+                    }
+                }
+            }
             "copy-image" => {
                 if let Some(rect) = ImageRect::from_value(&action.value) {
                     self.with_active_window(|window| copy_image(window, rect));

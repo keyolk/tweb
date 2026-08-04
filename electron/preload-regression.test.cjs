@@ -18,6 +18,16 @@ function assertPreload(source) {
   assert.match(source, /const rect = visibleRect\(item\.element\) \|\| item\.rect/);
   assert.doesNotMatch(source, /item\.element\.click\(\)/);
 
+  // Sweeping every probe point across every shadow root cost over a second on a
+  // page with a handful of web components. A root only needs the points its
+  // host covers — and it does need its own probe, since elementsFromPoint
+  // retargets at the boundary and would otherwise miss delegated surfaces.
+  const hitTest = source.slice(source.indexOf("function hitTestTargets(semantic)"),
+    source.indexOf("const mediaControlPresentation"));
+  assert.match(hitTest, /const bounds = host instanceof Element \? visibleRect\(host\) : null;/);
+  assert.match(hitTest, /if \(bounds && \(x < bounds\.left \|\| x > bounds\.right/);
+  assert.match(hitTest, /root\.elementsFromPoint\(x, y\)/);
+
   // Hints must land on the controls a site actually draws, so the pointer is
   // parked over the video first and no lookalike overlay is painted.
   assert.match(source, /function mediaHoverPoints\(\)/);
@@ -114,6 +124,21 @@ test("switching tabs replaces the image instead of deleting it", () => {
   assert.doesNotMatch(activateTab, /a=d,d=I/, "activateTab must not clear the image");
 });
 
+// Painting runs on Chromium's frame clock, so an overlay drawn just after the
+// clock dropped to its idle rate would sit invisible for up to a full interval.
+test("overlays ask for a paint instead of waiting for the frame clock", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "repaint":/);
+  assert.match(main, /const wasIdle = activeFrameRate !== maxActiveFrameRate;/);
+  assert.match(main, /if \(wasIdle && win && !win\.isDestroyed\(\) && terminalVisible\) win\.webContents\.invalidate\(\);/);
+  assert.match(electron, /function paintNow\(\)/);
+  // Every overlay mount must request it; the mode indicator rides along instead.
+  const mounts = electron.match(/document\.documentElement\.append\(host\);/g) || [];
+  const requests = electron.match(/^ +paintNow\(\);$/gm) || [];
+  assert.equal(requests.length, mounts.length - 1,
+    "each overlay except the mode indicator should request a paint");
+});
+
 // Same hazard as the tab switch: a delete with no frame behind it shows the
 // terminal. Only a moved pane leaves a placement the next frame cannot cover.
 test("a pure resize replaces the image instead of deleting it", () => {
@@ -134,6 +159,11 @@ test("the terminal caret follows the focused field for IME composition", () => {
 
 test("scroll keys can target a picked inner surface", () => {
   assert.match(electron, /function scrollableTargets\(\)/);
+  // An app shell's scroller fills the viewport and often shares a corner with
+  // the scroller nested in it; the hint filter would discard both.
+  const scrollable = electron.slice(electron.indexOf("function scrollableTargets()"),
+    electron.indexOf("function scrollSurface()"));
+  assert.doesNotMatch(scrollable, /uniqueVisibleTargets\(/);
   assert.match(electron, /case "s": startScrollPicker\(\); break;/);
   for (const key of ["h", "j", "k", "l"]) {
     assert.match(electron, new RegExp(`case "${key}": scrollSurfaceBy\\(`),

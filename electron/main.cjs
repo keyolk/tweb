@@ -57,6 +57,9 @@ let hiddenWindowWatchdog = null;
 let agentServer = null;
 // Mirrors the preload's insert mode so key dispatch knows to go native.
 let pageInsertMode = false;
+// Set while a close came from the tab list, so the list can be redrawn once the
+// tab has actually left `tabs`.
+let refreshTabListAfterClose = false;
 // Electron logs an ipcNative error when frame.send races preload setup or navigation.
 // A frame opts in only after its preload has installed all IPC listeners.
 const readyFrameKeysByTab = new WeakMap();
@@ -583,7 +586,12 @@ function applyActiveFrameRate(rate) {
 
 function markInteractionActivity() {
   if (!adaptiveFrameRate) return;
+  // Raising the rate only affects future paints, so coming out of the idle rate
+  // would otherwise leave the last idle frame on screen for a whole interval —
+  // a quarter second of "nothing happened" after a keypress.
+  const wasIdle = activeFrameRate !== maxActiveFrameRate;
   applyActiveFrameRate(maxActiveFrameRate);
+  if (wasIdle && win && !win.isDestroyed() && terminalVisible) win.webContents.invalidate();
   if (frameIdleTimer) clearTimeout(frameIdleTimer);
   frameIdleTimer = setTimeout(() => {
     frameIdleTimer = null;
@@ -622,7 +630,13 @@ function queueFrame(tab, image, immediate = false) {
   const viewport = lastViewport;
   const size = image?.getSize();
   const expected = viewport && renderedFrameSize(viewport);
-  if (!expected || !size || size.width !== expected.width || size.height !== expected.height) return;
+  if (!expected || !size || size.width !== expected.width || size.height !== expected.height) {
+    if (process.env.TWEB_DEBUG) {
+      console.error(`tweb: frame dropped got=${size?.width}x${size?.height}`
+        + ` want=${expected?.width}x${expected?.height}`);
+    }
+    return;
+  }
   tabFrames.set(tab, { image, generation });
   if (tab !== win || !terminalVisible) return;
   pendingFrame = { tab, image, generation };
@@ -1222,6 +1236,17 @@ function omniboxModel() {
   };
 }
 
+function tabListModel() {
+  return {
+    activeIndex: activeTabIndex,
+    tabs: tabs.map((candidate, index) => ({
+      index,
+      title: candidate.webContents.getTitle() || "새 탭",
+      url: candidate.webContents.getURL() || "about:blank",
+    })),
+  };
+}
+
 function handleNativeShortcut(tab, action, value) {
   if (!browserShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
   if (process.env.TWEB_DEBUG) console.error(`tweb: native shortcut ${action}`);
@@ -1236,14 +1261,7 @@ function handleNativeShortcut(tab, action, value) {
     case "previous-tab": cycleTab(-1); break;
     case "next-tab": cycleTab(1); break;
     case "list-tabs":
-      sendToTabFrames(tab, "tweb-tabs", {
-        activeIndex: activeTabIndex,
-        tabs: tabs.map((candidate, index) => ({
-          index,
-          title: candidate.webContents.getTitle() || "새 탭",
-          url: candidate.webContents.getURL() || "about:blank",
-        })),
-      });
+      sendToTabFrames(tab, "tweb-tabs", tabListModel());
       break;
     case "omnibox-model":
       sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
@@ -1251,7 +1269,13 @@ function handleNativeShortcut(tab, action, value) {
     case "activate-tab":
       if (Number.isInteger(value) && value >= 0 && value < tabs.length) activateTab(value);
       break;
-    case "close-tab": closeTab(); break;
+    // The tab list closes a specific row; the bare shortcut closes the active tab.
+    case "close-tab":
+      // Closing from the list keeps it open, so it has to be redrawn — but only
+      // then: sending the model unprompted would pop the list open.
+      refreshTabListAfterClose = Number.isInteger(value);
+      closeTab(Number.isInteger(value) ? value : activeTabIndex);
+      break;
     case "restore-tab": restoreClosedTab(); break;
     case "reload": contents.reload(); break;
     case "zoom-in": setBrowserZoom("in"); break;
@@ -1272,6 +1296,11 @@ function handleNativeShortcut(tab, action, value) {
       break;
     case "copy-text":
       clipboard.writeText(String(value || ""));
+      break;
+    // The address the tab actually settled on, which the page cannot always see:
+    // a subframe reports its own URL, and a cross-origin one cannot read the top.
+    case "copy-url":
+      clipboard.writeText(contents.getURL());
       break;
     case "copy-image":
       if ([value?.x, value?.y, value?.width, value?.height].every(Number.isFinite)) {
@@ -1301,6 +1330,12 @@ function handleNativeShortcut(tab, action, value) {
       break;
     case "insert-mode":
       pageInsertMode = Boolean(value);
+      break;
+    // An overlay just went up. Painting is driven by Chromium's frame clock, so
+    // without a nudge the hints would wait for the next tick to reach the pane.
+    case "repaint":
+      markInteractionActivity();
+      contents.invalidate();
       break;
     // In shortcuts mode keys reach the page as synthetic events, which sites
     // that gate on isTrusted ignore. A page-level Escape has to be real.
@@ -1853,6 +1888,10 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
     }
     if (wasActive) activateTab(Math.min(closedIndex, tabs.length - 1));
     else if (closedIndex < activeTabIndex) activeTabIndex -= 1;
+    if (refreshTabListAfterClose) {
+      refreshTabListAfterClose = false;
+      sendToTabFrames(win, "tweb-tabs", tabListModel());
+    }
     scheduleWindowSessionSave();
   });
 
@@ -1916,7 +1955,14 @@ function applyViewport(vp, origin = tmuxOrigin) {
   }
   if (viewportChanged) {
     for (const tab of tabs) {
-      if (!tab.isDestroyed()) tab.setContentSize(logical.width, logical.height);
+      if (tab.isDestroyed()) continue;
+      tab.setContentSize(logical.width, logical.height);
+      // Resizing the window resets the zoom factor, so a pane resize silently
+      // undid whatever the user had zoomed to. Put it back.
+      const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+      if (tab.webContents.getZoomFactor() !== zoomFactor) {
+        tab.webContents.setZoomFactor(zoomFactor);
+      }
     }
   }
   win?.webContents.invalidate();
@@ -2063,8 +2109,10 @@ function dispatchMouse(cb, rawX, rawY, release) {
       button: "right",
       modifiers,
     });
-    // Browser shortcut mode에서만 TWeb navigation menu를 덧붙인다.
-    if (browserShortcutsEnabled) showBrowserContextMenu(win, { x, y });
+    // The menu is built from the `context-menu` event instead: Chromium reports
+    // what is under the pointer there (link, image, selection, editability).
+    // Opening one here as well replaced that menu with a coordinates-only one,
+    // losing every entry that depends on the target.
   }
   if (process.env.TWEB_DEBUG && type !== "mouseMove") {
     console.error(`tweb: ${type} ${button} ${x},${y}`);
@@ -2119,6 +2167,19 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
 
   if (modifiers.includes("meta") && key.toLowerCase() === "a") {
     if (pressed) sendToTabFrames(win, "tweb-select-all");
+    return;
+  }
+
+  // Cmd-C/V/X reach us as CSI-u like Cmd-A does, but nothing acted on them, so
+  // copy and paste simply did nothing inside the page. Drive the editing
+  // commands directly: the renderer knows the selection and the focused field.
+  if (modifiers.includes("meta") && ["c", "v", "x"].includes(key.toLowerCase())) {
+    if (pressed) {
+      const contents = win.webContents;
+      if (key.toLowerCase() === "c") contents.copy();
+      else if (key.toLowerCase() === "v") contents.paste();
+      else contents.cut();
+    }
     return;
   }
 

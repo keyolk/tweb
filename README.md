@@ -145,7 +145,7 @@ IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중
 | `f` / `F` | 화면의 클릭 가능 요소에 hint 표시 / 링크를 새 탭에서 열기 |
 | `/`, `n`, `N` | 페이지 검색 (`Enter`로 확정) / 다음 / 이전 결과 |
 | `v` / `V` | visual picker로 대상 선택 / 페이지 전체 text를 Visual selection으로 열기 |
-| `b` | 열린 browser tab 목록 (`j`/`k`, `1`–`9`, `Enter`, `Esc`) |
+| `b` | 열린 browser tab 목록 (`j`/`k`, `1`–`9`, `Enter`, `x` 닫기, `Esc`) |
 | `I` | inspect picker: 요소 정보·selector 확인 |
 | `s` | 스크롤할 내부 영역 선택 (`Esc`로 페이지 복귀) |
 | `h` / `l` | 왼쪽 / 오른쪽으로 스크롤 |
@@ -158,6 +158,7 @@ IME 조합은 browser가 아니라 terminal emulator가 처리하고, 조합 중
 | `t`, `O` | 새 탭 fuzzy omnibox 열기 (열린 탭·전체 방문 기록) |
 | `o` | 현재 탭 fuzzy omnibox 열기 (현재 URL이 채워진 상태로 시작) |
 | `x` / `X` | 현재 tab 닫기 / 최근 닫은 tab 복원 |
+| `y` | 현재 page URL 복사 |
 | `r` | 새로고침 |
 | `zi` / `zo` / `zz` | 확대 / 축소 / 기본 배율 복원 |
 | `i` | insert mode: 페이지 자체 단축키 사용 (`Esc`로 복귀) |

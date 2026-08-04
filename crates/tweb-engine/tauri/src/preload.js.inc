@@ -17,6 +17,7 @@
   let passThroughEscape = false;
   let passThroughEscapeTimer = null;
   let scrollTarget = null;
+  let tabListRefresh = false;
   let pendingG = false;
   let pendingGTimer = null;
   let pendingZ = false;
@@ -51,6 +52,12 @@
 
   function send(action, value) {
     ipcRenderer.send("tweb-shortcut", { action, value });
+  }
+
+  // Overlays are only worth drawing if they reach the terminal promptly; the
+  // frame clock alone can hold them back by a whole idle interval.
+  function paintNow() {
+    send("repaint");
   }
 
   function isEditable(element) {
@@ -486,7 +493,6 @@
 
   function hitTestTargets(semantic) {
     const found = new Set(semantic);
-    const roots = collectRoots();
 
     // Topmost hit targets reveal delegated click surfaces whose child owns the
     // pixels while a pointer-styled ancestor owns the interaction.
@@ -503,8 +509,19 @@
         Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2)),
       ]);
     }
-    for (const [x, y] of points.slice(0, 600)) {
-      for (const root of roots) {
+    // elementsFromPoint retargets at a shadow boundary, so each root has to be
+    // probed to reach delegated surfaces inside it. Sweeping every point across
+    // every root is what made this slow — over a second on GitHub's 19 roots —
+    // so a root only sees the points its host actually covers.
+    const probes = points.slice(0, 600);
+    for (const root of collectRoots()) {
+      const host = root === document ? null : root.host;
+      const bounds = host instanceof Element ? visibleRect(host) : null;
+      if (host && !bounds) continue;
+      for (const [x, y] of probes) {
+        if (bounds && (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom)) {
+          continue;
+        }
         const hits = typeof root.elementsFromPoint === "function" ? root.elementsFromPoint(x, y) : [];
         const target = hits.map(clickableAncestor).find(Boolean);
         if (target) found.add(target);
@@ -602,8 +619,24 @@
           || element.scrollWidth > element.clientWidth + 8;
       })
       .slice(0, 200);
-    return uniqueVisibleTargets(scrollable)
-      .filter((item) => item.rect.width >= 80 && item.rect.height >= 80);
+
+    // Not uniqueVisibleTargets: it drops anything covering the viewport, which
+    // is exactly what an app shell's scroller looks like, and it dedupes by
+    // top-left corner, which would hide a nested scroller behind its parent.
+    const targets = [];
+    const seen = new Set();
+    for (const element of scrollable) {
+      if (seen.has(element)) continue;
+      const rect = visibleRect(element);
+      if (!rect || rect.width < 80 || rect.height < 80) continue;
+      seen.add(element);
+      targets.push({ element, rect });
+    }
+    // Innermost first: that is usually the one under discussion.
+    return targets.sort((left, right) =>
+      right.element.compareDocumentPosition(left.element) & Node.DOCUMENT_POSITION_CONTAINED_BY
+        ? -1
+        : left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
   function scrollSurface() {
@@ -694,6 +727,7 @@
     ].join(";");
     shadow.append(outline, ripple);
     document.documentElement.append(host);
+    paintNow();
     requestAnimationFrame(() => requestAnimationFrame(() => {
       outline.style.opacity = "0";
       outline.style.transform = "scale(1.04)";
@@ -781,6 +815,7 @@
       return { ...target, label: labels[index], badge };
     });
     document.documentElement.append(host);
+    paintNow();
     pickerState = { host, items, typed: "", mode, onPick };
     setMode(mode, `${targets.length}`);
   }
@@ -1016,6 +1051,7 @@
     });
     shadow.append(backdrop);
     document.documentElement.append(host);
+    paintNow();
     helpHost = host;
     setMode("help", "?·Esc 닫기");
     requestAnimationFrame(() => close.focus({ preventScroll: true }));
@@ -1141,6 +1177,7 @@
     box.append(input, list);
     shadow.append(box);
     document.documentElement.append(host);
+    paintNow();
     promptHost = host;
     setMode("omnibox");
     ipcRenderer.once("tweb-omnibox", (_event, nextModel) => {
@@ -1200,6 +1237,7 @@
     box.append(input, result);
     shadow.append(box);
     document.documentElement.append(host);
+    paintNow();
     searchState = { host, input, result };
     setMode("search");
     requestAnimationFrame(() => input.focus());
@@ -1232,6 +1270,14 @@
     send("activate-tab", item.tab.index);
   }
 
+  // Close a row without leaving the list; main sends a refreshed model back.
+  function closeSelectedTab() {
+    const item = tabListState?.items[tabListState.selected];
+    if (!item) return;
+    tabListRefresh = true;
+    send("close-tab", item.tab.index);
+  }
+
   function showTabList() {
     cancelTransient(false);
     setMode("tabs", "…");
@@ -1240,6 +1286,9 @@
 
   function renderTabList(model) {
     if (!topFrame || !Array.isArray(model?.tabs)) return;
+    // Closing a row re-renders the list; keep the cursor where it was so several
+    // tabs can be closed in a row.
+    const previousSelected = tabListState?.selected ?? 0;
     cancelTabList(false);
     const host = document.createElement("div");
     host.id = "__tweb_tabs__";
@@ -1248,7 +1297,7 @@
     const panel = document.createElement("div");
     panel.style.cssText = "box-sizing:border-box;width:min(760px,calc(100vw - 32px));max-height:76vh;overflow:auto;padding:8px;border:1px solid #5f6368;border-radius:8px;background:#202124;color:#e8eaed;box-shadow:0 12px 36px #000b;font:13px/1.4 system-ui,-apple-system,sans-serif";
     const title = document.createElement("div");
-    title.textContent = `열린 탭 ${model.tabs.length}개 · j/k 이동 · Enter 열기 · 1-9 바로 열기 · Esc`;
+    title.textContent = `열린 탭 ${model.tabs.length}개 · j/k 이동 · Enter 열기 · x 닫기 · 1-9 바로 열기 · Esc`;
     title.style.cssText = "padding:4px 7px 8px;color:#bdc1c6;font-size:12px";
     panel.append(title);
     const items = model.tabs.map((tab, index) => {
@@ -1274,8 +1323,14 @@
     });
     shadow.append(panel);
     document.documentElement.append(host);
+    paintNow();
     tabListState = { host, items, selected: 0 };
-    selectTabListIndex(Math.max(0, Number(model.activeIndex) || 0));
+    // A re-render after closing keeps the cursor; a fresh list starts on the
+    // active tab.
+    selectTabListIndex(tabListRefresh
+      ? Math.min(previousSelected, items.length - 1)
+      : Math.max(0, Number(model.activeIndex) || 0));
+    tabListRefresh = false;
   }
 
   function handleTabListKey(event, key) {
@@ -1288,6 +1343,7 @@
     else if (key === "g" || key === "Home") selectTabListIndex(0);
     else if (key === "G" || key === "End") selectTabListIndex(tabListState.items.length - 1);
     else if (key === "Enter") activateSelectedTab();
+    else if (key === "x" || key === "d") closeSelectedTab();
     else if (/^[1-9]$/.test(key) && Number(key) <= tabListState.items.length) {
       selectTabListIndex(Number(key) - 1);
       activateSelectedTab();
@@ -1719,6 +1775,7 @@
       case "O": showPrompt(true); break;
       case "x": send("close-tab"); break;
       case "X": send("restore-tab"); break;
+      case "y": send("copy-url"); flash("URL"); break;
       case "r": send("reload"); break;
       case "Escape":
         // Release a picked scroll surface before bothering the page.

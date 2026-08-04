@@ -82,7 +82,9 @@ fn forward_changed_geometry(
     control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     previous: &mut Option<terminal::WindowGeometry>,
 ) {
-    if let Some(message) = changed_geometry_message(previous, terminal::window_geometry()) {
+    let current = terminal::window_geometry();
+    tracing::debug!(?current, ?previous, "geometry poll");
+    if let Some(message) = changed_geometry_message(previous, current) {
         let _ = control_tx.send(message);
     }
 }
