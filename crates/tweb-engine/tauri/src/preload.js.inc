@@ -797,11 +797,20 @@
     mediaHoverTimer = null;
   }
 
+  // "0" alone reads as a malfunction. Say which kind of target came up empty, and
+  // stay up long enough to be read.
+  const emptyPickerReason = {
+    hint: "클릭할 대상 없음",
+    visual: "text·link·image 없음",
+    scroll: "내부 scroll 영역 없음",
+    inspect: "대상 없음",
+  };
+
   function startPicker(targets, mode, onPick) {
     cancelTransient(false);
     if (targets.length === 0) {
-      setMode(mode, "0");
-      setTimeout(normalMode, 500);
+      setMode(mode, emptyPickerReason[mode] || "0");
+      setTimeout(normalMode, 1100);
       return;
     }
     const labels = hintLabels(targets.length);
