@@ -31,6 +31,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/tmux-visibility.cjs"),
     ),
     (
+        "window-session.cjs",
+        include_str!("../../../electron/window-session.cjs"),
+    ),
+    (
         "agent-server.cjs",
         include_str!("../../../electron/agent-server.cjs"),
     ),

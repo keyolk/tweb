@@ -157,6 +157,19 @@ test("a resize re-places the existing image instead of baring the pane", () => {
   assert.match(replace, /a=p,i=\$\{imageId\}/);
 });
 
+test("bare open never restores or saves an internal blank page", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /require\("\.\/window-session\.cjs"\)/);
+  assert.match(main, /if \(showingLoadError \|\| !isRestorableUrl\(url\)\) return;/);
+  assert.match(main, /const state = windowSessionForSave\(/);
+  assert.match(main, /if \(!windowSessionPath \|\| tabs\.length === 0\) return;/);
+  assert.match(main, /if \(!state\) return;/);
+  assert.match(main, /restoreWindowSession && !isRestorableUrl\(url\)/);
+  assert.match(main, /noWindowSessionPage\(\)/);
+  assert.match(main, /if \(!isRestorableUrl\(url\) \|\| url\.startsWith\("tweb-action:"\)\) return;/);
+  assert.match(main, /if \(isRestorableUrl\(entry\?\.url\) && !seen\.has\(entry\.url\)\)/);
+});
+
 // A client can still report this window while tmux has zoomed a different pane.
 // In that state the TWeb image must be removed from that client, then repainted
 // when the zoom ends and the browser pane becomes visible again.
@@ -257,10 +270,10 @@ test("the first tab shows something before the real page commits", () => {
   assert.match(main, /function placeholderPage\(target\)/);
   const open = main.slice(main.indexOf("const load = () => {"),
     main.indexOf("function placeholderPage(target)"));
-  assert.match(open, /tabs\.length === 1 && url !== "about:blank"/,
-    "the placeholder is not limited to the first tab");
-  // A later tab has the previous page on screen to hold, and about:blank is
-  // already immediate.
+  assert.match(open, /showInitialPlaceholder && isRestorableUrl\(url\)/,
+    "the placeholder is not controlled by the active startup tab");
+  // A later tab has the previous page on screen to hold, while the restored
+  // active tab explicitly opts into the placeholder.
   assert.match(open, /once\("did-finish-load", load\)/);
   // If the placeholder itself fails there still has to be a navigation.
   assert.match(open, /loadURL\(placeholderPage\(url\)\)\.catch\(load\)/);
