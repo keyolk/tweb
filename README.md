@@ -43,11 +43,11 @@ workspace 안에서 돌 때는 `electron/node_modules`를, 시스템에 `electro
 공식 executable은 `tweb`입니다. `twb`는 선택적 alias입니다.
 
 ```sh
-# 현재 pane에서 열기
-tweb open https://localhost:5173
+# 현재 pane에서 열기. 인자 없이 실행하면 open과 같으며 이전 상태를 복원
+tweb
 
-# URL을 생략하면 현재 tmux window의 tab·active tab·zoom 복원
-tweb open
+# URL을 지정하거나 open 옵션을 사용할 때는 명시적 subcommand 사용
+tweb open https://localhost:5173
 
 # tmux browser pane 만들기 (기본: Electron, adaptive 4–30fps)
 tweb split https://localhost:5173

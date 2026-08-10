@@ -7,6 +7,8 @@ pub mod agent;
 pub mod doctor;
 pub mod mcp;
 
+use std::ffi::OsString;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
@@ -379,9 +381,18 @@ pub enum ChromeAction {
     Status,
 }
 
+fn default_open_args(mut args: Vec<OsString>) -> Vec<OsString> {
+    // The installed command is the browser entry point. Requiring an otherwise
+    // redundant `open` makes `make install && tweb` look like a broken install.
+    if args.len() == 1 {
+        args.push(OsString::from("open"));
+    }
+    args
+}
+
 /// CLI 실행.
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(default_open_args(std::env::args_os().collect()));
     tracing::debug!(?cli, "tweb command");
 
     match cli.command {
@@ -519,6 +530,19 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
     tweb_pane::run_with_options(url.unwrap_or("about:blank"), options).await
 }
 
+/// tmux split-window 인자. 호출 pane을 알면 client의 active window가 아니라
+/// 그 pane이 속한 window를 분할한다.
+fn split_window_args(pane: Option<&str>, command: &str) -> Vec<String> {
+    let mut args = ["split-window", "-h", "-p", "50"]
+        .map(String::from)
+        .to_vec();
+    if let Some(pane) = pane {
+        args.extend(["-t".to_string(), pane.to_string()]);
+    }
+    args.push(command.to_string());
+    args
+}
+
 /// tmux split-window로 pane 만들고 그 안에서 `tweb __pane` 실행.
 async fn split_and_run_pane(
     url: Option<&str>,
@@ -567,8 +591,10 @@ async fn split_and_run_pane(
         browser.shell_args(),
         url_arg
     );
+    let target_pane = std::env::var("TMUX_PANE").ok();
+    let split_args = split_window_args(target_pane.as_deref(), &pane_command);
     let status = std::process::Command::new("tmux")
-        .args(["split-window", "-h", "-p", "50", &pane_command])
+        .args(split_args)
         .status()?;
 
     if !status.success() {
@@ -654,7 +680,43 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::electron_app_dir;
+    use std::ffi::OsString;
+
+    use clap::Parser;
+
+    use super::{default_open_args, electron_app_dir, split_window_args, Cli, Command};
+
+    #[test]
+    fn no_subcommand_opens_the_browser() {
+        let cli = Cli::try_parse_from(default_open_args(vec![OsString::from("tweb")]))
+            .expect("bare tweb should parse as open");
+        match cli.command {
+            Command::Open { browser, url } => {
+                assert!(url.is_none());
+                assert_eq!(browser.frame_rate, 30);
+                assert!(browser.adaptive());
+            }
+            other => panic!("bare tweb parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_arguments_are_not_rewritten() {
+        let args = vec![OsString::from("tweb"), OsString::from("--version")];
+        assert_eq!(default_open_args(args.clone()), args);
+    }
+
+    #[test]
+    fn split_targets_the_calling_pane() {
+        assert_eq!(
+            split_window_args(Some("%42"), "tweb __pane"),
+            vec!["split-window", "-h", "-p", "50", "-t", "%42", "tweb __pane"]
+        );
+        assert_eq!(
+            split_window_args(None, "tweb __pane"),
+            vec!["split-window", "-h", "-p", "50", "tweb __pane"]
+        );
+    }
 
     /// The bug this guards: picking `node_modules/electron` as the app directory
     /// makes Electron load itself instead of TWeb, and the pane stays blank.
