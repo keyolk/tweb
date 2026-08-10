@@ -33,6 +33,9 @@ const { ipcRenderer } = require("electron");
   let contextMenuReturnFocus = null;
   let indicatorHost = null;
   let indicatorLabel = null;
+  let indicatorMode = "normal";
+  let indicatorDetail = "";
+  let tabState = { activeIndex: 0, count: 1 };
   let lastSearch = "";
 
   const hintAlphabet = "asdfghjklqwertyuiopzxcvbnm";
@@ -257,6 +260,32 @@ const { ipcRenderer } = require("electron");
     indicatorLabel = label;
   }
 
+  function renderIndicator() {
+    if (!topFrame) return;
+    ensureIndicator();
+    const short = modeLabels[indicatorMode] || indicatorMode.slice(0, 1).toUpperCase();
+    const modeText = indicatorDetail ? `${short} ${indicatorDetail}` : short;
+    const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
+    indicatorLabel.textContent = `${modeText} · 탭 ${active}/${tabState.count}`;
+    indicatorLabel.title = `TWeb ${indicatorMode}${indicatorDetail ? ` — ${indicatorDetail}` : ""} · 탭 ${active}/${tabState.count}`;
+    indicatorLabel.style.color = indicatorMode === "passthrough" ? "#9aa0a6"
+      : indicatorMode === "normal" ? "#8ab4f8"
+      : indicatorMode === "insert" ? "#81c995"
+      : "#fdd663";
+  }
+
+  function updateTabState(model) {
+    const count = Number.isInteger(model?.count) && model.count > 0 ? model.count : 1;
+    const activeIndex = Number.isInteger(model?.activeIndex) ? model.activeIndex : 0;
+    tabState = { activeIndex: Math.min(count - 1, Math.max(0, activeIndex)), count };
+    const root = document.documentElement;
+    if (root) {
+      root.dataset.twebTabIndex = String(tabState.activeIndex);
+      root.dataset.twebTabCount = String(tabState.count);
+    }
+    renderIndicator();
+  }
+
   function setMode(mode, detail = "") {
     const root = document.documentElement;
     if (!root) return;
@@ -266,14 +295,9 @@ const { ipcRenderer } = require("electron");
       if (document.hasFocus()) send("frame-mode", { mode, detail });
       return;
     }
-    ensureIndicator();
-    const short = modeLabels[mode] || mode.slice(0, 1).toUpperCase();
-    indicatorLabel.textContent = detail ? `${short} ${detail}` : short;
-    indicatorLabel.title = `TWeb ${mode}${detail ? ` — ${detail}` : ""}`;
-    indicatorLabel.style.color = mode === "passthrough" ? "#9aa0a6"
-      : mode === "normal" ? "#8ab4f8"
-      : mode === "insert" ? "#81c995"
-      : "#fdd663";
+    indicatorMode = mode;
+    indicatorDetail = detail;
+    renderIndicator();
   }
 
   function normalMode() {
@@ -2680,6 +2704,10 @@ const { ipcRenderer } = require("electron");
 
   ipcRenderer.on("tweb-tabs", (_event, model) => {
     renderTabList(model);
+  });
+
+  ipcRenderer.on("tweb-tab-state", (_event, model) => {
+    updateTabState(model);
   });
 
   ipcRenderer.on("tweb-context-menu", (_event, model) => {

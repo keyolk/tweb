@@ -269,6 +269,30 @@ test("browser context menu uses Chromium hit-test data and native commands", () 
   assert.match(electron, /menu\.onkeydown/);
 });
 
+test("mode indicator always includes the active and total tab count", () => {
+  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+    assert.match(source, /let tabState = \{ activeIndex: 0, count: 1 \}/,
+      `${name} has no initial tab state`);
+    assert.match(source, /function updateTabState\(model\)/,
+      `${name} cannot update tab state`);
+    assert.match(source, /indicatorLabel\.textContent = `\$\{modeText\} · 탭 \$\{active\}\/\$\{tabState\.count\}`/,
+      `${name} does not keep the tab count in its mode indicator`);
+    assert.match(source, /ipcRenderer\.on\("tweb-tab-state"/,
+      `${name} does not receive tab state updates`);
+  }
+
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /function tabStateModel\(\)/);
+  assert.match(main, /event\.reply\("tweb-tab-state", tabStateModel\(\)\)/);
+  assert.match(main, /function activateTab\(index\)[\s\S]*sendTabState\(\)/);
+
+  const tauriBrowser = fs.readFileSync(path.join(root,
+    "crates/tweb-engine/tauri/src/browser.rs"), "utf8");
+  assert.match(tauriBrowser, /fn send_tab_state\(&self\)/);
+  assert.match(tauriBrowser, /self\.emit_active\("tweb-tab-state", &model\)/);
+  assert.match(tauriBrowser, /fn activate_tab\(&self, index: usize\)[\s\S]*self\.send_tab_state\(\)/);
+});
+
 test("visual image actions copy pixels, copy current source, and download", () => {
   for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
     assert.match(source, /function imageSource\(image\)/, `${name} has no image source resolver`);
