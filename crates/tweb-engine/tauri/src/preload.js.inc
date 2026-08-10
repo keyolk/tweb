@@ -661,6 +661,26 @@
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
+  function resourceUrl(value, element) {
+    if (!value) return "";
+    try {
+      return new URL(value, element?.baseURI || document.baseURI).href;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function imageSource(image) {
+    if (!image) return "";
+    if (isTag(image, "img")) return resourceUrl(image.currentSrc || image.src, image);
+    if (isTag(image, "video")) return resourceUrl(image.poster || image.currentSrc || image.src, image);
+    const nested = image.querySelector?.("img,video");
+    if (nested) return imageSource(nested);
+    const background = ownerView(image).getComputedStyle(image).backgroundImage;
+    const match = background?.match(/url\((['"]?)(.*?)\1\)/);
+    return resourceUrl(match?.[2], image);
+  }
+
   function visualTargets() {
     const selector = [
       "a[href]", "img", "picture", "canvas", "svg", "video", "p", "li", "pre", "code", "blockquote",
@@ -671,8 +691,13 @@
       const link = element.closest("a[href]");
       const image = element.matches("img,picture,canvas,svg,video,[role=img]")
         ? element.querySelector?.("img,canvas,svg,video") || element
-        : null;
-      return { kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text", link, image };
+        : link?.querySelector?.("img,picture,canvas,svg,video,[role=img]") || null;
+      return {
+        kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text",
+        link,
+        image,
+        imageURL: imageSource(image),
+      };
     }).filter((item) => item.kind !== "text" || item.element.innerText?.trim());
   }
 
@@ -1092,8 +1117,8 @@
       ["v · V", "visual picker · 페이지 전체 선택"],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "visual 선택 범위 조정 (블록 밖까지)"],
       ["c · v", "caret로 내려가 시작점 옮기기 · 그 지점부터 선택"],
-      ["y · Y · u", "smart copy · text copy · URL copy"],
-      ["o/O · p · d", "링크 열기 · 붙여넣기 · inspect"],
+      ["y · Y · u", "smart copy · text copy · image/link URL copy"],
+      ["D · o/O · p · d", "image download · 대상 열기 · 붙여넣기 · inspect"],
       ["I", "inspect picker"],
     ]],
     ["Browser와 mode", [
@@ -1748,6 +1773,7 @@
     }
     visualState = { ...item, outline, selectionMade };
     if (selectionMade) updateVisualSelection();
+    else if (item.kind === "image") setMode("visual", "image y·Y·u·D·o");
     else setMode("visual", `${item.kind} y·Y·u·o·p`);
   }
 
@@ -1765,6 +1791,7 @@
       kind: "text",
       link: null,
       image: null,
+      imageURL: "",
       pageSelection: true,
     });
   }
@@ -1788,7 +1815,8 @@
       // same thing `v` then `y` has always done.
       const selectedText = item.selectionMade ? visualSelection()?.toString() || "" : "";
       const text = selectedText || (typeof item.element.value === "string" ? item.element.value
-        : item.element.innerText?.trim() || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
+        : item.element.innerText?.trim() || item.image?.getAttribute("alt")
+          || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
       if (text) send("copy-text", text);
     }
     cancelVisual(false);
@@ -1805,14 +1833,25 @@
     else if (key === "v" && visualState.caret) selectFromCaret();
     else if (key === "y") copyVisual(true);
     else if (key === "Y") copyVisual(false);
-    else if (key === "u" && visualState.link?.href) {
-      send("copy-text", visualState.link.href);
+    else if (key === "u") {
+      const url = visualState.kind === "image" ? visualState.imageURL : visualState.link?.href;
+      if (url) {
+        send("copy-text", url);
+        cancelVisual(false);
+        flash("url");
+      }
+    } else if (key === "D" && visualState.kind === "image" && visualState.imageURL) {
+      send("download", visualState.imageURL);
       cancelVisual(false);
-      flash("url");
-    } else if ((key === "o" || key === "O") && visualState.link?.href) {
-      const url = visualState.link.href;
-      cancelVisual();
-      send(key === "O" ? "new-tab" : "navigate", url);
+      flash("download");
+    } else if (key === "o" || key === "O") {
+      const url = visualState.kind === "image"
+        ? visualState.imageURL || visualState.link?.href
+        : visualState.link?.href;
+      if (url) {
+        cancelVisual();
+        send(key === "O" ? "new-tab" : "navigate", url);
+      }
     } else if (key === "p" && visualState.kind === "editable") {
       visualState.element.focus();
       send("paste");

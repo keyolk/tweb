@@ -17,6 +17,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/package.json"),
     ),
     ("main.cjs", include_str!("../../../electron/main.cjs")),
+    (
+        "context-menu.cjs",
+        include_str!("../../../electron/context-menu.cjs"),
+    ),
     ("preload.cjs", include_str!("../../../electron/preload.cjs")),
     (
         "gfx-worker.cjs",

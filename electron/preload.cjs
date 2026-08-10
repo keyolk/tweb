@@ -30,6 +30,7 @@ const { ipcRenderer } = require("electron");
   let inspectState = null;
   let tabListState = null;
   let helpHost = null;
+  let contextMenuReturnFocus = null;
   let indicatorHost = null;
   let indicatorLabel = null;
   let lastSearch = "";
@@ -585,6 +586,26 @@ const { ipcRenderer } = require("electron");
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
+  function resourceUrl(value, element) {
+    if (!value) return "";
+    try {
+      return new URL(value, element?.baseURI || document.baseURI).href;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function imageSource(image) {
+    if (!image) return "";
+    if (isTag(image, "img")) return resourceUrl(image.currentSrc || image.src, image);
+    if (isTag(image, "video")) return resourceUrl(image.poster || image.currentSrc || image.src, image);
+    const nested = image.querySelector?.("img,video");
+    if (nested) return imageSource(nested);
+    const background = ownerView(image).getComputedStyle(image).backgroundImage;
+    const match = background?.match(/url\((['"]?)(.*?)\1\)/);
+    return resourceUrl(match?.[2], image);
+  }
+
   function visualTargets() {
     const selector = [
       "a[href]", "img", "picture", "canvas", "svg", "video", "p", "li", "pre", "code", "blockquote",
@@ -595,8 +616,13 @@ const { ipcRenderer } = require("electron");
       const link = element.closest("a[href]");
       const image = element.matches("img,picture,canvas,svg,video,[role=img]")
         ? element.querySelector?.("img,canvas,svg,video") || element
-        : null;
-      return { kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text", link, image };
+        : link?.querySelector?.("img,picture,canvas,svg,video,[role=img]") || null;
+      return {
+        kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text",
+        link,
+        image,
+        imageURL: imageSource(image),
+      };
     }).filter((item) => item.kind !== "text" || item.element.innerText?.trim());
   }
 
@@ -1450,8 +1476,8 @@ const { ipcRenderer } = require("electron");
       ["v · V", "visual picker · 페이지 전체 선택"],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "visual 선택 범위 조정 (블록 밖까지)"],
       ["c · v", "caret로 내려가 시작점 옮기기 · 그 지점부터 선택"],
-      ["y · Y · u", "smart copy · text copy · URL copy"],
-      ["o/O · p · d", "링크 열기 · 붙여넣기 · inspect"],
+      ["y · Y · u", "smart copy · text copy · image/link URL copy"],
+      ["D · o/O · p · d", "image download · 대상 열기 · 붙여넣기 · inspect"],
       ["I", "inspect picker"],
     ]],
     ["Browser와 mode", [
@@ -2106,6 +2132,7 @@ const { ipcRenderer } = require("electron");
     }
     visualState = { ...item, outline, selectionMade };
     if (selectionMade) updateVisualSelection();
+    else if (item.kind === "image") setMode("visual", "image y·Y·u·D·o");
     else setMode("visual", `${item.kind} y·Y·u·o·p`);
   }
 
@@ -2123,6 +2150,7 @@ const { ipcRenderer } = require("electron");
       kind: "text",
       link: null,
       image: null,
+      imageURL: "",
       pageSelection: true,
     });
   }
@@ -2146,7 +2174,8 @@ const { ipcRenderer } = require("electron");
       // same thing `v` then `y` has always done.
       const selectedText = item.selectionMade ? visualSelection()?.toString() || "" : "";
       const text = selectedText || (typeof item.element.value === "string" ? item.element.value
-        : item.element.innerText?.trim() || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
+        : item.element.innerText?.trim() || item.image?.getAttribute("alt")
+          || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
       if (text) send("copy-text", text);
     }
     cancelVisual(false);
@@ -2163,14 +2192,25 @@ const { ipcRenderer } = require("electron");
     else if (key === "v" && visualState.caret) selectFromCaret();
     else if (key === "y") copyVisual(true);
     else if (key === "Y") copyVisual(false);
-    else if (key === "u" && visualState.link?.href) {
-      send("copy-text", visualState.link.href);
+    else if (key === "u") {
+      const url = visualState.kind === "image" ? visualState.imageURL : visualState.link?.href;
+      if (url) {
+        send("copy-text", url);
+        cancelVisual(false);
+        flash("url");
+      }
+    } else if (key === "D" && visualState.kind === "image" && visualState.imageURL) {
+      send("download", visualState.imageURL);
       cancelVisual(false);
-      flash("url");
-    } else if ((key === "o" || key === "O") && visualState.link?.href) {
-      const url = visualState.link.href;
-      cancelVisual();
-      send(key === "O" ? "new-tab" : "navigate", url);
+      flash("download");
+    } else if (key === "o" || key === "O") {
+      const url = visualState.kind === "image"
+        ? visualState.imageURL || visualState.link?.href
+        : visualState.link?.href;
+      if (url) {
+        cancelVisual();
+        send(key === "O" ? "new-tab" : "navigate", url);
+      }
     } else if (key === "p" && visualState.kind === "editable") {
       visualState.element.focus();
       send("paste");
@@ -2263,6 +2303,140 @@ const { ipcRenderer } = require("electron");
     return true;
   }
 
+  function closeBrowserContextMenu(action = null) {
+    const host = document.getElementById("__tweb_context_menu__");
+    if (!host) return;
+    host.remove();
+    const returnFocus = contextMenuReturnFocus;
+    contextMenuReturnFocus = null;
+    returnFocus?.focus?.({ preventScroll: true });
+    send(action ? "context-menu-command" : "context-menu-dismiss", action);
+    if (isEditable(activeElement())) setMode("insert");
+    else normalMode();
+  }
+
+  function showBrowserContextMenu(model) {
+    if (!topFrame || !model?.items?.length) return;
+    // Main has already replaced the one-shot command state with this menu. Remove
+    // the old DOM without dismissing that new state, but restore the focus the old
+    // menu borrowed before remembering where this one should return it.
+    const previousMenu = document.getElementById("__tweb_context_menu__");
+    if (previousMenu) {
+      previousMenu.remove();
+      contextMenuReturnFocus?.focus?.({ preventScroll: true });
+      contextMenuReturnFocus = null;
+    }
+    cancelTransient(false);
+    contextMenuReturnFocus = activeElement();
+    const host = document.createElement("div");
+    host.id = "__tweb_context_menu__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "closed" });
+    const backdrop = document.createElement("div");
+    backdrop.style.cssText = "position:fixed;inset:0;pointer-events:auto";
+    const menu = document.createElement("div");
+    menu.setAttribute("role", "menu");
+    menu.tabIndex = -1;
+    menu.style.cssText = [
+      "position:fixed", "box-sizing:border-box", "min-width:240px", "max-width:min(360px,calc(100vw - 8px))",
+      "padding:5px", "border:1px solid #5f6368", "border-radius:8px", "outline:0",
+      "background:#202124", "color:#f1f3f4", "box-shadow:0 10px 30px #000a",
+      "font:13px/1.35 system-ui,-apple-system,sans-serif", "pointer-events:auto",
+    ].join(";");
+    const buttons = [];
+    let selected = -1;
+    const select = (index) => {
+      if (!buttons.length) return;
+      if (selected >= 0) buttons[selected].style.background = "transparent";
+      selected = (index + buttons.length) % buttons.length;
+      buttons[selected].style.background = "#3c4043";
+      buttons[selected].focus({ preventScroll: true });
+    };
+    for (const item of model.items) {
+      if (item.separator) {
+        const separator = document.createElement("div");
+        separator.setAttribute("role", "separator");
+        separator.style.cssText = "height:1px;margin:4px 3px;background:#5f6368";
+        menu.append(separator);
+        continue;
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "menuitem");
+      button.textContent = item.label;
+      button.disabled = !item.enabled;
+      button.style.cssText = "display:block;box-sizing:border-box;width:100%;padding:6px 10px;border:0;border-radius:4px;outline:0;background:transparent;color:inherit;text-align:left;font:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      if (button.disabled) button.style.opacity = ".42";
+      else {
+        const index = buttons.length;
+        buttons.push(button);
+        button.onmouseenter = () => select(index);
+        button.onmouseleave = () => {
+          if (selected === index) button.style.background = "transparent";
+        };
+        button.onclick = () => closeBrowserContextMenu(item.action);
+      }
+      menu.append(button);
+    }
+    menu.onkeydown = (event) => {
+      if (["ArrowDown", "ArrowUp", "Home", "End", "Enter", " ", "Escape"].includes(event.key)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      if (event.key === "ArrowDown") select(selected + 1);
+      else if (event.key === "ArrowUp") select(selected - 1);
+      else if (event.key === "Home") select(0);
+      else if (event.key === "End") select(buttons.length - 1);
+      else if (["Enter", " "].includes(event.key) && selected >= 0) buttons[selected].click();
+      else if (event.key === "Escape") closeBrowserContextMenu();
+    };
+    backdrop.onclick = () => closeBrowserContextMenu();
+    backdrop.oncontextmenu = (event) => {
+      event.preventDefault();
+      closeBrowserContextMenu();
+    };
+    shadow.append(backdrop, menu);
+    document.documentElement.append(host);
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(4, Math.min(Number(model.x) || 0, innerWidth - rect.width - 4))}px`;
+    menu.style.top = `${Math.max(4, Math.min(Number(model.y) || 0, innerHeight - rect.height - 4))}px`;
+    paintNow();
+    requestAnimationFrame(() => {
+      menu.focus({ preventScroll: true });
+      select(0);
+    });
+  }
+
+  function contextTarget(point) {
+    if (!topFrame || !Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return null;
+    const element = document.elementFromPoint(point.x, point.y);
+    const rect = element && visibleRect(element);
+    if (!element || !rect) return null;
+    const link = element.closest?.("a[href]") || null;
+    const image = element.matches?.("img,picture,canvas,svg,video,[role=img]")
+      ? element.querySelector?.("img,canvas,svg,video") || element
+      : null;
+    return { element, rect, link, image, imageURL: imageSource(image) };
+  }
+
+  function inspectContextPoint(point) {
+    const item = contextTarget(point);
+    if (!item) return;
+    cancelTransient(false);
+    enterInspect(item);
+  }
+
+  function copyContextImage(point) {
+    const item = contextTarget(point);
+    if (!item?.image) return;
+    send("copy-image", {
+      x: Math.max(0, Math.floor(item.rect.left)),
+      y: Math.max(0, Math.floor(item.rect.top)),
+      width: Math.max(1, Math.ceil(item.rect.width)),
+      height: Math.max(1, Math.ceil(item.rect.height)),
+    });
+  }
+
   function resetPendingG() {
     pendingG = false;
     if (pendingGTimer) clearTimeout(pendingGTimer);
@@ -2283,10 +2457,22 @@ const { ipcRenderer } = require("electron");
     cancelInspect(false);
     cancelTabList(false);
     cancelHelp(false);
-    document.getElementById("__tweb_context_menu__")?.remove();
+    let restoredContextFocus = false;
+    const contextMenu = document.getElementById("__tweb_context_menu__");
+    if (contextMenu) {
+      contextMenu.remove();
+      const returnFocus = contextMenuReturnFocus;
+      contextMenuReturnFocus = null;
+      returnFocus?.focus?.({ preventScroll: true });
+      restoredContextFocus = true;
+      send("context-menu-dismiss");
+    }
     resetPendingG();
     resetPendingZ();
-    if (restoreMode) normalMode();
+    if (restoreMode) {
+      if (restoredContextFocus && isEditable(activeElement())) setMode("insert");
+      else normalMode();
+    }
   }
 
   // `Ctrl-;` flips the whole tmux/browser input plumbing, which is the right tool
@@ -2494,6 +2680,18 @@ const { ipcRenderer } = require("electron");
 
   ipcRenderer.on("tweb-tabs", (_event, model) => {
     renderTabList(model);
+  });
+
+  ipcRenderer.on("tweb-context-menu", (_event, model) => {
+    showBrowserContextMenu(model);
+  });
+
+  ipcRenderer.on("tweb-context-inspect", (_event, point) => {
+    inspectContextPoint(point);
+  });
+
+  ipcRenderer.on("tweb-context-copy-image", (_event, point) => {
+    copyContextImage(point);
   });
 
   // Only the top frame answers agent requests; subframe refs would collide.

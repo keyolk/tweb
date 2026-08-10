@@ -224,7 +224,7 @@ terminal cursor와 조합 preview를 그리는 것은 emulator이므로 글꼴 �
 | `Esc` | hint/search/visual/inspect/omnibox 취소 · 입력 focus 해제 · 전체화면 해제 |
 | `Esc` (normal) | 사이트 자동완성·popup을 outside click으로 닫기 |
 
-Visual의 text 대상을 선택하거나 normal mode에서 `V`로 페이지 전체 text를 선택한 뒤 `h`/`l`은 문자, `b`/`w`/`e`는 단어, `k`/`j`는 줄, `0`/`$`는 줄 경계, `{`/`}`는 문단 단위로 active edge를 조정하고 `o`는 조정할 selection endpoint를 바꿉니다. 조정한 범위에서 `y`/`Y`는 선택 text를 복사합니다. image/link/editable 대상에서는 기존처럼 `y`는 smart copy(image bitmap, link URL, text/value), `Y`는 표시 text, `u`는 link URL, `o`/`O`는 현재/새 tab에서 link 열기, `p`는 editable 대상에 clipboard 붙여넣기, `d`는 DevTools inspect를 실행합니다.
+Visual의 text 대상을 선택하거나 normal mode에서 `V`로 페이지 전체 text를 선택한 뒤 `h`/`l`은 문자, `b`/`w`/`e`는 단어, `k`/`j`는 줄, `0`/`$`는 줄 경계, `{`/`}`는 문단 단위로 active edge를 조정하고 `o`는 조정할 selection endpoint를 바꿉니다. 조정한 범위에서 `y`/`Y`는 선택 text를 복사합니다. image 대상에서는 `y`가 표시된 bitmap, `Y`가 대체 text, `u`가 실제 표시 중인 image URL(`currentSrc`), `D`가 image download, `o`/`O`가 image를 현재/새 tab에서 엽니다. link/editable 대상에서는 `y`가 link URL 또는 text/value를 smart copy하고, `u`는 link URL, `o`/`O`는 link를 열며, `p`는 clipboard를 붙여넣습니다. `d`는 대상을 inspect합니다.
 
 선택의 **시작점**을 옮기려면 `c`로 caret mode로 내려갑니다. selection이 caret 하나로 접히고 위의 motion이 selection을 만들지 않고 caret만 옮기므로, 원하는 지점에서 `v`를 누르면 거기서부터 다시 선택이 시작됩니다 — 문단 중간의 한 단어만 잡을 때 쓰는 흐름입니다. motion은 hint로 고른 블록에 갇히지 않으므로 `}`나 `j`로 다음 text 블록까지 이어서 선택할 수 있고, 선택이 화면을 벗어나면 따라 scroll합니다. caret mode에서 `y`는 caret이 놓인 블록 전체를 복사합니다.
 

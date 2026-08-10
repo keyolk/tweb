@@ -6,10 +6,11 @@
 // - frame file로 terminal byte flood를 피하고 direct transfer는 fallback으로 사용
 // - alternate screen, raw mode는 tweb-pane(Rust)이 처리
 
-const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen } = require("electron");
+const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen, session } = require("electron");
 const {
   appendFileSync,
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -24,6 +25,7 @@ const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
 const { startAgentServer } = require("./agent-server.cjs");
+const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
 const {
   isRestorableUrl,
@@ -34,6 +36,10 @@ const {
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
+}
+if (process.env.TWEB_DOWNLOAD_DIR) {
+  mkdirSync(process.env.TWEB_DOWNLOAD_DIR, { recursive: true });
+  app.setPath("downloads", process.env.TWEB_DOWNLOAD_DIR);
 }
 if (process.platform === "darwin") {
   app.setActivationPolicy("prohibited");
@@ -70,6 +76,9 @@ let refreshTabListAfterClose = false;
 // Electron logs an ipcNative error when frame.send races preload setup or navigation.
 // A frame opts in only after its preload has installed all IPC listeners.
 const readyFrameKeysByTab = new WeakMap();
+// Context-menu URLs come from Chromium's hit test, not renderer input. Keep them
+// here so a compromised page can only choose among the actions we displayed.
+const contextMenuStateByTab = new WeakMap();
 function commandLineValue(name) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -1116,6 +1125,17 @@ function sendToTabFrames(tab, channel, ...args) {
   }
 }
 
+function sendToMainTabFrame(tab, channel, ...args) {
+  if (!tab || tab.isDestroyed()) return;
+  try {
+    const frame = tab.webContents.mainFrame;
+    if (frame && !frame.isDestroyed() && !frame.detached
+      && readyFrameKeys(tab).has(frameKey(frame))) frame.send(channel, ...args);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: main frame send failed: ${error.message}`);
+  }
+}
+
 function sendToFocusedTabFrame(tab, channel, ...args) {
   if (!tab || tab.isDestroyed()) return;
   try {
@@ -1416,8 +1436,17 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
         }, 0);
       }
       break;
+    case "download":
+      downloadUrl(contents, value);
+      break;
     case "paste":
       contents.paste();
+      break;
+    case "context-menu-command":
+      runBrowserContextMenuCommand(tab, value);
+      break;
+    case "context-menu-dismiss":
+      contextMenuStateByTab.delete(tab);
       break;
     case "caret": {
       // Every same-origin frame runs this preload. A frame that just lost focus can
@@ -1856,6 +1885,97 @@ function pageToWindowPoint(contents, point) {
   };
 }
 
+function isDownloadableUrl(value) {
+  try {
+    return ["http:", "https:", "file:", "data:", "blob:"].includes(new URL(String(value)).protocol);
+  } catch (_) {
+    return false;
+  }
+}
+
+function downloadUrl(contents, value) {
+  if (!isDownloadableUrl(value)) return;
+  try {
+    contents.downloadURL(value);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: download failed: ${error.message}`);
+  }
+}
+
+const pendingDownloadPaths = new Set();
+
+function availableDownloadPath(filename) {
+  const directory = app.getPath("downloads");
+  mkdirSync(directory, { recursive: true });
+  const safeName = path.basename(filename || "download") || "download";
+  const extension = path.extname(safeName);
+  const stem = safeName.slice(0, safeName.length - extension.length) || "download";
+  for (let suffix = 0; ; suffix += 1) {
+    const candidate = path.join(directory, suffix === 0 ? safeName : `${stem} (${suffix})${extension}`);
+    if (!existsSync(candidate) && !pendingDownloadPaths.has(candidate)) return candidate;
+  }
+}
+
+function configureDownloads() {
+  session.defaultSession.on("will-download", (_event, item) => {
+    const destination = availableDownloadPath(item.getFilename());
+    pendingDownloadPaths.add(destination);
+    item.setSavePath(destination);
+    item.once("done", (_doneEvent, state) => {
+      pendingDownloadPaths.delete(destination);
+      if (debugLogging) console.error(`tweb: download ${state} ${destination}`);
+    });
+  });
+}
+
+function runBrowserContextMenuCommand(tab, action) {
+  const state = contextMenuStateByTab.get(tab);
+  contextMenuStateByTab.delete(tab);
+  if (!state || tab !== win || tab.isDestroyed()) return;
+  if (!state.actions.has(action)) return;
+  const { params } = state;
+  const contents = tab.webContents;
+  switch (action) {
+    case "undo": contents.undo(); break;
+    case "redo": contents.redo(); break;
+    case "cut": contents.cut(); break;
+    case "copy": contents.copy(); break;
+    case "paste": contents.paste(); break;
+    case "paste-plain": contents.pasteAndMatchStyle(); break;
+    case "select-all": contents.selectAll(); break;
+    case "search-selection":
+      createTab(`https://www.google.com/search?q=${encodeURIComponent(params.selectionText)}`, true);
+      break;
+    case "open-link": createTab(params.linkURL, true); break;
+    case "open-link-here": void contents.loadURL(params.linkURL); break;
+    case "save-link": downloadUrl(contents, params.linkURL); break;
+    case "copy-link": clipboard.writeText(params.linkURL); break;
+    case "open-image":
+    case "open-media": createTab(params.srcURL, true); break;
+    case "save-image":
+    case "save-media": downloadUrl(contents, params.srcURL); break;
+    case "copy-image":
+      contents.copyImageAt(Math.round(params.x), Math.round(params.y));
+      // copyImageAt is Chromium's native behavior, but some offscreen paths do not
+      // update the pasteboard. Capture the rendered element as the same fallback
+      // used by visual mode when the target belongs to the main document.
+      sendToMainTabFrame(tab, "tweb-context-copy-image", { x: params.x, y: params.y });
+      break;
+    case "copy-image-url":
+    case "copy-media-url": clipboard.writeText(params.srcURL); break;
+    case "back":
+      if (contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+      break;
+    case "forward":
+      if (contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+      break;
+    case "reload": contents.reload(); break;
+    case "inspect":
+      sendToMainTabFrame(tab, "tweb-context-inspect", { x: params.x, y: params.y });
+      break;
+  }
+}
+
 function showBrowserContextMenu(tab, inputParams) {
   if (tab !== win || tab.isDestroyed()) return;
   const contents = tab.webContents;
@@ -1865,93 +1985,21 @@ function showBrowserContextMenu(tab, inputParams) {
     isEditable: false,
     selectionText: "",
     linkURL: "",
+    srcURL: "",
+    mediaType: "none",
     editFlags: {},
     ...inputParams,
   };
-  const items = [];
-  if (params.isEditable) {
-    items.push(
-      { label: "실행 취소", action: "undo", enabled: params.editFlags.canUndo },
-      { label: "다시 실행", action: "redo", enabled: params.editFlags.canRedo },
-      { separator: true },
-      { label: "잘라내기", action: "cut", enabled: params.editFlags.canCut },
-      { label: "복사", action: "copy", enabled: params.editFlags.canCopy },
-      { label: "붙여넣기", action: "paste", enabled: params.editFlags.canPaste },
-      { label: "전체 선택", action: "selectAll", enabled: params.editFlags.canSelectAll },
-    );
-  } else if (params.selectionText) {
-    items.push({ label: "복사", action: "copy", enabled: true }, { separator: true });
-  }
-  if (params.linkURL) {
-    items.push(
-      { label: "링크를 새 탭에서 열기", action: "openLink", value: params.linkURL, enabled: true },
-      { label: "링크 주소 복사", action: "copyLink", value: params.linkURL, enabled: true },
-      { separator: true },
-    );
-  }
-  items.push(
-    { label: "뒤로", action: "back", enabled: contents.navigationHistory.canGoBack() },
-    { label: "앞으로", action: "forward", enabled: contents.navigationHistory.canGoForward() },
-    { label: "새로고침", action: "reload", enabled: true },
-  );
-
-  const model = JSON.stringify({ x: params.x, y: params.y, items });
-  void contents.executeJavaScript(`(() => {
-    const model = ${model};
-    document.getElementById('__tweb_context_menu__')?.remove();
-    const host = document.createElement('div');
-    host.id = '__tweb_context_menu__';
-    host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none';
-    const shadow = host.attachShadow({mode:'closed'});
-    const backdrop = document.createElement('div');
-    backdrop.style.cssText = 'position:fixed;inset:0;pointer-events:auto';
-    const menu = document.createElement('div');
-    menu.setAttribute('role', 'menu');
-    menu.style.cssText = 'position:fixed;min-width:190px;padding:5px;background:#202124;color:#f1f3f4;border:1px solid #5f6368;border-radius:7px;box-shadow:0 8px 24px #0008;font:13px/1.35 system-ui,-apple-system,sans-serif;pointer-events:auto';
-    for (const item of model.items) {
-      if (item.separator) {
-        const separator = document.createElement('div');
-        separator.style.cssText = 'height:1px;margin:4px 2px;background:#5f6368';
-        menu.append(separator);
-        continue;
-      }
-      const button = document.createElement('button');
-      button.textContent = item.label;
-      button.disabled = !item.enabled;
-      button.style.cssText = 'display:block;width:100%;padding:6px 10px;border:0;border-radius:4px;background:transparent;color:inherit;text-align:left;font:inherit';
-      if (!item.enabled) button.style.opacity = '.45';
-      button.onmouseenter = () => { if (!button.disabled) button.style.background = '#3c4043'; };
-      button.onmouseleave = () => { button.style.background = 'transparent'; };
-      button.onclick = async () => {
-        host.remove();
-        switch (item.action) {
-          case 'undo': document.execCommand('undo'); break;
-          case 'redo': document.execCommand('redo'); break;
-          case 'cut': document.execCommand('cut'); break;
-          case 'copy': document.execCommand('copy'); break;
-          case 'paste': document.execCommand('paste'); break;
-          case 'selectAll': document.execCommand('selectAll'); break;
-          case 'openLink': window.open(item.value, '_blank'); break;
-          case 'copyLink': await navigator.clipboard.writeText(item.value); break;
-          case 'back': history.back(); break;
-          case 'forward': history.forward(); break;
-          case 'reload': location.reload(); break;
-        }
-      };
-      menu.append(button);
-    }
-    backdrop.onclick = () => host.remove();
-    backdrop.oncontextmenu = (event) => { event.preventDefault(); host.remove(); };
-    shadow.append(backdrop, menu);
-    document.documentElement.append(host);
-    const rect = menu.getBoundingClientRect();
-    menu.style.left = Math.max(4, Math.min(model.x, innerWidth - rect.width - 4)) + 'px';
-    menu.style.top = Math.max(4, Math.min(model.y, innerHeight - rect.height - 4)) + 'px';
-  })()`, true).then(() => {
-    if (debugLogging) console.error("tweb: context menu shown");
-  }).catch((error) => {
-    if (debugLogging) console.error(`tweb: context menu failed: ${error.message}`);
+  const items = buildBrowserContextMenu(params, {
+    canGoBack: contents.navigationHistory.canGoBack(),
+    canGoForward: contents.navigationHistory.canGoForward(),
   });
+  contextMenuStateByTab.set(tab, {
+    params,
+    actions: new Set(items.filter((item) => item.enabled).map((item) => item.action)),
+  });
+  sendToMainTabFrame(tab, "tweb-context-menu", { x: params.x, y: params.y, items });
+  if (debugLogging) console.error("tweb: context menu shown");
 }
 
 function keepWindowHidden(tab) {
@@ -2747,6 +2795,7 @@ app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
 
 app.whenReady().then(() => {
   if (process.platform === "darwin") app.dock?.hide();
+  configureDownloads();
   hiddenWindowWatchdog = setInterval(enforceHiddenWindows, 50);
   hiddenWindowWatchdog.unref();
   enforceHiddenWindows();
