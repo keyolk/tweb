@@ -6,7 +6,33 @@ const {
   isRestorableUrl,
   normalizeWindowSession,
   windowSessionForSave,
+  windowSessionKeys,
 } = require("./window-session.cjs");
+
+const tmuxIdentity = {
+  socketPath: "/private/tmp/tmux-502/default",
+  serverStartedAt: "100",
+  session: "work",
+  windowId: "@7",
+  windowIndex: "3",
+};
+
+test("the primary session key survives a tmux server restart", () => {
+  const before = windowSessionKeys(tmuxIdentity);
+  const after = windowSessionKeys({
+    ...tmuxIdentity,
+    serverStartedAt: "200",
+    windowId: "@1",
+  });
+  assert.equal(before.primary, after.primary);
+  assert.notEqual(before.legacy, after.legacy);
+});
+
+test("session names and window slots keep independent state", () => {
+  const original = windowSessionKeys(tmuxIdentity).primary;
+  assert.notEqual(original, windowSessionKeys({ ...tmuxIdentity, session: "other" }).primary);
+  assert.notEqual(original, windowSessionKeys({ ...tmuxIdentity, windowIndex: "4" }).primary);
+});
 
 test("internal blank and placeholder URLs are not restorable", () => {
   assert.equal(isRestorableUrl("about:blank"), false);

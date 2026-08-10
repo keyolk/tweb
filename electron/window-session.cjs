@@ -1,5 +1,25 @@
 "use strict";
 
+const { createHash } = require("node:crypto");
+
+function sessionKey(parts) {
+  return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
+}
+
+function windowSessionKeys(identity) {
+  if (!identity?.socketPath || !identity?.session || identity?.windowIndex === undefined) return null;
+  const primary = sessionKey([
+    "v2",
+    identity.socketPath,
+    identity.session,
+    String(identity.windowIndex),
+  ]);
+  const legacy = identity.serverStartedAt && identity.windowId
+    ? sessionKey([identity.socketPath, identity.serverStartedAt, identity.windowId])
+    : null;
+  return { primary, legacy: legacy === primary ? null : legacy };
+}
+
 function isRestorableUrl(url) {
   return typeof url === "string"
     && url.length > 0
@@ -45,4 +65,9 @@ function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
   };
 }
 
-module.exports = { isRestorableUrl, normalizeWindowSession, windowSessionForSave };
+module.exports = {
+  isRestorableUrl,
+  normalizeWindowSession,
+  windowSessionForSave,
+  windowSessionKeys,
+};

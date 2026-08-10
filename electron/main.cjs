@@ -19,7 +19,6 @@ const {
   writeSync,
 } = require("node:fs");
 const { execFile, execFileSync } = require("node:child_process");
-const { createHash } = require("node:crypto");
 const { Worker } = require("node:worker_threads");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
@@ -30,6 +29,7 @@ const {
   isRestorableUrl,
   normalizeWindowSession,
   windowSessionForSave,
+  windowSessionKeys,
 } = require("./window-session.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
@@ -58,6 +58,7 @@ const navigationHistory = [];
 let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
 let windowSessionPath = null;
+let legacyWindowSessionPath = null;
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let agentServer = null;
@@ -420,16 +421,28 @@ function initializeTmuxVisibility() {
         "-p",
         "-t",
         process.env.TMUX_PANE,
-        "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{pane_title}",
+        "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_title}",
       ],
       { encoding: "utf8", timeout: 1000 }
     ).trim();
-    const [socketPath, serverStartedAt, session, windowId, ...titleParts] = output.split("\t");
-    if (socketPath && serverStartedAt && session && windowId) {
-      tmuxIdentity = { socketPath, serverStartedAt, session, windowId, paneId: process.env.TMUX_PANE };
-      const identity = [socketPath, serverStartedAt, windowId].join("\0");
-      const key = createHash("sha256").update(identity).digest("hex").slice(0, 24);
-      windowSessionPath = path.join(app.getPath("userData"), "window-sessions", `${key}.json`);
+    const [socketPath, serverStartedAt, session, windowId, windowIndex, ...titleParts] = output.split("\t");
+    if (socketPath && serverStartedAt && session && windowId && windowIndex !== "") {
+      tmuxIdentity = {
+        socketPath,
+        serverStartedAt,
+        session,
+        windowId,
+        windowIndex,
+        paneId: process.env.TMUX_PANE,
+      };
+      const keys = windowSessionKeys(tmuxIdentity);
+      if (keys) {
+        const directory = path.join(app.getPath("userData"), "window-sessions");
+        windowSessionPath = path.join(directory, `${keys.primary}.json`);
+        legacyWindowSessionPath = keys.legacy
+          ? path.join(directory, `${keys.legacy}.json`)
+          : null;
+      }
     }
     originalPaneTitle = titleParts.join("\t");
 
@@ -874,19 +887,41 @@ function tabLabel(tab, index) {
   return `${index + 1}/${tabs.length} ${title}`;
 }
 
+function writeWindowSessionState(state) {
+  if (!windowSessionPath || !state) return;
+  const temporaryPath = `${windowSessionPath}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.dirname(windowSessionPath), { recursive: true });
+    writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPath, windowSessionPath);
+  } catch (error) {
+    try { unlinkSync(temporaryPath); } catch {}
+    if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
+  }
+}
+
 function readWindowSession() {
   if (!restoreWindowSession || !windowSessionPath) return null;
-  try {
-    return normalizeWindowSession(
-      JSON.parse(readFileSync(windowSessionPath, "utf8")),
-      defaultZoomFactor
-    );
-  } catch (error) {
-    if (error.code !== "ENOENT" && debugLogging) {
-      console.error(`tweb: window session restore failed: ${error.message}`);
+  for (const candidate of [windowSessionPath, legacyWindowSessionPath]) {
+    if (!candidate) continue;
+    try {
+      const session = normalizeWindowSession(
+        JSON.parse(readFileSync(candidate, "utf8")),
+        defaultZoomFactor
+      );
+      if (!session) continue;
+      if (candidate !== windowSessionPath) {
+        writeWindowSessionState({ version: 1, ...session });
+        if (debugLogging) console.error("tweb: migrated legacy window session");
+      }
+      return session;
+    } catch (error) {
+      if (error.code !== "ENOENT" && debugLogging) {
+        console.error(`tweb: window session restore failed: ${error.message}`);
+      }
     }
-    return null;
   }
+  return null;
 }
 
 function writeWindowSession() {
@@ -900,16 +935,7 @@ function writeWindowSession() {
   }), activeTabIndex, defaultZoomFactor);
   // A bare startup used to replace the last useful session with about:blank
   // after 100 ms. Preserve the existing file until a real page commits.
-  if (!state) return;
-  const temporaryPath = `${windowSessionPath}.${process.pid}.tmp`;
-  try {
-    mkdirSync(path.dirname(windowSessionPath), { recursive: true });
-    writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, windowSessionPath);
-  } catch (error) {
-    try { unlinkSync(temporaryPath); } catch {}
-    if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
-  }
+  writeWindowSessionState(state);
 }
 
 function scheduleWindowSessionSave() {

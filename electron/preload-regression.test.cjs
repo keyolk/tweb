@@ -163,7 +163,10 @@ test("bare open never restores or saves an internal blank page", () => {
   assert.match(main, /if \(showingLoadError \|\| !isRestorableUrl\(url\)\) return;/);
   assert.match(main, /const state = windowSessionForSave\(/);
   assert.match(main, /if \(!windowSessionPath \|\| tabs\.length === 0\) return;/);
-  assert.match(main, /if \(!state\) return;/);
+  assert.match(main, /function writeWindowSessionState\(state\)/);
+  assert.match(main, /if \(!windowSessionPath \|\| !state\) return;/);
+  assert.match(main, /windowSessionKeys\(tmuxIdentity\)/);
+  assert.match(main, /for \(const candidate of \[windowSessionPath, legacyWindowSessionPath\]\)/);
   assert.match(main, /restoreWindowSession && !isRestorableUrl\(url\)/);
   assert.match(main, /noWindowSessionPage\(\)/);
   assert.match(main, /if \(!isRestorableUrl\(url\) \|\| url\.startsWith\("tweb-action:"\)\) return;/);
