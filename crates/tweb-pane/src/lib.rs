@@ -224,11 +224,16 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     let initial_geometry = terminal::window_geometry();
     // Kitty image ID는 terminal 전체 namespace이므로 pane process마다 고유해야 한다.
     let image_id = std::process::id();
-    let mut command = match options.engine {
+    let (mut command, engine_description) = match options.engine {
         BrowserEngine::Electron => {
             let (electron_path, electron_dir) = find_electron()?;
             tracing::debug!(path = %electron_path.display(), dir = %electron_dir.display(),
                 "resolved electron engine");
+            let description = format!(
+                "{} (app dir {})",
+                electron_path.display(),
+                electron_dir.display()
+            );
             let mut command = Command::new(&electron_path);
             command
                 .arg(".")
@@ -242,10 +247,11 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 })
                 .arg(url)
                 .current_dir(electron_dir);
-            command
+            (command, description)
         }
         BrowserEngine::Tauri => {
             let tauri_path = find_tauri()?;
+            let description = tauri_path.display().to_string();
             let mut command = Command::new(tauri_path);
             command
                 .arg("--frame-rate")
@@ -256,7 +262,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                     "--no-adaptive-frame-rate"
                 })
                 .arg(url);
-            command
+            (command, description)
         }
     };
     command
@@ -281,7 +287,9 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             format!("{},{},{},{}", size.cols, size.rows, size.width, size.height),
         );
     }
-    let mut child = command.spawn().context("failed to spawn browser engine")?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn browser engine: {engine_description}"))?;
 
     let child_stdin = child.stdin.take();
     let child_id = child.id();
@@ -525,18 +533,76 @@ fn engine_stderr() -> Stdio {
         .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
+fn absolute_from(path: std::path::PathBuf, directory: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        directory.join(path)
+    }
+}
+
+fn resolve_electron_paths(
+    executable: std::path::PathBuf,
+    app_directory: std::path::PathBuf,
+    current_directory: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        absolute_from(executable, current_directory),
+        absolute_from(app_directory, current_directory),
+    )
+}
+
 /// Electron binary 경로와 app directory 찾기.
 /// 반환: (electron binary path, electron app dir with package.json)
 fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    Ok((electron_executable()?, electron_app_directory()?))
+    // `Command::current_dir` is applied before a relative program path is resolved.
+    // Resolve workspace-relative selections before changing into the Electron app
+    // directory, or `electron/node_modules/...` becomes `electron/electron/...`.
+    let directory = std::env::current_dir().context("cannot resolve the current directory")?;
+    Ok(resolve_electron_paths(
+        electron_executable()?,
+        electron_app_directory()?,
+        &directory,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_geometry_message, matching_client_ttys, raw_kitty_delete, tmux_passthrough,
+        changed_geometry_message, matching_client_ttys, raw_kitty_delete, resolve_electron_paths,
+        tmux_passthrough,
     };
     use crate::terminal::{WindowGeometry, WindowSize};
+
+    #[test]
+    fn electron_paths_resolve_against_the_original_working_directory() {
+        let cwd = std::path::Path::new("/workspace/tweb");
+        let paths = resolve_electron_paths(
+            std::path::PathBuf::from("electron/node_modules/electron"),
+            std::path::PathBuf::from("electron"),
+            cwd,
+        );
+        assert_eq!(
+            paths,
+            (
+                std::path::PathBuf::from("/workspace/tweb/electron/node_modules/electron"),
+                std::path::PathBuf::from("/workspace/tweb/electron"),
+            )
+        );
+
+        let absolute = resolve_electron_paths(
+            std::path::PathBuf::from("/opt/electron"),
+            std::path::PathBuf::from("/opt/tweb-app"),
+            cwd,
+        );
+        assert_eq!(
+            absolute,
+            (
+                std::path::PathBuf::from("/opt/electron"),
+                std::path::PathBuf::from("/opt/tweb-app"),
+            )
+        );
+    }
 
     #[test]
     fn kitty_delete_targets_one_image_without_response() {
