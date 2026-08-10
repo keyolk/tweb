@@ -249,6 +249,42 @@ test("id reads survive a form whose control is named id", () => {
   }
 });
 
+test("browser context menu uses Chromium hit-test data and native commands", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /buildBrowserContextMenu\(params/);
+  assert.match(main, /contextMenuStateByTab\.set\(tab/);
+  assert.match(main, /actions: new Set\(items\.filter\(\(item\) => item\.enabled\)/);
+  assert.match(main, /case "paste-plain": contents\.pasteAndMatchStyle\(\)/);
+  assert.match(main, /case "copy-image":\s+contents\.copyImageAt/);
+  assert.match(main, /case "save-image":[\s\S]*downloadUrl\(contents, params\.srcURL\)/);
+  assert.match(main, /session\.defaultSession\.on\("will-download"/);
+  assert.match(main, /item\.setSavePath\(destination\)/);
+  assert.match(main, /configureDownloads\(\)/);
+  assert.match(main, /sendToMainTabFrame\(tab, "tweb-context-menu"/);
+  assert.doesNotMatch(main, /navigator\.clipboard\.writeText\(item\.value\)/);
+  assert.match(electron, /function showBrowserContextMenu\(model\)/);
+  assert.match(electron, /send\(action \? "context-menu-command" : "context-menu-dismiss", action\)/);
+  assert.match(electron, /returnFocus\?\.focus\?\.\(\{ preventScroll: true \}\)/);
+  assert.match(electron, /restoredContextFocus && isEditable\(activeElement\(\)\)/);
+  assert.match(electron, /menu\.onkeydown/);
+});
+
+test("visual image actions copy pixels, copy current source, and download", () => {
+  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+    assert.match(source, /function imageSource\(image\)/, `${name} has no image source resolver`);
+    assert.match(source, /image\.currentSrc \|\| image\.src/);
+    assert.match(source, /imageURL: imageSource\(image\)/);
+    assert.match(source, /link\?\.querySelector\?\.\("img,picture,canvas,svg,video,\[role=img\]"\) \|\| null/,
+      `${name} does not preserve an image nested inside a link`);
+    const handler = source.slice(source.indexOf("function handleVisualKey(event, key)"),
+      source.indexOf("function cssSelector(element)"));
+    assert.match(handler, /visualState\.kind === "image" \? visualState\.imageURL/);
+    assert.match(handler, /key === "D" && visualState\.kind === "image" && visualState\.imageURL/);
+    assert.match(handler, /send\("download", visualState\.imageURL\)/);
+    assert.match(source, /send\("copy-image", \{/);
+  }
+});
+
 // A picked image or link has no selection, so `c` had nothing to collapse and did
 // nothing at all — the caret was unreachable from anything but a text target.
 test("c reaches a caret from a target that carries no text", () => {

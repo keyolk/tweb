@@ -481,6 +481,16 @@ impl BrowserRuntime {
                     self.with_active_window(|window| copy_image(window, rect));
                 }
             }
+            "download" => {
+                if let Some(url) = action.value.as_str().filter(|url| is_downloadable_url(url)) {
+                    let url = javascript_string(url);
+                    self.with_active_window(|window| {
+                        let _ = window.eval(format!(
+                            "(()=>{{const a=document.createElement('a');a.href={url};a.download='';a.style.display='none';document.documentElement.append(a);a.click();a.remove()}})()"
+                        ));
+                    });
+                }
+            }
             "paste" => {
                 if let Some(text) = read_text() {
                     let text = javascript_string(&text);
@@ -1121,6 +1131,11 @@ fn has_scheme(value: &str) -> bool {
                 character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
             }
         })
+}
+
+fn is_downloadable_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file" | "data" | "blob"))
 }
 
 fn url_encode(value: &str) -> String {

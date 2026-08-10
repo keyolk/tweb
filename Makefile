@@ -42,6 +42,7 @@ electron-test: ## Electron unit test 실행
 
 electron-check: electron-test ## Electron JavaScript 문법 검사
 	node --check electron/main.cjs
+	node --check electron/context-menu.cjs
 	node --check electron/preload.cjs
 	node --check electron/gfx-worker.cjs
 	node --check electron/mouse-click-state.cjs
