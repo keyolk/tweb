@@ -157,6 +157,19 @@ test("a resize re-places the existing image instead of baring the pane", () => {
   assert.match(replace, /a=p,i=\$\{imageId\}/);
 });
 
+// A client can still report this window while tmux has zoomed a different pane.
+// In that state the TWeb image must be removed from that client, then repainted
+// when the zoom ends and the browser pane becomes visible again.
+test("another pane owning tmux zoom hides the browser image", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /require\("\.\/tmux-visibility\.cjs"\)/);
+  assert.match(main, /#\{window_zoomed_flag\}\\t#\{pane_id\}/);
+  assert.match(main, /paneId: process\.env\.TMUX_PANE/);
+  assert.match(main, /const next = visibleTmuxClientTtys\(stdout, tmuxIdentity\);/);
+  assert.match(main, /if \(!next\.has\(tty\)\) deleteImageFromClientTty\(tty\);/);
+  assert.match(main, /if \(becameVisible\) repaintActiveTab\(\);/);
+});
+
 // The block a hint can pick is rarely exactly what one wants to copy, so `v` has
 // to lead somewhere: a caret to move the start to, and motions free to leave the
 // block.

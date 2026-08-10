@@ -25,6 +25,7 @@ const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
 const { startAgentServer } = require("./agent-server.cjs");
+const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
@@ -420,7 +421,7 @@ function initializeTmuxVisibility() {
     ).trim();
     const [socketPath, serverStartedAt, session, windowId, ...titleParts] = output.split("\t");
     if (socketPath && serverStartedAt && session && windowId) {
-      tmuxIdentity = { socketPath, serverStartedAt, session, windowId };
+      tmuxIdentity = { socketPath, serverStartedAt, session, windowId, paneId: process.env.TMUX_PANE };
       const identity = [socketPath, serverStartedAt, windowId].join("\0");
       const key = createHash("sha256").update(identity).digest("hex").slice(0, 24);
       windowSessionPath = path.join(app.getPath("userData"), "window-sessions", `${key}.json`);
@@ -430,18 +431,11 @@ function initializeTmuxVisibility() {
     if (tmuxIdentity) {
       const clients = execFileSync(
         "tmux",
-        ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}"],
+        ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
         { encoding: "utf8", timeout: 1000 }
       );
-      const initial = new Set();
-      for (const line of clients.trim().split("\n")) {
-        const [tty, clientSession, clientWindow] = line.split("\t");
-        if (tty && clientSession === tmuxIdentity.session && clientWindow === tmuxIdentity.windowId) {
-          initial.add(tty);
-        }
-      }
-      visibleClientTtys = initial;
-      terminalVisible = initial.size > 0;
+      visibleClientTtys = visibleTmuxClientTtys(clients, tmuxIdentity);
+      terminalVisible = visibleClientTtys.size > 0;
     }
   } catch (error) {
     if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
@@ -456,18 +450,12 @@ function syncTmuxVisibility() {
   visibilityCheckRunning = true;
   execFile(
     "tmux",
-    ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}"],
+    ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
     { encoding: "utf8", timeout: 1000 },
     (error, stdout) => {
       visibilityCheckRunning = false;
       if (error) return;
-      const next = new Set();
-      for (const line of stdout.trim().split("\n")) {
-        const [tty, session, windowId] = line.split("\t");
-        if (tty && session === tmuxIdentity.session && windowId === tmuxIdentity.windowId) {
-          next.add(tty);
-        }
-      }
+      const next = visibleTmuxClientTtys(stdout, tmuxIdentity);
 
       const wasVisible = terminalVisible;
       for (const tty of visibleClientTtys) {
