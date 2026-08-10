@@ -19,13 +19,18 @@ const {
   writeSync,
 } = require("node:fs");
 const { execFile, execFileSync } = require("node:child_process");
-const { createHash } = require("node:crypto");
 const { Worker } = require("node:worker_threads");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
 const { startAgentServer } = require("./agent-server.cjs");
 const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
+const {
+  isRestorableUrl,
+  normalizeWindowSession,
+  windowSessionForSave,
+  windowSessionKeys,
+} = require("./window-session.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
@@ -53,6 +58,7 @@ const navigationHistory = [];
 let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
 let windowSessionPath = null;
+let legacyWindowSessionPath = null;
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let agentServer = null;
@@ -415,16 +421,28 @@ function initializeTmuxVisibility() {
         "-p",
         "-t",
         process.env.TMUX_PANE,
-        "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{pane_title}",
+        "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_title}",
       ],
       { encoding: "utf8", timeout: 1000 }
     ).trim();
-    const [socketPath, serverStartedAt, session, windowId, ...titleParts] = output.split("\t");
-    if (socketPath && serverStartedAt && session && windowId) {
-      tmuxIdentity = { socketPath, serverStartedAt, session, windowId, paneId: process.env.TMUX_PANE };
-      const identity = [socketPath, serverStartedAt, windowId].join("\0");
-      const key = createHash("sha256").update(identity).digest("hex").slice(0, 24);
-      windowSessionPath = path.join(app.getPath("userData"), "window-sessions", `${key}.json`);
+    const [socketPath, serverStartedAt, session, windowId, windowIndex, ...titleParts] = output.split("\t");
+    if (socketPath && serverStartedAt && session && windowId && windowIndex !== "") {
+      tmuxIdentity = {
+        socketPath,
+        serverStartedAt,
+        session,
+        windowId,
+        windowIndex,
+        paneId: process.env.TMUX_PANE,
+      };
+      const keys = windowSessionKeys(tmuxIdentity);
+      if (keys) {
+        const directory = path.join(app.getPath("userData"), "window-sessions");
+        windowSessionPath = path.join(directory, `${keys.primary}.json`);
+        legacyWindowSessionPath = keys.legacy
+          ? path.join(directory, `${keys.legacy}.json`)
+          : null;
+      }
     }
     originalPaneTitle = titleParts.join("\t");
 
@@ -869,45 +887,8 @@ function tabLabel(tab, index) {
   return `${index + 1}/${tabs.length} ${title}`;
 }
 
-function readWindowSession() {
-  if (!restoreWindowSession || !windowSessionPath) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(windowSessionPath, "utf8"));
-    if (parsed?.version !== 1 || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
-    const restoredTabs = parsed.tabs.slice(0, 50).flatMap((entry) => {
-      if (!entry || typeof entry.url !== "string" || !entry.url || entry.url.length > 2_000_000) return [];
-      const zoom = Number.isFinite(entry.zoom)
-        ? Math.min(2, Math.max(0.5, entry.zoom))
-        : defaultZoomFactor;
-      return [{ url: entry.url, zoom }];
-    });
-    if (restoredTabs.length === 0) return null;
-    const activeIndex = Number.isInteger(parsed.activeIndex)
-      ? Math.min(restoredTabs.length - 1, Math.max(0, parsed.activeIndex))
-      : 0;
-    return { tabs: restoredTabs, activeIndex };
-  } catch (error) {
-    if (error.code !== "ENOENT" && debugLogging) {
-      console.error(`tweb: window session restore failed: ${error.message}`);
-    }
-    return null;
-  }
-}
-
-function writeWindowSession() {
-  if (!windowSessionPath || tabs.length === 0) return;
-  const savedTabs = tabs.flatMap((tab) => {
-    if (tab.isDestroyed()) return [];
-    const url = tabSessionUrls.get(tab) || tab.webContents.getURL() || "about:blank";
-    const zoom = tabZoomFactors.get(tab) ?? defaultZoomFactor;
-    return [{ url, zoom }];
-  });
-  if (savedTabs.length === 0) return;
-  const state = {
-    version: 1,
-    activeIndex: Math.min(savedTabs.length - 1, Math.max(0, activeTabIndex)),
-    tabs: savedTabs,
-  };
+function writeWindowSessionState(state) {
+  if (!windowSessionPath || !state) return;
   const temporaryPath = `${windowSessionPath}.${process.pid}.tmp`;
   try {
     mkdirSync(path.dirname(windowSessionPath), { recursive: true });
@@ -917,6 +898,44 @@ function writeWindowSession() {
     try { unlinkSync(temporaryPath); } catch {}
     if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
   }
+}
+
+function readWindowSession() {
+  if (!restoreWindowSession || !windowSessionPath) return null;
+  for (const candidate of [windowSessionPath, legacyWindowSessionPath]) {
+    if (!candidate) continue;
+    try {
+      const session = normalizeWindowSession(
+        JSON.parse(readFileSync(candidate, "utf8")),
+        defaultZoomFactor
+      );
+      if (!session) continue;
+      if (candidate !== windowSessionPath) {
+        writeWindowSessionState({ version: 1, ...session });
+        if (debugLogging) console.error("tweb: migrated legacy window session");
+      }
+      return session;
+    } catch (error) {
+      if (error.code !== "ENOENT" && debugLogging) {
+        console.error(`tweb: window session restore failed: ${error.message}`);
+      }
+    }
+  }
+  return null;
+}
+
+function writeWindowSession() {
+  if (!windowSessionPath || tabs.length === 0) return;
+  const state = windowSessionForSave(tabs.flatMap((tab) => {
+    if (tab.isDestroyed()) return [];
+    return [{
+      url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
+      zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor,
+    }];
+  }), activeTabIndex, defaultZoomFactor);
+  // A bare startup used to replace the last useful session with about:blank
+  // after 100 ms. Preserve the existing file until a real page commits.
+  writeWindowSessionState(state);
 }
 
 function scheduleWindowSessionSave() {
@@ -1181,7 +1200,7 @@ function closeTab(index = activeTabIndex) {
   const tab = tabs[index];
   if (!tab || tab.isDestroyed()) return;
   const url = tab.webContents.getURL();
-  if (url && url !== "about:blank") {
+  if (isRestorableUrl(url)) {
     closedTabs.push(url);
     if (closedTabs.length > 25) closedTabs.shift();
   }
@@ -1219,7 +1238,7 @@ function historyPath() {
 }
 
 function recordNavigationHistory(url, title = "") {
-  if (typeof url !== "string" || !url || url === "about:blank" || url.startsWith("tweb-action:")) return;
+  if (!isRestorableUrl(url) || url.startsWith("tweb-action:")) return;
   const existing = navigationHistory.findIndex((entry) => entry.url === url);
   if (existing >= 0) navigationHistory.splice(existing, 1);
   navigationHistory.unshift({ url, title: String(title || url), recency: ++navigationSerial });
@@ -1262,7 +1281,7 @@ function readGlobalHistory(limit = historyLimit) {
     if (!line) continue;
     try {
       const entry = JSON.parse(line);
-      if (entry?.url && !seen.has(entry.url)) {
+      if (isRestorableUrl(entry?.url) && !seen.has(entry.url)) {
         seen.set(entry.url, { url: entry.url, title: entry.title || entry.url });
       }
     } catch (_) {
@@ -2019,7 +2038,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 
   let showingLoadError = false;
   const recordNavigation = (url) => {
-    if (showingLoadError || typeof url !== "string" || !url) return;
+    if (showingLoadError || !isRestorableUrl(url)) return;
     tabSessionUrls.set(tab, url);
     recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
@@ -2103,7 +2122,8 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
 function createTab(
   url = "about:blank",
   activate = true,
-  initialZoomFactor = defaultZoomFactor
+  initialZoomFactor = defaultZoomFactor,
+  showInitialPlaceholder = tabs.length === 0
 ) {
   const tab = adoptTab(
     new BrowserWindow(browserWindowOptions()),
@@ -2123,7 +2143,7 @@ function createTab(
   // pane was simply black. A placeholder commits in about half of one second, and
   // paint holding keeps it up while the real page loads. Only the first tab needs
   // it — any later one has the previous page on screen to hold.
-  if (tabs.length === 1 && url !== "about:blank" && !process.env.TWEB_NO_PLACEHOLDER) {
+  if (showInitialPlaceholder && isRestorableUrl(url) && !process.env.TWEB_NO_PLACEHOLDER) {
     tab.webContents.once("did-finish-load", load);
     void tab.loadURL(placeholderPage(url)).catch(load);
   } else {
@@ -2148,6 +2168,15 @@ function placeholderPage(target) {
 <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
 background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace">
 ${escaped} 여는 중…</body>`)}`;
+}
+
+function noWindowSessionPage() {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html>
+<meta charset="utf-8"><title>TWeb</title>
+<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;
+flex-direction:column;gap:8px">
+<div>복원할 이전 페이지가 없습니다</div><div style="color:#6f747c">t 키로 주소를 입력하세요</div></body>`)}`;
 }
 
 function applyViewport(vp, origin = tmuxOrigin) {
@@ -2209,10 +2238,15 @@ function createWindow(url) {
   lastViewport = vp;
 
   const session = readWindowSession();
-  if (!session) return createTab(url, true);
+  if (!session) {
+    const initialUrl = restoreWindowSession && !isRestorableUrl(url)
+      ? noWindowSessionPage()
+      : url;
+    return createTab(initialUrl, true);
+  }
 
-  for (const tab of session.tabs) {
-    createTab(tab.url, false, tab.zoom);
+  for (const [index, tab] of session.tabs.entries()) {
+    createTab(tab.url, false, tab.zoom, index === session.activeIndex);
   }
   activateTab(session.activeIndex);
   if (debugLogging) {
