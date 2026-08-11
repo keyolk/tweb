@@ -224,7 +224,7 @@ terminal cursor와 조합 preview를 그리는 것은 emulator이므로 글꼴 �
 | `Esc` | hint/search/visual/inspect/omnibox 취소 · 입력 focus 해제 · 전체화면 해제 |
 | `Esc` (normal) | 사이트 자동완성·popup을 outside click으로 닫기 |
 
-우하단 mode indicator는 현재 mode와 함께 `탭 현재/전체`를 항상 표시합니다. 예를 들어 두 번째 탭이 활성화된 상태로 총 다섯 개가 열려 있으면 `N · 탭 2/5`로 보이며, 탭 생성·전환·닫기에 맞춰 즉시 갱신됩니다.
+각 TWeb pane 우하단에는 mode indicator와 분리된 `현재/전체` 탭 badge가 표시됩니다. 예를 들어 총 다섯 개 중 두 번째 탭이면 `N  2/5`로 보입니다. Badge에 마우스를 올리거나 클릭하면 그 pane의 탭 제목 목록이 열리고, 제목을 클릭하면 해당 탭으로 전환됩니다. 탭 상태는 pane마다 독립적이며 tmux status의 pane title에는 노출하지 않습니다.
 
 Visual의 text 대상을 선택하거나 normal mode에서 `V`로 페이지 전체 text를 선택한 뒤 `h`/`l`은 문자, `b`/`w`/`e`는 단어, `k`/`j`는 줄, `0`/`$`는 줄 경계, `{`/`}`는 문단 단위로 active edge를 조정하고 `o`는 조정할 selection endpoint를 바꿉니다. 조정한 범위에서 `y`/`Y`는 선택 text를 복사합니다. image 대상에서는 `y`가 표시된 bitmap, `Y`가 대체 text, `u`가 실제 표시 중인 image URL(`currentSrc`), `D`가 image download, `o`/`O`가 image를 현재/새 tab에서 엽니다. link/editable 대상에서는 `y`가 link URL 또는 text/value를 smart copy하고, `u`는 link URL, `o`/`O`는 link를 열며, `p`는 clipboard를 붙여넣습니다. `d`는 대상을 inspect합니다.
 

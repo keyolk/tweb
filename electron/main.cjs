@@ -965,12 +965,10 @@ function notify(message) {
 }
 
 function updatePaneTitle() {
-  if (!win || !process.env.TMUX_PANE) return;
-  execFile(
-    "tmux",
-    ["select-pane", "-t", process.env.TMUX_PANE, "-T", `tweb ${tabLabel(win, activeTabIndex)}`],
-    () => {}
-  );
+  if (!process.env.TMUX_PANE) return;
+  // Tab state belongs to this pane's in-page badge. Putting it in tmux's pane
+  // title makes one active pane look like the state of the whole window.
+  execFile("tmux", ["select-pane", "-t", process.env.TMUX_PANE, "-T", "tweb"], () => {});
 }
 
 function restorePaneTitle() {
@@ -1363,7 +1361,14 @@ function tabListModel() {
 }
 
 function tabStateModel() {
-  return { activeIndex: activeTabIndex, count: tabs.length };
+  return {
+    activeIndex: activeTabIndex,
+    count: tabs.length,
+    tabs: tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
+      index,
+      title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "새 탭",
+    }]),
+  };
 }
 
 function sendTabState(tab = win) {
@@ -2132,7 +2137,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   tab.on("page-title-updated", (_event, title) => {
     const url = tabSessionUrls.get(tab) || contents.getURL();
     recordNavigationHistory(url, title);
-    if (tab === win) updatePaneTitle();
+    sendTabState();
     if (debugLogging) console.error(`tweb: title ${title}`);
   });
   contents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {

@@ -31,9 +31,13 @@
   let helpHost = null;
   let indicatorHost = null;
   let indicatorLabel = null;
+  let tabBadge = null;
+  let tabPopover = null;
+  let tabPopoverPinned = false;
+  let tabPopoverTimer = null;
   let indicatorMode = "normal";
   let indicatorDetail = "";
-  let tabState = { activeIndex: 0, count: 1 };
+  let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "새 탭" }] };
   let caretIndicator = null;
   let caretCanvas = null;
   let terminalEditable = null;
@@ -244,11 +248,68 @@
     }
   }
 
+  function hideTabPopover() {
+    clearTimeout(tabPopoverTimer);
+    tabPopoverTimer = null;
+    tabPopoverPinned = false;
+    if (tabPopover) tabPopover.style.display = "none";
+    if (tabBadge) tabBadge.setAttribute("aria-expanded", "false");
+    if (document.documentElement) document.documentElement.dataset.twebTabPopover = "closed";
+    paintNow();
+  }
+
+  function scheduleTabPopoverHide() {
+    clearTimeout(tabPopoverTimer);
+    if (!tabPopoverPinned) tabPopoverTimer = setTimeout(hideTabPopover, 180);
+  }
+
+  function showTabPopover(pinned = false) {
+    if (!topFrame) return;
+    ensureIndicator();
+    clearTimeout(tabPopoverTimer);
+    tabPopoverTimer = null;
+    tabPopoverPinned = pinned;
+    tabPopover.replaceChildren();
+    for (const tab of tabState.tabs) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.style.cssText = [
+        "display:flex", "width:100%", "gap:7px", "align-items:center", "padding:5px 7px",
+        "border:0", "border-radius:4px", "background:transparent", "color:#e8eaed",
+        "font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace", "text-align:left",
+        "cursor:pointer", "white-space:nowrap",
+      ].join(";");
+      if (tab.index === tabState.activeIndex) button.style.background = "#8ab4f82b";
+      const number = document.createElement("span");
+      number.textContent = `${tab.index + 1}`;
+      number.style.cssText = "flex:0 0 18px;color:#8ab4f8;text-align:right";
+      const title = document.createElement("span");
+      title.textContent = tab.title || "새 탭";
+      title.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis";
+      button.append(number, title);
+      button.onmouseenter = () => { button.style.background = "#ffffff18"; };
+      button.onmouseleave = () => {
+        button.style.background = tab.index === tabState.activeIndex ? "#8ab4f82b" : "transparent";
+      };
+      button.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        hideTabPopover();
+        if (tab.index !== tabState.activeIndex) send("activate-tab", tab.index);
+      };
+      tabPopover.append(button);
+    }
+    tabPopover.style.display = "block";
+    tabBadge.setAttribute("aria-expanded", "true");
+    if (document.documentElement) document.documentElement.dataset.twebTabPopover = "open";
+    paintNow();
+  }
+
   function ensureIndicator() {
     if (!topFrame || !document.documentElement || indicatorHost?.isConnected) return;
     const host = document.createElement("div");
     host.id = "__tweb_mode__";
-    host.style.cssText = "position:fixed;right:5px;bottom:5px;z-index:2147483647;pointer-events:none";
+    host.style.cssText = "position:fixed;right:5px;bottom:5px;z-index:2147483647;display:flex;gap:4px;align-items:flex-end;pointer-events:none";
     const shadow = host.attachShadow({ mode: "closed" });
     const label = document.createElement("div");
     label.style.cssText = [
@@ -257,30 +318,70 @@
       "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
       "text-align:center", "white-space:nowrap", "backdrop-filter:blur(3px)",
     ].join(";");
-    shadow.append(label);
+    const badge = document.createElement("button");
+    badge.type = "button";
+    badge.setAttribute("aria-haspopup", "menu");
+    badge.setAttribute("aria-expanded", "false");
+    badge.style.cssText = [
+      "box-sizing:border-box", "height:18px", "padding:1px 6px", "border:1px solid #8ab4f866",
+      "border-radius:4px", "background:#111d", "color:#8ab4f8", "box-shadow:0 1px 4px #0007",
+      "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace", "cursor:pointer",
+      "white-space:nowrap", "pointer-events:auto", "backdrop-filter:blur(3px)",
+    ].join(";");
+    const popover = document.createElement("div");
+    popover.setAttribute("role", "menu");
+    popover.style.cssText = [
+      "display:none", "position:absolute", "right:0", "bottom:22px", "width:min(300px,calc(100vw - 10px))",
+      "max-height:min(50vh,320px)", "overflow:auto", "box-sizing:border-box", "padding:5px",
+      "border:1px solid #5f6368", "border-radius:6px", "background:#202124f5", "color:#e8eaed",
+      "box-shadow:0 6px 22px #000a", "pointer-events:auto", "backdrop-filter:blur(5px)",
+    ].join(";");
+    badge.onmouseenter = () => showTabPopover(false);
+    badge.onmouseleave = scheduleTabPopoverHide;
+    badge.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (tabPopover.style.display !== "none" && tabPopoverPinned) hideTabPopover();
+      else showTabPopover(true);
+    };
+    popover.onmouseenter = () => clearTimeout(tabPopoverTimer);
+    popover.onmouseleave = scheduleTabPopoverHide;
+    shadow.append(label, badge, popover);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
+    tabBadge = badge;
+    tabPopover = popover;
   }
 
   function renderIndicator() {
     if (!topFrame) return;
     ensureIndicator();
     const short = modeLabels[indicatorMode] || indicatorMode.slice(0, 1).toUpperCase();
-    const modeText = indicatorDetail ? `${short} ${indicatorDetail}` : short;
-    const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
-    indicatorLabel.textContent = `${modeText} · 탭 ${active}/${tabState.count}`;
-    indicatorLabel.title = `TWeb ${indicatorMode}${indicatorDetail ? ` — ${indicatorDetail}` : ""} · 탭 ${active}/${tabState.count}`;
+    indicatorLabel.textContent = indicatorDetail ? `${short} ${indicatorDetail}` : short;
+    indicatorLabel.title = `TWeb ${indicatorMode}${indicatorDetail ? ` — ${indicatorDetail}` : ""}`;
     indicatorLabel.style.color = indicatorMode === "passthrough" ? "#9aa0a6"
       : indicatorMode === "normal" ? "#8ab4f8"
       : indicatorMode === "insert" ? "#81c995"
       : "#fdd663";
+    const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
+    tabBadge.textContent = `${active}/${tabState.count}`;
+    tabBadge.title = `이 pane의 탭 ${active}/${tabState.count} · hover/click으로 목록`;
+    if (tabPopover.style.display !== "none") showTabPopover(tabPopoverPinned);
   }
 
   function updateTabState(model) {
-    const count = Number.isInteger(model?.count) && model.count > 0 ? model.count : 1;
+    const tabs = Array.isArray(model?.tabs) ? model.tabs.flatMap((tab, index) => {
+      if (!tab || !Number.isInteger(tab.index)) return [];
+      return [{ index: tab.index, title: String(tab.title || `탭 ${index + 1}`) }];
+    }) : [];
+    const count = tabs.length || (Number.isInteger(model?.count) && model.count > 0 ? model.count : 1);
     const activeIndex = Number.isInteger(model?.activeIndex) ? model.activeIndex : 0;
-    tabState = { activeIndex: Math.min(count - 1, Math.max(0, activeIndex)), count };
+    tabState = {
+      activeIndex: Math.min(count - 1, Math.max(0, activeIndex)),
+      count,
+      tabs: tabs.length ? tabs : Array.from({ length: count }, (_, index) => ({ index, title: `탭 ${index + 1}` })),
+    };
     const root = document.documentElement;
     if (root) {
       root.dataset.twebTabIndex = String(tabState.activeIndex);

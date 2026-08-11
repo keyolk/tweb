@@ -132,11 +132,16 @@ test("overlays ask for a paint instead of waiting for the frame clock", () => {
   assert.match(main, /const wasIdle = activeFrameRate !== maxActiveFrameRate;/);
   assert.match(main, /if \(wasIdle && win && !win\.isDestroyed\(\) && terminalVisible\) win\.webContents\.invalidate\(\);/);
   assert.match(electron, /function paintNow\(\)/);
-  // Every overlay mount must request it; the mode indicator rides along instead.
+  // Every transient overlay mount requests a paint. The persistent mode/tab
+  // indicator additionally repaints when its hover popover opens or closes.
   const mounts = electron.match(/document\.documentElement\.append\(host\);/g) || [];
   const requests = electron.match(/^ +paintNow\(\);$/gm) || [];
-  assert.equal(requests.length, mounts.length - 1,
-    "each overlay except the mode indicator should request a paint");
+  assert.ok(requests.length >= mounts.length - 1,
+    "each transient overlay should request a paint");
+  const tabPopover = electron.slice(electron.indexOf("function hideTabPopover()"),
+    electron.indexOf("function ensureIndicator()"));
+  assert.equal(tabPopover.match(/^ +paintNow\(\);$/gm)?.length, 2,
+    "opening and closing the tab popover should repaint immediately");
 });
 
 // Same hazard as the tab switch: a delete with no frame behind it shows the
@@ -269,28 +274,36 @@ test("browser context menu uses Chromium hit-test data and native commands", () 
   assert.match(electron, /menu\.onkeydown/);
 });
 
-test("mode indicator always includes the active and total tab count", () => {
+test("each pane owns an interactive tab badge instead of publishing tabs in tmux", () => {
   for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
-    assert.match(source, /let tabState = \{ activeIndex: 0, count: 1 \}/,
-      `${name} has no initial tab state`);
-    assert.match(source, /function updateTabState\(model\)/,
-      `${name} cannot update tab state`);
-    assert.match(source, /indicatorLabel\.textContent = `\$\{modeText\} · 탭 \$\{active\}\/\$\{tabState\.count\}`/,
-      `${name} does not keep the tab count in its mode indicator`);
+    assert.match(source, /let tabState = \{ activeIndex: 0, count: 1, tabs:/,
+      `${name} has no initial pane-local tab state`);
+    assert.match(source, /function showTabPopover\(pinned = false\)/,
+      `${name} has no hoverable tab-title popover`);
+    assert.match(source, /badge\.onmouseenter = \(\) => showTabPopover\(false\)/,
+      `${name} does not open tab titles on hover`);
+    assert.match(source, /button\.onclick = \(event\) => \{[\s\S]*send\("activate-tab", tab\.index\)/,
+      `${name} cannot switch tabs by clicking a title`);
+    assert.match(source, /tabBadge\.textContent = `\$\{active\}\/\$\{tabState\.count\}`/,
+      `${name} does not render current\/total in a separate badge`);
     assert.match(source, /ipcRenderer\.on\("tweb-tab-state"/,
-      `${name} does not receive tab state updates`);
+      `${name} does not receive pane-local tab state updates`);
   }
 
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /function tabStateModel\(\)/);
+  assert.match(main, /function tabStateModel\(\)[\s\S]*title: candidate\.webContents\.getTitle\(\)/);
   assert.match(main, /event\.reply\("tweb-tab-state", tabStateModel\(\)\)/);
   assert.match(main, /function activateTab\(index\)[\s\S]*sendTabState\(\)/);
+  const paneTitle = main.slice(main.indexOf("function updatePaneTitle()"),
+    main.indexOf("function restorePaneTitle()"));
+  assert.match(paneTitle, /"-T", "tweb"/);
+  assert.doesNotMatch(paneTitle, /tabLabel|activeTabIndex/);
 
   const tauriBrowser = fs.readFileSync(path.join(root,
     "crates/tweb-engine/tauri/src/browser.rs"), "utf8");
-  assert.match(tauriBrowser, /fn send_tab_state\(&self\)/);
+  assert.match(tauriBrowser, /fn send_tab_state\(&self\)[\s\S]*"title": tab\.title/);
   assert.match(tauriBrowser, /self\.emit_active\("tweb-tab-state", &model\)/);
-  assert.match(tauriBrowser, /fn activate_tab\(&self, index: usize\)[\s\S]*self\.send_tab_state\(\)/);
+  assert.match(tauriBrowser, /fn sync_title\(&self\)[\s\S]*self\.tmux\.update_title\("tweb"\)/);
 });
 
 test("visual image actions copy pixels, copy current source, and download", () => {
