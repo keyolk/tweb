@@ -1,18 +1,18 @@
-//! PageRegistry — tmux pane ID ↔ browser page 매핑.
+//! PageRegistry — the tmux pane ID ↔ browser page mapping.
 //!
-//! DESIGN.md 섹션 5.1. BrowserPageID를 tmux pane ID만으로 만들지 않고
-//! tmux server identity와 opaque generation을 함께 저장 (pane ID 재사용 대비).
+//! DESIGN.md section 5.1. A BrowserPageID is not built from the tmux pane ID alone; the tmux server
+//! identity and an opaque generation are stored alongside it (pane IDs get reused).
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use tweb_core::page::{PageId, PaneId};
 
-/// pane ↔ page 매핑 entry.
+/// A pane ↔ page mapping entry.
 #[derive(Debug, Clone)]
 pub struct PageEntry {
     pub page_id: PageId,
     pub pane: PaneId,
-    /// tmux server identity (pane ID 재사용 대비).
+    /// tmux server identity (pane IDs get reused).
     pub tmux_server_id: String,
     pub url: String,
     pub visible: bool,
@@ -29,31 +29,31 @@ impl PageRegistry {
         Self::default()
     }
 
-    /// pane에 page 등록.
+    /// Registers a page for a pane.
     pub fn register(&self, entry: PageEntry) {
         let mut inner = self.inner.lock();
         inner.insert(entry.pane, entry);
     }
 
-    /// pane의 page 등록 해제.
+    /// Unregisters a pane's page.
     pub fn unregister(&self, pane: &PaneId) -> Option<PageEntry> {
         let mut inner = self.inner.lock();
         inner.remove(pane)
     }
 
-    /// pane의 page 조회.
+    /// Looks up a pane's page.
     pub fn get(&self, pane: &PaneId) -> Option<PageEntry> {
         self.inner.lock().get(pane).cloned()
     }
 
-    /// pane의 가시성 변경.
+    /// Changes a pane's visibility.
     pub fn set_visible(&self, pane: &PaneId, visible: bool) {
         if let Some(entry) = self.inner.lock().get_mut(pane) {
             entry.visible = visible;
         }
     }
 
-    /// 모든 page 목록.
+    /// Every page.
     pub fn list(&self) -> Vec<PageEntry> {
         self.inner.lock().values().cloned().collect()
     }

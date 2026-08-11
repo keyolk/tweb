@@ -1,1 +1,1 @@
-//! Electron BrowserEngineAdapter 구현 (TODO).
+//! The Electron BrowserEngineAdapter implementation (TODO).

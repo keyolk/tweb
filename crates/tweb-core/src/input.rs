@@ -1,7 +1,7 @@
-//! InputSink — 입력 주입 추상.
+//! InputSink — the input injection abstraction.
 //!
-//! Electron/CDP/Shell이 각각 구현.
-//! 한글 IME composition을 포함. DETAIL.md 섹션 9.2.
+//! Implemented separately for Electron/CDP/Shell.
+//! Covers Korean IME composition. DETAIL.md section 9.2.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -18,7 +18,7 @@ pub enum InputError {
 
 pub type InputResult<T> = Result<T, InputError>;
 
-/// key event. Kitty keyboard protocol 기반.
+/// A key event. Based on the Kitty keyboard protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyEvent {
     pub key: String,
@@ -41,7 +41,7 @@ pub enum KeyKind {
     Up,
 }
 
-/// mouse event. SGR pixel 좌표.
+/// A mouse event. In SGR pixel coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MouseEvent {
     pub x: i32,
@@ -68,34 +68,35 @@ pub enum MouseKind {
     Scroll,
 }
 
-/// IME composition event (한글).
-/// native IME 경로(Electron)는 browser가 직접 받고, 수동 주입 경로는 이 event로 전달.
+/// An IME composition event (Korean).
+/// On the native IME path (Electron) the browser receives it directly; the manual injection path
+/// delivers it through this event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositionEvent {
-    /// 조합 중간 상태 (marked text).
+    /// An in-progress composition state (marked text).
     MarkedText {
         text: String,
         selected_range: Option<(usize, usize)>,
     },
-    /// 조합 완료 text.
+    /// The committed composition text.
     InsertText { text: String },
-    /// 조합 취소.
+    /// The composition was cancelled.
     UnmarkText,
 }
 
 /// InputSink trait.
-/// 구현체: ElectronInputSink, CdpInputSink, ShellInputSink.
+/// Implementations: ElectronInputSink, CdpInputSink, ShellInputSink.
 #[async_trait]
 pub trait InputSink: Send + Sync {
-    /// key event 주입.
+    /// Injects a key event.
     async fn send_key(&self, event: KeyEvent) -> InputResult<()>;
 
-    /// mouse event 주입.
+    /// Injects a mouse event.
     async fn send_mouse(&self, event: MouseEvent) -> InputResult<()>;
 
-    /// IME composition 주입 (한글).
+    /// Injects an IME composition (Korean).
     async fn send_composition(&self, event: CompositionEvent) -> InputResult<()>;
 
-    /// committed text 주입.
+    /// Injects committed text.
     async fn insert_text(&self, text: &str) -> InputResult<()>;
 }

@@ -1,13 +1,13 @@
-//! KittyGraphicsTransport — SHM + Kitty graphics 전송 (로컬).
+//! KittyGraphicsTransport — SHM + Kitty graphics transfer (local).
 //!
-//! DESIGN.md 섹션 7.3, DETAIL.md 섹션 2.
-//! SurfaceSource에서 frame을 받아 tweb-native의 tile/convert/kitty로 전송.
+//! DESIGN.md section 7.3, DETAIL.md section 2.
+//! Takes frames from a SurfaceSource and sends them through tweb-native's tile/convert/kitty.
 //!
-//! 핵심 최적화:
-//! - 매 paint shm_open 금지 (ShmPool이 persistent buffer 관리)
-//! - dirty tile만 변환/전송 (전체 frame 변환 금지)
-//! - static page zero transfer (Idle event 시 frame 생성 안 함)
-//! - bounded pool로 image ID 재사용
+//! Key optimizations:
+//! - never shm_open per paint (ShmPool owns the persistent buffer)
+//! - convert/transfer dirty tiles only (never the whole frame)
+//! - zero transfer for static pages (no frame is produced on an Idle event)
+//! - image IDs are reused from a bounded pool
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -24,25 +24,25 @@ use tweb_native::tile::{self, TileGrid, TilePlan};
 
 /// KittyGraphicsTransport.
 pub struct KittyGraphicsTransport {
-    /// page별 상태.
+    /// Per-page state.
     pages: Mutex<HashMap<PageId, PageTransportState>>,
-    /// SHM pool (page별 persistent buffer).
+    /// SHM pool (one persistent buffer per page).
     shm: ShmPool,
 }
 
-/// page별 전송 상태.
+/// Per-page transfer state.
 struct PageTransportState {
     /// tile grid.
     grid: TileGrid,
     /// image ID pool (bounded).
     image_ids: ImageIdPool,
-    /// 현재 할당된 tile image ID map (tile index → image id).
+    /// The tile image IDs currently allocated (tile index → image id).
     tile_image_ids: HashMap<(u32, u32), u32>,
-    /// RGBA 변환 buffer (재사용).
+    /// RGBA conversion buffer (reused).
     rgba_buffer: Vec<u8>,
-    /// 현재 viewport size.
+    /// The current viewport size.
     viewport: PixelSize,
-    /// visible 여부.
+    /// Whether the page is visible.
     visible: bool,
 }
 
@@ -54,7 +54,7 @@ impl KittyGraphicsTransport {
         }
     }
 
-    /// page 전송 상태 초기화.
+    /// Initializes the page's transfer state.
     fn init_page(&self, page_id: PageId, viewport: PixelSize) -> TransportResult<()> {
         self.shm
             .get_or_create(page_id, viewport)
@@ -75,7 +75,7 @@ impl KittyGraphicsTransport {
         Ok(())
     }
 
-    /// frame event 처리.
+    /// Handles a frame event.
     fn handle_frame(
         &self,
         page_id: PageId,
@@ -91,18 +91,18 @@ impl KittyGraphicsTransport {
                 generation: _,
             } => {
                 if !state.visible {
-                    return Ok(()); // hidden page는 전송 안 함.
+                    return Ok(()); // Hidden pages transfer nothing.
                 }
 
-                // tile plan 수립.
+                // Work out the tile plan.
                 let plan = tile::plan(&state.grid, &rects, 0.2);
 
                 match plan {
                     TilePlan::FullFrame => {
-                        // full-frame 전송.
+                        // Full-frame transfer.
                         convert::convert_full_to_rgba(&pixels.data, format, &mut state.rgba_buffer);
 
-                        // SHM에 write.
+                        // Write into SHM.
                         self.shm
                             .write(page_id, &state.rgba_buffer)
                             .map_err(|e| TransportError::Io(e.to_string()))?;
@@ -114,7 +114,7 @@ impl KittyGraphicsTransport {
                             size,
                             src_rect: None,
                             image_id,
-                            medium: KittyMedium::Direct, // TODO: SHM로 전환.
+                            medium: KittyMedium::Direct, // TODO: switch to SHM.
                             action: KittyAction::Transmit,
                         };
                         kitty::write_to_stdout(&cmd)
@@ -133,22 +133,22 @@ impl KittyGraphicsTransport {
                             .map_err(|e| TransportError::Io(e.to_string()))?;
                     }
                     TilePlan::Tiles(tiles) => {
-                        // tile별 전송.
+                        // Per-tile transfer.
                         for tile_idx in &tiles {
                             let tile_rect = state.grid.tile_rect(tile_idx);
                             let key = (tile_idx.col, tile_idx.row);
 
-                            // tile image ID 가져오기 또는 할당.
+                            // Fetch or allocate the tile's image ID.
                             let image_id = *state
                                 .tile_image_ids
                                 .entry(key)
                                 .or_insert_with(|| state.image_ids.acquire());
 
-                            // dirty rect와 tile rect 교집합의 pixel data 추출.
+                            // Extract the pixel data where the dirty rect and the tile rect overlap.
                             let tile_pixels =
                                 extract_tile_pixels(&pixels.data, &size, format, &tile_rect);
 
-                            // RGBA 변환.
+                            // Convert to RGBA.
                             let mut rgba = Vec::with_capacity(tile_pixels.len());
                             convert::convert_full_to_rgba(&tile_pixels, format, &mut rgba);
 
@@ -164,7 +164,7 @@ impl KittyGraphicsTransport {
                             kitty::write_to_stdout(&cmd)
                                 .map_err(|e| TransportError::Io(e.to_string()))?;
 
-                            // placement (제자리 갱신).
+                            // placement (updated in place).
                             let place_cmd = KittyCommand {
                                 data: Vec::new(),
                                 size: PixelSize::new(tile_rect.width, tile_rect.height),
@@ -184,10 +184,10 @@ impl KittyGraphicsTransport {
                 tracing::warn!("GPU frame event not yet supported in KittyGraphicsTransport");
             }
             FrameEvent::Idle => {
-                // static page. frame 전송 안 함.
+                // A static page. Nothing is transferred.
             }
             FrameEvent::End => {
-                // page 종료. image delete.
+                // The page ended. Delete the images.
                 let mut pages = self.pages.lock();
                 if let Some(state) = pages.get_mut(&page_id) {
                     for (_, image_id) in state.tile_image_ids.drain() {
@@ -225,7 +225,7 @@ impl FrameTransport for KittyGraphicsTransport {
         page_id: PageId,
         mut source: Box<dyn SurfaceSource>,
     ) -> TransportResult<()> {
-        // page가 아직 초기화되지 않았으면 기본 viewport로 초기화.
+        // If the page has not been initialized yet, initialize it with the default viewport.
         {
             let pages = self.pages.lock();
             if !pages.contains_key(&page_id) {
@@ -251,7 +251,7 @@ impl FrameTransport for KittyGraphicsTransport {
                 break;
             }
 
-            // TODO: display frame 단위 coalescing. 현재는 매 frame 처리.
+            // TODO: coalesce per display frame. For now every frame is handled.
             tokio::task::yield_now().await;
         }
 
@@ -263,8 +263,8 @@ impl FrameTransport for KittyGraphicsTransport {
         if let Some(state) = pages.get_mut(&page_id) {
             state.visible = visible;
             if !visible {
-                // hidden: 마지막 image는 유지하되, 새 frame 전송 중지.
-                // TODO: compositor begin-frame 중지.
+                // hidden: keep the last image, but stop transferring new frames.
+                // TODO: stop the compositor's begin-frame.
             }
         }
         Ok(())
@@ -277,7 +277,7 @@ impl FrameTransport for KittyGraphicsTransport {
                 state.grid = TileGrid::default_256(size);
                 state.viewport = size;
                 state.rgba_buffer = Vec::with_capacity(size.rgba_bytes());
-                // 이전 tile image ID 해제.
+                // Release the previous tile image IDs.
                 for (_, image_id) in state.tile_image_ids.drain() {
                     state.image_ids.release(image_id);
                 }
@@ -313,7 +313,7 @@ impl FrameTransport for KittyGraphicsTransport {
     }
 }
 
-/// tile 영역의 pixel data 추출.
+/// Extracts the pixel data for a tile's area.
 fn extract_tile_pixels(
     src: &[u8],
     size: &PixelSize,

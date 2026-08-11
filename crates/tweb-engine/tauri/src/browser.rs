@@ -274,7 +274,7 @@ impl BrowserRuntime {
                 window,
                 url,
                 zoom,
-                title: "새 탭".to_string(),
+                title: "New tab".to_string(),
             });
             if activate || tabs.values.len() == 1 {
                 tabs.active = tabs.values.len() - 1;

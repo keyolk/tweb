@@ -1,7 +1,7 @@
-//! TWeb core — platform/engine 무관 공통 type과 trait.
+//! TWeb core — the common types and traits, independent of platform and engine.
 //!
-//! core는 engine/transport/agent/platform 구현체를 모르고 trait만 정의한다.
-//! 새 구현체 추가가 기존 코드를 바꾸지 않는다 (DETAIL.md 섹션 9).
+//! core knows nothing about the engine/transport/agent/platform implementations; it only defines traits.
+//! Adding a new implementation never changes existing code (DETAIL.md section 9).
 
 pub mod agent;
 pub mod engine;

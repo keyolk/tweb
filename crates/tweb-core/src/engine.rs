@@ -1,8 +1,8 @@
-//! BrowserEngineAdapter — browser process 추상.
+//! BrowserEngineAdapter — the browser process abstraction.
 //!
-//! Electron/ExternalChrome/CustomShell이 각각 구현.
-//! core API는 page/profile/resource/automation을 다루고 engine 세부를 모름.
-//! engine 교체가 core API를 바꾸지 않는다 (DETAIL.md 섹션 9.4).
+//! Implemented separately for Electron/ExternalChrome/CustomShell.
+//! The core API deals in pages/profiles/resources/automation and knows nothing about engine internals.
+//! Swapping the engine never changes the core API (DETAIL.md section 9.4).
 
 use crate::extension::ExtensionHost;
 use crate::frame::SurfaceSource;
@@ -42,28 +42,28 @@ pub enum Action {
 }
 
 /// BrowserEngineAdapter trait.
-/// 구현체: ElectronAdapter, ExternalChromeAdapter, CustomShellAdapter.
+/// Implementations: ElectronAdapter, ExternalChromeAdapter, CustomShellAdapter.
 #[async_trait]
 pub trait BrowserEngineAdapter: Send + Sync {
-    /// page 생성. pane identity와 연결.
+    /// Creates a page, tied to a pane identity.
     async fn create_page(&self, pane: crate::page::PaneId, url: &Url) -> EngineResult<PageId>;
 
-    /// page 종료.
+    /// Closes a page.
     async fn close_page(&self, page: PageId) -> EngineResult<()>;
 
     /// navigation.
     async fn navigate(&self, page: PageId, url: &Url) -> EngineResult<()>;
 
-    /// page viewport size. resize 시 호출.
+    /// The page's viewport size. Called on resize.
     async fn resize(&self, page: PageId, size: PixelSize) -> EngineResult<()>;
 
-    /// page 가시성. hidden page는 frame production 중지.
+    /// Page visibility. Hidden pages stop producing frames.
     async fn set_visible(&self, page: PageId, visible: bool) -> EngineResult<()>;
 
-    /// frame 생산 source. FrameTransport이 소비.
+    /// The frame production source. Consumed by FrameTransport.
     async fn frame_source(&self, page: PageId) -> EngineResult<Box<dyn SurfaceSource>>;
 
-    /// 입력 주입 sink.
+    /// The input injection sink.
     async fn input_sink(&self, page: PageId) -> EngineResult<Box<dyn InputSink>>;
 
     /// extension host.
@@ -72,12 +72,12 @@ pub trait BrowserEngineAdapter: Send + Sync {
     /// profile store.
     fn profile_store(&self) -> &dyn ProfileStore;
 
-    /// page 상태 snapshot (agent automation용).
+    /// A snapshot of the page state (for agent automation).
     async fn snapshot(&self, page: PageId) -> EngineResult<PageSnapshot>;
 
-    /// agent action 실행 (click/fill/press/scroll/navigate).
+    /// Executes an agent action (click/fill/press/scroll/navigate).
     async fn execute_action(&self, page: PageId, action: &Action) -> EngineResult<()>;
 
-    /// engine 종료.
+    /// Shuts the engine down.
     async fn shutdown(&self) -> EngineResult<()>;
 }

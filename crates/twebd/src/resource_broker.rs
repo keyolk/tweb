@@ -1,11 +1,11 @@
-//! ResourceBroker 구현.
+//! The ResourceBroker implementation.
 //!
-//! DESIGN.md 섹션 12.3-12.15. immutable resource store, scope, TTL, quota.
-//! opaque ID만 사용, caller identity와 capability 확인.
+//! DESIGN.md sections 12.3–12.15. Immutable resource store, scope, TTL, quota.
+//! Opaque IDs only, with the caller's identity and capability checked.
 
 use tweb_core::resource::{ResourceDescriptor, ResourceError, ResourceId, ResourceResult};
 
-/// ResourceBroker 구현체. TODO: 실제 store.
+/// The ResourceBroker implementation. TODO: a real store.
 #[derive(Default)]
 pub struct ResourceBrokerImpl;
 

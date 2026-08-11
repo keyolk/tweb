@@ -1,24 +1,24 @@
-# TWeb 상세 설계 — P1 damage-aware Kitty path + twebd/Electron 통합
+# TWeb detailed design — the P1 damage-aware Kitty path + twebd/Electron integration
 
-이 문서는 `PREDEV.md`의 critical path 첫 단계(P1)와 twebd/Electron 통합 구조를 구현 수준으로
-깊이 설계합니다. Engine = Electron 확정(S0)을 전제로 합니다.
+This document designs the first stage of `PREDEV.md`'s critical path (P1) and the twebd/Electron
+integration structure down to implementation depth. It assumes Engine = Electron is settled (S0).
 
-조사 기준일: 2026-07-31.
+Research date: 2026-07-31.
 
-## 1. Electron offscreen rendering API 확보
+## 1. Securing the Electron offscreen rendering API
 
-### 1.1 paint event 정확한 의미
+### 1.1 What the paint event actually means
 
 ```js
 win.webContents.on('paint', (event, dirty, image) => { ... })
 ```
 
-- `dirty`(`Rectangle`): repaint된 영역. 단, `image`는 **전체 frame**을 담음.
-- `image`(`NativeImage`): 전체 viewport. `.toBitmap()`로 raw pixel(BGRA on macOS) 획득.
-- **awrit는 `_dirty`를 무시하고 전체 image를 항상 재전송** — 이게 DESIGN.md 섹션 7.1이 진단한
-  병목 중 하나. TWeb은 dirty rect를 적극 활용.
-- `event.texture`(`OffscreenSharedTexture`): `useSharedTexture: true`일 때만 존재(experimental).
-  `texture.release()`로 명시적 해제 필요. "Only a limited number of textures can exist at the
+- `dirty` (`Rectangle`): the repainted area. Note that `image` carries the **whole frame**.
+- `image` (`NativeImage`): the entire viewport. `.toBitmap()` yields raw pixels (BGRA on macOS).
+- **awrit ignores `_dirty` and always retransmits the whole image** — one of the bottlenecks DESIGN.md
+  section 7.1 diagnosed. TWeb makes active use of the dirty rect.
+- `event.texture` (`OffscreenSharedTexture`): exists only with `useSharedTexture: true` (experimental).
+  Requires an explicit `texture.release()`. "Only a limited number of textures can exist at the
   same time."
 
 ### 1.2 dirty-only subscription
@@ -27,190 +27,194 @@ win.webContents.on('paint', (event, dirty, image) => { ... })
 win.webContents.beginFrameSubscription(true, (image, dirty) => { ... })
 ```
 
-`onlyDirty: true`면 callback의 `image`가 **repaint된 영역만** 담음. 단, paint event와 동시에 쓰면
-안 되고 둘 중 하나를 선택.
+With `onlyDirty: true`, the callback's `image` carries **only the repainted area**. It must not be used
+together with the paint event, though — pick one or the other.
 
-### 1.3 frame rate 제어
+### 1.3 Frame rate control
 
 ```js
-win.webContents.setFrameRate(60)  // 최대 240, 그 이상은 "performance losses only"
+win.webContents.setFrameRate(60)  // max 240; beyond that it is "performance losses only"
 ```
 
-### 1.4 두 GPU 경로
+### 1.4 The two GPU paths
 
-| mode | `useSharedTexture` | output | CPU copy | 비고 |
+| mode | `useSharedTexture` | output | CPU copy | notes |
 |---|---|---|---|---|
-| shared memory bitmap | `false`(기본) | `NativeImage` `.toBitmap()` (BGRA) | 있음 | WebGL/3D CSS 지원. awrit가 쓴 경로. |
-| shared texture | `true` | `event.texture` (`OffscreenSharedTexture`) | 없음 | experimental, native module 필요, texture 수 제한. |
-| software output | `app.disableHardwareAcceleration()` | `NativeImage` (빠른 생성) | 있음 | WebGL 포기. frame 생성 자체는 빠름. |
+| shared memory bitmap | `false` (default) | `NativeImage` `.toBitmap()` (BGRA) | yes | Supports WebGL/3D CSS. The path awrit used. |
+| shared texture | `true` | `event.texture` (`OffscreenSharedTexture`) | no | experimental, needs a native module, limited texture count. |
+| software output | `app.disableHardwareAcceleration()` | `NativeImage` (fast to produce) | yes | Gives up WebGL. Frame production itself is fast. |
 
-TWeb 기본 경로: **shared memory bitmap** + dirty rect 활용. GPU fast path(shared texture)는 S1
-검증 후 선택적 Tier 3.
+TWeb's default path: **shared memory bitmap** plus active dirty rect use. The GPU fast path (shared
+texture) is an optional Tier 3 after S1 validation.
 
-## 2. Memory pipeline 설계 (awrit 병목 회피)
+## 2. Memory pipeline design (avoiding awrit's bottlenecks)
 
-### 2.1 awrit의 병목 (조사 확인)
+### 2.1 awrit's bottlenecks (confirmed by research)
 
-1. `paint`마다 `image.toBitmap()`으로 전체 frame을 CPU memory에 만듦.
-2. **`_dirty` 무시, 전체 frame 복사**.
-3. Rust bridge가 `paint`마다 `shm_open`, `ftruncate`, `mmap`, `munmap` 반복.
-4. BGRA→RGBA 변환을 전체 frame에 수행(awrit `paint.ts`에는 변환 코드가 안 보이나, Kitty가
-   RGBA를 요구하므로 어딘가에서 수행).
-5. Browser→Node→Rust→shared memory 중복 copy.
+1. Every `paint` builds the whole frame in CPU memory via `image.toBitmap()`.
+2. **`_dirty` is ignored and the whole frame is copied**.
+3. The Rust bridge repeats `shm_open`, `ftruncate`, `mmap`, `munmap` on every `paint`.
+4. BGRA→RGBA conversion runs over the whole frame (no conversion code is visible in awrit's
+   `paint.ts`, but Kitty requires RGBA, so it happens somewhere).
+5. Redundant copies through Browser→Node→Rust→shared memory.
 
-### 2.2 TWeb의 개선
+### 2.2 What TWeb improves
 
 ```text
 Electron main process (Node.js)
 │
-├── BrowserWindow (offscreen, 단일 main process, pane마다 window가 아니라 page 분리)
+├── BrowserWindow (offscreen, a single main process, pages separated rather than a window per pane)
 │   └── webContents.on('paint', (event, dirty, image) => ...)
 │         │
-│         ├── dirty rect 추출 (awrit는 무시, TWeb은 적극 활용)
-│         ├── image.toBitmap() → BGRA raw pixel (전체 frame)
-│         └── Rust native module (awrit-native-rs 처럼)로 전달
+│         ├── extract the dirty rect (awrit ignores it, TWeb uses it actively)
+│         ├── image.toBitmap() → BGRA raw pixels (whole frame)
+│         └── hand off to a Rust native module (like awrit-native-rs)
 │               │
-│               ├── persistent POSIX SHM ring (매 paint shm_open 금지)
-│               │   ├── page 생성 시 2~3개 mapped buffer preallocate
-│               │   ├── resize 때만 buffer 교체
-│               │   └── buffer pool 재사용 (이름/image ID 무한 생성 금지)
+│               ├── a persistent POSIX SHM ring (never shm_open per paint)
+│               │   ├── preallocate 2–3 mapped buffers when the page is created
+│               │   ├── swap buffers only on resize
+│               │   └── reuse the buffer pool (never mint names/image IDs without limit)
 │               │
-│               ├── dirty rect → adaptive tile 매핑
-│               │   ├── 256×256 tile grid
-│               │   ├── dirty rect와 겹치는 tile만 갱신
-│               │   ├── scroll처럼 변경 면적이 크면 full-frame/stripe로 합침
-│               │   └── static page는 frame/command 생성 안 함
+│               ├── dirty rect → adaptive tile mapping
+│               │   ├── a 256×256 tile grid
+│               │   ├── update only the tiles a dirty rect overlaps
+│               │   ├── fold into a full-frame/stripe when the changed area is large, as in a scroll
+│               │   └── produce no frame or command for a static page
 │               │
-│               ├── BGRA→RGBA 변환 (변경 tile만 SIMD)
-│               │   └── 전체 frame 변환 금지, dirty tile만
+│               ├── BGRA→RGBA conversion (SIMD, changed tiles only)
+│               │   └── never the whole frame, only the dirty tiles
 │               │
-│               └── Kitty graphics 전송
+│               └── Kitty graphics transfer
 │                   ├── t=s (shared memory) + a=t (transmit-only) + a=p,U=1 (virtual placement)
-│                   ├── stable tile image ID 제자리 갱신 (a=p,i=<id> replace)
-│                   └── terminal ACK 전까지 같은 transfer buffer 재사용 금지
+│                   ├── stable tile image IDs updated in place (a=p,i=<id> replace)
+│                   └── never reuse the same transfer buffer before the terminal ACKs
 │
-└── twebd IPC — tmux pane identity ↔ BrowserWindow/page 매핑
+└── twebd IPC — tmux pane identity ↔ BrowserWindow/page mapping
 ```
 
-### 2.3 핵심 최적화 원칙
+### 2.3 The core optimization principles
 
-1. **매 paint shm_open 금지**: page 생성 시 2~3개 persistent mapped buffer preallocate, resize
-   때만 교체.
-2. **Browser→Node→Rust→SHM 중복 copy 제거**: Rust native module이 `toBitmap()` 결과를 destination
-   SHM buffer로 직접 write. Node `Buffer` 왕복 금지.
-3. **dirty tile만 변환/전송**: 전체 frame BGRA→RGBA 변환 금지, dirty tile만 SIMD 변환.
-4. **static page zero transfer**: damage가 없으면 frame과 terminal command를 만들지 않음.
-5. **bounded pool**: SHM name과 image ID를 무한 생성하지 않고 bounded pool에서 재사용.
-6. **backpressure**: queue가 밀리면 intermediate generation을 버리고 최신 complete frame만 남김.
+1. **Never shm_open per paint**: preallocate 2–3 persistent mapped buffers when the page is created and
+   swap them only on resize.
+2. **Remove the redundant Browser→Node→Rust→SHM copies**: the Rust native module writes the
+   `toBitmap()` result straight into the destination SHM buffer. No round trip through a Node `Buffer`.
+3. **Convert/transfer dirty tiles only**: never convert the whole frame BGRA→RGBA; SIMD-convert the
+   dirty tiles alone.
+4. **Zero transfer for static pages**: with no damage, produce neither a frame nor a terminal command.
+5. **Bounded pools**: reuse SHM names and image IDs from a bounded pool rather than minting them
+   without limit.
+6. **Backpressure**: when the queue falls behind, drop intermediate generations and keep only the
+   latest complete frame.
 
-## 3. Tile 전략 상세
+## 3. Tile strategy in detail
 
-### 3.1 tile 크기 선택
+### 3.1 Choosing the tile size
 
 ```text
-작은 tile (128×128) → command/image 수와 placement 비용 증가
-큰 tile   (512×512) → 불필요한 pixel copy와 texture upload 증가
-기본 후보 256×256, workload에 따라 128~512 범위에서 조정
+small tiles (128×128) → more commands/images and higher placement cost
+large tiles (512×512) → more unnecessary pixel copies and texture uploads
+starting candidate 256×256, adjusted in the 128–512 range by workload
 ```
 
-tile 크기는 고정 상수가 아니라 측정 결과로 선택. 측정 항목:
-- tile당 Kitty command byte 수
-- tile당 texture upload 시간
-- dirty tile 평균 개수 (scroll vs static vs animation)
+The tile size is not a fixed constant but a measured choice. What to measure:
+- Kitty command bytes per tile
+- texture upload time per tile
+- the average number of dirty tiles (scroll vs static vs animation)
 
-### 3.2 damage → tile 매핑
+### 3.2 damage → tile mapping
 
 ```text
 paint event
     ↓
 dirty rect (x, y, width, height)
     ↓
-겹치는 tile 집합 계산
+compute the set of overlapping tiles
     ↓
-한 display interval의 여러 damage event union
+union the damage events of one display interval
     ↓
-변경 면적 판정:
-    작음 (≤ 20% viewport) → tile별 Kitty 전송
-    큼 (> 20% viewport)   → full-frame 또는 stripe로 합침
+judge the changed area:
+    small (≤ 20% of the viewport) → per-tile Kitty transfer
+    large (> 20% of the viewport) → fold into a full-frame or a stripe
     ↓
-scroll event 감지 시 → 수백 개의 작은 command 대신 full-frame/stripe
+on detecting a scroll event → a full-frame/stripe instead of hundreds of small commands
 ```
 
-### 3.3 Kitty capability별 전략
+### 3.3 Strategy per Kitty capability
 
 ```text
-load + animation frame + composite 지원
-    → base image에 damage frame composite (a=f, c=<base>)
+load + animation frame + composite supported
+    → composite the damage frame onto the base image (a=f, c=<base>)
 
-independent image placement + replace 지원
-    → stable tile image ID 제자리 갱신 (a=p, i=<id>, X=1 replace)
+independent image placement + replace supported
+    → update stable tile image IDs in place (a=p, i=<id>, X=1 replace)
 
 basic transfer/display only
-    → coalesced full-frame fallback + 낮은 frame cap
-    → UI에 제한 상태 표시 (숨기지 않음)
+    → a coalesced full-frame fallback plus a lower frame cap
+    → surface the restricted state in the UI (never hide it)
 ```
 
-capability는 terminal 이름으로 추측하지 않고 graphics query(`a=q` + `ESC[c`)로 판정.
+Capabilities are decided by a graphics query (`a=q` + `ESC[c`), never guessed from the terminal name.
 
-## 4. twebd + Electron 통합 구조
+## 4. The twebd + Electron integration structure
 
-### 4.1 process topology
+### 4.1 Process topology
 
 ```text
 Host
 ├── tmux server
 │   └── pane %3
-│       └── tweb __pane (Rust binary, tmux가 실행하는 foreground process)
+│       └── tweb __pane (a Rust binary; the foreground process tmux launches)
 │           ├── terminal capability negotiation (Kitty graphics query)
 │           ├── keyboard/mouse decoding (raw terminal mode)
 │           ├── SIGWINCH → pixel viewport resize
-│           └── frame display (Kitty graphics 수신하여 Ghostty에 표시)
+│           └── frame display (receives Kitty graphics and shows them in Ghostty)
 │
-├── Electron main process (Node.js, 단일)
+├── Electron main process (Node.js, single)
 │   ├── BrowserWindow #1 (offscreen, page = pane %3)
 │   │   └── webContents.on('paint') → Rust native module → SHM → Kitty graphics
 │   ├── BrowserWindow #2 (offscreen, page = pane %5)
 │   │   └── ...
-│   ├── session.loadExtension() — vimium, 1Password 등
-│   ├── session.cookies — Profile Bridge에서 받은 cookie 주입
-│   └── IPC server — twebd와 통신
+│   ├── session.loadExtension() — vimium, 1Password and the like
+│   ├── session.cookies — injects the cookies received from the Profile Bridge
+│   └── IPC server — talks to twebd
 │
-├── twebd (Rust daemon)
-│   ├── authenticated Unix socket (peer credential 확인)
-│   ├── PageRegistry — tmux pane ID ↔ BrowserWindow/page 매핑
-│   ├── ProfileManager — session별 persistent profile
+├── twebd (a Rust daemon)
+│   ├── an authenticated Unix socket (peer credential check)
+│   ├── PageRegistry — tmux pane ID ↔ BrowserWindow/page mapping
+│   ├── ProfileManager — a persistent profile per session
 │   ├── ResourceBroker — resource store, scope, TTL
-│   ├── AutomationController — agent action 직렬화
-│   └── tmux integration — pane lifecycle, hook
+│   ├── AutomationController — serializes agent actions
+│   └── tmux integration — pane lifecycle, hooks
 │
-└── Google Chrome (사용자의 일반 Chrome, Profile Bridge extension)
-    └── TWeb Profile Bridge extension (cookie transfer, engine 무관)
+└── Google Chrome (the user's ordinary Chrome, with the Profile Bridge extension)
+    └── The TWeb Profile Bridge extension (cookie transfer, engine-agnostic)
 ```
 
-### 4.2 BrowserWindow reuse 전략 (memory 완화 핵심)
+### 4.2 The BrowserWindow reuse strategy (the heart of the memory mitigation)
 
-Orca는 per-worktree BrowserWindow를 만듦. TWeb은:
+Orca creates a BrowserWindow per worktree. TWeb instead:
 
 ```text
-Electron main process (단일, Node.js runtime 1개)
+Electron main process (single, one Node.js runtime)
 ├── BrowserWindow A (offscreen)
 │   └── webContents page = pane %3
 ├── BrowserWindow B (offscreen)
 │   └── webContents page = pane %5
 └── ...
 
-memory 절감 원칙:
-- main process Node.js runtime은 1개 (process 자체가 1개)
-- pane마다 새 Electron process가 아니라 BrowserWindow만 추가
-- renderer process는 Chromium이 관리 (page 격리)
-- nodeIntegration: false → renderer는 순수 Chromium, Node.js 복제 없음
-- offscreen window는 frameless, 표시 안 됨 → GPU surface 최소화
+The memory-saving principles:
+- one Node.js runtime in the main process (one process, period)
+- add a BrowserWindow per pane, not a new Electron process
+- renderer processes stay Chromium's business (page isolation)
+- nodeIntegration: false → renderers are pure Chromium, with no duplicated Node.js
+- offscreen windows are frameless and never displayed → minimal GPU surface
 ```
 
-단, BrowserWindow마다 renderer process가 생길 수 있음(Chromium process model). `processReuse` 또는
-`site isolation` 정책으로 renderer process 재사용을 검토. 이건 S1 측정 항목.
+A renderer process can still appear per BrowserWindow, though (Chromium's process model). Renderer
+process reuse is to be examined via `processReuse` or `site isolation` policy. That is an S1
+measurement item.
 
-### 4.3 IPC 흐름
+### 4.3 The IPC flow
 
 ```text
 tweb CLI (short-lived)
@@ -218,240 +222,242 @@ tweb CLI (short-lived)
 twebd (Unix socket, peer credential)
     ↓ "create page for pane %3, load URL"
 Electron main process (IPC)
-    ↓ BrowserWindow 생성, loadURL
-    ↓ webContents.on('paint') 시작
+    ↓ create the BrowserWindow, loadURL
+    ↓ webContents.on('paint') starts
 Rust native module
-    ↓ SHM write + Kitty graphics 전송
-tweb __pane (pane %3의 foreground process)
-    ↓ Kitty graphics 수신
-    ↓ Ghostty에 표시
+    ↓ SHM write + Kitty graphics transfer
+tweb __pane (pane %3's foreground process)
+    ↓ receives the Kitty graphics
+    ↓ displays them in Ghostty
 ```
 
-### 4.4 resize 흐름
+### 4.4 The resize flow
 
 ```text
 tmux pane resize
     ↓ SIGWINCH
 tweb __pane
     ↓ terminal pixel query (CSI 14t)
-    ↓ viewport generation 증가
-    ↓ twebd에 resize 요청
+    ↓ bump the viewport generation
+    ↓ request a resize from twebd
 twebd
-    ↓ Electron main process에 viewport resize 전달
+    ↓ forwards the viewport resize to the Electron main process
 Electron
-    ↓ BrowserWindow.setSize() 또는 webContents.setViewRect()
+    ↓ BrowserWindow.setSize() or webContents.setViewRect()
     ↓ Chromium viewport resize → CSS reflow → ResizeObserver
-    ↓ 새 generation frame paint
-    ↓ 2 display frame 내 새 generation만 표시 (이전 size frame drop)
+    ↓ paints frames of the new generation
+    ↓ only the new generation is displayed within 2 display frames (old-size frames are dropped)
 ```
 
-100ms debounce 금지. display frame 단위 coalescing만.
+No 100ms debounce. Coalescing per display frame only.
 
-## 5. frame lifetime과 backpressure
+## 5. Frame lifetime and backpressure
 
-### 5.1 surface ring
+### 5.1 The surface ring
 
 ```text
-visible page마다 2~3개 surface 순환 (mailbox)
-- GPU fast path: 기본 2-surface, measured stall 시 3개로 확장
-- shared memory bitmap: 2-surface (CPU bitmap이므로 GPU surface보다 가벼움)
-- Ghostty가 release하기 전에 producer가 surface 덮어쓰지 않음
-- queue가 밀리면 아직 present하지 않은 중간 frame 버리고 최신 complete frame만 남김
+2–3 surfaces cycle per visible page (a mailbox)
+- GPU fast path: 2 surfaces by default, extended to 3 on a measured stall
+- shared memory bitmap: 2 surfaces (a CPU bitmap is lighter than a GPU surface)
+- the producer never overwrites a surface before Ghostty releases it
+- when the queue falls behind, drop the intermediate frames not yet presented and keep only the latest complete frame
 ```
 
-### 5.2 generation 관리
+### 5.2 Generation management
 
 ```text
-resize마다 generation 증가
-- 이전 size/generation frame 표시 금지
-- 새 generation frame만 2 display frame 내에 표시
-- hidden page: compositor begin-frame 중지, 마지막 surface만 유지
-- GPU process crash 시 page 단위로 Kitty backend로 전환
+the generation is bumped on every resize
+- frames from an earlier size/generation are never displayed
+- only new-generation frames are displayed, within 2 display frames
+- hidden page: stop the compositor's begin-frame and keep only the last surface
+- on a GPU process crash, switch to the Kitty backend per page
 ```
 
-### 5.3 hidden page 처리
+### 5.3 Handling hidden pages
 
 ```text
 hidden tmux window
-    ↓ tweb __pane이 visibility loss 감지 (tmux hook 또는 client visibility)
-    ↓ twebd에 hidden 전달
-    ↓ Electron: webContents.beginFrameSubscription 중지 또는 setFrameRate(0)
-    ↓ GPU/SHM surface 해제, compressed thumbnail만 선택적 유지
-    ↓ visible 복귀 시 전체 redraw reconcile
+    ↓ tweb __pane detects the visibility loss (a tmux hook or client visibility)
+    ↓ reports hidden to twebd
+    ↓ Electron: stop webContents.beginFrameSubscription or setFrameRate(0)
+    ↓ release the GPU/SHM surfaces, optionally keeping only a compressed thumbnail
+    ↓ reconcile with a full redraw on returning to visible
 ```
 
-## 6. 입력 처리 (Browser mode)
+## 6. Input handling (Browser mode)
 
-### 6.1 입력 경로
+### 6.1 The input path
 
 ```text
-Ghostty (로컬)
-    ↓ keyboard/mouse event (Kitty keyboard protocol, SGR pixel mouse)
+Ghostty (local)
+    ↓ keyboard/mouse events (Kitty keyboard protocol, SGR pixel mouse)
 tweb __pane (raw terminal mode)
-    ↓ tmux mode 판정: TMUX mode 또는 BROWSER mode
-    ↓ BROWSER mode: twebd로 입력 전달
+    ↓ decide the tmux mode: TMUX mode or BROWSER mode
+    ↓ BROWSER mode: forward the input to twebd
 twebd
-    ↓ Electron main process에 input event 전달
+    ↓ forwards the input event to the Electron main process
 Electron
     ↓ webContents.sendInputEvent() (Chromium input injection)
-    ↓ 한글 IME: BrowserWindow가 macOS NSTextInputClient로 native composition
+    ↓ Korean IME: the BrowserWindow does native composition via macOS NSTextInputClient
 ```
 
-### 6.2 Browser mode (DESIGN.md 섹션 9)
+### 6.2 Browser mode (DESIGN.md section 9)
 
 ```text
-TMUX mode: 모든 key → tmux key table (root)
-BROWSER mode: reserved toggle → tmux 복귀, 나머지 key → browser pane
+TMUX mode: every key → the tmux key table (root)
+BROWSER mode: the reserved toggle returns to tmux, every other key goes to the browser pane
 
-mode 진입: switch-client -T tweb-browser
-mode 표시: terminal title/OSC, tmux pane-border-format, browser toolbar badge
-client_key_table과 실제 browser focus 불일치 시 입력 전달 금지, TMUX mode로 복구
+entering the mode: switch-client -T tweb-browser
+surfacing the mode: terminal title/OSC, tmux pane-border-format, a browser toolbar badge
+when client_key_table and the real browser focus disagree, stop forwarding input and recover to TMUX mode
 ```
 
-### 6.3 한글 IME (로컬 case)
+### 6.3 Korean IME (the local case)
 
 ```text
 macOS IME → Ghostty NSTextInputClient → ... → tweb __pane → twebd → Electron
-    단, Electron BrowserWindow가 macOS window이므로 NSTextInputClient를 직접 받음
-    composition 중간 상태가 browser input field에 실시간 표시 (native)
-    방향키/delete 시 commit-then-act (Ghostty #11461 fix와 동일)
+    though, the Electron BrowserWindow being a macOS window, it receives NSTextInputClient directly
+    the in-progress composition state shows live in the browser input field (native)
+    commit-then-act on arrow keys/delete (same as the Ghostty #11461 fix)
 ```
 
-**주의**: Electron BrowserWindow가 offscreen(frameless, 표시 안 됨)이면 macOS IME가 활성화될지
-확인 필요. offscreen window는 first responder가 아니어서 IME event를 안 받을 수 있음. 이건 S1/P3
-검증 항목 — offscreen window에서 native IME가 동작하는지, 아니면 input injection 경로로
-`setMarkedText`/`insertText`를 수동 주입해야 하는지.
+**Caution**: whether the macOS IME activates at all when the Electron BrowserWindow is offscreen
+(frameless, never displayed) needs confirming. An offscreen window is not the first responder and may
+receive no IME events. This is an S1/P3 validation item — does the native IME work in an offscreen
+window, or must `setMarkedText`/`insertText` be injected manually through the input injection path?
 
-## 7. extension loading
+## 7. Extension loading
 
-### 7.1 Electron extension API
+### 7.1 The Electron extension API
 
 ```js
 const { session } = require('electron')
 
-// unpacked extension 로드
+// load an unpacked extension
 await session.defaultSession.loadExtension('/path/to/vimium')
 
-// extension은 매 실행마다 reload (persistent 아님)
-// Web Store 설치는 지원 안 됨, unpacked만
+// extensions reload on every run (they are not persistent)
+// Web Store installs are unsupported; unpacked only
 ```
 
-### 7.2 TWeb extension 관리
+### 7.2 TWeb extension management
 
 ```text
 tweb profile bootstrap chrome
-    ↓ 사용자 Chrome profile에서 extension metadata 읽기
-    ↓ Web Store ID 보존
-    ↓ extension을 TWeb data dir에 unpack하여 저장
-    ↓ Electron session.loadExtension()으로 매 실행마다 로드
+    ↓ read the extension metadata from the user's Chrome profile
+    ↓ preserve the Web Store IDs
+    ↓ unpack the extensions into the TWeb data dir and store them
+    ↓ load them on every run via Electron session.loadExtension()
 
-extension compatibility 분류:
-    compatible — 자동 재설치 가능
-    needs-adapter — native messaging 등 host 구현 필요
-    managed-chrome-only — Device Trust, enterprise policy 의존 (1Password, Okta)
+extension compatibility classes:
+    compatible — can be reinstalled automatically
+    needs-adapter — needs host support such as native messaging
+    managed-chrome-only — depends on Device Trust or enterprise policy (1Password, Okta)
 ```
 
-### 7.3 Native Messaging host (1Password 등)
+### 7.3 Native Messaging hosts (1Password and the like)
 
 ```text
 Electron extension (1Password)
     ↓ chrome.runtime.connectNative('com.tweb.bridge')
-Native Messaging host (Rust binary, twebd가 관리)
+Native Messaging host (a Rust binary, managed by twebd)
     ↓ stdin/stdout JSON, 32-bit length prefix
-    ↓ secure enclave / credential store 접근
+    ↓ secure enclave / credential store access
 ```
 
-TWeb이 Native Messaging host를 자체 구현해야 하는 extension(1Password 등)은 `needs-adapter`.
-단, 1Password는 기존 host binary를 재사용할 수 있는지 확인 필요.
+Extensions for which TWeb would have to implement a Native Messaging host itself (1Password and the
+like) are `needs-adapter`. Whether 1Password's existing host binary can be reused needs confirming,
+though.
 
-## 8. 측정 항목 (S1/P1 release gate)
+## 8. Measurement items (the S1/P1 release gate)
 
 ```text
 frame pacing
-├── static page idle 시 frame transfer 0회
-├── 1080p continuous scroll 60Hz frame pacing
-├── 10분 animation 후 stale image/shm object 0개
-├── resize 후 2 display frame 내 새 generation만 표시
-└── CPU full-frame copy 0회 (dirty tile만 전송 확인)
+├── 0 frame transfers while a static page is idle
+├── 60Hz frame pacing during a 1080p continuous scroll
+├── 0 stale image/shm objects after 10 minutes of animation
+├── only the new generation displayed within 2 display frames after a resize
+└── 0 CPU full-frame copies (confirming dirty tiles only are transferred)
 
-memory (Orca 대비)
-├── pane 1/2/4개일 때 RSS, private dirty, PSS
-├── idle pane frontend는 frame-sized buffer 소유 안 함
-├── hidden page GPU/SHM surface byte 0으로 수렴
-└── page close/renderer crash 후 resource count와 private bytes baseline 복귀
+memory (against Orca)
+├── RSS, private dirty and PSS at 1/2/4 panes
+├── an idle pane frontend owns no frame-sized buffer
+├── a hidden page's GPU/SHM surface bytes converge to 0
+└── resource counts and private bytes return to baseline after page close/renderer crash
 
 input
-├── 한글 2-Set IME 조합 과정 실시간 표시 (offscreen window에서)
-├── 방향키/delete 시 commit-then-act
+├── the Korean 2-set IME composition shows live (in an offscreen window)
+├── commit-then-act on arrow keys/delete
 ├── bracketed paste, OSC 52 clipboard
-└── mouse: pane border resize vs interior event 분리
+└── mouse: pane border resize separated from interior events
 
 extension
-├── vimium 설치 후 link hints, scroll 동작
-├── React DevTools 설치 후 panel 동작
-└── 1Password native messaging 연결
+├── link hints and scrolling work after installing vimium
+├── the panel works after installing React DevTools
+└── 1Password native messaging connects
 ```
 
-## 9. 확장용이한 컴포넌트 및 인터페이스 구조
+## 9. A component and interface structure built for extension
 
-DESIGN.md가 `BrowserEngineAdapter`, `FrameTransport`, `BrowserRuntime`, `AgentBridge` trait를
-제안했으나, 구현 가능한 Rust trait/protocol 수준으로 구체화해야 합니다. 핵심 원칙:
-**engine 교체(Electron → custom shell), transport 교체(Kitty → video), agent bridge 확장,
-platform 확장이 trait 경계 뒤에서 일어나서 core API를 바꾸지 않는다.**
+DESIGN.md proposed the `BrowserEngineAdapter`, `FrameTransport`, `BrowserRuntime` and `AgentBridge`
+traits, but they need making concrete at the level of implementable Rust traits/protocols. The core
+principle: **swapping the engine (Electron → a custom shell), swapping the transport (Kitty → video),
+extending the agent bridges and extending platforms all happen behind trait boundaries and never
+change the core API.**
 
-### 9.1 trait 계층 구조
+### 9.1 The trait hierarchy
 
 ```text
-core (platform/engine 무관)
-├── BrowserEngineAdapter    — browser process 추상. Electron, ExternalChrome, CustomShell
-├── FrameTransport          — frame 전달 추상. KittyGraphics, NativeSurface, RemoteVideo
-├── SurfaceSource           — frame 생산 추상. paint event, CDP screenshot, GPU texture
-├── InputSink               — 입력 주입 추상. webContents.sendInputEvent, CDP Input, host IME
-├── ExtensionHost           — extension loading 추상. session.loadExtension, --load-extension
-├── ProfileStore            — profile 추상. Electron session, Chrome profile, CEF user-data-dir
-├── AgentBridge             — agent 전달 추상. ClaudeCode, Codex, Generic, ShellInbox
-├── TerminalCapability      — terminal capability 추상. Kitty query 결과
-├── PlatformService         — OS 추상. IPC, handle transfer, credential, path
-└── ResourceBroker          — resource store 추상. local, remote, scoped
+core (platform- and engine-agnostic)
+├── BrowserEngineAdapter    — the browser process abstraction. Electron, ExternalChrome, CustomShell
+├── FrameTransport          — the frame delivery abstraction. KittyGraphics, NativeSurface, RemoteVideo
+├── SurfaceSource           — the frame production abstraction. paint events, CDP screenshots, GPU textures
+├── InputSink               — the input injection abstraction. webContents.sendInputEvent, CDP Input, host IME
+├── ExtensionHost           — the extension loading abstraction. session.loadExtension, --load-extension
+├── ProfileStore            — the profile abstraction. Electron sessions, Chrome profiles, a CEF user-data-dir
+├── AgentBridge             — the agent delivery abstraction. ClaudeCode, Codex, Generic, ShellInbox
+├── TerminalCapability      — the terminal capability abstraction. The Kitty query result
+├── PlatformService         — the OS abstraction. IPC, handle transfer, credentials, paths
+└── ResourceBroker          — the resource store abstraction. local, remote, scoped
 ```
 
-### 9.2 Rust trait 정의 (핵심)
+### 9.2 The Rust trait definitions (the core of it)
 
 ```rust
 // src/core/engine.rs
-/// Browser process 추상. Electron/ExternalChrome/CustomShell이 각각 구현.
-/// core API는 page/profile/resource/automation을 다루고, engine 세부를 모름.
+/// The browser process abstraction. Implemented separately by Electron/ExternalChrome/CustomShell.
+/// The core API deals in pages/profiles/resources/automation and knows nothing of engine internals.
 #[async_trait]
 pub trait BrowserEngineAdapter: Send + Sync {
-    /// page 생성. pane identity와 연결.
+    /// Creates a page, tied to a pane identity.
     async fn create_page(&self, pane: PaneId, url: &str) -> Result<PageId>;
-    /// page 종료.
+    /// Closes a page.
     async fn close_page(&self, page: PageId) -> Result<()>;
     /// navigation.
     async fn navigate(&self, page: PageId, url: &str) -> Result<()>;
-    /// frame 생산 source. FrameTransport이 소비.
+    /// The frame production source. Consumed by FrameTransport.
     async fn frame_source(&self, page: PageId) -> Result<Box<dyn SurfaceSource>>;
-    /// 입력 주입 sink.
+    /// The input injection sink.
     async fn input_sink(&self, page: PageId) -> Result<Box<dyn InputSink>>;
     /// extension host.
     fn extension_host(&self) -> &dyn ExtensionHost;
     /// profile store.
     fn profile_store(&self) -> &dyn ProfileStore;
-    /// page 상태 snapshot (agent automation용).
+    /// A snapshot of the page state (for agent automation).
     async fn snapshot(&self, page: PageId) -> Result<PageSnapshot>;
-    /// agent action 실행 (click/fill/press/scroll).
+    /// Executes an agent action (click/fill/press/scroll).
     async fn execute_action(&self, page: PageId, action: &Action) -> Result<()>;
 }
 
 // src/core/frame.rs
-/// frame 전달 추상. KittyGraphics/NativeSurface/RemoteVideo가 각각 구현.
+/// The frame delivery abstraction. Implemented separately by KittyGraphics/NativeSurface/RemoteVideo.
 #[async_trait]
 pub trait FrameTransport: Send + Sync {
-    /// terminal capability로 transport 선택.
+    /// Selects a transport from the terminal capabilities.
     fn supports(&self, caps: &TerminalCapability) -> bool;
-    /// surface source에서 frame을 받아 terminal에 전달.
+    /// Takes frames from a surface source and delivers them to the terminal.
     async fn stream(&self, page: PageId, source: Box<dyn SurfaceSource>) -> Result<()>;
-    /// page visibility 변화.
+    /// A change in page visibility.
     async fn set_visible(&self, page: PageId, visible: bool) -> Result<()>;
     /// page resize.
     async fn resize(&self, page: PageId, size: PixelSize) -> Result<()>;
@@ -459,34 +465,34 @@ pub trait FrameTransport: Send + Sync {
     async fn close(&self, page: PageId) -> Result<()>;
 }
 
-/// frame 생산 추상. engine이 구현.
+/// The frame production abstraction, implemented by the engine.
 pub trait SurfaceSource: Send {
-    /// 다음 frame 또는 damage event. backpressure는 구현체가 처리.
+    /// The next frame or damage event. Backpressure is the implementation's job.
     fn next_frame(&mut self) -> Result<FrameEvent>;
 }
 
 pub enum FrameEvent {
-    /// dirty rect와 pixel data (CPU bitmap 경로).
+    /// Dirty rects plus pixel data (the CPU bitmap path).
     Dirty { rects: Vec<Rect>, pixels: BitmapRef, generation: u64 },
-    /// GPU texture handle (GPU fast path).
+    /// A GPU texture handle (the GPU fast path).
     Gpu { handle: SurfaceHandle, fence: SyncPrimitive, generation: u64 },
-    /// page가 idle, frame 없음.
+    /// The page is idle, no frame.
     Idle,
-    /// page 종료.
+    /// The page ended.
     End,
 }
 
 // src/core/input.rs
-/// 입력 주입 추상. engine이 구현.
+/// The input injection abstraction, implemented by the engine.
 #[async_trait]
 pub trait InputSink: Send + Sync {
-    /// key event 주입.
+    /// Injects a key event.
     async fn send_key(&self, event: KeyEvent) -> Result<()>;
-    /// mouse event 주입.
+    /// Injects a mouse event.
     async fn send_mouse(&self, event: MouseEvent) -> Result<()>;
-    /// IME composition 주입 (한글).
+    /// Injects an IME composition (Korean).
     async fn send_composition(&self, event: CompositionEvent) -> Result<()>;
-    /// committed text 주입.
+    /// Injects committed text.
     async fn insert_text(&self, text: &str) -> Result<()>;
 }
 
@@ -497,28 +503,28 @@ pub enum CompositionEvent {
 }
 
 // src/core/extension.rs
-/// extension loading 추상. engine이 구현.
+/// The extension loading abstraction, implemented by the engine.
 #[async_trait]
 pub trait ExtensionHost: Send + Sync {
-    /// unpacked extension 로드.
+    /// Loads an unpacked extension.
     async fn load_extension(&self, path: &Path) -> Result<ExtensionId>;
-    /// extension 목록.
+    /// Lists the extensions.
     async fn list_extensions(&self) -> Result<Vec<ExtensionInfo>>;
-    /// extension 제거.
+    /// Removes an extension.
     async fn remove_extension(&self, id: &ExtensionId) -> Result<()>;
-    /// native messaging host 연결.
+    /// Connects to a native messaging host.
     async fn connect_native(&self, name: &str) -> Result<Box<dyn NativeMessagingChannel>>;
 }
 
 // src/core/agent.rs
-/// agent 전달 추상. ClaudeCode/Codex/Generic/ShellInbox가 각각 구현.
+/// The agent delivery abstraction. Implemented separately by ClaudeCode/Codex/Generic/ShellInbox.
 #[async_trait]
 pub trait AgentBridge: Send + Sync {
-    /// agent가 받을 수 있는 resource kind/mime 협상.
+    /// Negotiates the resource kinds/mimes the agent can accept.
     fn accepts(&self) -> &AgentCapability;
-    /// resource 전달.
+    /// Delivers a resource.
     async fn deliver(&self, resource: &ResourceDescriptor, broker: &dyn ResourceBroker) -> Result<DeliveryStatus>;
-    /// agent alive 확인.
+    /// Checks whether the agent is alive.
     async fn is_alive(&self) -> bool;
 }
 
@@ -530,7 +536,7 @@ pub struct AgentCapability {
 }
 
 // src/core/platform.rs
-/// OS 추상. platform별 구현체가 각각 구현.
+/// The OS abstraction. Implemented separately per platform.
 pub trait PlatformService: Send + Sync {
     fn local_ipc(&self) -> &dyn LocalIpcTransport;
     fn handle_transfer(&self) -> &dyn HandleTransfer;
@@ -541,16 +547,16 @@ pub trait PlatformService: Send + Sync {
 }
 ```
 
-### 9.3 구현체 매트릭스 (확장 지점)
+### 9.3 The implementation matrix (the extension points)
 
 ```text
 BrowserEngineAdapter
-├── ElectronAdapter          (src/electron/ — TypeScript main + Rust native module)
+├── ElectronAdapter          (src/electron/ — a TypeScript main plus a Rust native module)
 ├── ExternalChromeAdapter    (src/external/ — Rust, CDP WebSocket)
-└── CustomShellAdapter       (src/shell/ — Rust + C++ Chromium embed, 장기 전환)
+└── CustomShellAdapter       (src/shell/ — Rust + a C++ Chromium embed, the long-term move)
 
 FrameTransport
-├── KittyGraphicsTransport   (src/native/kitty.rs — SHM + Kitty graphics, 로컬)
+├── KittyGraphicsTransport   (src/native/kitty.rs — SHM + Kitty graphics, local)
 ├── NativeSurfaceTransport   (src/native/surface.rs — IOSurface/DMA-BUF, Tier 3)
 └── RemoteVideoTransport     (src/remote/video.rs — H.264/VP8 encode, remote)
 
@@ -562,193 +568,194 @@ InputSink
 ExtensionHost
 ├── ElectronExtensionHost    (session.loadExtension)
 ├── ChromeExtensionHost      (--load-extension)
-└── ShellExtensionHost       (Chromium extension API)
+└── ShellExtensionHost       (the Chromium extension API)
 
 AgentBridge
-├── ClaudeCodeBridge         (attachment RPC 또는 local file)
-├── CodexBridge              (attachment RPC 또는 local file)
-├── GenericTerminalAgentBridge (inbox notification + tweb://resource/<id>)
-└── ShellInboxBridge         (shell inbox + reference)
+├── ClaudeCodeBridge         (attachment RPC or a local file)
+├── CodexBridge              (attachment RPC or a local file)
+├── GenericTerminalAgentBridge (an inbox notification + tweb://resource/<id>)
+└── ShellInboxBridge         (a shell inbox + a reference)
 
 PlatformService
 ├── MacosPlatform            (IOSurface, Mach/XPC, Keychain, launchd)
 ├── LinuxPlatform            (DMA-BUF, SCM_RIGHTS, Secret Service, systemd)
-└── WindowsPlatform          (DXGI, DuplicateHandle, DPAPI, Job Object)
+└── WindowsPlatform          (DXGI, DuplicateHandle, DPAPI, Job Objects)
 ```
 
-### 9.4 교체가 core API에 미치는 영향
+### 9.4 What a swap costs the core API
 
 ```text
-Electron → CustomShell 전환 (장기)
-    BrowserEngineAdapter 교체
-    core API (create_page/navigate/snapshot/execute_action) 변화 없음
-    FrameTransport/InputSink/ExtensionHost 구현체만 교체
-    ProfileStore가 profile migration 처리
+Electron → CustomShell (long term)
+    swap BrowserEngineAdapter
+    no change to the core API (create_page/navigate/snapshot/execute_action)
+    only the FrameTransport/InputSink/ExtensionHost implementations are swapped
+    ProfileStore handles the profile migration
 
-로컬 → remote 전환
-    FrameTransport만 KittyGraphics → RemoteVideo로 교체
-    BrowserPageID/profile/automation API 유지
-    ResourceBroker가 locality 판정하여 전송 방식 선택
+local → remote
+    only FrameTransport changes, KittyGraphics → RemoteVideo
+    the BrowserPageID/profile/automation APIs stay
+    ResourceBroker judges locality and picks the transfer mechanism
 
-agent 확장 (새 agent 추가)
-    AgentBridge 구현체 추가
-    AgentCapability 협상으로 resource kind/mime 자동 조정
-    core가 agent 종류를 모름
+extending agents (adding a new one)
+    add an AgentBridge implementation
+    AgentCapability negotiation adjusts the resource kinds/mimes automatically
+    core knows nothing about agent kinds
 
-platform 확장 (새 OS 추가)
-    PlatformService 구현체 추가
-    core가 OS를 모름
+extending platforms (adding a new OS)
+    add a PlatformService implementation
+    core knows nothing about the OS
 ```
 
-### 9.5 확장 지점 원칙
+### 9.5 The extension-point principles
 
-1. **core는 engine/transport/agent/platform을 모른다**: core는 trait만 본다. 구현체는
-   `BrowserEngineAdapter` 등 trait 뒤에서 교체.
-2. **새 구현체 추가가 기존 코드를 안 바꾼다**: 새 `AgentBridge` 구현체를 추가해도 core가 변하지
-   않음. capability 협상으로 자동 조정.
-3. **trait 경계가 process/IPC 경계와 일치**: Rust↔TypeScript(Electron)는 C ABI 또는 IPC,
-   Rust↔C++(custom shell)는 C ABI. trait은 같은 process 내에서만.
-4. **SurfaceSource/InputSink가 engine에 종속**: engine이 `Box<dyn SurfaceSource>`를 반환하므로,
-   frame 생산과 입력 주입은 engine 구현체가 책임. core는 trait만 소비.
-5. **FrameTransport가 capability로 선택**: `TerminalCapability`로 Kitty/Native/Remote를 판정.
-   engine과 독립적으로 transport만 교체 가능.
+1. **core knows nothing of engine/transport/agent/platform**: core sees only traits. Implementations
+   are swapped behind `BrowserEngineAdapter` and friends.
+2. **Adding an implementation changes no existing code**: adding a new `AgentBridge` implementation
+   leaves core untouched. Capability negotiation adjusts automatically.
+3. **Trait boundaries line up with process/IPC boundaries**: Rust↔TypeScript (Electron) is a C ABI or
+   IPC; Rust↔C++ (the custom shell) is a C ABI. Traits live within a single process only.
+4. **SurfaceSource/InputSink belong to the engine**: since the engine returns
+   `Box<dyn SurfaceSource>`, frame production and input injection are the engine implementation's
+   responsibility. core only consumes the traits.
+5. **FrameTransport is chosen by capability**: `TerminalCapability` decides Kitty/Native/Remote. The
+   transport can be swapped independently of the engine.
 
-## 10. 구현 파일 구조 (제안)
+## 10. The implementation file structure (proposed)
 
 ```text
 tweb/
 ├── src/
-│   ├── core/               (Rust, platform/engine 무관 core — trait 정의 + 공통 로직)
+│   ├── core/               (Rust, the platform/engine-agnostic core — trait definitions plus shared logic)
 │   │   ├── mod.rs
-│   │   ├── engine.rs       (BrowserEngineAdapter trait)
-│   │   ├── frame.rs        (FrameTransport, SurfaceSource, FrameEvent trait)
+│   │   ├── engine.rs       (the BrowserEngineAdapter trait)
+│   │   ├── frame.rs        (the FrameTransport, SurfaceSource, FrameEvent traits)
 │   │   ├── input.rs        (InputSink, CompositionEvent, KeyEvent, MouseEvent)
-│   │   ├── extension.rs    (ExtensionHost, NativeMessagingChannel trait)
-│   │   ├── profile.rs      (ProfileStore, BrowserProfile trait)
-│   │   ├── agent.rs        (AgentBridge, AgentCapability trait)
-│   │   ├── platform.rs     (PlatformService, LocalIpc, HandleTransfer, CredentialStore trait)
-│   │   ├── resource.rs     (ResourceBroker, ResourceDescriptor trait)
-│   │   ├── page.rs         (PageId, PaneId, PageSnapshot — 공통 type)
+│   │   ├── extension.rs    (the ExtensionHost, NativeMessagingChannel traits)
+│   │   ├── profile.rs      (the ProfileStore, BrowserProfile traits)
+│   │   ├── agent.rs        (the AgentBridge, AgentCapability traits)
+│   │   ├── platform.rs     (the PlatformService, LocalIpc, HandleTransfer, CredentialStore traits)
+│   │   ├── resource.rs     (the ResourceBroker, ResourceDescriptor traits)
+│   │   ├── page.rs         (PageId, PaneId, PageSnapshot — the shared types)
 │   │   └── routing.rs      (BrowserRoutingPolicy — embedded/managed-chrome/remote/ask)
 │   │
-│   ├── twebd/              (Rust, daemon — core trait을 사용해 orchestration)
+│   ├── twebd/              (Rust, the daemon — orchestrates using the core traits)
 │   │   ├── main.rs
-│   │   ├── ipc.rs          (Unix socket, peer credential)
-│   │   ├── page_registry.rs (pane ID ↔ page 매핑, BrowserEngineAdapter 호출)
-│   │   ├── profile_manager.rs (ProfileStore 사용)
-│   │   ├── resource_broker.rs (ResourceBroker 구현)
-│   │   ├── automation.rs   (BrowserEngineAdapter.snapshot/execute_action 호출)
-│   │   ├── agent_bridge.rs (AgentBridge 구현체 관리, capability 협상)
-│   │   └── tmux.rs         (tmux integration, hook)
+│   │   ├── ipc.rs          (Unix socket, peer credentials)
+│   │   ├── page_registry.rs (pane ID ↔ page mapping, calls BrowserEngineAdapter)
+│   │   ├── profile_manager.rs (uses ProfileStore)
+│   │   ├── resource_broker.rs (implements ResourceBroker)
+│   │   ├── automation.rs   (calls BrowserEngineAdapter.snapshot/execute_action)
+│   │   ├── agent_bridge.rs (manages the AgentBridge implementations, capability negotiation)
+│   │   └── tmux.rs         (tmux integration, hooks)
 │   │
-│   ├── pane/               (Rust, tweb __pane frontend)
+│   ├── pane/               (Rust, the tweb __pane frontend)
 │   │   ├── main.rs
-│   │   ├── terminal.rs     (TerminalCapability — Kitty graphics query, raw mode)
-│   │   ├── input.rs        (keyboard/mouse decode, Browser mode 관리, InputSink 호출)
-│   │   ├── resize.rs       (SIGWINCH, pixel query, FrameTransport.resize 호출)
-│   │   └── display.rs      (FrameTransport.stream 소비, Ghostty 표시)
+│   │   ├── terminal.rs     (TerminalCapability — the Kitty graphics query, raw mode)
+│   │   ├── input.rs        (keyboard/mouse decoding, Browser mode management, calls InputSink)
+│   │   ├── resize.rs       (SIGWINCH, pixel query, calls FrameTransport.resize)
+│   │   └── display.rs      (consumes FrameTransport.stream, displays in Ghostty)
 │   │
-│   ├── engine/             (Rust, BrowserEngineAdapter 구현체들)
-│   │   ├── mod.rs          (engine 선택: cfg 또는 runtime 판정)
-│   │   ├── electron/       (Electron adapter — TypeScript main과 IPC)
-│   │   │   ├── adapter.rs  (BrowserEngineAdapter 구현, IPC로 TypeScript main 호출)
-│   │   │   ├── frame_source.rs (SurfaceSource 구현 — paint event 수신)
-│   │   │   ├── input_sink.rs   (InputSink 구현 — sendInputEvent + IME)
-│   │   │   └── extension.rs    (ExtensionHost 구현 — session.loadExtension)
-│   │   ├── external/       (External Chrome adapter — CDP WebSocket, 장기 후보)
+│   ├── engine/             (Rust, the BrowserEngineAdapter implementations)
+│   │   ├── mod.rs          (engine selection: cfg or a runtime decision)
+│   │   ├── electron/       (the Electron adapter — IPC with the TypeScript main)
+│   │   │   ├── adapter.rs  (implements BrowserEngineAdapter, calls the TypeScript main over IPC)
+│   │   │   ├── frame_source.rs (implements SurfaceSource — receives paint events)
+│   │   │   ├── input_sink.rs   (implements InputSink — sendInputEvent + IME)
+│   │   │   └── extension.rs    (implements ExtensionHost — session.loadExtension)
+│   │   ├── external/       (the External Chrome adapter — CDP WebSocket, a long-term candidate)
 │   │   │   ├── adapter.rs
 │   │   │   ├── frame_source.rs (SurfaceSource — captureScreenshot)
 │   │   │   ├── input_sink.rs   (InputSink — CDP Input)
 │   │   │   └── extension.rs    (ExtensionHost — --load-extension)
-│   │   └── shell/          (Custom Chromium shell adapter — 장기 전환, 최후 hybrid)
+│   │   └── shell/          (the custom Chromium shell adapter — the long-term move, the final hybrid)
 │   │       ├── adapter.rs
 │   │       ├── frame_source.rs (SurfaceSource — GPU texture export)
 │   │       ├── input_sink.rs   (InputSink — TextInputClient)
-│   │       └── extension.rs    (ExtensionHost — Chromium extension API)
+│   │       └── extension.rs    (ExtensionHost — the Chromium extension API)
 │   │
-│   ├── transport/          (Rust, FrameTransport 구현체들)
-│   │   ├── mod.rs          (transport 선택: TerminalCapability로 판정)
-│   │   ├── kitty.rs        (KittyGraphicsTransport — SHM + Kitty graphics, 로컬)
+│   ├── transport/          (Rust, the FrameTransport implementations)
+│   │   ├── mod.rs          (transport selection: decided by TerminalCapability)
+│   │   ├── kitty.rs        (KittyGraphicsTransport — SHM + Kitty graphics, local)
 │   │   ├── surface.rs      (NativeSurfaceTransport — IOSurface/DMA-BUF, Tier 3)
 │   │   └── remote.rs       (RemoteVideoTransport — H.264/VP8 encode, remote)
 │   │
-│   ├── native/             (Rust native module, 공유 최적화 — transport/engine이 사용)
-│   │   ├── shm.rs          (persistent SHM ring, shm_open 금지)
-│   │   ├── tile.rs         (dirty rect → adaptive tile 매핑)
-│   │   ├── convert.rs      (BGRA→RGBA SIMD, dirty tile만)
-│   │   └── kitty_proto.rs  (Kitty graphics 전송, bounded pool)
+│   ├── native/             (the Rust native module, shared optimizations — used by transport/engine)
+│   │   ├── shm.rs          (the persistent SHM ring, no shm_open per paint)
+│   │   ├── tile.rs         (dirty rect → adaptive tile mapping)
+│   │   ├── convert.rs      (BGRA→RGBA SIMD, dirty tiles only)
+│   │   └── kitty_proto.rs  (Kitty graphics transfer, bounded pools)
 │   │
-│   ├── platform/           (Rust, PlatformService 구현체들)
-│   │   ├── mod.rs          (platform 선택: cfg(target_os))
+│   ├── platform/           (Rust, the PlatformService implementations)
+│   │   ├── mod.rs          (platform selection: cfg(target_os))
 │   │   ├── macos.rs        (IOSurface, Mach/XPC, Keychain, launchd)
 │   │   ├── linux.rs        (DMA-BUF, SCM_RIGHTS, Secret Service, systemd)
-│   │   └── windows.rs      (DXGI, DuplicateHandle, DPAPI, Job Object)
+│   │   └── windows.rs      (DXGI, DuplicateHandle, DPAPI, Job Objects)
 │   │
-│   ├── agent/              (Rust, AgentBridge 구현체들)
-│   │   ├── mod.rs          (agent 등록, capability 협상)
-│   │   ├── claude_code.rs  (ClaudeCodeBridge — attachment RPC 또는 local file)
+│   ├── agent/              (Rust, the AgentBridge implementations)
+│   │   ├── mod.rs          (agent registration, capability negotiation)
+│   │   ├── claude_code.rs  (ClaudeCodeBridge — attachment RPC or a local file)
 │   │   ├── codex.rs        (CodexBridge)
-│   │   ├── generic.rs      (GenericTerminalAgentBridge — inbox + tweb://resource/<id>)
+│   │   ├── generic.rs      (GenericTerminalAgentBridge — an inbox + tweb://resource/<id>)
 │   │   └── shell_inbox.rs  (ShellInboxBridge)
 │   │
-│   └── electron/           (TypeScript, Electron main process — engine/electron/와 IPC)
-│       ├── main.ts         (BrowserWindow 관리, IPC server, Rust native module 로드)
-│       ├── paint.ts        (paint event → Rust native module, dirty rect 전달)
-│       ├── extension.ts    (session.loadExtension 관리)
+│   └── electron/           (TypeScript, the Electron main process — IPC with engine/electron/)
+│       ├── main.ts         (BrowserWindow management, the IPC server, loads the Rust native module)
+│       ├── paint.ts        (paint event → the Rust native module, passes the dirty rect)
+│       ├── extension.ts    (manages session.loadExtension)
 │       ├── input.ts        (webContents.sendInputEvent, IME, CompositionEvent)
 │       └── ipc.ts          (twebd ↔ Electron main process IPC)
 │
-├── extension/              (TypeScript, TWeb Profile Bridge Chrome extension)
+├── extension/              (TypeScript, the TWeb Profile Bridge Chrome extension)
 │   ├── manifest.json       (nativeMessaging, cookies optional, management)
-│   ├── background.ts       (cookie transfer, native messaging host 연결)
-│   └── popup.ts            (origin 선택 UI, permission 요청)
+│   ├── background.ts       (cookie transfer, connects to the native messaging host)
+│   └── popup.ts            (the origin selection UI, permission requests)
 │
-└── tweb/                   (CLI binary, Rust)
+└── tweb/                   (the CLI binary, Rust)
     └── main.rs             (tweb open/split/snapshot/click/profile/doctor)
 ```
 
-### 10.1 모듈 의존성 방향
+### 10.1 Module dependency direction
 
 ```text
-core (trait 정의) ← twebd, pane, engine/*, transport/*, platform/*, agent/*
-                    (모두 core trait을 구현하거나 소비)
+core (the trait definitions) ← twebd, pane, engine/*, transport/*, platform/*, agent/*
+                               (all of them either implement or consume the core traits)
 
-core는 어떤 구현체도 모름 (trait만 정의)
-twebd는 core trait을 사용해 orchestration (구현체 선택)
-engine/*는 BrowserEngineAdapter + InputSink + ExtensionHost 구현
-transport/*는 FrameTransport 구현
-platform/*는 PlatformService 구현
-agent/*는 AgentBridge 구현
-native/*는 transport/engine이 공유하는 최적화 (SHM, tile, convert, kitty_proto)
-electron/ (TypeScript)는 engine/electron/와 IPC, Rust native module 로드
+core knows no implementation at all (it only defines traits)
+twebd orchestrates using the core traits (choosing implementations)
+engine/* implements BrowserEngineAdapter + InputSink + ExtensionHost
+transport/* implements FrameTransport
+platform/* implements PlatformService
+agent/* implements AgentBridge
+native/* holds the optimizations shared by transport/engine (SHM, tile, convert, kitty_proto)
+electron/ (TypeScript) does IPC with engine/electron/ and loads the Rust native module
 ```
 
-### 10.2 확장 시 파일 추가/변경
+### 10.2 What an extension adds or changes
 
 ```text
-새 engine 추가 (예: CEF 재고려)
-    src/engine/cef/ 추가 (adapter, frame_source, input_sink, extension)
-    core 변화 없음, twebd의 engine 선택 로직만 추가
+adding an engine (reconsidering CEF, say)
+    add src/engine/cef/ (adapter, frame_source, input_sink, extension)
+    no core change; only twebd's engine selection logic gains a branch
 
-새 transport 추가 (예: Sixel)
-    src/transport/sixel.rs 추가
-    core 변화 없음, transport/mod.rs 선택 로직만 추가
+adding a transport (Sixel, say)
+    add src/transport/sixel.rs
+    no core change; only transport/mod.rs's selection logic gains a branch
 
-새 agent 추가
-    src/agent/<name>.rs 추가
-    core 변화 없음, agent/mod.rs 등록만 추가
+adding an agent
+    add src/agent/<name>.rs
+    no core change; only agent/mod.rs gains a registration
 
-새 platform 추가
-    src/platform/<name>.rs 추가
-    core 변화 없음, platform/mod.rs 선택 로직만 추가
+adding a platform
+    add src/platform/<name>.rs
+    no core change; only platform/mod.rs's selection logic gains a branch
 ```
 
-## 참고 자료
+## References
 
 - Electron webContents paint event — https://www.electronjs.org/docs/latest/api/web-contents
 - Electron offscreen rendering — https://www.electronjs.org/docs/latest/tutorial/offscreen-rendering
 - awrit paint.ts — https://github.com/chase/awrit/blob/electron/src/paint.ts
 - Kitty graphics protocol — https://sw.kovidgoyal.net/kitty/graphics-protocol/
-- DESIGN.md 섹션 6.5, 7.1-7.7 — 본 저장소
-- FEASIBILITY.md 섹션 1, 7 — 본 저장소
-- PREDEV.md S1, P1 — 본 저장소
+- DESIGN.md sections 6.5, 7.1–7.7 — this repository
+- FEASIBILITY.md sections 1, 7 — this repository
+- PREDEV.md S1, P1 — this repository

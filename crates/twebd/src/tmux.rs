@@ -1,7 +1,7 @@
 //! tmux integration — pane lifecycle, hook, identity.
 //!
-//! DESIGN.md 섹션 5.2, 9. `$TMUX`, `$TMUX_PANE`로 pane identity 등록.
-//! tmux server/session/window/pane stable ID 수집.
+//! DESIGN.md sections 5.2 and 9. Registers pane identity from `$TMUX` and `$TMUX_PANE`.
+//! Collects the stable tmux server/session/window/pane IDs.
 
 use tweb_core::page::PaneId;
 
@@ -15,7 +15,7 @@ pub struct TmuxPaneIdentity {
 }
 
 impl TmuxPaneIdentity {
-    /// 환경 변수에서 pane identity 수집.
+    /// Collects the pane identity from the environment variables.
     /// `$TMUX_PANE` = `%3`, `$TMUX` = `/tmp/tmux-501/default,12345,0`.
     pub fn from_env() -> Option<Self> {
         let tmux_pane = std::env::var("TMUX_PANE").ok()?;
@@ -28,7 +28,7 @@ impl TmuxPaneIdentity {
             .map(PaneId)?;
 
         // $TMUX = "/tmp/tmux-501/default,12345,0" → socket path, pid, session.
-        // 단, session_id는 $TMUX에서 안 나오므로 별도 query 필요.
+        // Note that session_id does not appear in $TMUX, so it needs a separate query.
         let tmux_server_id = tmux
             .split(',')
             .next()
@@ -44,7 +44,7 @@ impl TmuxPaneIdentity {
     }
 }
 
-/// tmux command 실행 (TODO: `tmux` CLI 호출).
+/// Runs a tmux command (TODO: invoke the `tmux` CLI).
 pub fn tmux_command(args: &[&str]) -> anyhow::Result<String> {
     let output = std::process::Command::new("tmux").args(args).output()?;
     if output.status.success() {
