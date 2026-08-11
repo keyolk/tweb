@@ -1208,6 +1208,7 @@ function activateTab(index) {
   updatePaintingState();
   win.webContents.invalidate();
   updatePaneTitle();
+  sendTabState();
   scheduleWindowSessionSave();
   if (debugLogging) console.error(`tweb: tab active ${tabLabel(win, normalized)}`);
 }
@@ -1359,6 +1360,14 @@ function tabListModel() {
       url: candidate.webContents.getURL() || "about:blank",
     })),
   };
+}
+
+function tabStateModel() {
+  return { activeIndex: activeTabIndex, count: tabs.length };
+}
+
+function sendTabState(tab = win) {
+  sendToMainTabFrame(tab, "tweb-tab-state", tabStateModel());
 }
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
@@ -1513,7 +1522,10 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-enabled", browserShortcutsEnabled);
-  if (tab === win) event.reply("tweb-cell-metrics", cellMetrics());
+  if (tab === win && frame === tab.webContents.mainFrame) {
+    event.reply("tweb-cell-metrics", cellMetrics());
+    event.reply("tweb-tab-state", tabStateModel());
+  }
 });
 
 ipcMain.on("tweb-shortcut", (event, message) => {
@@ -2153,7 +2165,10 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
       return;
     }
     if (wasActive) activateTab(Math.min(closedIndex, tabs.length - 1));
-    else if (closedIndex < activeTabIndex) activeTabIndex -= 1;
+    else {
+      if (closedIndex < activeTabIndex) activeTabIndex -= 1;
+      sendTabState();
+    }
     if (refreshTabListAfterClose) {
       refreshTabListAfterClose = false;
       sendToTabFrames(win, "tweb-tabs", tabListModel());
@@ -2162,7 +2177,10 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
   });
 
   if (activate) activateTab(index);
-  else scheduleWindowSessionSave();
+  else {
+    sendTabState();
+    scheduleWindowSessionSave();
+  }
   if (debugLogging) console.error(`tweb: tab opened ${index + 1} ${url}`);
   return tab;
 }

@@ -284,6 +284,7 @@ impl BrowserRuntime {
             self.activate_by_label(&label);
         } else {
             self.sync_windows();
+            self.send_tab_state();
             self.write_window_session();
         }
         Ok(())
@@ -441,6 +442,7 @@ impl BrowserRuntime {
             "tweb-preload-ready" => {
                 self.update_page_meta(label, &action.value);
                 self.send_shortcut_mode();
+                self.send_tab_state();
             }
             "page-meta" => self.update_page_meta(label, &action.value),
             "history-back" => self.with_active_window(go_back),
@@ -821,6 +823,17 @@ impl BrowserRuntime {
         self.emit_active("tweb-shortcuts-enabled", &Value::Bool(enabled));
     }
 
+    fn send_tab_state(&self) {
+        let model = self
+            .tabs
+            .lock()
+            .ok()
+            .map(|tabs| json!({ "activeIndex": tabs.active, "count": tabs.values.len() }));
+        if let Some(model) = model {
+            self.emit_active("tweb-tab-state", &model);
+        }
+    }
+
     fn send_tab_list(&self) {
         let model = self.tabs.lock().ok().map(|tabs| {
             json!({
@@ -911,6 +924,7 @@ impl BrowserRuntime {
         self.sync_windows();
         self.sync_title();
         self.send_shortcut_mode();
+        self.send_tab_state();
         self.write_window_session();
     }
 
@@ -956,6 +970,7 @@ impl BrowserRuntime {
             *self.snapshot.last_hash.lock().unwrap() = None;
             self.sync_windows();
             self.sync_title();
+            self.send_tab_state();
             self.write_window_session();
         }
     }
