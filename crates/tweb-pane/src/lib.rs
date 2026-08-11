@@ -1,14 +1,14 @@
-//! tweb __pane — tmux browser pane의 foreground process.
+//! tweb __pane — the foreground process of a tmux browser pane.
 //!
-//! DESIGN.md 섹션 5.2. 각 tmux browser pane의 실제 foreground process.
-//! 핵심: Electron offscreen process를 spawn하고, paint event(frame)를
-//! stdout Kitty graphics로 terminal에 전달.
+//! DESIGN.md section 5.2. The actual foreground process of every tmux browser pane.
+//! Core job: spawn the Electron offscreen process and forward paint events (frames)
+//! to the terminal as Kitty graphics on stdout.
 //!
-//! 최소 기능:
-//! - `tweb __pane <url>` → Electron spawn, URL 로드
-//! - paint event → Kitty graphics → terminal 표시
+//! Minimum feature set:
+//! - `tweb __pane <url>` → spawn Electron, load the URL
+//! - paint event → Kitty graphics → shown in the terminal
 //! - pane resize → Electron viewport resize
-//! - pane kill → Electron 종료, image delete
+//! - pane kill → Electron shutdown, image delete
 
 pub mod display;
 mod engine_app;
@@ -144,8 +144,9 @@ fn visible_client_ttys(pane: &str) -> Vec<String> {
     )
 }
 
-/// Pane PTY와 이 tmux window를 보고 있는 terminal client 모두에서 image를 제거한다.
-/// Pane 종료 중에는 PTY 출력이 유실될 수 있으므로 client TTY에도 raw command를 쓴다.
+/// Removes the image both from the pane PTY and from every terminal client watching
+/// this tmux window. PTY output can be lost while the pane is shutting down, so the
+/// raw command also goes to the client TTYs.
 fn write_kitty_delete(image_id: u32, pane: &str) {
     let delete = raw_kitty_delete(image_id);
     let sequence = if std::env::var_os("TMUX").is_some() {
@@ -167,8 +168,8 @@ fn write_kitty_delete(image_id: u32, pane: &str) {
     }
 }
 
-/// 현재 tmux pane을 TWeb browser로 표시한다. root key binding은 이 marker가
-/// 있는 pane에서만 browser passthrough mode를 활성화한다.
+/// Marks the current tmux pane as a TWeb browser. The root key binding enables
+/// browser passthrough mode only in panes carrying this marker.
 struct TmuxPaneMarker {
     pane: Option<String>,
 }
@@ -198,12 +199,12 @@ impl Drop for TmuxPaneMarker {
     }
 }
 
-/// 기본 Electron engine으로 tweb __pane을 실행한다.
+/// Runs tweb __pane on the default Electron engine.
 pub async fn run(url: &str) -> Result<()> {
     run_with_options(url, PaneOptions::default()).await
 }
 
-/// 선택한 browser engine과 frame policy로 tweb __pane을 실행한다.
+/// Runs tweb __pane on the chosen browser engine and frame policy.
 pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     tracing::info!(url, ?options, "tweb __pane starting");
 
@@ -211,7 +212,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     tracing::info!(pane = %pane, "tmux pane identity");
     let _pane_marker = TmuxPaneMarker::install(&pane);
 
-    // raw terminal mode와 browser 입력(mouse/Kitty keyboard) 활성화.
+    // Enable raw terminal mode and browser input (mouse/Kitty keyboard).
     let _raw_guard = terminal::RawModeGuard::enter()?;
     let _input_guard = terminal::InputModeGuard::enter();
     // Declared after the others so it is dropped first: the screen has to still be
@@ -219,10 +220,10 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     // put on.
     let _screen_guard = terminal::ScreenGuard::enter();
 
-    // Engine process spawn. stdin은 resize/raw input control channel이고,
-    // stdout은 engine이 Kitty graphics를 terminal에 직접 쓰도록 상속한다.
+    // Spawn the engine process. stdin is the resize/raw input control channel, and
+    // stdout is inherited so the engine writes Kitty graphics to the terminal itself.
     let initial_geometry = terminal::window_geometry();
-    // Kitty image ID는 terminal 전체 namespace이므로 pane process마다 고유해야 한다.
+    // Kitty image IDs live in a terminal-wide namespace, so each pane process needs its own.
     let image_id = std::process::id();
     let (mut command, engine_description) = match options.engine {
         BrowserEngine::Electron => {
@@ -295,7 +296,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     let child_id = child.id();
     tracing::debug!(pid = ?child_id, "browser engine spawned");
 
-    // Engine stdin은 terminal 입력과 섞지 않고 resize/raw input control message에 사용한다.
+    // Engine stdin carries resize/raw input control messages and is never mixed with terminal input.
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let control_handle = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
@@ -312,9 +313,9 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         }
     });
 
-    // 입력 처리 task: 모든 raw bytes를 Electron에 전달한다. Ctrl-C의 종료/웹 전달
-    // 여부도 browser mode를 아는 Electron이 결정한다.
-    // hex framing을 사용해 newline, escape sequence, UTF-8 chunk를 손실 없이 보낸다.
+    // Input task: forward every raw byte to Electron. Whether Ctrl-C quits or goes to
+    // the page is also Electron's call, since it is the side that knows the browser mode.
+    // Hex framing keeps newlines, escape sequences and UTF-8 chunks intact on the way over.
     let input_handle = tokio::spawn({
         let control_tx = control_tx.clone();
         async move {
@@ -341,10 +342,10 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         }
     });
 
-    // SIGWINCH와 tmux geometry polling을 함께 사용한다. tmux는 pane 크기가 같고
-    // 위치만 바뀐 layout 변경에는 SIGWINCH를 보내지 않을 수 있다.
-    // SIGUSR1은 Electron의 native DevTools가 terminal mode를 초기화한 뒤
-    // PTY stdout 소유자인 frontend에 keyboard mode 재선언을 요청한다.
+    // SIGWINCH and tmux geometry polling are used together: tmux may not send SIGWINCH
+    // for a layout change that moves the pane without changing its size.
+    // SIGUSR1 is how Electron asks the frontend — the owner of the PTY stdout — to
+    // re-declare keyboard mode after its native DevTools reset the terminal modes.
     let sig_handle = tokio::spawn({
         let control_tx = control_tx.clone();
         async move {
@@ -393,11 +394,11 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         }
     });
 
-    // child 종료 대기.
+    // Wait for the child to exit.
     let status = child.wait().await;
     tracing::info!(?status, engine = ?options.engine, "browser engine exited");
 
-    // Engine이 비정상 종료해도 이 pane 소유 image를 pane PTY와 실제 client에서 제거한다.
+    // Even if the engine died abnormally, drop this pane's image from the pane PTY and the real clients.
     write_kitty_delete(image_id, &pane);
 
     input_handle.abort();
@@ -423,21 +424,21 @@ fn find_tauri() -> Result<std::path::PathBuf> {
         .context("Tauri engine binary not found; build tweb-tauri or set TWEB_TAURI")
 }
 
-/// `make install`이 놓는 위치: binary가 `<prefix>/bin/tweb`이면 Electron runtime은
-/// `<prefix>/libexec/tweb/electron`에 있다. 설치본은 workspace 안에서 돌지 않으므로
-/// current_exe 기준 상대 경로 말고는 찾을 단서가 없다.
+/// Where `make install` puts things: if the binary is `<prefix>/bin/tweb`, the Electron
+/// runtime sits at `<prefix>/libexec/tweb/electron`. An installed copy never runs from
+/// inside the workspace, so a path relative to current_exe is the only clue available.
 pub fn installed_electron_dir() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.parent()?.join("libexec/tweb/electron");
     dir.is_dir().then_some(dir)
 }
 
-/// 주어진 directory 안의 Electron 실행 파일.
+/// The Electron executable inside the given directory.
 pub fn electron_binary_in(directory: &std::path::Path) -> Option<std::path::PathBuf> {
     for relative in [
         "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
         "node_modules/.bin/electron",
-        // 1회성 설치가 풀어놓는 모양: node_modules 없이 dist만 온다.
+        // The shape a one-shot install unpacks into: dist only, no node_modules.
         "dist/Electron.app/Contents/MacOS/Electron",
         "Electron.app/Contents/MacOS/Electron",
     ] {
@@ -449,7 +450,7 @@ pub fn electron_binary_in(directory: &std::path::Path) -> Option<std::path::Path
     None
 }
 
-/// workspace를 실행 중일 때의 `electron/` 후보들.
+/// `electron/` candidates for when we are running from the workspace.
 fn workspace_electron_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -464,10 +465,11 @@ fn workspace_electron_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// Electron이 `.`으로 로드할 app directory.
+/// The app directory Electron loads as `.`.
 ///
-/// workspace 안에서 돌고 있으면 그 `electron/`을 쓴다 — 고친 preload가 rebuild 없이 바로
-/// 반영되어야 개발이 된다. 그 밖에서는 binary에 담긴 app을 cache에 푼다.
+/// When running inside the workspace, use its `electron/` — development only works if an
+/// edited preload takes effect without a rebuild. Elsewhere, unpack the app embedded in
+/// the binary into the cache.
 fn electron_app_directory() -> Result<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("TWEB_ELECTRON_DIR") {
         return Ok(std::path::PathBuf::from(dir));
@@ -480,7 +482,8 @@ fn electron_app_directory() -> Result<std::path::PathBuf> {
     engine_app::extracted_app_dir()
 }
 
-/// Electron 실행 파일 찾기. app 코드는 binary에 담겨 있으므로 이것만 밖에서 온다.
+/// Finds the Electron executable. The app code is embedded in the binary, so this is the
+/// only piece that has to come from outside.
 fn electron_executable() -> Result<std::path::PathBuf> {
     if let Ok(path) = std::env::var("TWEB_ELECTRON") {
         return Ok(std::path::PathBuf::from(path));
@@ -499,10 +502,10 @@ fn electron_executable() -> Result<std::path::PathBuf> {
     if let Ok(binary) = which::which("electron") {
         return Ok(binary);
     }
-    // 어디에도 없으면 한 번 설치한다. 295MB를 binary에 넣지 않는 대신 필요할 때 가져온다.
+    // Nowhere to be found: install it once. Rather than ship 295MB inside the binary, fetch it on demand.
     engine_app::install_runtime().with_context(|| {
         format!(
-            "Electron runtime을 찾을 수 없고 설치도 실패했습니다. 확인한 위치: {}",
+            "Could not find the Electron runtime, and installing it failed. Looked in: {}",
             searched
                 .iter()
                 .map(|path| path.display().to_string())
@@ -512,12 +515,12 @@ fn electron_executable() -> Result<std::path::PathBuf> {
     })
 }
 
-/// engine stderr 목적지.
+/// Where the engine's stderr goes.
 ///
-/// Chromium은 자기 진단을 stderr로 쓴다. pane image가 terminal text **아래**에
-/// 그려지게 된 뒤로 그 줄들이 page 위에 그대로 보이기 때문에 화면으로 내보낼 수 없다.
-/// agent가 실제로 필요한 것은 engine이 메모리에 들고 있는 `engine-log`이므로, stderr는
-/// 파일로 보낸다 — 시작 자체가 실패하는 경우를 그래도 진단할 수 있어야 한다.
+/// Chromium writes its own diagnostics to stderr. Since the pane image started being drawn
+/// **below** the terminal text, those lines show through on top of the page, so they cannot
+/// go to the screen. What an agent actually needs is the `engine-log` the engine keeps in
+/// memory, so stderr goes to a file — a startup that fails outright still has to be diagnosable.
 fn engine_stderr() -> Stdio {
     if std::env::var("TWEB_DEBUG").is_ok() {
         return Stdio::inherit();
@@ -552,8 +555,8 @@ fn resolve_electron_paths(
     )
 }
 
-/// Electron binary 경로와 app directory 찾기.
-/// 반환: (electron binary path, electron app dir with package.json)
+/// Finds the Electron binary path and the app directory.
+/// Returns: (electron binary path, electron app dir with package.json)
 fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     // `Command::current_dir` is applied before a relative program path is resolved.
     // Resolve workspace-relative selections before changing into the Electron app

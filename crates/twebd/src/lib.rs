@@ -1,15 +1,15 @@
 //! twebd — TWeb browser daemon.
 //!
-//! Host당 하나의 daemon. pane마다 Electron/Node/V8를 복제하지 않고
-//! browser process 하나가 여러 page를 관리. DESIGN.md 섹션 5.1.
+//! One daemon per host. Rather than duplicating Electron/Node/V8 per pane, a single browser
+//! process manages many pages. DESIGN.md section 5.1.
 //!
-//! 책임:
-//! - authenticated local IPC (사용자 전용 runtime directory, peer credential 확인)
-//! - PageRegistry (tmux pane ID ↔ page 매핑)
-//! - ProfileManager (session별 persistent profile)
+//! Responsibilities:
+//! - authenticated local IPC (user-private runtime directory, peer credential check)
+//! - PageRegistry (tmux pane ID ↔ page mapping)
+//! - ProfileManager (a persistent profile per session)
 //! - ResourceBroker (immutable resource store, scope, TTL)
-//! - AutomationController (agent action 직렬화)
-//! - tmux integration (pane lifecycle, hook)
+//! - AutomationController (serializing agent actions)
+//! - tmux integration (pane lifecycle, hooks)
 
 pub mod automation;
 pub mod ipc;
@@ -23,7 +23,7 @@ use tweb_core::frame::FrameTransport;
 use tweb_core::platform::PlatformService;
 use tweb_core::routing::BrowserRoutingPolicy;
 
-/// twebd daemon 전체 상태.
+/// The twebd daemon's whole state.
 pub struct Daemon {
     /// browser engine adapter (Electron/ExternalChrome/CustomShell).
     pub engine: Box<dyn BrowserEngineAdapter>,
@@ -31,9 +31,9 @@ pub struct Daemon {
     pub transport: Box<dyn FrameTransport>,
     /// platform service (macOS/Linux/Windows).
     pub platform: Box<dyn PlatformService>,
-    /// URL routing 정책.
+    /// The URL routing policy.
     pub routing: BrowserRoutingPolicy,
-    /// page registry (pane ID ↔ page 매핑).
+    /// page registry (pane ID ↔ page mapping).
     pub pages: page_registry::PageRegistry,
     /// profile manager.
     pub profiles: profile_manager::ProfileManager,
@@ -42,11 +42,11 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// daemon 시작.
+    /// Starts the daemon.
     pub async fn run(self) -> anyhow::Result<()> {
         tracing::info!("twebd starting");
 
-        // IPC server 시작.
+        // Start the IPC server.
         let ipc_path = self.platform.paths().runtime_dir().join("twebd.sock");
         let daemon = std::sync::Arc::new(self);
 

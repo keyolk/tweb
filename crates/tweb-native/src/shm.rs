@@ -1,11 +1,11 @@
 //! Persistent POSIX shared-memory ring.
 //!
-//! DESIGN.md 섹션 7.3. 매 paint shm_open/ftruncate/mmap 금지.
-//! page 생성 시 2~3개 mapped buffer preallocate, resize 때만 교체.
-//! bounded pool로 SHM name 재사용.
+//! DESIGN.md section 7.3. Never shm_open/ftruncate/mmap per paint.
+//! Preallocate 2–3 mapped buffers when the page is created, and swap them only on resize.
+//! SHM names are reused from a bounded pool.
 //!
 //! macOS: `shm_open` (name `/tweb-<id>`).
-//! Linux: `memfd_create` 또는 `shm_open`.
+//! Linux: `memfd_create` or `shm_open`.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -14,13 +14,13 @@ use tweb_core::page::PageId;
 
 /// SHM buffer.
 pub struct ShmBuffer {
-    /// SHM name (macOS: `/tweb-<id>`, 전송 시 terminal에 알려줌).
+    /// The SHM name (macOS: `/tweb-<id>`; told to the terminal on transfer).
     pub name: String,
     /// mmap'd pointer.
     pub ptr: *mut u8,
-    /// buffer 크기 (byte).
+    /// The buffer size, in bytes.
     pub size: usize,
-    /// 현재 write된 byte.
+    /// How many bytes are currently written.
     pub len: usize,
 }
 
@@ -28,14 +28,14 @@ unsafe impl Send for ShmBuffer {}
 unsafe impl Sync for ShmBuffer {}
 
 impl ShmBuffer {
-    /// SHM 생성 또는 재사용.
+    /// Creates or reuses an SHM segment.
     pub fn create(name: &str, size: usize) -> std::io::Result<Self> {
-        // TODO: 실제 shm_open + ftruncate + mmap.
-        // 현재는 placeholder — heap allocation으로 동작 검증.
-        // 실제 SHM 구현 시 mmap'd pointer를 반환.
+        // TODO: real shm_open + ftruncate + mmap.
+        // A placeholder for now — a heap allocation, enough to verify the behaviour.
+        // The real SHM implementation will return an mmap'd pointer.
         let data = vec![0u8; size];
         let ptr = data.as_ptr() as *mut u8;
-        std::mem::forget(data); // SHM처럼 수명 관리 (placeholder).
+        std::mem::forget(data); // Lifetime managed like SHM would be (placeholder).
         Ok(Self {
             name: name.to_string(),
             ptr,
@@ -44,7 +44,7 @@ impl ShmBuffer {
         })
     }
 
-    /// buffer에 pixel data write.
+    /// Writes pixel data into the buffer.
     pub fn write(&mut self, data: &[u8]) {
         let len = data.len().min(self.size);
         unsafe {
@@ -53,27 +53,27 @@ impl ShmBuffer {
         self.len = len;
     }
 
-    /// buffer 해제.
+    /// Releases the buffer.
     pub fn destroy(self) {
         // TODO: munmap + shm_unlink.
-        // placeholder: heap allocation이므로 Vec이 drop되게 둠.
-        // (현재 구현은 heap 기반 placeholder, 실제 SHM 구현 시 munmap 호출)
+        // placeholder: it is a heap allocation, so the Vec is simply left to drop.
+        // (The current implementation is heap-based; the real SHM one will call munmap.)
         let _ = self.ptr;
     }
 }
 
-/// SHM ring. page마다 2~3개 buffer 순환.
+/// SHM ring. Cycles through 2–3 buffers per page.
 pub struct ShmRing {
     pub page_id: PageId,
     pub buffers: Vec<ShmBuffer>,
-    /// 현재 write buffer index.
+    /// The index of the current write buffer.
     current: usize,
-    /// buffer 크기.
+    /// The buffer size.
     buffer_size: usize,
 }
 
 impl ShmRing {
-    /// ring 생성. buffer_count개의 buffer를 preallocate.
+    /// Creates the ring, preallocating buffer_count buffers.
     pub fn new(page_id: PageId, viewport: PixelSize, buffer_count: usize) -> std::io::Result<Self> {
         let buffer_size = viewport.rgba_bytes();
         let mut buffers = Vec::with_capacity(buffer_count);
@@ -89,7 +89,7 @@ impl ShmRing {
         })
     }
 
-    /// 다음 write buffer 획득 (round-robin).
+    /// Takes the next write buffer (round-robin).
     pub fn next_buffer(&mut self) -> Option<&mut ShmBuffer> {
         if self.buffers.is_empty() {
             return None;
@@ -99,13 +99,13 @@ impl ShmRing {
         Some(&mut self.buffers[idx])
     }
 
-    /// viewport resize 시 buffer 교체.
+    /// Swaps the buffers on a viewport resize.
     pub fn resize(&mut self, viewport: PixelSize) -> std::io::Result<()> {
         let new_size = viewport.rgba_bytes();
         if new_size == self.buffer_size {
             return Ok(());
         }
-        // 기존 buffer 해제, 새 buffer 생성.
+        // Release the existing buffers, create new ones.
         let old_buffers = std::mem::take(&mut self.buffers);
         for buf in old_buffers {
             buf.destroy();
@@ -120,7 +120,7 @@ impl ShmRing {
         Ok(())
     }
 
-    /// 현재 buffer 크기.
+    /// The current buffer size.
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
     }
@@ -135,7 +135,7 @@ impl Drop for ShmRing {
     }
 }
 
-/// page별 SHM ring 관리.
+/// Manages one SHM ring per page.
 pub struct ShmPool {
     rings: Mutex<HashMap<PageId, ShmRing>>,
 }
@@ -147,7 +147,7 @@ impl ShmPool {
         }
     }
 
-    /// page의 ring 가져오기 또는 생성.
+    /// Fetches or creates a page's ring.
     pub fn get_or_create(&self, page_id: PageId, viewport: PixelSize) -> std::io::Result<()> {
         let mut rings = self.rings.lock();
         if let std::collections::hash_map::Entry::Vacant(entry) = rings.entry(page_id) {
@@ -157,7 +157,7 @@ impl ShmPool {
         Ok(())
     }
 
-    /// page의 ring에 pixel data write.
+    /// Writes pixel data into a page's ring.
     pub fn write(&self, page_id: PageId, data: &[u8]) -> std::io::Result<()> {
         let mut rings = self.rings.lock();
         if let Some(ring) = rings.get_mut(&page_id) {
@@ -177,7 +177,7 @@ impl ShmPool {
         Ok(())
     }
 
-    /// page 제거.
+    /// Removes a page.
     pub fn remove(&self, page_id: &PageId) {
         let mut rings = self.rings.lock();
         rings.remove(page_id);

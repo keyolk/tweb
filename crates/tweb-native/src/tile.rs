@@ -1,8 +1,9 @@
-//! Dirty rect → adaptive tile 매핑.
+//! Dirty rect → adaptive tile mapping.
 //!
-//! DESIGN.md 섹션 7.3. 256×256 기본 tile, workload에 따라 128~512 조정.
-//! dirty rect와 겹치는 tile만 갱신. 한 display interval의 여러 damage event union.
-//! scroll처럼 변경 면적이 크면 full-frame/stripe로 합침.
+//! DESIGN.md section 7.3. 256×256 tiles by default, adjusted between 128 and 512 by workload.
+//! Only tiles overlapping a dirty rect are updated, and the damage events of one display interval
+//! are unioned together.
+//! When the changed area is large — a scroll, say — everything is folded into a full-frame/stripe.
 
 use tweb_core::geometry::{PixelSize, Rect};
 
@@ -16,7 +17,7 @@ pub struct TileGrid {
 }
 
 impl TileGrid {
-    /// viewport size와 tile size로 grid 생성.
+    /// Builds the grid from a viewport size and a tile size.
     pub fn new(viewport: PixelSize, tile_size: u32) -> Self {
         let cols = viewport.width.div_ceil(tile_size);
         let rows = viewport.height.div_ceil(tile_size);
@@ -33,7 +34,7 @@ impl TileGrid {
         Self::new(viewport, 256)
     }
 
-    /// dirty rect와 겹치는 tile 집합 계산.
+    /// Computes the set of tiles a dirty rect overlaps.
     pub fn tiles_for_rect(&self, rect: &Rect) -> Vec<TileIndex> {
         let mut tiles = Vec::new();
 
@@ -52,7 +53,7 @@ impl TileGrid {
         tiles
     }
 
-    /// 여러 dirty rect의 tile 집합 합집합.
+    /// The union of the tile sets of several dirty rects.
     pub fn tiles_for_rects(&self, rects: &[Rect]) -> Vec<TileIndex> {
         let mut set: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         let mut tiles = Vec::new();
@@ -76,7 +77,8 @@ impl TileGrid {
         Rect::new(x as i32, y as i32, width, height)
     }
 
-    /// 변경 면적이 큰지 판정. viewport의 일정 비율 이상이면 full-frame/stripe로 합침.
+    /// Decides whether the changed area is large. Past a set fraction of the viewport, it is folded
+    /// into a full-frame/stripe.
     pub fn should_full_frame(&self, rects: &[Rect], threshold: f32) -> bool {
         let viewport_area = self.viewport.width as f32 * self.viewport.height as f32;
         let dirty_area: f32 = rects.iter().map(|r| r.width as f32 * r.height as f32).sum();
@@ -91,16 +93,16 @@ pub struct TileIndex {
     pub row: u32,
 }
 
-/// tile 전송 결정.
+/// The tile transfer decision.
 #[derive(Debug, Clone)]
 pub enum TilePlan {
-    /// tile별 전송.
+    /// Per-tile transfer.
     Tiles(Vec<TileIndex>),
-    /// full-frame 전송 (변경 면적이 큼).
+    /// Full-frame transfer (the changed area is large).
     FullFrame,
 }
 
-/// dirty rects에서 전송 계획 수립.
+/// Works out the transfer plan from the dirty rects.
 pub fn plan(grid: &TileGrid, rects: &[Rect], full_frame_threshold: f32) -> TilePlan {
     if rects.is_empty() {
         return TilePlan::Tiles(Vec::new());
@@ -139,7 +141,7 @@ mod tests {
         let grid = TileGrid::new(PixelSize::new(1920, 1080), 256);
         let rect = Rect::new(250, 250, 20, 20);
         let tiles = grid.tiles_for_rect(&rect);
-        // 250-270이 tile 0(0-255)과 tile 1(256-511)에 걸침.
+        // 250-270 straddles tile 0 (0-255) and tile 1 (256-511).
         assert_eq!(tiles.len(), 4);
     }
 

@@ -1,10 +1,10 @@
 // tweb-electron/main.cjs — Electron offscreen browser → Kitty graphics.
 //
-// cliweb 방식 정확히 따름:
-// - tmux passthrough: ESC 두 번 escape + pane origin anchor
+// Follows the cliweb approach exactly:
+// - tmux passthrough: double-escaped ESC + pane origin anchor
 // - a=T transfer&display, C=1, f=100 PNG, local file transport
-// - frame file로 terminal byte flood를 피하고 direct transfer는 fallback으로 사용
-// - alternate screen, raw mode는 tweb-pane(Rust)이 처리
+// - frame files avoid flooding the terminal with bytes; direct transfer is the fallback
+// - alternate screen and raw mode are handled by tweb-pane (Rust)
 
 const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen } = require("electron");
 const {
@@ -152,7 +152,7 @@ gfxWorker.unref();
 const ESC = "\x1b";
 const CSI = (s) => `${ESC}[${s}`;
 
-// --- tmux passthrough (cliweb escapeCodes.ts 방식) ---
+// --- tmux passthrough (the cliweb escapeCodes.ts approach) ---
 
 let tmuxOrigin = null;
 
@@ -176,13 +176,13 @@ function getTmuxPaneOrigin() {
   } catch (e) {}
 }
 
-// cliweb wrapTmuxPassthrough: ESC를 두 번으로 escape.
+// cliweb wrapTmuxPassthrough: escape each ESC by doubling it.
 function wrapTmuxPassthrough(sequence) {
   const escaped = sequence.split(ESC).join(ESC + ESC);
   return `${ESC}Ptmux;${escaped}${ESC}\\`;
 }
 
-// cliweb anchorTmuxGraphics: pane origin에 cursor 이동 후 graphics, 복원.
+// cliweb anchorTmuxGraphics: move the cursor to the pane origin, emit the graphics, restore it.
 function anchorTmuxGraphics(sequence) {
   if (!tmuxOrigin) return wrapTmuxPassthrough(sequence);
   const row = tmuxOrigin.top + 1;
@@ -258,8 +258,8 @@ function configureTmuxRootBindings() {
     );
   };
 
-  // User110은 Ghostty의 Ctrl-; private sequence다. 이전 TWeb의 binding은
-  // client table까지 바꿨지만, 이제 engine만 table 전환과 복원을 담당한다.
+  // User110 is Ghostty's private sequence for Ctrl-;. TWeb's earlier binding also switched the
+  // client table, but the engine is now the only side that switches tables and restores them.
   const toggle = tmuxRootBinding("User110");
   const legacyToggle = toggle.includes("@tweb_browser") && toggle.includes("35 30 30 31");
   if (legacyToggle) {
@@ -544,7 +544,7 @@ function writeGfx(header, payload) {
     raw += `;${payload}`;
   }
   raw += `${ESC}\\`;
-  // tmux passthrough로 감쌈.
+  // Wrap it in tmux passthrough.
   const wrapped = graphicsPassthrough(raw);
   try {
     writeSync(1, wrapped);
@@ -552,12 +552,12 @@ function writeGfx(header, payload) {
 }
 
 // --- terminal setup ---
-// 주의: tmux 안에서는 alternate screen(1049h)이나 clear screen(2J)이
-// 다른 pane에 영향을 줄 수 있으므로 사용하지 않음.
-// image가 pane 영역에만 placement되도록 cell 단위 placement 사용.
+// Note: inside tmux, the alternate screen (1049h) and clear screen (2J) can affect other
+// panes, so neither is used.
+// Cell-based placement keeps the image confined to the pane's own area.
 
 function terminalSetup() {
-  // 아무것도 안 함. image가 자연스럽게 pane에 표시됨.
+  // Nothing to do. The image shows up in the pane on its own.
 }
 
 function requestTrackedKeyboardModeRestore() {
@@ -582,16 +582,16 @@ function scheduleTrackedKeyboardModeRestore() {
 
 function terminalCleanup() {
   try {
-    // image delete만 수행.
+    // Delete the image, nothing else.
     writeGfx(`a=d,d=I,i=${imageId}`, "");
   } catch (e) {}
-  // caret parking이 cursor shape를 bar로 바꿔 두므로 terminal 기본값으로 돌려준다.
+  // Caret parking leaves the cursor shape as a bar, so restore the terminal default.
   try {
     writeSync(1, CSI("0 q"));
   } catch (e) {}
 }
 
-// --- frame 전송 ---
+// --- frame transfer ---
 
 function applyActiveFrameRate(rate) {
   const next = Math.min(maxActiveFrameRate, Math.max(1, Math.round(rate)));
@@ -673,8 +673,8 @@ function sendFrameNow(image, generation) {
   const expected = viewport && renderedFrameSize(viewport);
   if (!expected || size.width !== expected.width || size.height !== expected.height) return;
   try {
-    // PNG 생성 후 base64 변환과 terminal write는 worker에 맡긴다. stdout
-    // backpressure가 생겨도 Electron main thread와 keyboard input은 멈추지 않는다.
+    // Hand the base64 conversion and the terminal write off to a worker once the PNG exists.
+    // Even under stdout backpressure, the Electron main thread and keyboard input keep going.
     const png = image.toPNG();
     imageTransferred = true;
     transferFrame(png, generation);
@@ -763,7 +763,7 @@ function queryTmuxViewport() {
   return null;
 }
 
-// tmux의 pane cell 수와 Ghostty client cell pixel 크기를 최우선으로 사용한다.
+// Prefer tmux's pane cell count and Ghostty's client cell pixel size above everything else.
 function queryViewportSize() {
   return parseViewport(process.env.TWEB_VIEWPORT)
     || queryTmuxViewport()
@@ -791,7 +791,7 @@ function errorPage(url, code, description) {
   const html = `<!doctype html><meta charset="utf-8"><style>
     :root{color-scheme:light dark}body{font:16px system-ui;margin:3rem;line-height:1.5}
     code{overflow-wrap:anywhere}small{opacity:.7}
-  </style><h1>페이지를 열 수 없음</h1><p><code>${escapeHtml(url)}</code></p>
+  </style><h1>Can't open this page</h1><p><code>${escapeHtml(url)}</code></p>
   <p>${escapeHtml(description)} <small>(${code})</small></p>`;
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
@@ -813,9 +813,9 @@ function renderScaleFactor() {
 }
 
 function logicalContentSize(vp) {
-  // tmux/Ghostty viewport는 device pixel이고 BrowserWindow 크기는 DIP이다.
-  // CSS 크기는 scale로 나누되 offscreen output은 같은 scale로 렌더링해
-  // 최종 bitmap이 pane의 실제 pixel 크기에 최대한 가깝게 한다.
+  // The tmux/Ghostty viewport is in device pixels while BrowserWindow sizes are DIPs.
+  // Divide the CSS size by the scale, but render the offscreen output at that same scale so the
+  // final bitmap lands as close as possible to the pane's real pixel size.
   const scaleFactor = renderScaleFactor();
   return {
     width: Math.max(1, Math.round(vp.width / scaleFactor)),
@@ -865,7 +865,7 @@ function browserWindowOptions(vp = lastViewport || queryViewportSize()) {
 }
 
 function tabLabel(tab, index) {
-  const title = tab.webContents.getTitle() || tab.webContents.getURL() || "새 탭";
+  const title = tab.webContents.getTitle() || tab.webContents.getURL() || "New tab";
   return `${index + 1}/${tabs.length} ${title}`;
 }
 
@@ -1316,7 +1316,7 @@ function tabListModel() {
     activeIndex: activeTabIndex,
     tabs: tabs.map((candidate, index) => ({
       index,
-      title: candidate.webContents.getTitle() || "새 탭",
+      title: candidate.webContents.getTitle() || "New tab",
       url: candidate.webContents.getURL() || "about:blank",
     })),
   };
@@ -1852,28 +1852,28 @@ function showBrowserContextMenu(tab, inputParams) {
   const items = [];
   if (params.isEditable) {
     items.push(
-      { label: "실행 취소", action: "undo", enabled: params.editFlags.canUndo },
-      { label: "다시 실행", action: "redo", enabled: params.editFlags.canRedo },
+      { label: "Undo", action: "undo", enabled: params.editFlags.canUndo },
+      { label: "Redo", action: "redo", enabled: params.editFlags.canRedo },
       { separator: true },
-      { label: "잘라내기", action: "cut", enabled: params.editFlags.canCut },
-      { label: "복사", action: "copy", enabled: params.editFlags.canCopy },
-      { label: "붙여넣기", action: "paste", enabled: params.editFlags.canPaste },
-      { label: "전체 선택", action: "selectAll", enabled: params.editFlags.canSelectAll },
+      { label: "Cut", action: "cut", enabled: params.editFlags.canCut },
+      { label: "Copy", action: "copy", enabled: params.editFlags.canCopy },
+      { label: "Paste", action: "paste", enabled: params.editFlags.canPaste },
+      { label: "Select all", action: "selectAll", enabled: params.editFlags.canSelectAll },
     );
   } else if (params.selectionText) {
-    items.push({ label: "복사", action: "copy", enabled: true }, { separator: true });
+    items.push({ label: "Copy", action: "copy", enabled: true }, { separator: true });
   }
   if (params.linkURL) {
     items.push(
-      { label: "링크를 새 탭에서 열기", action: "openLink", value: params.linkURL, enabled: true },
-      { label: "링크 주소 복사", action: "copyLink", value: params.linkURL, enabled: true },
+      { label: "Open link in new tab", action: "openLink", value: params.linkURL, enabled: true },
+      { label: "Copy link address", action: "copyLink", value: params.linkURL, enabled: true },
       { separator: true },
     );
   }
   items.push(
-    { label: "뒤로", action: "back", enabled: contents.navigationHistory.canGoBack() },
-    { label: "앞으로", action: "forward", enabled: contents.navigationHistory.canGoForward() },
-    { label: "새로고침", action: "reload", enabled: true },
+    { label: "Back", action: "back", enabled: contents.navigationHistory.canGoBack() },
+    { label: "Forward", action: "forward", enabled: contents.navigationHistory.canGoForward() },
+    { label: "Reload", action: "reload", enabled: true },
   );
 
   const model = JSON.stringify({ x: params.x, y: params.y, items });
@@ -1985,9 +1985,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     queueFrame(tab, image);
   });
 
-  // Electron이 custom offscreen child를 연결하기 전에 macOS OffScreenView
-  // placeholder를 native popup으로 노출할 수 있다. 원 요청은 거부하고 URL을
-  // 별도 TWeb tab으로 직접 열어 native popup 생성 자체를 막는다.
+  // Before Electron attaches our custom offscreen child, it can surface the macOS OffScreenView
+  // placeholder as a native popup. Deny the original request and open the URL directly in a
+  // separate TWeb tab, which keeps the native popup from ever being created.
   contents.setWindowOpenHandler((details) => {
     const target = details.url || "about:blank";
     setImmediate(() => createTab(target, true));
@@ -2147,7 +2147,7 @@ function placeholderPage(target) {
 <meta charset="utf-8"><title>${escaped}</title>
 <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
 background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace">
-${escaped} 여는 중…</body>`)}`;
+Opening ${escaped}…</body>`)}`;
 }
 
 function applyViewport(vp, origin = tmuxOrigin) {
@@ -2250,7 +2250,7 @@ function logicalMousePoint(rawX, rawY) {
   const vp = lastViewport || queryViewportSize();
   const logical = logicalContentSize(vp);
   if (process.env.TMUX) {
-    // tmux는 1016을 받아도 pane-relative cell 좌표를 전달한다.
+    // tmux delivers pane-relative cell coordinates even when 1016 was requested.
     return {
       x: Math.min(logical.width - 1, Math.max(0, Math.floor((rawX - 0.5) * logical.width / vp.cols))),
       y: Math.min(logical.height - 1, Math.max(0, Math.floor((rawY - 0.5) * logical.height / vp.rows))),
@@ -2282,7 +2282,7 @@ function setBrowserZoom(action) {
 }
 
 function hasZoomModifier(modifiers) {
-  // Cmd +/-는 Ghostty의 font zoom이 먼저 소비하므로 browser shortcut으로 쓰지 않는다.
+  // Cmd +/- is consumed by Ghostty's font zoom first, so it is not used as a browser shortcut.
   return modifiers.includes("control") && !modifiers.includes("meta");
 }
 
@@ -2337,7 +2337,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
     modifiers,
     clickCount,
   });
-  // 일부 offscreen Chromium 경로는 right mouseUp만으로 contextmenu를 만들지 않는다.
+  // Some offscreen Chromium paths do not raise contextmenu from a right mouseUp alone.
   if (type === "mouseUp" && button === "right") {
     contents.sendInputEvent({
       type: "contextMenu",
@@ -2395,8 +2395,8 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   const control = modifiers.includes("control");
   const shift = modifiers.includes("shift");
 
-  // tmux가 modifier를 제거하지 않는 환경에서는 표준 CSI-u도 지원한다.
-  // release도 소비해 웹페이지에 orphan keyUp이 전달되지 않게 한다.
+  // Where tmux does not strip the modifiers, standard CSI-u is supported too.
+  // The release is consumed as well, so no orphan keyUp reaches the page.
   if (control && key === ";") {
     if (pressed) toggleBrowserShortcuts();
     return;
@@ -2420,8 +2420,8 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
     return;
   }
 
-  // Browser shortcut mode에서만 Ctrl-C를 pane 종료로 사용한다. Web passthrough
-  // mode에서는 페이지의 KeyboardEvent로 그대로 전달한다.
+  // Ctrl-C quits the pane only in browser shortcut mode. In web passthrough mode it goes to
+  // the page as an ordinary KeyboardEvent.
   if (browserShortcutsEnabled && key.toLowerCase() === "c" && control) {
     if (pressed) app.quit();
     return;
@@ -2554,8 +2554,8 @@ function scheduleRawInputFlush() {
   rawInputFlushTimer = setTimeout(() => {
     rawInputFlushTimer = null;
     if (rawInput[0] === 0x1b) {
-      // ESC-prefix sequence가 추가 byte 없이 끝나면 실제 Escape key다. 짧은
-      // disambiguation 시간 후 첫 ESC를 전달하고 나머지는 다시 파싱한다.
+      // An ESC-prefixed sequence that ends without further bytes is a real Escape key. After a
+      // short disambiguation window, deliver that first ESC and re-parse the rest.
       dispatchKey(27);
       rawInput = rawInput.subarray(1);
       consumeRawInput();
@@ -2580,8 +2580,8 @@ function consumeRawInput() {
 
     const input = rawInput.toString("utf8");
 
-    // Focus reporting은 사용하지 않는다. 이전 실행이나 tmux/terminal 상태에서
-    // 남아 들어온 ESC[I/ESC[O도 browser text 또는 shell 문자열로 보내지 않는다.
+    // Focus reporting is not used. An ESC[I/ESC[O left over from a previous run or from
+    // tmux/terminal state is never forwarded as browser text or a shell string either.
     const focus = /^\x1b\[[IO]/.exec(input);
     if (focus) {
       rawInput = rawInput.subarray(Buffer.byteLength(focus[0]));
@@ -2653,21 +2653,21 @@ function consumeRawInput() {
     // Escape followed by a normal-mode key; the fallback below emits Escape
     // and then reparses the remaining printable input instead.
 
-    // escape sequence가 아직 덜 들어왔다면 다음 INPUT chunk를 기다린다.
-    // 단독 ESC는 짧은 판별 시간이 지나면 Escape key로 확정한다.
+    // If the escape sequence is still incomplete, wait for the next INPUT chunk.
+    // A lone ESC is settled as the Escape key once the short disambiguation window passes.
     if (/^\x1b(?:\[|\[<|O)?[0-9;:<]*$/.test(input)) {
       scheduleRawInputFlush();
       return;
     }
 
-    // 알 수 없는 ESC는 Escape key로 전달하고 한 byte만 소비한다.
+    // An unrecognized ESC is delivered as the Escape key, consuming just that one byte.
     dispatchKey(27);
     rawInput = rawInput.subarray(1);
   }
 }
 
 // --- resize/input control channel ---
-// tweb-pane이 SIGWINCH와 raw terminal input을 이 pipe로 전달한다.
+// tweb-pane forwards SIGWINCH and raw terminal input over this pipe.
 let controlBuffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -2718,7 +2718,7 @@ app.whenReady().then(() => {
   enforceHiddenWindows();
   getTmuxPaneOrigin();
 
-  // Electron app path 다음의 첫 인자를 URL로 사용한다. scheme 없는 host도 허용한다.
+  // The first argument after the Electron app path is the URL. A bare host with no scheme is allowed.
   const rawUrl = process.env.TWEB_URL
     || commandLineUrl()
     || "https://example.com";
@@ -2800,7 +2800,7 @@ app.on("before-quit", () => {
   restorePaneTitle();
 });
 
-// process exit에서도 image delete (안전망).
+// Delete the image on process exit too (safety net).
 process.on("exit", () => {
   cleanupFrameFiles();
   try {

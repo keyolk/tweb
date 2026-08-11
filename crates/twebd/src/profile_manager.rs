@@ -1,11 +1,11 @@
-//! ProfileManager — session별 persistent profile 관리.
+//! ProfileManager — manages one persistent profile per session.
 //!
-//! DESIGN.md 섹션 6.2. 기본 profile key = hash(tmux server identity, session ID).
-//! session rename이나 window reorder로 profile identity가 바뀌지 않아야 함.
+//! DESIGN.md section 6.2. The default profile key = hash(tmux server identity, session ID).
+//! Renaming a session or reordering windows must not change the profile identity.
 
 use tweb_core::profile::{BrowserProfile, ProfileId, ProfileStore};
 
-/// ProfileManager. ProfileStore를 위임.
+/// ProfileManager. Delegates to a ProfileStore.
 pub struct ProfileManager {
     store: Box<dyn ProfileStore>,
 }
@@ -15,7 +15,7 @@ impl ProfileManager {
         Self { store }
     }
 
-    /// session에 대한 profile ID 계산.
+    /// Computes the profile ID for a session.
     /// hash(tmux server identity, session ID).
     pub fn profile_id_for(tmux_server_id: &str, session_id: &str) -> ProfileId {
         use std::hash::{Hash, Hasher};
@@ -25,7 +25,7 @@ impl ProfileManager {
         ProfileId(format!("{:016x}", hasher.finish()))
     }
 
-    /// profile 가져오기 또는 생성.
+    /// Fetches or creates a profile.
     pub async fn get_or_create(&self, id: &ProfileId) -> anyhow::Result<BrowserProfile> {
         self.store.get_or_create(id).await.map_err(Into::into)
     }

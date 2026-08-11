@@ -1,18 +1,18 @@
-//! BrowserRoutingPolicy — URL routing 정책.
+//! BrowserRoutingPolicy — the URL routing policy.
 //!
-//! DESIGN.md 섹션 11. embedded/managed-chrome/remote/ask.
+//! DESIGN.md section 11. embedded/managed-chrome/remote/ask.
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// URL routing 정책.
+/// The URL routing policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserRoutingPolicy {
-    /// sensitive domain denylist (Okta, IdP 등).
+    /// A denylist of sensitive domains (Okta, IdPs and the like).
     pub sensitive_domains: Vec<String>,
-    /// managed Chrome으로 열 URL pattern.
+    /// URL patterns to open in managed Chrome.
     pub managed_chrome_patterns: Vec<String>,
-    /// remote browser로 열 URL pattern.
+    /// URL patterns to open in a remote browser.
     pub remote_patterns: Vec<String>,
 }
 
@@ -26,25 +26,25 @@ impl Default for BrowserRoutingPolicy {
     }
 }
 
-/// routing 결정.
+/// The routing decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteDecision {
     /// TWeb embedded browser.
     Embedded,
-    /// 실제 Google Chrome (managed Chrome handoff).
+    /// Real Google Chrome (the managed Chrome handoff).
     ManagedChrome,
     /// remote browser.
     Remote,
-    /// 사용자에게 묻기.
+    /// Ask the user.
     Ask,
 }
 
 impl BrowserRoutingPolicy {
-    /// URL에 대한 routing 결정.
+    /// The routing decision for a URL.
     pub fn route(&self, url: &Url) -> RouteDecision {
         let host = url.host_str().unwrap_or("");
-        // sensitive domain은 managed Chrome.
+        // Sensitive domains go to managed Chrome.
         for pattern in &self.sensitive_domains {
             if let Some(suffix) = pattern.strip_prefix("*.") {
                 if host.ends_with(suffix) {

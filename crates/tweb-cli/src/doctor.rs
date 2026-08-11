@@ -1,11 +1,11 @@
-//! `tweb doctor` — terminal/tmux/GPU/extension capability 진단.
+//! `tweb doctor` — diagnoses terminal/tmux/GPU/extension capabilities.
 //!
-//! DESIGN.md 섹션 4.1. 지원 환경 진단.
-//! terminal 이름으로 추측하지 않고 실제 capability query로 판정.
+//! DESIGN.md section 4.1. Diagnoses whether the environment is supported.
+//! Decided by an actual capability query, never guessed from the terminal name.
 
 use std::process::Command;
 
-/// 진단 항목 결과.
+/// The result of one diagnostic check.
 struct Check {
     name: &'static str,
     status: CheckStatus,
@@ -28,7 +28,7 @@ impl CheckStatus {
     }
 }
 
-/// doctor 실행.
+/// Runs doctor.
 pub async fn run() {
     println!("tweb doctor — environment diagnosis\n");
 
@@ -43,12 +43,12 @@ pub async fn run() {
         check_pixel_size_query(),
     ];
 
-    // 출력.
+    // Output.
     for c in &checks {
         println!("  [{:>4}] {}: {}", c.status.label(), c.name, c.detail);
     }
 
-    // 요약.
+    // Summary.
     let ok = checks
         .iter()
         .filter(|c| matches!(c.status, CheckStatus::Ok))
@@ -76,7 +76,7 @@ fn check_terminal() -> Check {
     } else {
         format!("TERM={}, TERM_PROGRAM={}", term, term_program)
     };
-    // Kitty graphics 지원은 이름이 아닌 query로 판정해야 하지만, doctor에서는 hint만.
+    // Kitty graphics support should be decided by a query rather than a name; doctor only hints here.
     let status = if term_program.contains("ghostty")
         || term_program.contains("WezTerm")
         || term == "xterm-kitty"
@@ -138,7 +138,7 @@ fn check_tmux_version() -> Check {
     match result {
         Ok(out) if out.status.success() => {
             let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // "tmux 3.5a" → parse version. 접미사(a, b, rc) 제거.
+            // "tmux 3.5a" → parse the version. Strip the suffix (a, b, rc).
             let version = v.strip_prefix("tmux ").unwrap_or("");
             let parts: Vec<u32> = version
                 .split('.')
@@ -153,7 +153,7 @@ fn check_tmux_version() -> Check {
                 .collect();
             let major = parts.first().copied().unwrap_or(0);
             let minor = parts.get(1).copied().unwrap_or(0);
-            // 3.3+ 필요 (allow-passthrough 도입).
+            // 3.3+ is required (where allow-passthrough was introduced).
             if major > 3 || (major == 3 && minor >= 3) {
                 Check {
                     name: "tmux version",
@@ -255,8 +255,8 @@ fn check_tmux_mouse() -> Check {
 }
 
 fn check_pixel_size_query() -> Check {
-    // TODO: 실제 CSI 14t query로 terminal pixel size 확인.
-    // 현재는 placeholder.
+    // TODO: confirm the terminal pixel size with a real CSI 14t query.
+    // A placeholder for now.
     Check {
         name: "pixel size query (CSI 14t)",
         status: CheckStatus::Warn,

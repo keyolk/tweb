@@ -1,13 +1,13 @@
-//! BGRA → RGBA 변환. dirty tile만.
+//! BGRA → RGBA conversion, dirty tiles only.
 //!
-//! DESIGN.md 섹션 7.1. awrit는 전체 frame에 변환. TWeb은 dirty tile만 SIMD.
-//! macOS NativeImage는 BGRA, Kitty graphics는 RGBA 요구.
+//! DESIGN.md section 7.1. awrit converts the whole frame; TWeb SIMD-converts dirty tiles only.
+//! macOS NativeImage is BGRA while Kitty graphics wants RGBA.
 
 use tweb_core::geometry::{PixelFormat, Rect};
 
-/// pixel data의 format을 RGBA로 변환.
-/// source가 BGRA면 byte swap (B,R 교환), RGBA면 그대로.
-/// dirty rect 영역만 변환 (전체 frame 변환 금지).
+/// Converts pixel data's format to RGBA.
+/// A BGRA source is byte-swapped (B and R exchanged); RGBA is left as is.
+/// Only the dirty rect areas are converted (never the whole frame).
 pub fn convert_to_rgba(
     src: &[u8],
     src_format: PixelFormat,
@@ -22,17 +22,17 @@ pub fn convert_to_rgba(
 
     match src_format {
         PixelFormat::Rgba => {
-            // 이미 RGBA. dirty rect만 copy.
+            // Already RGBA. Copy the dirty rects only.
             copy_dirty_regions(src, src_size, dirty_rects, dst);
         }
         PixelFormat::Bgra => {
-            // BGRA → RGBA. dirty rect 영역만 byte swap.
+            // BGRA → RGBA. Byte-swap the dirty rect areas only.
             swap_bgra_to_rgba_dirty(src, src_size, dirty_rects, dst);
         }
     }
 }
 
-/// 전체 frame을 RGBA로 변환 (full-frame 전송 시).
+/// Converts a whole frame to RGBA (for a full-frame transfer).
 pub fn convert_full_to_rgba(src: &[u8], src_format: PixelFormat, dst: &mut Vec<u8>) {
     if dst.len() < src.len() {
         dst.resize(src.len(), 0);
@@ -42,7 +42,7 @@ pub fn convert_full_to_rgba(src: &[u8], src_format: PixelFormat, dst: &mut Vec<u
             dst[..src.len()].copy_from_slice(src);
         }
         PixelFormat::Bgra => {
-            // 4 byte 단위로 B와 R 교환.
+            // Exchange B and R, 4 bytes at a time.
             for (i, chunk) in src.chunks_exact(4).enumerate() {
                 let off = i * 4;
                 dst[off] = chunk[2]; // R ← B
@@ -54,7 +54,7 @@ pub fn convert_full_to_rgba(src: &[u8], src_format: PixelFormat, dst: &mut Vec<u
     }
 }
 
-/// dirty rect 영역만 copy (src가 이미 RGBA).
+/// Copies the dirty rect areas only (src is already RGBA).
 fn copy_dirty_regions(
     src: &[u8],
     size: &tweb_core::geometry::PixelSize,
@@ -78,7 +78,7 @@ fn copy_dirty_regions(
     }
 }
 
-/// dirty rect 영역만 BGRA → RGBA 변환.
+/// Converts BGRA → RGBA over the dirty rect areas only.
 fn swap_bgra_to_rgba_dirty(
     src: &[u8],
     size: &tweb_core::geometry::PixelSize,
@@ -141,7 +141,7 @@ mod tests {
         let dirty = vec![Rect::new(1, 0, 1, 1)];
         let mut dst = src.clone(); // start with copy.
         swap_bgra_to_rgba_dirty(&src, &size, &dirty, &mut dst);
-        // pixel 1만 변환: [40,50,60] → [60,50,40].
+        // Only pixel 1 is converted: [40,50,60] → [60,50,40].
         assert_eq!(
             dst,
             vec![10, 20, 30, 255, 60, 50, 40, 255, 70, 80, 90, 255, 1, 2, 3, 255,]

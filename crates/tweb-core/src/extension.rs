@@ -1,7 +1,7 @@
-//! ExtensionHost — extension loading 추상.
+//! ExtensionHost — the extension loading abstraction.
 //!
-//! Electron/Chrome/Shell이 각각 구현.
-//! DETAIL.md 섹션 9.2.
+//! Implemented separately for Electron/Chrome/Shell.
+//! DETAIL.md section 9.2.
 
 use async_trait::async_trait;
 use std::path::Path;
@@ -21,7 +21,7 @@ pub enum ExtensionError {
 
 pub type ExtensionResult<T> = Result<T, ExtensionError>;
 
-/// extension 식별자.
+/// An extension identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExtensionId(pub String);
 
@@ -34,46 +34,46 @@ pub struct ExtensionInfo {
     pub path: String,
 }
 
-/// extension compatibility 분류 (DESIGN.md 섹션 10.5).
+/// Extension compatibility classes (DESIGN.md section 10.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExtensionClass {
-    /// 자동 재설치 가능.
+    /// Can be reinstalled automatically.
     Compatible,
-    /// native messaging, toolbar, side panel 등 host 구현 필요.
+    /// Needs host support: native messaging, toolbar, side panel and the like.
     NeedsAdapter,
-    /// Device Trust, enterprise policy, Chrome identity 의존.
+    /// Depends on Device Trust, enterprise policy or Chrome identity.
     ManagedChromeOnly,
 }
 
-/// Native Messaging channel. 1Password 등이 사용.
+/// A Native Messaging channel. Used by 1Password among others.
 #[async_trait]
 pub trait NativeMessagingChannel: Send + Sync {
-    /// host로 message 전송.
+    /// Sends a message to the host.
     async fn send(&self, message: &serde_json::Value) -> ExtensionResult<()>;
 
-    /// host에서 message 수신.
+    /// Receives a message from the host.
     async fn recv(&self) -> ExtensionResult<serde_json::Value>;
 
-    /// channel 종료.
+    /// Closes the channel.
     async fn close(&self) -> ExtensionResult<()>;
 }
 
 /// ExtensionHost trait.
-/// 구현체: ElectronExtensionHost, ChromeExtensionHost, ShellExtensionHost.
+/// Implementations: ElectronExtensionHost, ChromeExtensionHost, ShellExtensionHost.
 #[async_trait]
 pub trait ExtensionHost: Send + Sync {
-    /// unpacked extension 로드.
+    /// Loads an unpacked extension.
     async fn load_extension(&self, path: &Path) -> ExtensionResult<ExtensionId>;
 
-    /// extension 목록.
+    /// Lists the extensions.
     async fn list_extensions(&self) -> ExtensionResult<Vec<ExtensionInfo>>;
 
-    /// extension 제거.
+    /// Removes an extension.
     async fn remove_extension(&self, id: &ExtensionId) -> ExtensionResult<()>;
 
-    /// extension compatibility 분류.
+    /// Classifies an extension's compatibility.
     async fn classify(&self, id: &ExtensionId) -> ExtensionResult<ExtensionClass>;
 
-    /// native messaging host 연결.
+    /// Connects to a native messaging host.
     async fn connect_native(&self, name: &str) -> ExtensionResult<Box<dyn NativeMessagingChannel>>;
 }

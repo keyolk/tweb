@@ -289,7 +289,7 @@ test("engine stderr stays off the pane and in the log buffer", () => {
     path.join(__dirname, "..", "crates", "tweb-pane", "src", "terminal.rs"), "utf8");
   assert.match(term, /impl Drop for ScreenGuard/, "the user's screen is never restored");
   assert.match(term, /\\x1b\[\?1049h/);
-  const stderr = pane.slice(pane.indexOf("fn engine_stderr()"), pane.indexOf("/// Electron binary 경로"));
+  const stderr = pane.slice(pane.indexOf("fn engine_stderr()"), pane.indexOf("/// Finds the Electron binary path"));
   // stdout is the graphics channel; only stderr may be redirected.
   assert.match(stderr, /TWEB_DEBUG.*is_ok\(\)/s, "TWEB_DEBUG no longer keeps stderr inherited");
   assert.match(stderr, /engine-\{name\}\.log/, "engine stderr is not kept anywhere");
@@ -338,7 +338,7 @@ test("a picked scroll surface survives use and can be left", () => {
     assert.match(source, /if \(scrollSurface\(\)\) \{\n\s+scrollTarget = null;/,
       `${name} does not release the surface on Escape`);
     // The state is invisible without this: the indicator said nothing was picked.
-    assert.match(source, /scrollSurface\(\) \? "⇅ 내부 · Esc" : ""/,
+    assert.match(source, /scrollSurface\(\) \? "⇅ inner · Esc" : ""/,
       `${name} does not show a picked surface`);
   }
 });

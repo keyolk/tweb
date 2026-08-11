@@ -1,26 +1,26 @@
-//! Input — keyboard/mouse decode, Browser mode 관리.
+//! Input — keyboard/mouse decoding and Browser mode management.
 //!
-//! DESIGN.md 섹션 9. tmux mode와 Browser mode 입력 소유권 분리.
+//! DESIGN.md section 9. Splits input ownership between tmux mode and Browser mode.
 //! Kitty keyboard protocol key-down/repeat/up, SGR pixel mouse.
 
 use tweb_core::input::{KeyEvent, KeyKind, KeyModifiers, MouseEvent};
 
-/// 입력 mode.
+/// The input mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// 모든 key → tmux key table.
+    /// Every key → the tmux key table.
     Tmux,
-    /// reserved toggle → tmux 복귀, 나머지 key → browser pane.
+    /// The reserved toggle returns to tmux; every other key goes to the browser pane.
     Browser,
 }
 
-/// mode 전환 toggle key (DESIGN.md 섹션 9.2 기본 `C-g`).
+/// The mode toggle key (DESIGN.md section 9.2, `C-g` by default).
 pub const TOGGLE_KEY: &str = "C-g";
 
-/// raw terminal 입력을 KeyEvent로 decode.
-/// TODO: Kitty keyboard protocol parse.
+/// Decodes raw terminal input into a KeyEvent.
+/// TODO: parse the Kitty keyboard protocol.
 pub fn decode_key(data: &[u8]) -> Option<KeyEvent> {
-    // placeholder: 단일 byte를 문자로.
+    // placeholder: a single byte as a character.
     if data.len() == 1 {
         let ch = data[0] as char;
         if ch.is_ascii() {
@@ -34,7 +34,7 @@ pub fn decode_key(data: &[u8]) -> Option<KeyEvent> {
     None
 }
 
-/// raw terminal 입력을 MouseEvent로 decode.
+/// Decodes raw terminal input into a MouseEvent.
 /// TODO: SGR pixel mouse parse.
 pub fn decode_mouse(_data: &[u8]) -> Option<MouseEvent> {
     None
