@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod mcp;
 
 use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -394,13 +395,57 @@ fn default_open_args(mut args: Vec<OsString>) -> Vec<OsString> {
     args
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    normalized
+}
+
+fn resolve_url_argument(value: &str, working_directory: &Path) -> String {
+    let value = value.trim();
+    let path = Path::new(value);
+    let explicit_relative =
+        value == "." || value == ".." || value.starts_with("./") || value.starts_with("../");
+    let candidate: Option<PathBuf> = if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        let joined = working_directory.join(path);
+        (explicit_relative || joined.exists()).then_some(joined)
+    };
+
+    candidate
+        .map(|path| normalize_path(&path))
+        .and_then(|path| url::Url::from_file_path(path).ok())
+        .map(Into::into)
+        .unwrap_or_else(|| value.to_string())
+}
+
 /// CLI 실행.
 pub async fn run() -> Result<()> {
     let cli = Cli::parse_from(default_open_args(std::env::args_os().collect()));
     tracing::debug!(?cli, "tweb command");
+    let working_directory =
+        std::env::current_dir().context("cannot resolve the current directory")?;
 
     match cli.command {
         Command::Open { browser, url } => {
+            // Resolve local paths before Electron changes into its app directory or a
+            // split pane starts in a different shell directory.
+            let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // URL 미지정은 pane frontend까지 보존해 tmux window session을 복원한다.
             run_pane(url.as_deref(), &browser).await?;
         }
@@ -409,6 +454,7 @@ pub async fn run() -> Result<()> {
             url,
             horizontal,
         } => {
+            let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // tmux split-window에서도 URL 미지정을 보존한다.
             split_and_run_pane(url.as_deref(), &browser, horizontal).await?;
         }
@@ -424,7 +470,10 @@ pub async fn run() -> Result<()> {
         Command::Tab { action } => {
             let (method, params, agent) = match action {
                 TabAction::Switch { index, agent } => ("tab", json!({ "index": index }), agent),
-                TabAction::New { url, agent } => ("tab-new", json!({ "url": url }), agent),
+                TabAction::New { url, agent } => {
+                    let url = url.map(|value| resolve_url_argument(&value, &working_directory));
+                    ("tab-new", json!({ "url": url }), agent)
+                }
                 TabAction::Close { index, agent } => {
                     ("tab-close", json!({ "index": index }), agent)
                 }
@@ -432,7 +481,7 @@ pub async fn run() -> Result<()> {
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
         }
         other => {
-            let (method, params, agent) = agent_call(other)?;
+            let (method, params, agent) = agent_call(other, &working_directory)?;
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
         }
     }
@@ -441,10 +490,16 @@ pub async fn run() -> Result<()> {
 }
 
 /// Map a page-driving subcommand onto its JSON-RPC method and params.
-fn agent_call(command: Command) -> Result<(&'static str, serde_json::Value, AgentOptions)> {
+fn agent_call(
+    command: Command,
+    working_directory: &Path,
+) -> Result<(&'static str, serde_json::Value, AgentOptions)> {
     let act = |r#ref: String, action: &str, value: Option<String>| json!({ "ref": r#ref, "action": action, "value": value });
     Ok(match command {
-        Command::Navigate { url, agent } => ("navigate", json!({ "url": url }), agent),
+        Command::Navigate { url, agent } => {
+            let url = resolve_url_argument(&url, working_directory);
+            ("navigate", json!({ "url": url }), agent)
+        }
         Command::Back { agent } => ("back", json!({}), agent),
         Command::Forward { agent } => ("forward", json!({}), agent),
         Command::Reload { agent } => ("reload", json!({}), agent),
@@ -685,10 +740,13 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::Path;
 
     use clap::Parser;
 
-    use super::{default_open_args, electron_app_dir, split_window_args, Cli, Command};
+    use super::{
+        default_open_args, electron_app_dir, resolve_url_argument, split_window_args, Cli, Command,
+    };
 
     #[test]
     fn no_subcommand_opens_the_browser() {
@@ -708,6 +766,23 @@ mod tests {
     fn explicit_arguments_are_not_rewritten() {
         let args = vec![OsString::from("tweb"), OsString::from("--version")];
         assert_eq!(default_open_args(args.clone()), args);
+    }
+
+    #[test]
+    fn local_paths_resolve_against_the_calling_directory() {
+        let directory = Path::new("/Users/example/project");
+        assert_eq!(
+            resolve_url_argument("./README.md", directory),
+            "file:///Users/example/project/README.md"
+        );
+        assert_eq!(
+            resolve_url_argument("../docs/계획 #1.md", directory),
+            "file:///Users/example/docs/%EA%B3%84%ED%9A%8D%20%231.md"
+        );
+        assert_eq!(
+            resolve_url_argument("example.com", directory),
+            "example.com"
+        );
     }
 
     #[test]

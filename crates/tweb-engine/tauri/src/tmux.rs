@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 const PASSTHROUGH_TABLE: &str = "tweb-pass";
+const CTRL_SEMICOLON: &str = "C-\\;";
 
 #[derive(Clone)]
 struct ClientState {
@@ -148,6 +149,25 @@ impl TmuxRuntime {
             "switch-client",
             "-T",
             PASSTHROUGH_TABLE,
+        ]);
+        let _ = tmux_status(&[
+            "bind-key",
+            "-T",
+            PASSTHROUGH_TABLE,
+            CTRL_SEMICOLON,
+            "send-keys",
+            "-H",
+            "1b",
+            "5b",
+            "35",
+            "30",
+            "31",
+            "32",
+            "7e",
+            ";",
+            "switch-client",
+            "-T",
+            "root",
         ]);
         for (key, code) in [
             ("User113", 5002),
@@ -302,6 +322,12 @@ fn configure_root_toggle_binding() {
         );
         ensure_root_binding(key, &action, &[&signature]);
     }
+    let passthrough_on = ["send-keys", "-H", "1b", "5b", "35", "30", "31", "31", "7e"];
+    ensure_root_binding(
+        CTRL_SEMICOLON,
+        &passthrough_on,
+        &["send-keys -H 1b 5b 35 30 31 31 7e"],
+    );
     ensure_root_binding("User112", &["detach-client"], &["detach-client"]);
 }
 
@@ -357,10 +383,15 @@ fn tmux_status(args: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_title;
+    use super::{sanitize_title, CTRL_SEMICOLON};
 
     #[test]
     fn pane_titles_drop_terminal_controls() {
         assert_eq!(sanitize_title("hello\n\x1b[2Jworld"), "hello[2Jworld");
+    }
+
+    #[test]
+    fn ctrl_semicolon_is_escaped_for_the_tmux_parser() {
+        assert_eq!(CTRL_SEMICOLON, "C-\\;");
     }
 }
