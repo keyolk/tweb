@@ -31,9 +31,95 @@ keybind = ctrl+minus=text:\x1b[5003~
 keybind = ctrl+zero=text:\x1b[5004~
 keybind = shift+enter=text:\x1b[5008~
 
-# Ghostty changes the surface-local table and forwards Ctrl-; to tmux. The
-# root and passthrough tmux tables turn it into idempotent ON/OFF commands.
-keybind = tweb/unconsumed:ctrl+semicolon=deactivate_key_table
+# Default Cmd shortcuts (super+k=clear_screen, super+t=new_tab, ...) win over
+# the catch-all below: Ghostty's catch_all only matches keys that are *not
+# otherwise bound*, and inner-table lookup falls back to the default table, so
+# Cmd-K never reached the page. `unbind` cannot fix this either — it removes a
+# binding rather than adding one, so inside a table it is a no-op and does not
+# register at all. Bind each key explicitly inside the tweb table instead:
+# `ignore` claims the trigger so the default action never runs, and
+# `unconsumed:` still sends the key's terminal encoding down the PTY. Outside
+# the tweb table (Shortcuts mode) the defaults come back untouched.
+keybind = tweb/unconsumed:super+a=ignore
+keybind = tweb/unconsumed:super+b=ignore
+keybind = tweb/unconsumed:super+c=ignore
+keybind = tweb/unconsumed:super+d=ignore
+keybind = tweb/unconsumed:super+e=ignore
+keybind = tweb/unconsumed:super+f=ignore
+keybind = tweb/unconsumed:super+g=ignore
+keybind = tweb/unconsumed:super+h=ignore
+keybind = tweb/unconsumed:super+i=ignore
+keybind = tweb/unconsumed:super+j=ignore
+keybind = tweb/unconsumed:super+k=ignore
+keybind = tweb/unconsumed:super+l=ignore
+keybind = tweb/unconsumed:super+m=ignore
+keybind = tweb/unconsumed:super+n=ignore
+keybind = tweb/unconsumed:super+o=ignore
+keybind = tweb/unconsumed:super+p=ignore
+keybind = tweb/unconsumed:super+q=ignore
+keybind = tweb/unconsumed:super+r=ignore
+keybind = tweb/unconsumed:super+s=ignore
+keybind = tweb/unconsumed:super+t=ignore
+keybind = tweb/unconsumed:super+u=ignore
+keybind = tweb/unconsumed:super+v=ignore
+keybind = tweb/unconsumed:super+w=ignore
+keybind = tweb/unconsumed:super+x=ignore
+keybind = tweb/unconsumed:super+y=ignore
+keybind = tweb/unconsumed:super+z=ignore
+keybind = tweb/unconsumed:super+1=ignore
+keybind = tweb/unconsumed:super+2=ignore
+keybind = tweb/unconsumed:super+3=ignore
+keybind = tweb/unconsumed:super+4=ignore
+keybind = tweb/unconsumed:super+5=ignore
+keybind = tweb/unconsumed:super+6=ignore
+keybind = tweb/unconsumed:super+7=ignore
+keybind = tweb/unconsumed:super+8=ignore
+keybind = tweb/unconsumed:super+9=ignore
+keybind = tweb/unconsumed:super+0=ignore
+keybind = tweb/unconsumed:super+enter=ignore
+keybind = tweb/unconsumed:super+backspace=ignore
+keybind = tweb/unconsumed:super+comma=ignore
+keybind = tweb/unconsumed:super+period=ignore
+keybind = tweb/unconsumed:super+slash=ignore
+keybind = tweb/unconsumed:super+left_bracket=ignore
+keybind = tweb/unconsumed:super+right_bracket=ignore
+keybind = tweb/unconsumed:super+equal=ignore
+keybind = tweb/unconsumed:super+minus=ignore
+keybind = tweb/unconsumed:super+home=ignore
+keybind = tweb/unconsumed:super+end=ignore
+keybind = tweb/unconsumed:super+page_up=ignore
+keybind = tweb/unconsumed:super+page_down=ignore
+keybind = tweb/unconsumed:super+arrow_up=ignore
+keybind = tweb/unconsumed:super+arrow_down=ignore
+keybind = tweb/unconsumed:super+arrow_left=ignore
+keybind = tweb/unconsumed:super+arrow_right=ignore
+keybind = tweb/unconsumed:super+shift+a=ignore
+keybind = tweb/unconsumed:super+shift+c=ignore
+keybind = tweb/unconsumed:super+shift+d=ignore
+keybind = tweb/unconsumed:super+shift+e=ignore
+keybind = tweb/unconsumed:super+shift+f=ignore
+keybind = tweb/unconsumed:super+shift+g=ignore
+keybind = tweb/unconsumed:super+shift+k=ignore
+keybind = tweb/unconsumed:super+shift+n=ignore
+keybind = tweb/unconsumed:super+shift+p=ignore
+keybind = tweb/unconsumed:super+shift+t=ignore
+keybind = tweb/unconsumed:super+shift+v=ignore
+keybind = tweb/unconsumed:super+shift+w=ignore
+keybind = tweb/unconsumed:super+shift+z=ignore
+keybind = tweb/unconsumed:super+shift+enter=ignore
+keybind = tweb/unconsumed:super+shift+comma=ignore
+keybind = tweb/unconsumed:super+shift+left_bracket=ignore
+keybind = tweb/unconsumed:super+shift+right_bracket=ignore
+
+# Ctrl-; toggles the tweb key table and emits the private 5001 sequence so the
+# engine toggles browser shortcuts reliably regardless of the active keyboard
+# encoding (modifyOtherKeys ESC[27;5;59~ vs Kitty CSI-u ESC[59;5u). chain sends
+# 5001 after the table action; the key is consumed because the private sequence
+# carries the toggle, not the raw Ctrl-; encoding.
+keybind = ctrl+semicolon=activate_key_table:tweb
+keybind = chain=text:\x1b[5001~
+keybind = tweb/ctrl+semicolon=deactivate_key_table
+keybind = chain=text:\x1b[5001~
 # Inner-table catch-all bindings shadow Ghostty application shortcuts while
 # unconsumed preserves each key's terminal encoding for TWeb.
 keybind = tweb/unconsumed:super+catch_all=ignore
@@ -44,7 +130,6 @@ keybind = tweb/unconsumed:super+shift+alt+catch_all=ignore
 keybind = tweb/unconsumed:super+shift+ctrl+catch_all=ignore
 keybind = tweb/unconsumed:super+alt+ctrl+catch_all=ignore
 keybind = tweb/unconsumed:super+shift+alt+ctrl+catch_all=ignore
-keybind = unconsumed:ctrl+semicolon=activate_key_table:tweb
 "#;
 
 const TMUX_MANAGED_CONFIG: &str = r#"# Managed by `tweb doctor --fix`; edit the main tmux config instead.
@@ -560,6 +645,11 @@ fn is_legacy_ghostty_binding(line: &str) -> bool {
         r"keybind = ctrl+minus=text:\x1b[5003~",
         r"keybind = ctrl+zero=text:\x1b[5004~",
         r"keybind = shift+enter=text:\x1b[5008~",
+        // The unconsumed:-based Ctrl-; toggle never emitted the 5001 sequence,
+        // so the engine toggle depended on Ctrl-; surviving as CSI-u through
+        // tmux — unreliable across keyboard encodings. Migrate to chain=.
+        r"keybind = unconsumed:ctrl+semicolon=activate_key_table:tweb",
+        r"keybind = tweb/unconsumed:ctrl+semicolon=deactivate_key_table",
     ]
     .iter()
     .any(|binding| line.eq_ignore_ascii_case(binding))
