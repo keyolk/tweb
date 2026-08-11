@@ -292,8 +292,12 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// terminal/tmux/GPU/extension capability 진단.
-    Doctor,
+    /// terminal/tmux/GPU/extension capability 진단·설정.
+    Doctor {
+        /// 안전하게 관리되는 설정 block을 설치하고 다시 진단.
+        #[arg(long)]
+        fix: bool,
+    },
     /// internal: pane frontend (tmux가 실행, 문서화된 automation API가 아님).
     #[command(name = "__pane", hide = true)]
     PaneInternal {
@@ -412,8 +416,8 @@ pub async fn run() -> Result<()> {
             // URL이 없으면 tmux window session을 복원한다.
             run_pane(page.as_deref().or(url.as_deref()), &browser).await?;
         }
-        Command::Doctor => {
-            doctor::run().await;
+        Command::Doctor { fix } => {
+            doctor::run(fix).await?;
         }
         Command::Panes { agent } => agent::list_panes(agent.json)?,
         Command::Mcp { agent } => mcp::serve(agent.pane.as_deref())?,

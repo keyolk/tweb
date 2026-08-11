@@ -116,7 +116,7 @@ tweb snapshot --pane %3     browser page 제어
 tweb resource ...           resource 조회·전달·materialize
 tweb profile ...            profile bootstrap·관리
 tweb chrome ...             managed Chrome handoff·bridge 관리
-tweb doctor                 terminal/tmux/GPU/extension capability 진단
+tweb doctor [--fix]         terminal/tmux/Ghostty capability 진단·관리 설정
 ```
 
 Pane frontend의 내부 invocation은 사용자-facing contract와 분리한다.
