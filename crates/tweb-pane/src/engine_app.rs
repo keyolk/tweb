@@ -39,6 +39,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/window-session.cjs"),
     ),
     (
+        "url-normalization.cjs",
+        include_str!("../../../electron/url-normalization.cjs"),
+    ),
+    (
         "agent-server.cjs",
         include_str!("../../../electron/agent-server.cjs"),
     ),

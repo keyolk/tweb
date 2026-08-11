@@ -15,13 +15,14 @@ const GHOSTTY_END: &str = "# <<< tweb doctor managed passthrough <<<";
 const TMUX_BEGIN: &str = "# >>> tweb doctor managed terminal options >>>";
 const TMUX_END: &str = "# <<< tweb doctor managed terminal options <<<";
 
+const LEGACY_GHOSTTY_TOGGLE: &str = r"keybind = ctrl+semicolon=text:\x1b[5001~";
+
 const GHOSTTY_BLOCK: &str = r#"# >>> tweb doctor managed passthrough >>>
-# Ctrl-; toggles TWeb and a surface-local Cmd forwarding table together.
-keybind = ctrl+semicolon=activate_key_table:tweb
-keybind = chain=text:\x1b[5001~
-keybind = tweb/ctrl+semicolon=deactivate_key_table
-keybind = chain=text:\x1b[5001~
-# Shadow Ghostty application shortcuts while preserving terminal encoding.
+# Ghostty changes the surface-local table and forwards Ctrl-; to tmux. The
+# root and passthrough tmux tables turn it into idempotent ON/OFF commands.
+keybind = tweb/unconsumed:ctrl+semicolon=deactivate_key_table
+# Inner-table catch-all bindings shadow Ghostty application shortcuts while
+# unconsumed preserves each key's terminal encoding for TWeb.
 keybind = tweb/unconsumed:super+catch_all=ignore
 keybind = tweb/unconsumed:super+shift+catch_all=ignore
 keybind = tweb/unconsumed:super+alt+catch_all=ignore
@@ -30,6 +31,7 @@ keybind = tweb/unconsumed:super+shift+alt+catch_all=ignore
 keybind = tweb/unconsumed:super+shift+ctrl+catch_all=ignore
 keybind = tweb/unconsumed:super+alt+ctrl+catch_all=ignore
 keybind = tweb/unconsumed:super+shift+alt+ctrl+catch_all=ignore
+keybind = unconsumed:ctrl+semicolon=activate_key_table:tweb
 # <<< tweb doctor managed passthrough <<<"#;
 
 const TMUX_BLOCK: &str = r#"# >>> tweb doctor managed terminal options >>>
@@ -116,9 +118,6 @@ pub async fn run(fix: bool) -> Result<()> {
 
     if !fix && checks.iter().any(needs_fix) {
         println!("\n  Run `tweb doctor --fix` to install managed Ghostty/tmux settings.");
-    }
-    if fix {
-        println!("\n  Reload Ghostty config (Cmd-Shift-,) before testing Cmd shortcuts.");
     }
     if fail > 0 {
         println!(
@@ -312,7 +311,8 @@ fn check_ghostty_cmd_passthrough() -> Check {
     let path = ghostty_config_path();
     let content = fs::read_to_string(&path).unwrap_or_default();
     let installed = managed_block(&content, GHOSTTY_BEGIN, GHOSTTY_END)
-        .is_some_and(|block| block.trim() == GHOSTTY_BLOCK.trim());
+        .is_some_and(|block| block.trim() == GHOSTTY_BLOCK.trim())
+        && !content.lines().any(is_legacy_ghostty_toggle);
     let conflict = command_output("ghostty", &["+show-config"])
         .is_some_and(|config| config.contains("keybind = super+k=clear_screen"));
     Check {
@@ -345,7 +345,7 @@ fn check_pixel_size_query() -> Check {
 
 fn apply_tmux_fix() -> Result<String> {
     let path = tmux_config_path();
-    let changed = install_managed_block(&path, TMUX_BEGIN, TMUX_END, TMUX_BLOCK, None)?;
+    let changed = install_managed_block(&path, TMUX_BEGIN, TMUX_END, TMUX_BLOCK, None, None)?;
 
     let mut live = true;
     for args in [
@@ -388,17 +388,35 @@ fn apply_ghostty_fix() -> Result<String> {
         GHOSTTY_BEGIN,
         GHOSTTY_END,
         GHOSTTY_BLOCK,
+        Some(migrate_legacy_ghostty_toggle),
         Some(validate_ghostty_config),
     )?;
+    let reload = if changed && std::env::var_os("TWEB_GHOSTTY_CONFIG").is_none() {
+        if reload_ghostty_config() {
+            " and reloaded in running Ghostty processes"
+        } else {
+            " (no running Ghostty process reloaded; use Cmd-Shift-,)"
+        }
+    } else {
+        ""
+    };
     Ok(format!(
-        "Ghostty Cmd passthrough {} in {}",
+        "Ghostty Cmd passthrough {} in {}{}",
         if changed {
             "installed"
         } else {
             "already current"
         },
-        path.display()
+        path.display(),
+        reload
     ))
+}
+
+fn reload_ghostty_config() -> bool {
+    Command::new("pkill")
+        .args(["-USR2", "-x", "ghostty"])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn ghostty_config_path() -> PathBuf {
@@ -411,12 +429,26 @@ fn ghostty_config_path() -> PathBuf {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
+    select_ghostty_config_path(&home, &xdg, cfg!(target_os = "macos"))
+}
+
+fn select_ghostty_config_path(home: &Path, xdg: &Path, prefer_macos: bool) -> PathBuf {
     let xdg_path = xdg.join("ghostty/config");
     let macos_path = home.join("Library/Application Support/com.mitchellh.ghostty/config");
-    if xdg_path.exists() || !macos_path.exists() {
-        xdg_path
-    } else {
+    let macos_exists = macos_path.exists();
+    select_ghostty_config_candidate(xdg_path, macos_path, prefer_macos, macos_exists)
+}
+
+fn select_ghostty_config_candidate(
+    xdg_path: PathBuf,
+    macos_path: PathBuf,
+    prefer_macos: bool,
+    macos_exists: bool,
+) -> PathBuf {
+    if prefer_macos && macos_exists {
         macos_path
+    } else {
+        xdg_path
     }
 }
 
@@ -436,15 +468,28 @@ fn tmux_config_path() -> PathBuf {
     }
 }
 
+fn is_legacy_ghostty_toggle(line: &str) -> bool {
+    line.trim().eq_ignore_ascii_case(LEGACY_GHOSTTY_TOGGLE)
+}
+
+fn migrate_legacy_ghostty_toggle(content: &str) -> String {
+    content
+        .split_inclusive('\n')
+        .filter(|line| !is_legacy_ghostty_toggle(line))
+        .collect()
+}
+
 fn install_managed_block(
     path: &Path,
     begin: &str,
     end: &str,
     block: &str,
+    preprocess: Option<fn(&str) -> String>,
     validator: Option<fn(&Path) -> Result<()>>,
 ) -> Result<bool> {
     let original = fs::read_to_string(path).unwrap_or_default();
-    let updated = upsert_managed_block(&original, begin, end, block)?;
+    let migrated = preprocess.map_or_else(|| original.clone(), |process| process(&original));
+    let updated = upsert_managed_block(&migrated, begin, end, block)?;
     if original == updated {
         return Ok(false);
     }
@@ -581,10 +626,28 @@ fn tmux_option(args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
-        ghostty_version_supported, managed_block, upsert_managed_block, GHOSTTY_BEGIN,
-        GHOSTTY_BLOCK, GHOSTTY_END,
+        ghostty_version_supported, managed_block, migrate_legacy_ghostty_toggle,
+        select_ghostty_config_candidate, upsert_managed_block, GHOSTTY_BEGIN, GHOSTTY_BLOCK,
+        GHOSTTY_END,
     };
+
+    #[test]
+    fn macos_config_wins_when_both_ghostty_locations_exist() {
+        let xdg = PathBuf::from("/home/user/.config/ghostty/config");
+        let macos =
+            PathBuf::from("/home/user/Library/Application Support/com.mitchellh.ghostty/config");
+        assert_eq!(
+            select_ghostty_config_candidate(xdg.clone(), macos.clone(), true, true),
+            macos
+        );
+        assert_eq!(
+            select_ghostty_config_candidate(xdg.clone(), PathBuf::from("unused"), true, false),
+            xdg
+        );
+    }
 
     #[test]
     fn managed_block_is_added_without_rewriting_user_config() {
@@ -625,6 +688,34 @@ mod tests {
         let duplicate = format!("{GHOSTTY_BLOCK}\n{GHOSTTY_BLOCK}\n");
         assert!(
             upsert_managed_block(&duplicate, GHOSTTY_BEGIN, GHOSTTY_END, GHOSTTY_BLOCK).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_ghostty_toggle_is_removed_without_touching_other_bindings() {
+        let original = concat!(
+            "font-size = 13\n",
+            "  KEYBIND = CTRL+SEMICOLON=TEXT:\\X1B[5001~  \n",
+            "keybind = ctrl+semicolon=text:\\x1b[5999~\n",
+            "theme = Arthur\n",
+        );
+        assert_eq!(
+            migrate_legacy_ghostty_toggle(original),
+            concat!(
+                "font-size = 13\n",
+                "keybind = ctrl+semicolon=text:\\x1b[5999~\n",
+                "theme = Arthur\n",
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_ghostty_toggle_migration_handles_final_line_without_newline() {
+        assert_eq!(
+            migrate_legacy_ghostty_toggle(
+                "font-size = 13\nkeybind = ctrl+semicolon=text:\\x1b[5001~"
+            ),
+            "font-size = 13\n"
         );
     }
 

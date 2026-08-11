@@ -17,6 +17,7 @@
   let passThroughEscape = false;
   let passThroughEscapeTimer = null;
   let scrollTarget = null;
+  let panTarget = null;
   let tabListRefresh = false;
   let pendingG = false;
   let pendingGTimer = null;
@@ -234,11 +235,7 @@
       return;
     }
     if (key === "PageUp" || key === "PageDown") {
-      if (isTag(active, "textarea") && active.scrollHeight > active.clientHeight) {
-        active.scrollBy({ top: (key === "PageUp" ? -1 : 1) * active.clientHeight * 0.9, behavior: "instant" });
-      } else {
-        scrollBy({ top: (key === "PageUp" ? -1 : 1) * innerHeight * 0.9, behavior: "instant" });
-      }
+      scrollSurfaceBy(0, key === "PageUp" ? -90 : 90);
       return;
     }
     if (editable && typeof payload.text === "string" && payload.text) {
@@ -408,6 +405,7 @@
     if (!shortcutsEnabled) setMode("passthrough");
     else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
+    else if (panSurface()) setMode("normal", "↔ pan · Esc");
     else setMode("normal", scrollSurface() ? "⇅ 내부 · Esc" : "");
   }
 
@@ -828,7 +826,8 @@
 
   // Comment panels, sidebars and chat logs scroll independently of the page and
   // only react to a wheel while the pointer is over them, so `j`/`k` on the
-  // document does nothing. Let the user pick which surface the scroll keys drive.
+  // document does nothing. Large canvas/SVG apps often pan only by mouse drag;
+  // expose both kinds through the same `s` picker.
   function scrollableTargets() {
     const roots = collectRoots();
     const scrollable = roots
@@ -862,21 +861,36 @@
       seen.add(element);
       targets.push({ element, rect });
     }
+
+    // Charts and maps commonly keep their viewport in a transform instead of DOM
+    // scroll offsets. Restrict this fallback to large root drawing surfaces so icon
+    // SVGs do not flood the picker. A real overflow container wins if it is both.
+    for (const element of roots.flatMap((root) => [...root.querySelectorAll("canvas,svg")])) {
+      if (seen.has(element) || ownId(element).startsWith("__tweb_")) continue;
+      if (element.parentElement?.closest("canvas,svg")) continue;
+      const rect = visibleRect(element);
+      if (!rect || rect.width < 320 || rect.height < 220) continue;
+      if (ownerView(element).getComputedStyle(element).pointerEvents === "none") continue;
+      seen.add(element);
+      targets.push({ element, rect, pan: true });
+    }
+
     // Without the page in the list there is no way back once an inner surface is
     // picked — and on a page whose content is one big frame, the only candidate
     // would be that frame forever.
+    const picked = Boolean(scrollTarget || panTarget);
     const page = document.scrollingElement;
-    if (page && (scrollTarget || scrollsAtAll(page))) {
+    if (page && (picked || scrollsAtAll(page))) {
       const entry = { element: page, page: true,
                       rect: { left: 2, top: 2, right: 40, bottom: 20, width: 38, height: 18, x: 2, y: 2 } };
       // Picked something already? Then getting back out is the likely intent.
-      if (scrollTarget) targets.unshift(entry);
+      if (picked) targets.unshift(entry);
       else targets.push(entry);
     }
 
     // Innermost first: that is usually the one under discussion.
     return targets.sort((left, right) => {
-      if (left.page !== right.page) return left.page ? (scrollTarget ? -1 : 1) : (scrollTarget ? 1 : -1);
+      if (left.page !== right.page) return left.page ? (picked ? -1 : 1) : (picked ? 1 : -1);
       const related = left.element.ownerDocument === right.element.ownerDocument
         && right.element.compareDocumentPosition(left.element) & Node.DOCUMENT_POSITION_CONTAINED_BY;
       if (related) return -1;
@@ -899,30 +913,74 @@
     return null;
   }
 
+  function panSurface() {
+    if (panTarget?.isConnected && visibleRect(panTarget)) return panTarget;
+    panTarget = null;
+    return null;
+  }
+
+  function panSurfaceBy(left, top) {
+    const target = panSurface();
+    if (!target) return false;
+    const rect = visibleRect(target);
+    const dx = Math.max(-rect.width * 0.35, Math.min(rect.width * 0.35, -left));
+    const dy = Math.max(-rect.height * 0.35, Math.min(rect.height * 0.35, -top));
+    if (!dx && !dy) return true;
+
+    // Prefer blank drawing surface so a card or map marker does not turn the pan
+    // into an activation. Fall back to any point inside the selected surface.
+    const ratios = [[.18, .18], [.82, .18], [.18, .82], [.82, .82], [.5, .5], [.5, .25], [.5, .75]];
+    let fallback = null;
+    let start = null;
+    for (const [rx, ry] of ratios) {
+      const point = { x: rect.left + rect.width * rx, y: rect.top + rect.height * ry };
+      const end = { x: point.x + dx, y: point.y + dy };
+      if (end.x < rect.left + 4 || end.x > rect.right - 4
+        || end.y < rect.top + 4 || end.y > rect.bottom - 4) continue;
+      const hit = target.ownerDocument.elementFromPoint(point.x, point.y);
+      if (!hit || !target.contains(hit)) continue;
+      fallback ||= point;
+      if (hit === target) {
+        start = point;
+        break;
+      }
+    }
+    start ||= fallback || { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    send("native-drag", {
+      from: topViewportPoint(start),
+      to: topViewportPoint({ x: start.x + dx, y: start.y + dy }),
+    });
+    return true;
+  }
+
   function scrollSurfaceBy(left, top) {
+    if (panSurfaceBy(left, top)) return;
     const target = scrollSurface();
     if (target) target.scrollBy({ left, top, behavior: "instant" });
     else scrollBy({ left, top, behavior: "instant" });
   }
 
   function scrollSurfaceTo(top) {
+    if (panSurface()) return;
     const target = scrollSurface();
     if (target) target.scrollTo({ top, behavior: "instant" });
     else scrollTo({ top, behavior: "instant" });
   }
 
   function scrollSurfaceHeight() {
-    return scrollSurface()?.clientHeight || innerHeight;
+    return visibleRect(panSurface())?.height || scrollSurface()?.clientHeight || innerHeight;
   }
 
   function scrollSurfaceEnd() {
+    if (panSurface()) return 0;
     return scrollSurface()?.scrollHeight ?? document.documentElement.scrollHeight;
   }
 
   function startScrollPicker() {
     startPicker(scrollableTargets(), "scroll", (item) => {
       // The page entry means "no inner surface", which is what null already is.
-      scrollTarget = item.page ? null : item.element;
+      scrollTarget = item.page || item.pan ? null : item.element;
+      panTarget = item.pan ? item.element : null;
       // Some panels also gate their wheel handling on hover, so move the pointer.
       send("native-hover", hintClickPoint(item));
       normalMode();
@@ -1235,7 +1293,7 @@
       ["J · K", "이전 · 다음 탭"],
       ["x · X", "탭 닫기 · 최근 탭 복원"],
       ["r · gi", "새로고침 · 첫 입력 요소 focus"],
-      ["s", "스크롤할 내부 영역 선택 (Esc 또는 s에서 page로 복귀)"],
+      ["s", "스크롤·drag-pan 영역 선택 (Esc 또는 s에서 page로 복귀)"],
     ]],
     ["검색과 선택", [
       ["/ · n · N", "검색 · 다음 · 이전 결과"],
@@ -2236,9 +2294,10 @@
       case "y": send("copy-url"); flash("URL"); break;
       case "r": send("reload"); break;
       case "Escape":
-        // Release a picked scroll surface before bothering the page.
-        if (scrollSurface()) {
+        // Release a picked scroll or pan surface before bothering the page.
+        if (scrollSurface() || panSurface()) {
           scrollTarget = null;
+          panTarget = null;
           normalMode();
         } else {
           handled = dismissPageOverlay();

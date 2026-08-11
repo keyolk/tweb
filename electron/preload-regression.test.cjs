@@ -346,8 +346,8 @@ test("the first tab shows something before the real page commits", () => {
   assert.match(main, /function placeholderPage\(target\)/);
   const open = main.slice(main.indexOf("const load = () => {"),
     main.indexOf("function placeholderPage(target)"));
-  assert.match(open, /showInitialPlaceholder && isRestorableUrl\(url\)/,
-    "the placeholder is not controlled by the active startup tab");
+  assert.match(open, /showInitialPlaceholder && isRestorableUrl\(url\) && !url\.startsWith\("file:"\)/,
+    "the placeholder must skip local files and respect the active startup tab");
   // A later tab has the previous page on screen to hold, while the restored
   // active tab explicitly opts into the placeholder.
   assert.match(open, /once\("did-finish-load", load\)/);
@@ -410,7 +410,7 @@ test("a picked scroll surface survives use and can be left", () => {
   for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
     path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
     const surface = source.slice(source.indexOf("function scrollSurface()"),
-      source.indexOf("function scrollSurfaceBy("));
+      source.indexOf("function panSurface()"));
     // A scrolled document root sits above the viewport, so visibility is the wrong
     // test — it is what dropped the surface.
     assert.doesNotMatch(surface, /visibleRect/, `${name} still gates the surface on visibility`);
@@ -419,12 +419,12 @@ test("a picked scroll surface survives use and can be left", () => {
     const targets = source.slice(source.indexOf("function scrollableTargets()"),
       source.indexOf("function scrollSurface()"));
     assert.match(targets, /page: true/, `${name} offers no page candidate`);
-    assert.match(targets, /if \(scrollTarget\) targets\.unshift\(entry\)/,
+    assert.match(targets, /if \(picked\) targets\.unshift\(entry\)/,
       `${name} does not put the way out first`);
-    assert.match(source, /scrollTarget = item\.page \? null : item\.element;/,
+    assert.match(source, /scrollTarget = item\.page \|\| item\.pan \? null : item\.element;/,
       `${name} does not release the surface when the page is picked`);
     // Escape is the other way out.
-    assert.match(source, /if \(scrollSurface\(\)\) \{\n\s+scrollTarget = null;/,
+    assert.match(source, /if \(scrollSurface\(\) \|\| panSurface\(\)\) \{\n\s+scrollTarget = null;\n\s+panTarget = null;/,
       `${name} does not release the surface on Escape`);
     // The state is invisible without this: the indicator said nothing was picked.
     assert.match(source, /scrollSurface\(\) \? "⇅ 내부 · Esc" : ""/,
@@ -580,6 +580,33 @@ test("scroll keys can target a picked inner surface", () => {
       `${key} must scroll the picked surface`);
   }
   assert.doesNotMatch(electron, /case "j": scrollBy\(/);
+  assert.match(electron, /if \(key === "PageUp" \|\| key === "PageDown"\) \{\s*scrollSurfaceBy\(0, key === "PageUp" \? -90 : 90\);/);
+});
+
+test("large canvas and SVG surfaces can be panned with scroll keys", () => {
+  for (const source of [electron, tauri]) {
+    assert.match(source, /querySelectorAll\("canvas,svg"\)/);
+    assert.match(source, /rect\.width < 320 \|\| rect\.height < 220/);
+    assert.match(source, /function panSurfaceBy\(left, top\)/);
+    assert.match(source, /send\("native-drag", \{/);
+    assert.match(source, /scrollTarget = item\.page \|\| item\.pan \? null : item\.element/);
+    assert.match(source, /panTarget = item\.pan \? item\.element : null/);
+  }
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "native-drag":/);
+  assert.match(main, /type: "mouseDown"[\s\S]*type: "mouseMove"[\s\S]*type: "mouseUp"/);
+  const browser = fs.readFileSync(path.join(root, "crates/tweb-engine/tauri/src/browser.rs"), "utf8");
+  assert.match(browser, /"native-drag" =>/);
+  assert.match(browser, /fn dispatch_native_drag\(/);
+});
+
+test("Ghostty mode commands set passthrough explicitly", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /privateKey\("C-\\\\;", "5011"\)/);
+  assert.match(main, /passthroughTable, "C-\\\\;"[\s\S]*"35", "30", "31", "32"/);
+  assert.match(main, /code === 5011 \|\| code === 5012/);
+  assert.match(main, /setBrowserShortcutsEnabled\(code === 5012\)/);
+  assert.match(main, /50\(\?:0\[1-9\]\|1\[0-2\]\)/);
 });
 
 // A site's own shortcuts (m to mute, j/k on a feed) check isTrusted, so insert

@@ -48,6 +48,7 @@ electron-check: electron-test ## Electron JavaScript 문법 검사
 	node --check electron/mouse-click-state.cjs
 	node --check electron/tmux-visibility.cjs
 	node --check electron/window-session.cjs
+	node --check electron/url-normalization.cjs
 
 run: build ## Electron engine으로 TWeb 실행 (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

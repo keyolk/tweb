@@ -27,6 +27,7 @@ const { MouseClickState } = require("./mouse-click-state.cjs");
 const { startAgentServer } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
+const { normalizeUrl } = require("./url-normalization.cjs");
 const {
   isRestorableUrl,
   normalizeWindowSession,
@@ -288,6 +289,7 @@ function configureTmuxRootBindings() {
   privateKey("User114", "5003");
   privateKey("User115", "5004");
   privateKey("User116", "5007");
+  privateKey("C-\\;", "5011");
   ensureTmuxRootBinding(
     "User112",
     ["detach-client"],
@@ -313,6 +315,11 @@ function ensureTmuxPassthroughTable() {
       "bind-key", "-T", passthroughTable, "User110",
       "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
       "\\;", "switch-client", "-T", passthroughTable,
+    ],
+    [
+      "bind-key", "-T", passthroughTable, "C-\\;",
+      "send-keys", "-H", "1b", "5b", "35", "30", "31", "32", "7e",
+      "\\;", "switch-client", "-T", "root",
     ],
   ];
   for (const [_index, key, code] of zoomUserKeys) {
@@ -802,18 +809,6 @@ let paneCells = { cols: 80, rows: 24 };
 
 // --- browser window ---
 
-function normalizeUrl(input) {
-  const value = (input || "").trim();
-  if (!value) return "https://example.com";
-  if (/^(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(value)) {
-    return `http://${value}`;
-  }
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^(about|data|file):/i.test(value)) {
-    return value;
-  }
-  return `https://${value}`;
-}
-
 function errorPage(url, code, description) {
   const html = `<!doctype html><meta charset="utf-8"><style>
     :root{color-scheme:light dark}body{font:16px system-ui;margin:3rem;line-height:1.5}
@@ -1163,18 +1158,24 @@ function broadcastShortcutMode() {
   }
 }
 
-function toggleBrowserShortcuts() {
-  browserShortcutsEnabled = !browserShortcutsEnabled;
+function setBrowserShortcutsEnabled(enabled) {
+  browserShortcutsEnabled = enabled;
   // The preload drops insert mode on this signal; keep the mirror in step.
   pageInsertMode = false;
   broadcastShortcutMode();
   if (!browserShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
+  // Reconcile even when the mode was already correct: Ghostty config reloads and
+  // pane restarts can reset one side of the terminal/engine state independently.
   reconcileTmuxPassthrough();
   updatePaneTitle();
   if (debugLogging) {
     console.error(`tweb: input mode ${browserShortcutsEnabled ? "shortcuts" : "passthrough"}`);
   }
   notify(browserShortcutsEnabled ? "browser shortcuts ON" : "web passthrough ON");
+}
+
+function toggleBrowserShortcuts() {
+  setBrowserShortcutsEnabled(!browserShortcutsEnabled);
 }
 
 function activateTab(index) {
@@ -1500,6 +1501,25 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
         contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
       }
       break;
+    case "native-drag": {
+      const from = value?.from;
+      const to = value?.to;
+      if (![from?.x, from?.y, to?.x, to?.y].every(Number.isFinite)) break;
+      const start = pageToWindowPoint(contents, from);
+      const end = pageToWindowPoint(contents, to);
+      contents.sendInputEvent({ type: "mouseMove", ...start });
+      contents.sendInputEvent({ type: "mouseDown", ...start, button: "left", clickCount: 1 });
+      for (const ratio of [0.34, 0.67, 1]) {
+        contents.sendInputEvent({
+          type: "mouseMove",
+          x: Math.round(start.x + (end.x - start.x) * ratio),
+          y: Math.round(start.y + (end.y - start.y) * ratio),
+          button: "left",
+        });
+      }
+      contents.sendInputEvent({ type: "mouseUp", ...end, button: "left", clickCount: 1 });
+      break;
+    }
     case "frame-mode":
       sendToTabFrames(tab, "tweb-frame-mode", value);
       break;
@@ -2214,7 +2234,10 @@ function createTab(
   // pane was simply black. A placeholder commits in about half of one second, and
   // paint holding keeps it up while the real page loads. Only the first tab needs
   // it — any later one has the previous page on screen to hold.
-  if (showInitialPlaceholder && isRestorableUrl(url) && !process.env.TWEB_NO_PLACEHOLDER) {
+  // Local files commit immediately, and navigating away from the placeholder can
+  // race Chromium's file load into a spurious ERR_FILE_NOT_FOUND error page.
+  if (showInitialPlaceholder && isRestorableUrl(url) && !url.startsWith("file:")
+    && !process.env.TWEB_NO_PLACEHOLDER) {
     tab.webContents.once("did-finish-load", load);
     void tab.loadURL(placeholderPage(url)).catch(load);
   } else {
@@ -2635,6 +2658,10 @@ function dispatchPrivateShortcut(code) {
     toggleBrowserShortcuts();
     return;
   }
+  if (code === 5011 || code === 5012) {
+    setBrowserShortcutsEnabled(code === 5012);
+    return;
+  }
   if (browserShortcutsEnabled) {
     if (code === 5002 || code === 5007) setBrowserZoom("in");
     else if (code === 5003) setBrowserZoom("out");
@@ -2693,7 +2720,7 @@ function consumeRawInput() {
       continue;
     }
 
-    let match = /^\x1b\[(500[1-9])~/.exec(input);
+    let match = /^\x1b\[(50(?:0[1-9]|1[0-2]))~/.exec(input);
     if (match) {
       dispatchPrivateShortcut(Number(match[1]));
       rawInput = rawInput.subarray(Buffer.byteLength(match[0]));

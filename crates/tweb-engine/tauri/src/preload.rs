@@ -107,6 +107,7 @@ mod tests {
         assert!(script.contains("singleLineTextarea"));
         assert!(script.contains("scrollSurfaceBy(-90, 0)"));
         assert!(script.contains("scrollSurfaceBy(90, 0)"));
+        assert!(script.contains("scrollSurfaceBy(0, key === \"PageUp\" ? -90 : 90)"));
         assert!(script.contains(&token));
     }
 }
