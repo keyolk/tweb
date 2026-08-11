@@ -40,14 +40,23 @@ test("internal blank and placeholder URLs are not restorable", () => {
   assert.equal(isRestorableUrl("https://example.com/path"), true);
 });
 
-test("restore drops an internal active tab and selects the next surviving page", () => {
-  assert.deepEqual(normalizeWindowSession({
+test("legacy sessions without successful-load proof are not restored", () => {
+  assert.equal(normalizeWindowSession({
     version: 1,
+    activeIndex: 0,
+    tabs: [{ url: "https://failed.example", zoom: 0.8 }],
+  }, 0.8), null);
+});
+
+test("restore drops unconfirmed and internal tabs and selects the next loaded page", () => {
+  assert.deepEqual(normalizeWindowSession({
+    version: 2,
     activeIndex: 1,
     tabs: [
-      { url: "https://one.example", zoom: 0.1 },
-      { url: "about:blank", zoom: 0.8 },
-      { url: "https://two.example", zoom: 3 },
+      { url: "https://one.example", zoom: 0.1, loaded: true },
+      { url: "https://failed.example", zoom: 0.8, loaded: false },
+      { url: "about:blank", zoom: 0.8, loaded: true },
+      { url: "https://two.example", zoom: 3, loaded: true },
     ],
   }, 0.8), {
     activeIndex: 1,
@@ -58,14 +67,14 @@ test("restore drops an internal active tab and selects the next surviving page",
   });
 });
 
-test("restore falls back to the last page when an internal active tab was last", () => {
+test("restore falls back to the last loaded page when the active tab never loaded", () => {
   assert.deepEqual(normalizeWindowSession({
-    version: 1,
+    version: 2,
     activeIndex: 2,
     tabs: [
-      { url: "https://one.example", zoom: 0.8 },
-      { url: "https://two.example", zoom: 0.8 },
-      { url: "about:blank", zoom: 0.8 },
+      { url: "https://one.example", zoom: 0.8, loaded: true },
+      { url: "https://two.example", zoom: 0.8, loaded: true },
+      { url: "https://failed.example", zoom: 0.8, loaded: false },
     ],
   }, 0.8), {
     activeIndex: 1,
@@ -76,20 +85,21 @@ test("restore falls back to the last page when an internal active tab was last",
   });
 });
 
-test("blank-only state does not replace the last useful session", () => {
+test("blank-only and never-loaded state does not replace the last useful session", () => {
   assert.equal(windowSessionForSave([
-    { url: "about:blank", zoom: 0.8 },
-    { url: "data:text/html,loading", zoom: 0.8 },
+    { url: "about:blank", zoom: 0.8, loaded: true },
+    { url: "data:text/html,loading", zoom: 0.8, loaded: true },
+    { url: "https://failed.example", zoom: 0.8, loaded: false },
   ], 0, 0.8), null);
 });
 
-test("save omits internal tabs and remaps the active index", () => {
+test("save emits only successfully loaded tabs and remaps the active index", () => {
   assert.deepEqual(windowSessionForSave([
-    { url: "about:blank", zoom: 0.8 },
-    { url: "https://example.com", zoom: 1.25 },
+    { url: "https://failed.example", zoom: 0.8, loaded: false },
+    { url: "https://example.com", zoom: 1.25, loaded: true },
   ], 0, 0.8), {
-    version: 1,
+    version: 2,
     activeIndex: 0,
-    tabs: [{ url: "https://example.com", zoom: 1.25 }],
+    tabs: [{ url: "https://example.com", zoom: 1.25, loaded: true }],
   });
 });

@@ -915,7 +915,11 @@ function readWindowSession() {
       );
       if (!session) continue;
       if (candidate !== windowSessionPath) {
-        writeWindowSessionState({ version: 1, ...session });
+        writeWindowSessionState({
+          version: 2,
+          activeIndex: session.activeIndex,
+          tabs: session.tabs.map((tab) => ({ ...tab, loaded: true })),
+        });
         if (debugLogging) console.error("tweb: migrated legacy window session");
       }
       return session;
@@ -933,8 +937,9 @@ function writeWindowSession() {
   const state = windowSessionForSave(tabs.flatMap((tab) => {
     if (tab.isDestroyed()) return [];
     return [{
-      url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
+      url: tabSessionUrls.get(tab),
       zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor,
+      loaded: tabSessionUrls.has(tab),
     }];
   }), activeTabIndex, defaultZoomFactor);
   // A bare startup used to replace the last useful session with about:blank
@@ -2122,19 +2127,19 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   });
 
   let showingLoadError = false;
-  const recordNavigation = (url) => {
+  const recordSuccessfulNavigation = (url) => {
     if (showingLoadError || !isRestorableUrl(url)) return;
     tabSessionUrls.set(tab, url);
     recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
   };
-  contents.on("did-navigate", (_event, url) => recordNavigation(url));
   contents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
-    if (isMainFrame) recordNavigation(url);
+    if (isMainFrame && tabSessionUrls.has(tab)) recordSuccessfulNavigation(url);
   });
 
   let initialZoomApplied = false;
   contents.on("did-finish-load", () => {
+    if (!showingLoadError) recordSuccessfulNavigation(contents.getURL());
     showingLoadError = false;
     const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
     contents.setZoomFactor(zoomFactor);
@@ -2155,8 +2160,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     }
   });
   tab.on("page-title-updated", (_event, title) => {
-    const url = tabSessionUrls.get(tab) || contents.getURL();
-    recordNavigationHistory(url, title);
+    const successfulUrl = tabSessionUrls.get(tab);
+    if (!showingLoadError && successfulUrl && contents.getURL() === successfulUrl) {
+      recordNavigationHistory(successfulUrl, title);
+    }
     sendTabState();
     if (debugLogging) console.error(`tweb: title ${title}`);
   });
@@ -2168,10 +2175,16 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   });
 }
 
-function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
+function adoptTab(
+  tab,
+  url,
+  activate = true,
+  initialZoomFactor = defaultZoomFactor,
+  initialSuccessfulUrl = null
+) {
   if (tabs.includes(tab)) return tab;
   configureTab(tab, initialZoomFactor);
-  tabSessionUrls.set(tab, url || "about:blank");
+  if (isRestorableUrl(initialSuccessfulUrl)) tabSessionUrls.set(tab, initialSuccessfulUrl);
   tabs.push(tab);
   const index = tabs.length - 1;
 
@@ -2214,13 +2227,15 @@ function createTab(
   url = "about:blank",
   activate = true,
   initialZoomFactor = defaultZoomFactor,
-  showInitialPlaceholder = tabs.length === 0
+  showInitialPlaceholder = tabs.length === 0,
+  initialSuccessfulUrl = null
 ) {
   const tab = adoptTab(
     new BrowserWindow(browserWindowOptions()),
     url,
     activate,
-    initialZoomFactor
+    initialZoomFactor,
+    initialSuccessfulUrl
   );
   const load = () => {
     // did-fail-load owns user-visible failures. loadURL also rejects for a normal
@@ -2340,7 +2355,7 @@ function createWindow(url) {
   }
 
   for (const [index, tab] of session.tabs.entries()) {
-    createTab(tab.url, false, tab.zoom, index === session.activeIndex);
+    createTab(tab.url, false, tab.zoom, index === session.activeIndex, tab.url);
   }
   activateTab(session.activeIndex);
   if (debugLogging) {

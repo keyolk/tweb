@@ -39,9 +39,9 @@ function activeRestoredIndex(entries, activeIndex) {
 }
 
 function normalizeWindowSession(parsed, defaultZoomFactor) {
-  if (parsed?.version !== 1 || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
+  if (parsed?.version !== 2 || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
   const entries = parsed.tabs.slice(0, 50).flatMap((entry, sourceIndex) => {
-    if (!entry || !isRestorableUrl(entry.url)) return [];
+    if (!entry?.loaded || !isRestorableUrl(entry.url)) return [];
     return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex }];
   });
   if (entries.length === 0) return null;
@@ -54,14 +54,14 @@ function normalizeWindowSession(parsed, defaultZoomFactor) {
 function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
   if (!Array.isArray(tabs) || tabs.length === 0) return null;
   const entries = tabs.slice(0, 50).flatMap((entry, sourceIndex) => {
-    if (!entry || !isRestorableUrl(entry.url)) return [];
+    if (!entry?.loaded || !isRestorableUrl(entry.url)) return [];
     return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex }];
   });
   if (entries.length === 0) return null;
   return {
-    version: 1,
+    version: 2,
     activeIndex: activeRestoredIndex(entries, activeIndex),
-    tabs: entries.map(({ url, zoom }) => ({ url, zoom })),
+    tabs: entries.map(({ url, zoom }) => ({ url, zoom, loaded: true })),
   };
 }
 

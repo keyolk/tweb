@@ -173,9 +173,45 @@ struct TmuxPaneMarker {
     pane: Option<String>,
 }
 
+fn parse_pane_image_id(output: &[u8]) -> Option<u32> {
+    String::from_utf8_lossy(output).trim().parse().ok()
+}
+
+fn previous_pane_image_id(pane: &str) -> Option<u32> {
+    let output = std::process::Command::new("tmux")
+        .args(["show-option", "-p", "-v", "-t", pane, "@tweb_image_id"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_pane_image_id(&output.stdout))
+        .flatten()
+}
+
+fn pane_image_id(previous: Option<u32>, fallback: u32) -> u32 {
+    previous.unwrap_or(fallback)
+}
+
 impl TmuxPaneMarker {
-    fn install(pane: &str) -> Self {
+    fn install(pane: &str, image_id: u32) -> Self {
         if std::env::var_os("TMUX").is_some() {
+            // A hard-killed frontend can leave its Kitty placement behind even
+            // after the pane has returned to the shell. Remember the owner on
+            // the pane and remove it before the replacement starts painting.
+            if let Some(previous) = previous_pane_image_id(pane) {
+                write_kitty_delete(previous, pane);
+            }
+            let _ = std::process::Command::new("tmux")
+                .args([
+                    "set-option",
+                    "-p",
+                    "-t",
+                    pane,
+                    "@tweb_image_id",
+                    &image_id.to_string(),
+                ])
+                .status();
             let _ = std::process::Command::new("tmux")
                 .args(["set-option", "-p", "-t", pane, "@tweb_browser", "1"])
                 .status();
@@ -191,9 +227,11 @@ impl TmuxPaneMarker {
 impl Drop for TmuxPaneMarker {
     fn drop(&mut self) {
         if let Some(pane) = &self.pane {
-            let _ = std::process::Command::new("tmux")
-                .args(["set-option", "-p", "-u", "-t", pane, "@tweb_browser"])
-                .status();
+            for option in ["@tweb_browser", "@tweb_image_id"] {
+                let _ = std::process::Command::new("tmux")
+                    .args(["set-option", "-p", "-u", "-t", pane, option])
+                    .status();
+            }
         }
     }
 }
@@ -209,7 +247,14 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
 
     let pane = std::env::var("TMUX_PANE").unwrap_or_else(|_| "%0".to_string());
     tracing::info!(pane = %pane, "tmux pane identity");
-    let _pane_marker = TmuxPaneMarker::install(&pane);
+    // Reusing a hard-killed frontend's ID makes the first replacement frame
+    // overwrite the placement even on terminals that ignore the delete command.
+    let previous_image_id = std::env::var_os("TMUX")
+        .is_some()
+        .then(|| previous_pane_image_id(&pane))
+        .flatten();
+    let image_id = pane_image_id(previous_image_id, std::process::id());
+    let _pane_marker = TmuxPaneMarker::install(&pane, image_id);
 
     // raw terminal mode와 browser 입력(mouse/Kitty keyboard) 활성화.
     let _raw_guard = terminal::RawModeGuard::enter()?;
@@ -222,8 +267,6 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     // Engine process spawn. stdin은 resize/raw input control channel이고,
     // stdout은 engine이 Kitty graphics를 terminal에 직접 쓰도록 상속한다.
     let initial_geometry = terminal::window_geometry();
-    // Kitty image ID는 terminal 전체 namespace이므로 pane process마다 고유해야 한다.
-    let image_id = std::process::id();
     let (mut command, engine_description) = match options.engine {
         BrowserEngine::Electron => {
             let (electron_path, electron_dir) = find_electron()?;
@@ -569,8 +612,8 @@ fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_geometry_message, matching_client_ttys, raw_kitty_delete, resolve_electron_paths,
-        tmux_passthrough,
+        changed_geometry_message, matching_client_ttys, pane_image_id, parse_pane_image_id,
+        raw_kitty_delete, resolve_electron_paths, tmux_passthrough,
     };
     use crate::terminal::{WindowGeometry, WindowSize};
 
@@ -607,6 +650,20 @@ mod tests {
     #[test]
     fn kitty_delete_targets_one_image_without_response() {
         assert_eq!(raw_kitty_delete(42), "\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
+    }
+
+    #[test]
+    fn pane_image_id_accepts_only_a_single_unsigned_integer() {
+        assert_eq!(parse_pane_image_id(b"60336\n"), Some(60336));
+        assert_eq!(parse_pane_image_id(b""), None);
+        assert_eq!(parse_pane_image_id(b"60336 extra\n"), None);
+        assert_eq!(parse_pane_image_id(b"-1\n"), None);
+    }
+
+    #[test]
+    fn restart_reuses_the_previous_pane_image_id() {
+        assert_eq!(pane_image_id(Some(60336), 22239), 60336);
+        assert_eq!(pane_image_id(None, 22239), 22239);
     }
 
     #[test]

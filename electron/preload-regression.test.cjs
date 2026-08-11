@@ -166,6 +166,14 @@ test("bare open never restores or saves an internal blank page", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /require\("\.\/window-session\.cjs"\)/);
   assert.match(main, /if \(showingLoadError \|\| !isRestorableUrl\(url\)\) return;/);
+  assert.match(main, /if \(!showingLoadError\) recordSuccessfulNavigation\(contents\.getURL\(\)\);/);
+  assert.doesNotMatch(main, /contents\.on\("did-navigate",/,
+    "a committed navigation must not be persisted before it finishes loading");
+  assert.match(main, /loaded: tabSessionUrls\.has\(tab\)/);
+  assert.match(main, /if \(isRestorableUrl\(initialSuccessfulUrl\)\) tabSessionUrls\.set\(tab, initialSuccessfulUrl\);/);
+  assert.match(main, /createTab\(tab\.url, false, tab\.zoom, index === session\.activeIndex, tab\.url\)/);
+  assert.match(main, /if \(!showingLoadError && successfulUrl && contents\.getURL\(\) === successfulUrl\)/,
+    "an error page title must not overwrite the last successful history entry");
   assert.match(main, /const state = windowSessionForSave\(/);
   assert.match(main, /if \(!windowSessionPath \|\| tabs\.length === 0\) return;/);
   assert.match(main, /function writeWindowSessionState\(state\)/);
