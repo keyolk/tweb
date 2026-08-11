@@ -764,6 +764,7 @@ impl BrowserRuntime {
             }
         }
         self.sync_title();
+        self.send_tab_state();
     }
 
     fn page_loaded(&self, label: &str, url: &str) {
@@ -788,6 +789,7 @@ impl BrowserRuntime {
             self.snapshot.mark_interaction();
             self.send_shortcut_mode();
             self.sync_title();
+            self.send_tab_state();
             self.write_window_session();
         }
     }
@@ -824,11 +826,16 @@ impl BrowserRuntime {
     }
 
     fn send_tab_state(&self) {
-        let model = self
-            .tabs
-            .lock()
-            .ok()
-            .map(|tabs| json!({ "activeIndex": tabs.active, "count": tabs.values.len() }));
+        let model = self.tabs.lock().ok().map(|tabs| {
+            json!({
+                "activeIndex": tabs.active,
+                "count": tabs.values.len(),
+                "tabs": tabs.values.iter().enumerate().map(|(index, tab)| json!({
+                    "index": index,
+                    "title": tab.title,
+                })).collect::<Vec<_>>(),
+            })
+        });
         if let Some(model) = model {
             self.emit_active("tweb-tab-state", &model);
         }
@@ -1000,18 +1007,9 @@ impl BrowserRuntime {
     }
 
     fn sync_title(&self) {
-        let title = self.tabs.lock().ok().and_then(|tabs| {
-            let tab = tabs.values.get(tabs.active)?;
-            Some(format!(
-                "tweb {}/{} {}",
-                tabs.active + 1,
-                tabs.values.len(),
-                tab.title
-            ))
-        });
-        if let Some(title) = title {
-            self.tmux.update_title(&title);
-        }
+        // Tab state belongs to this pane's in-page badge. Putting it in tmux's
+        // pane title makes one active pane look like the state of the window.
+        self.tmux.update_title("tweb");
     }
 
     fn set_zoom(&self, action: ZoomAction) {
