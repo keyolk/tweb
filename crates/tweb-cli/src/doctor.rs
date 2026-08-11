@@ -1,6 +1,6 @@
 //! `tweb doctor` — terminal/tmux/GPU/extension capability 진단과 안전한 설정.
 //!
-//! `--fix`는 marker로 둘러싼 TWeb 관리 block만 갱신하고 기존 파일을 backup한다.
+//! `--fix`는 사용자 설정에 managed include만 갱신하고 기존 파일을 backup한다.
 
 use std::fs;
 use std::io::Write;
@@ -16,8 +16,21 @@ const TMUX_BEGIN: &str = "# >>> tweb doctor managed terminal options >>>";
 const TMUX_END: &str = "# <<< tweb doctor managed terminal options <<<";
 
 const LEGACY_GHOSTTY_TOGGLE: &str = r"keybind = ctrl+semicolon=text:\x1b[5001~";
+const LEGACY_TMUX_BEGIN: &str =
+    "# TWeb browser passthrough mode. Every unmatched key is forwarded to the pane,";
+const LEGACY_TMUX_END: &str =
+    "bind-key -T tweb-pass WheelDownPane send-keys -M \\; switch-client -T tweb-pass";
 
-const GHOSTTY_BLOCK: &str = r#"# >>> tweb doctor managed passthrough >>>
+const GHOSTTY_MANAGED_CONFIG: &str = r#"# Managed by `tweb doctor --fix`; edit the main Ghostty config instead.
+# Private CSI sequences preserve browser shortcuts through tmux.
+keybind = ctrl+comma=text:\x1b[5009~
+keybind = ctrl+shift+semicolon=text:\x1b[5010~
+keybind = ctrl+equal=text:\x1b[5002~
+keybind = ctrl+shift+equal=text:\x1b[5007~
+keybind = ctrl+minus=text:\x1b[5003~
+keybind = ctrl+zero=text:\x1b[5004~
+keybind = shift+enter=text:\x1b[5008~
+
 # Ghostty changes the surface-local table and forwards Ctrl-; to tmux. The
 # root and passthrough tmux tables turn it into idempotent ON/OFF commands.
 keybind = tweb/unconsumed:ctrl+semicolon=deactivate_key_table
@@ -32,14 +45,14 @@ keybind = tweb/unconsumed:super+shift+ctrl+catch_all=ignore
 keybind = tweb/unconsumed:super+alt+ctrl+catch_all=ignore
 keybind = tweb/unconsumed:super+shift+alt+ctrl+catch_all=ignore
 keybind = unconsumed:ctrl+semicolon=activate_key_table:tweb
-# <<< tweb doctor managed passthrough <<<"#;
+"#;
 
-const TMUX_BLOCK: &str = r#"# >>> tweb doctor managed terminal options >>>
+const TMUX_MANAGED_CONFIG: &str = r#"# Managed by `tweb doctor --fix`; edit the main tmux config instead.
 set-option -g allow-passthrough all
 set-option -g mouse on
 set-option -s extended-keys on
 set-option -s extended-keys-format csi-u
-# <<< tweb doctor managed terminal options <<<"#;
+"#;
 
 /// 진단 항목 결과.
 struct Check {
@@ -309,10 +322,14 @@ fn check_ghostty_version() -> Check {
 
 fn check_ghostty_cmd_passthrough() -> Check {
     let path = ghostty_config_path();
+    let managed_path = managed_config_dir().join("ghostty.conf");
     let content = fs::read_to_string(&path).unwrap_or_default();
+    let expected = ghostty_include_block(&managed_path);
+    let managed = fs::read_to_string(&managed_path).unwrap_or_default();
     let installed = managed_block(&content, GHOSTTY_BEGIN, GHOSTTY_END)
-        .is_some_and(|block| block.trim() == GHOSTTY_BLOCK.trim())
-        && !content.lines().any(is_legacy_ghostty_toggle);
+        .is_some_and(|block| block.trim() == expected.trim())
+        && managed == GHOSTTY_MANAGED_CONFIG
+        && !content.lines().any(is_legacy_ghostty_binding);
     let conflict = command_output("ghostty", &["+show-config"])
         .is_some_and(|config| config.contains("keybind = super+k=clear_screen"));
     Check {
@@ -323,14 +340,14 @@ fn check_ghostty_cmd_passthrough() -> Check {
             CheckStatus::Warn
         },
         detail: if installed {
-            format!("managed surface-local key table: {}", path.display())
+            format!("managed config included from {}", managed_path.display())
         } else if conflict {
             format!(
                 "Cmd-K and other app shortcuts are consumed before PTY; configure {}",
                 path.display()
             )
         } else {
-            format!("managed key table not installed: {}", path.display())
+            format!("managed include not installed in {}", path.display())
         },
     }
 }
@@ -345,7 +362,26 @@ fn check_pixel_size_query() -> Check {
 
 fn apply_tmux_fix() -> Result<String> {
     let path = tmux_config_path();
-    let changed = install_managed_block(&path, TMUX_BEGIN, TMUX_END, TMUX_BLOCK, None, None)?;
+    let managed_path = managed_config_dir().join("tmux.conf");
+    let include = tmux_include_block(&managed_path);
+    let managed_original = fs::read(&managed_path).ok();
+    let managed_changed = write_managed_config(&managed_path, TMUX_MANAGED_CONFIG, None)?;
+    let main_changed = match install_managed_block(
+        &path,
+        TMUX_BEGIN,
+        TMUX_END,
+        &include,
+        Some(migrate_legacy_tmux_config),
+        None,
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            if managed_changed {
+                restore_managed_config(&managed_path, managed_original)?;
+            }
+            return Err(error);
+        }
+    };
 
     let mut live = true;
     for args in [
@@ -361,13 +397,13 @@ fn apply_tmux_fix() -> Result<String> {
     }
 
     Ok(format!(
-        "tmux options {} in {}{}",
-        if changed {
+        "tmux managed include {} from {}{}",
+        if managed_changed || main_changed {
             "installed"
         } else {
             "already current"
         },
-        path.display(),
+        managed_path.display(),
         if live {
             " and applied to the running server"
         } else {
@@ -383,14 +419,31 @@ fn apply_ghostty_fix() -> Result<String> {
         bail!("Ghostty 1.3+ is required for surface-local key tables");
     }
     let path = ghostty_config_path();
-    let changed = install_managed_block(
+    let managed_path = managed_config_dir().join("ghostty.conf");
+    let include = ghostty_include_block(&managed_path);
+    let managed_original = fs::read(&managed_path).ok();
+    let managed_changed = write_managed_config(
+        &managed_path,
+        GHOSTTY_MANAGED_CONFIG,
+        Some(validate_ghostty_config),
+    )?;
+    let main_changed = match install_managed_block(
         &path,
         GHOSTTY_BEGIN,
         GHOSTTY_END,
-        GHOSTTY_BLOCK,
-        Some(migrate_legacy_ghostty_toggle),
+        &include,
+        Some(migrate_legacy_ghostty_config),
         Some(validate_ghostty_config),
-    )?;
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            if managed_changed {
+                restore_managed_config(&managed_path, managed_original)?;
+            }
+            return Err(error);
+        }
+    };
+    let changed = managed_changed || main_changed;
     let reload = if changed && std::env::var_os("TWEB_GHOSTTY_CONFIG").is_none() {
         if reload_ghostty_config() {
             " and reloaded in running Ghostty processes"
@@ -401,13 +454,13 @@ fn apply_ghostty_fix() -> Result<String> {
         ""
     };
     Ok(format!(
-        "Ghostty Cmd passthrough {} in {}{}",
+        "Ghostty managed include {} from {}{}",
         if changed {
             "installed"
         } else {
             "already current"
         },
-        path.display(),
+        managed_path.display(),
         reload
     ))
 }
@@ -468,15 +521,118 @@ fn tmux_config_path() -> PathBuf {
     }
 }
 
-fn is_legacy_ghostty_toggle(line: &str) -> bool {
-    line.trim().eq_ignore_ascii_case(LEGACY_GHOSTTY_TOGGLE)
+fn managed_config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("TWEB_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("tweb")
 }
 
-fn migrate_legacy_ghostty_toggle(content: &str) -> String {
+fn ghostty_include_block(path: &Path) -> String {
+    format!(
+        "{GHOSTTY_BEGIN}\nconfig-file = {}\n{GHOSTTY_END}",
+        path.display()
+    )
+}
+
+fn tmux_include_block(path: &Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("{TMUX_BEGIN}\nsource-file -q \"{escaped}\"\n{TMUX_END}")
+}
+
+fn is_legacy_ghostty_binding(line: &str) -> bool {
+    let line = line.trim();
+    [
+        LEGACY_GHOSTTY_TOGGLE,
+        r"keybind = ctrl+comma=text:\x1b[5009~",
+        r"keybind = ctrl+shift+semicolon=text:\x1b[5010~",
+        r"keybind = ctrl+equal=text:\x1b[5002~",
+        r"keybind = ctrl+shift+equal=text:\x1b[5007~",
+        r"keybind = ctrl+minus=text:\x1b[5003~",
+        r"keybind = ctrl+zero=text:\x1b[5004~",
+        r"keybind = shift+enter=text:\x1b[5008~",
+    ]
+    .iter()
+    .any(|binding| line.eq_ignore_ascii_case(binding))
+}
+
+fn migrate_legacy_ghostty_config(content: &str) -> String {
     content
         .split_inclusive('\n')
-        .filter(|line| !is_legacy_ghostty_toggle(line))
+        .filter(|line| !is_legacy_ghostty_binding(line))
         .collect()
+}
+
+fn migrate_legacy_tmux_config(content: &str) -> String {
+    let mut migrated = content.to_string();
+    while let Some(start) = migrated.find(LEGACY_TMUX_BEGIN) {
+        let Some(relative_end) = migrated[start..].find(LEGACY_TMUX_END) else {
+            break;
+        };
+        let finish = start + relative_end + LEGACY_TMUX_END.len();
+        migrated.replace_range(start..finish, "");
+    }
+    migrated
+}
+
+fn restore_managed_config(path: &Path, original: Option<Vec<u8>>) -> Result<()> {
+    match original {
+        Some(content) => fs::write(path, content)
+            .with_context(|| format!("restore managed config {}", path.display())),
+        None if path.exists() => fs::remove_file(path)
+            .with_context(|| format!("remove managed config {}", path.display())),
+        None => Ok(()),
+    }
+}
+
+fn write_managed_config(
+    path: &Path,
+    content: &str,
+    validator: Option<fn(&Path) -> Result<()>>,
+) -> Result<bool> {
+    if fs::read_to_string(path).ok().as_deref() == Some(content) {
+        return Ok(false);
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create config directory {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let temporary = parent.join(format!(".{file_name}.tweb.tmp-{}", std::process::id()));
+    {
+        let mut file = fs::File::create(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(&temporary, metadata.permissions())?;
+    }
+    if let Some(validate) = validator {
+        if let Err(error) = validate(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
+    if path.exists() {
+        let backup = backup_path(path);
+        fs::copy(path, &backup)
+            .with_context(|| format!("backup {} to {}", path.display(), backup.display()))?;
+    }
+    fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(true)
 }
 
 fn install_managed_block(
@@ -534,27 +690,25 @@ fn upsert_managed_block(content: &str, begin: &str, end: &str, block: &str) -> R
         bail!("managed block markers are duplicated; remove stale blocks manually");
     }
 
-    let mut without = content.trim_end().to_string();
     if let Some(start) = content.find(begin) {
         let Some(relative_end) = content[start..].find(end) else {
             bail!("managed block starts with {begin:?} but has no end marker");
         };
         let finish = start + relative_end + end.len();
-        let before = content[..start].trim_end();
-        let after = content[finish..].trim_start();
-        without = match (before.is_empty(), after.is_empty()) {
-            (true, _) => after.to_string(),
-            (_, true) => before.to_string(),
-            (false, false) => format!("{before}\n{after}"),
-        };
-    } else if content.contains(end) {
+        let mut updated = String::with_capacity(content.len() + replacement.len());
+        updated.push_str(&content[..start]);
+        updated.push_str(replacement);
+        updated.push_str(&content[finish..]);
+        return Ok(updated);
+    }
+    if content.contains(end) {
         bail!("managed block has end marker {end:?} but no start marker");
     }
 
-    if without.is_empty() {
+    if content.trim().is_empty() {
         Ok(format!("{replacement}\n"))
     } else {
-        Ok(format!("{}\n\n{replacement}\n", without.trim_end()))
+        Ok(format!("{}\n\n{replacement}\n", content.trim_end()))
     }
 }
 
@@ -626,13 +780,18 @@ fn tmux_option(args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        ghostty_version_supported, managed_block, migrate_legacy_ghostty_toggle,
-        select_ghostty_config_candidate, upsert_managed_block, GHOSTTY_BEGIN, GHOSTTY_BLOCK,
-        GHOSTTY_END,
+        ghostty_include_block, ghostty_version_supported, managed_block,
+        migrate_legacy_ghostty_config, migrate_legacy_tmux_config, select_ghostty_config_candidate,
+        tmux_include_block, upsert_managed_block, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN,
+        LEGACY_TMUX_END, TMUX_BEGIN, TMUX_END,
     };
+
+    fn ghostty_include() -> String {
+        ghostty_include_block(Path::new("/home/user/.config/tweb/ghostty.conf"))
+    }
 
     #[test]
     fn macos_config_wins_when_both_ghostty_locations_exist() {
@@ -650,57 +809,60 @@ mod tests {
     }
 
     #[test]
-    fn managed_block_is_added_without_rewriting_user_config() {
+    fn managed_include_is_added_without_rewriting_user_config() {
         let original = "font-size = 13\nkeybind = super+k=clear_screen\n";
-        let updated =
-            upsert_managed_block(original, GHOSTTY_BEGIN, GHOSTTY_END, GHOSTTY_BLOCK).unwrap();
+        let include = ghostty_include();
+        let updated = upsert_managed_block(original, GHOSTTY_BEGIN, GHOSTTY_END, &include).unwrap();
         assert!(updated.starts_with(original.trim_end()));
         assert_eq!(
             managed_block(&updated, GHOSTTY_BEGIN, GHOSTTY_END)
                 .unwrap()
                 .trim(),
-            GHOSTTY_BLOCK.trim()
+            include.trim()
         );
     }
 
     #[test]
-    fn managed_block_update_is_idempotent() {
-        let once = upsert_managed_block("", GHOSTTY_BEGIN, GHOSTTY_END, GHOSTTY_BLOCK).unwrap();
-        let twice = upsert_managed_block(&once, GHOSTTY_BEGIN, GHOSTTY_END, GHOSTTY_BLOCK).unwrap();
+    fn managed_include_update_is_idempotent() {
+        let include = ghostty_include();
+        let once = upsert_managed_block("", GHOSTTY_BEGIN, GHOSTTY_END, &include).unwrap();
+        let twice = upsert_managed_block(&once, GHOSTTY_BEGIN, GHOSTTY_END, &include).unwrap();
         assert_eq!(once, twice);
     }
 
     #[test]
-    fn replacing_a_middle_block_preserves_surrounding_lines() {
+    fn replacing_a_middle_block_preserves_position_and_surrounding_lines() {
         let original =
             format!("font-size = 13\n\n{GHOSTTY_BEGIN}\nstale\n{GHOSTTY_END}\ntheme = Arthur\n");
         let updated =
-            upsert_managed_block(&original, GHOSTTY_BEGIN, GHOSTTY_END, GHOSTTY_BLOCK).unwrap();
-        assert!(updated.contains("font-size = 13\ntheme = Arthur\n\n"));
-        assert!(!updated.contains("13theme"));
+            upsert_managed_block(&original, GHOSTTY_BEGIN, GHOSTTY_END, &ghostty_include())
+                .unwrap();
+        let include_position = updated.find(GHOSTTY_BEGIN).unwrap();
+        assert!(include_position > updated.find("font-size = 13").unwrap());
+        assert!(include_position < updated.find("theme = Arthur").unwrap());
+        assert!(updated.ends_with("theme = Arthur\n"));
     }
 
     #[test]
     fn malformed_or_duplicate_managed_blocks_are_refused() {
-        let missing_end =
-            upsert_managed_block(GHOSTTY_BEGIN, GHOSTTY_BEGIN, GHOSTTY_END, GHOSTTY_BLOCK);
+        let include = ghostty_include();
+        let missing_end = upsert_managed_block(GHOSTTY_BEGIN, GHOSTTY_BEGIN, GHOSTTY_END, &include);
         assert!(missing_end.is_err());
-        let duplicate = format!("{GHOSTTY_BLOCK}\n{GHOSTTY_BLOCK}\n");
-        assert!(
-            upsert_managed_block(&duplicate, GHOSTTY_BEGIN, GHOSTTY_END, GHOSTTY_BLOCK).is_err()
-        );
+        let duplicate = format!("{include}\n{include}\n");
+        assert!(upsert_managed_block(&duplicate, GHOSTTY_BEGIN, GHOSTTY_END, &include).is_err());
     }
 
     #[test]
-    fn legacy_ghostty_toggle_is_removed_without_touching_other_bindings() {
+    fn ghostty_migration_moves_only_tweb_bindings() {
         let original = concat!(
             "font-size = 13\n",
             "  KEYBIND = CTRL+SEMICOLON=TEXT:\\X1B[5001~  \n",
+            "keybind = ctrl+equal=text:\\x1B[5002~\n",
             "keybind = ctrl+semicolon=text:\\x1b[5999~\n",
             "theme = Arthur\n",
         );
         assert_eq!(
-            migrate_legacy_ghostty_toggle(original),
+            migrate_legacy_ghostty_config(original),
             concat!(
                 "font-size = 13\n",
                 "keybind = ctrl+semicolon=text:\\x1b[5999~\n",
@@ -710,12 +872,56 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ghostty_toggle_migration_handles_final_line_without_newline() {
+    fn ghostty_migration_handles_final_line_without_newline() {
         assert_eq!(
-            migrate_legacy_ghostty_toggle(
+            migrate_legacy_ghostty_config(
                 "font-size = 13\nkeybind = ctrl+semicolon=text:\\x1b[5001~"
             ),
             "font-size = 13\n"
+        );
+    }
+
+    #[test]
+    fn tmux_migration_removes_duplicates_but_keeps_tmux_chrome() {
+        let legacy = format!(
+            "{LEGACY_TMUX_BEGIN}\nset -s user-keys[110] \"\\e[5001~\"\n{LEGACY_TMUX_END}\n"
+        );
+        let original = format!(
+            "set-option -g mouse on\nset-option -gq allow-passthrough on\n\
+             {legacy}{legacy}\
+             # tmux-chrome tab group bridge\nset -s user-keys[100] \"\\e[5005~\"\n\
+             set -s user-keys[101] \"\\e[5006~\"\n\
+             {TMUX_BEGIN}\nset-option -g allow-passthrough all\n{TMUX_END}\n"
+        );
+        let migrated = migrate_legacy_tmux_config(&original);
+        assert!(!migrated.contains(LEGACY_TMUX_BEGIN));
+        assert!(migrated.contains("allow-passthrough on"));
+        assert!(migrated.contains("set-option -g mouse on"));
+        assert!(migrated.contains("user-keys[100]"));
+        assert!(migrated.contains("user-keys[101]"));
+        assert!(migrated.contains("tmux-chrome tab group bridge"));
+    }
+
+    #[test]
+    fn tmux_migration_preserves_unmanaged_terminal_options() {
+        let original = concat!(
+            "set-option -g mouse on\n",
+            "set-option -gq allow-passthrough on\n",
+            "set-option -s extended-keys on\n",
+        );
+        assert_eq!(migrate_legacy_tmux_config(original), original);
+    }
+
+    #[test]
+    fn include_blocks_reference_separate_managed_files() {
+        let ghostty = ghostty_include();
+        assert!(ghostty.contains("config-file = /home/user/.config/tweb/ghostty.conf"));
+        let tmux = tmux_include_block(Path::new("/home/user/.config/tweb/tmux.conf"));
+        assert_eq!(
+            tmux,
+            format!(
+                "{TMUX_BEGIN}\nsource-file -q \"/home/user/.config/tweb/tmux.conf\"\n{TMUX_END}"
+            )
         );
     }
 

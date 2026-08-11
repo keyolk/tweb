@@ -78,7 +78,7 @@ tweb profile bootstrap chrome
 # 지원 환경 진단
 tweb doctor
 
-# Ghostty Cmd passthrough와 tmux CSI-u/mouse 설정을 안전하게 설치
+# Ghostty Cmd passthrough와 tmux CSI-u/mouse 설정을 별도 include 파일로 설치
 tweb doctor --fix
 ```
 
@@ -165,7 +165,7 @@ Web passthrough 상태에서도 `Ctrl-;`만 escape hatch로 사용해 Shortcuts 
 
 focus가 cross-origin iframe(광고·embed)에 들어가면 그 frame의 preload는 shortcut을 처리하지 않습니다. TWeb은 shortcut을 처리할 수 있는 frame을 추적해 그런 경우 main frame으로 키를 보내므로, iframe을 클릭한 뒤에도 `?`나 `f`가 계속 동작합니다.
 
-macOS 또는 terminal emulator가 PTY보다 먼저 소비하는 application shortcut은 별도 설정 없이는 웹에 전달할 수 없습니다. `tweb doctor`는 Ghostty의 `Cmd-K` 같은 충돌과 tmux CSI-u/mouse/passthrough 설정을 진단하며, `tweb doctor --fix`는 기존 파일을 backup한 뒤 marker로 구분된 관리 block만 설치합니다. Ghostty 1.3+에서는 surface-local `tweb` key table이 `Ctrl-;`와 함께 켜져 passthrough mode 동안 `Cmd` 조합을 PTY로 전달하고, mode를 끄면 Ghostty 기본 단축키가 다시 동작합니다. 적용 후 Ghostty config를 reload해야 합니다.
+macOS 또는 terminal emulator가 PTY보다 먼저 소비하는 application shortcut은 별도 설정 없이는 웹에 전달할 수 없습니다. `tweb doctor`는 Ghostty의 `Cmd-K` 같은 충돌과 tmux CSI-u/mouse/passthrough 설정을 진단합니다. `tweb doctor --fix`는 기존 파일을 backup하고 사용자 Ghostty/tmux config에는 marker로 구분된 include 한 줄만 설치하며, 실제 TWeb 설정은 `${XDG_CONFIG_HOME:-~/.config}/tweb/ghostty.conf`와 `tmux.conf`에서 관리합니다. 기존 inline doctor block과 식별 가능한 legacy TWeb binding은 자동으로 migration합니다. Ghostty 1.3+에서는 surface-local `tweb` key table이 `Ctrl-;`와 함께 켜져 passthrough mode 동안 `Cmd` 조합을 PTY로 전달하고, mode를 끄면 Ghostty 기본 단축키가 다시 동작합니다. 변경 시 실행 중인 Ghostty에도 reload signal을 보냅니다.
 
 ### Mode indicator
 
