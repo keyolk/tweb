@@ -92,7 +92,18 @@ set-option -s extended-keys-format csi-u
 ///
 /// Codes start at 5020 and slots at 120 to stay clear of the existing 5001-5010
 /// shortcuts and the tmux-chrome bridge on slots 100/101.
-const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[("super+k", 5020, 120)];
+///
+/// Cmd-A/C/V/X matter most while typing (mode `E`): the engine turns them into
+/// select-all, copy, paste and cut against the focused field. Without an entry
+/// here Ghostty keeps them for itself — its own copy/paste act on the terminal
+/// selection, not on the page, so an input box never sees them.
+const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[
+    ("super+k", 5020, 120),
+    ("super+a", 5021, 121),
+    ("super+c", 5022, 122),
+    ("super+v", 5023, 123),
+    ("super+x", 5024, 124),
+];
 
 fn cmd_passthrough_ghostty_bindings() -> String {
     CMD_PASSTHROUGH_KEYS
@@ -533,6 +544,46 @@ fn apply_tmux_fix() -> Result<String> {
     ))
 }
 
+/// Drops managed blocks from every Ghostty config we are *not* installing into.
+///
+/// Both candidate locations can exist on one machine, and Ghostty loads only
+/// one of them — but if that one includes our managed file while the other
+/// still holds an old inline block, the stale copy is parsed too and its later
+/// keybind wins. That is how an obsolete `unconsumed:ctrl+semicolon` kept
+/// overriding the current toggle.
+fn remove_stale_ghostty_blocks(active: &Path) -> Result<bool> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let candidates = [
+        xdg.join("ghostty/config"),
+        home.join("Library/Application Support/com.mitchellh.ghostty/config"),
+    ];
+
+    let mut removed = false;
+    for candidate in candidates {
+        if candidate == active || !candidate.exists() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Some(block) = managed_block(&content, GHOSTTY_BEGIN, GHOSTTY_END) else {
+            continue;
+        };
+        let stripped = content.replace(block, "");
+        let backup = backup_path(&candidate);
+        fs::copy(&candidate, &backup).with_context(|| format!("backup {}", candidate.display()))?;
+        fs::write(&candidate, stripped.trim_end().to_string() + "\n")
+            .with_context(|| format!("rewrite {}", candidate.display()))?;
+        removed = true;
+    }
+    Ok(removed)
+}
+
 fn apply_ghostty_fix() -> Result<String> {
     let version = command_output("ghostty", &["+version"])
         .context("ghostty command not found; install Ghostty 1.3+ or skip this fix")?;
@@ -541,6 +592,11 @@ fn apply_ghostty_fix() -> Result<String> {
     }
     let path = ghostty_config_path();
     let managed_path = managed_config_dir().join("ghostty.conf");
+    // Ghostty reads one config, but a machine can carry both candidate paths —
+    // and a managed block left in the one we are not installing into silently
+    // overrides ours, because a later keybind wins over an earlier one. Strip
+    // the stale block instead of leaving two definitions of Ctrl-;.
+    let stale_removed = remove_stale_ghostty_blocks(&path)?;
     let include = ghostty_include_block(&managed_path);
     let managed_original = fs::read(&managed_path).ok();
     let managed_changed = write_managed_config(
@@ -564,7 +620,7 @@ fn apply_ghostty_fix() -> Result<String> {
             return Err(error);
         }
     };
-    let changed = managed_changed || main_changed;
+    let changed = managed_changed || main_changed || stale_removed;
     let reload = if changed && std::env::var_os("TWEB_GHOSTTY_CONFIG").is_none() {
         if reload_ghostty_config() {
             " and reloaded in running Ghostty processes"
@@ -575,13 +631,18 @@ fn apply_ghostty_fix() -> Result<String> {
         ""
     };
     Ok(format!(
-        "Ghostty managed include {} from {}{}",
+        "Ghostty managed include {} from {}{}{}",
         if changed {
             "installed"
         } else {
             "already current"
         },
         managed_path.display(),
+        if stale_removed {
+            ", stale block removed from the unused config"
+        } else {
+            ""
+        },
         reload
     ))
 }

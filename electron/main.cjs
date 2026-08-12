@@ -2545,9 +2545,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
     return;
   }
 
-  // Cmd-C/V/X reach us as CSI-u like Cmd-A does, but nothing acted on them, so
-  // copy and paste simply did nothing inside the page. Drive the editing
-  // commands directly: the renderer knows the selection and the focused field.
+  // Editing commands are driven directly rather than dispatched as key events:
+  // the renderer knows the selection and the focused field, so this works while
+  // typing (mode E) where it matters most. Ghostty's own Cmd-C/V act on the
+  // terminal selection instead, which is why these need a passthrough entry.
   if (modifiers.includes("meta") && ["c", "v", "x"].includes(key.toLowerCase())) {
     if (pressed) {
       const contents = win.webContents;
@@ -2672,6 +2673,10 @@ function dispatchText(buffer) {
 // doctor의 CMD_PASSTHROUGH_KEYS와 code가 일치해야 한다.
 const CMD_PRIVATE_KEYS = new Map([
   [5020, "k"],
+  [5021, "a"],
+  [5022, "c"],
+  [5023, "v"],
+  [5024, "x"],
 ]);
 
 function dispatchPrivateShortcut(code) {
