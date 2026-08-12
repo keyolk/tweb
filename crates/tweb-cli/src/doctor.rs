@@ -93,8 +93,10 @@ fn cmd_passthrough_ghostty_bindings() -> String {
 fn cmd_passthrough_tmux_config() -> String {
     let mut config = String::new();
     for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
+        // "\\e" is the spelling tmux expands in a config file; the running
+        // server is fed a real ESC byte instead, further down.
         config.push_str(&format!(
-            "set-option -s user-keys[{slot}] \"\\033[{code}~\"\n"
+            "set-option -s user-keys[{slot}] \"\\e[{code}~\"\n"
         ));
     }
     for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
@@ -482,7 +484,10 @@ fn apply_tmux_fix() -> Result<String> {
     // The config file only takes effect on a fresh server, and the Cmd keys are
     // useless until tmux knows them, so apply them to the running one as well.
     for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
-        let sequence = format!("\\033[{code}~");
+        // A real ESC byte, not the "\033" spelling: tmux expands that escape
+        // when parsing a config file but stores a CLI argument verbatim, so the
+        // literal backslash form never matches the incoming sequence.
+        let sequence = format!("\u{1b}[{code}~");
         live &= run_tmux(&["set-option", "-s", &format!("user-keys[{slot}]"), &sequence]);
         let hex = private_sequence_hex(*code);
         let mut root = vec!["bind-key", "-T", "root"];
@@ -923,7 +928,7 @@ mod tests {
                 "{trigger} missing its Ghostty binding"
             );
             assert!(
-                tmux.contains(&format!("user-keys[{slot}] \"\\033[{code}~\"")),
+                tmux.contains(&format!("user-keys[{slot}] \"\\e[{code}~\"")),
                 "{trigger} missing its tmux user-key"
             );
             assert!(
@@ -934,6 +939,31 @@ mod tests {
                 engine.contains(&format!("[{code}, ")),
                 "{trigger} missing from the engine CMD_PRIVATE_KEYS table"
             );
+            // The engine parses private sequences with a bounded regex, and a
+            // code outside its range is dropped before any table is consulted —
+            // which is exactly how 5020 went missing while arriving intact.
+            assert!(
+                engine_parses_private_code(*code),
+                "the engine's private-sequence regex does not cover {code}"
+            );
+        }
+    }
+
+    /// Mirrors the `50(?:0[1-9]|1[0-2]|[2-9][0-9])` alternation in main.cjs.
+    fn engine_parses_private_code(code: u16) -> bool {
+        let text = code.to_string();
+        let Some(tail) = text.strip_prefix("50") else {
+            return false;
+        };
+        let digits: Vec<char> = tail.chars().collect();
+        let [first, second] = digits[..] else {
+            return false;
+        };
+        match first {
+            '0' => ('1'..='9').contains(&second),
+            '1' => ('0'..='2').contains(&second),
+            '2'..='9' => second.is_ascii_digit(),
+            _ => false,
         }
     }
 

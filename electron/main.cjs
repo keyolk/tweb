@@ -2742,7 +2742,8 @@ function consumeRawInput() {
       continue;
     }
 
-    let match = /^\x1b\[(50(?:0[1-9]|1[0-2]))~/.exec(input);
+    // 5001-5012는 기존 shortcut, 5020부터는 Cmd 조합 (CMD_PRIVATE_KEYS).
+    let match = /^\x1b\[(50(?:0[1-9]|1[0-2]|[2-9][0-9]))~/.exec(input);
     if (match) {
       dispatchPrivateShortcut(Number(match[1]));
       rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
