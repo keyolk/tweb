@@ -2500,9 +2500,16 @@ function keyName(codepoint) {
   return null;
 }
 
+// preload로 보내는 이름은 웹 표준 KeyboardEvent.key지만, sendInputEvent의 keyCode는
+// Electron Accelerator 이름만 받는다. 방향키는 두 체계의 이름이 달라서 그대로 넘기면
+// Chromium이 조용히 무시한다 — Slack 검색창에서 ArrowUp/Down이 먹지 않던 원인.
+const ACCELERATOR_KEYS = new Map([
+  ["ArrowUp", "Up"], ["ArrowDown", "Down"], ["ArrowLeft", "Left"], ["ArrowRight", "Right"],
+]);
+
 function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
   const event = {
-    keyCode: key,
+    keyCode: ACCELERATOR_KEYS.get(key) || key,
     modifiers,
   };
   if (eventKind === 3) {
@@ -2855,9 +2862,13 @@ process.stdin.on("data", (chunk) => {
         clearTimeout(rawInputFlushTimer);
         rawInputFlushTimer = null;
       }
-      // Raw bytes, before any decoding: the only way to tell "the terminal
-      // never sent the key" apart from "we decoded it into nothing".
-      if (debugLogging && input[1]) console.error(`tweb: input ${input[1]}`);
+      // Escape sequence의 raw byte. decoding 전 값이라 "terminal이 아예 안 보냈다"와
+      // "받았지만 해석하지 못했다"를 가른다 — tmux가 모르는 sequence의 ESC를
+      // 재인코딩해 ESC[5020~을 ESC[91;3u5020~으로 만든 것도 이 로그로 찾았다.
+      // 평범한 타이핑까지 찍으면 로그가 밀리므로 sequence만 남긴다.
+      if (debugLogging && input[1].startsWith("1b")) {
+        console.error(`tweb: input ${input[1]}`);
+      }
       rawInput = Buffer.concat([rawInput, Buffer.from(input[1], "hex")]);
       consumeRawInput();
     }

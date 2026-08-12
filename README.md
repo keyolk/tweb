@@ -165,7 +165,16 @@ Web passthrough 상태에서도 `Ctrl-;`만 escape hatch로 사용해 Shortcuts 
 
 focus가 cross-origin iframe(광고·embed)에 들어가면 그 frame의 preload는 shortcut을 처리하지 않습니다. TWeb은 shortcut을 처리할 수 있는 frame을 추적해 그런 경우 main frame으로 키를 보내므로, iframe을 클릭한 뒤에도 `?`나 `f`가 계속 동작합니다.
 
-macOS 또는 terminal emulator가 PTY보다 먼저 소비하는 application shortcut은 별도 설정 없이는 웹에 전달할 수 없습니다. `tweb doctor`는 Ghostty의 `Cmd-K` 같은 충돌과 tmux CSI-u/mouse/passthrough 설정을 진단합니다. `tweb doctor --fix`는 기존 파일을 backup하고 사용자 Ghostty/tmux config에는 marker로 구분된 include 한 줄만 설치하며, 실제 TWeb 설정은 `${XDG_CONFIG_HOME:-~/.config}/tweb/ghostty.conf`와 `tmux.conf`에서 관리합니다. 기존 inline doctor block과 식별 가능한 legacy TWeb binding은 자동으로 migration합니다. Ghostty 1.3+에서는 surface-local `tweb` key table이 `Ctrl-;`와 함께 켜져 passthrough mode 동안 `Cmd` 조합을 PTY로 전달하고, mode를 끄면 Ghostty 기본 단축키가 다시 동작합니다. 변경 시 실행 중인 Ghostty에도 reload signal을 보냅니다.
+macOS 또는 terminal emulator가 PTY보다 먼저 소비하는 application shortcut은 별도 설정 없이는 웹에 전달할 수 없습니다. `tweb doctor`는 Ghostty의 `Cmd-K` 같은 충돌과 tmux CSI-u/mouse/passthrough 설정을 진단합니다. `tweb doctor --fix`는 기존 파일을 backup하고 사용자 Ghostty/tmux config에는 marker로 구분된 include 한 줄만 설치하며, 실제 TWeb 설정은 `${XDG_CONFIG_HOME:-~/.config}/tweb/ghostty.conf`와 `tmux.conf`에서 관리합니다. 기존 inline doctor block과 식별 가능한 legacy TWeb binding은 자동으로 migration합니다. 변경 시 실행 중인 Ghostty에도 reload signal을 보냅니다.
+
+`Cmd` 조합은 Ghostty가 **PTY encoding 자체를 만들지 않습니다** — key probe로 확인한 결과 `Cmd-K`/`Cmd-A`는 plain·modifyOtherKeys·Kitty flag 어느 mode에서도 단 한 byte도 보내지 않습니다. 그래서 key table 설정만으로는 전달이 불가능하고, `Ctrl-;`와 같은 방식으로 **사설 sequence에 실어 보냅니다**. doctor의 `CMD_PASSTHROUGH_KEYS`가 단일 정의이며 네 층이 모두 맞아야 키 하나가 도착합니다.
+
+1. `keybind = tweb/super+k=text:\x1b[5020~` — `tweb` key table이 켜져 있을 때만 보내므로, mode를 끄면 Ghostty 기본 `Cmd-K`가 그대로 동작합니다. root에서 `unbind`하면 TWeb pane 밖에서도 단축키가 사라지므로 쓰지 않습니다.
+2. tmux `user-keys[120]`과 root/`tweb-pass` binding — 등록하지 않으면 tmux가 모르는 sequence의 앞 ESC를 재인코딩해 `ESC[5020~`가 `ESC[91;3u5020~`로 깨집니다.
+3. engine의 `CMD_PRIVATE_KEYS` — code를 원래 `Cmd` key event로 되돌립니다.
+4. engine의 private sequence parser — 이 code 대역을 인식해야 합니다.
+
+`Cmd` 조합은 항상 native key event로 전달합니다. 이 단축키를 쓰는 이유가 웹앱 자신의 handler이고, 그 handler들이 바로 `isTrusted`를 확인하는 쪽이기 때문입니다. 새 조합을 추가하려면 `CMD_PASSTHROUGH_KEYS`에 한 줄, engine의 `CMD_PRIVATE_KEYS`에 한 줄을 더하면 되고, 층이 어긋나면 test가 잡습니다.
 
 ### Mode indicator
 
