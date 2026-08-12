@@ -2578,7 +2578,10 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
     contents.sendInputEvent({ ...event, type: "keyUp" });
     return;
   }
-  contents.sendInputEvent({ ...event, type: "rawKeyDown" });
+  // keyDown (not rawKeyDown) so Chromium runs its keyboard-shortcut path — the one a web
+  // app's Cmd handler is listening on. rawKeyDown bypasses that and the page never
+  // sees the key as a shortcut, which is why Cmd-K was arriving but Slack ignored it.
+  contents.sendInputEvent({ ...event, type: "keyDown" });
   if (text && !modifiers.includes("control") && !modifiers.includes("meta")) {
     contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
   }
