@@ -1202,7 +1202,7 @@ function applyShortcutMode() {
 function modeLabel() {
   const v = vimiumShortcutsEnabled;
   const b = cmdBypassEnabled;
-  if (v && !b) return "browser shortcuts ON";
+  if (v && !b) return "bypass OFF";
   if (!v && b) return "web bypass ON";
   if (v && b) return "shortcuts + bypass ON";
   return "web only ON";
@@ -2973,7 +2973,7 @@ app.whenReady().then(() => {
   // has settled.
   scheduleTrackedKeyboardModeRestore();
   notify(
-    `browser shortcuts ON — toggle: Ctrl-; · frame: ${adaptiveFrameRate ? `adaptive 4-${maxActiveFrameRate}` : `${maxActiveFrameRate}`}fps`
+    `bypass OFF — toggle: Ctrl-; · frame: ${adaptiveFrameRate ? `adaptive 4-${maxActiveFrameRate}` : `${maxActiveFrameRate}`}fps`
     + ` · zoom: Ctrl +/-/0 · default: ${Math.round(defaultZoomFactor * 100)}%`
   );
 });

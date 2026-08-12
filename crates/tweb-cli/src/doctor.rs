@@ -109,9 +109,18 @@ set-option -s extended-keys-format csi-u
 const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[("super+k", 5020, 120)];
 
 fn cmd_passthrough_ghostty_bindings() -> String {
+    // root와 tweb table 양쪽에 같은 바인딩을 둔다. root에서는 Ghostty 기본
+    // shortcut(예: super+k=clear_screen)을 대체하고, tweb table 안에서는
+    // catch_all보다 먼저 매칭되어 5020~를 내보낸다. tweb table에 없으면
+    // catch_all에 걸려 원시 인코딩(ESC[93;5u 등)이 나가서 engine이 무시한다.
     CMD_PASSTHROUGH_KEYS
         .iter()
-        .map(|(trigger, code, _)| format!("keybind = {trigger}=text:\\x1b[{code}~\n"))
+        .flat_map(|(trigger, code, _)| {
+            [
+                format!("keybind = {trigger}=text:\\x1b[{code}~\n"),
+                format!("keybind = tweb/{trigger}=text:\\x1b[{code}~\n"),
+            ]
+        })
         .collect()
 }
 
@@ -1053,13 +1062,21 @@ mod tests {
                 "{trigger} would cost terminal copy/paste across all of Ghostty"
             );
         }
-        for line in cmd_passthrough_ghostty_bindings().lines() {
-            // Table-scoped bindings cannot work: a key table is only enterable by
-            // pressing its binding, so a new pane would deliver nothing until the
-            // user pressed Ctrl-; first.
+        // Each Cmd key needs both a root binding (so a fresh pane works before
+        // Ctrl-; enters the table) and a tweb-table binding (so it wins over
+        // catch_all once inside the table, which otherwise emits a raw CSI-u the
+        // engine does not recognise).
+        for (trigger, _, _) in CMD_PASSTHROUGH_KEYS {
+            let root = format!("keybind = {trigger}=");
+            let table = format!("keybind = tweb/{trigger}=");
+            let bindings = cmd_passthrough_ghostty_bindings();
             assert!(
-                !line.starts_with("keybind = tweb/"),
-                "{line} is table-scoped and would not reach a fresh pane"
+                bindings.contains(&root),
+                "{trigger} missing its root binding"
+            );
+            assert!(
+                bindings.contains(&table),
+                "{trigger} missing its tweb-table binding"
             );
         }
         assert!(cmd_passthrough_tmux_config().contains("switch-client -T tweb-pass"));
