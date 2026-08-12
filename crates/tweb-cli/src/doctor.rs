@@ -21,7 +21,7 @@ const LEGACY_TMUX_BEGIN: &str =
 const LEGACY_TMUX_END: &str =
     "bind-key -T tweb-pass WheelDownPane send-keys -M \\; switch-client -T tweb-pass";
 
-const GHOSTTY_MANAGED_CONFIG: &str = r#"# Managed by `tweb doctor --fix`; edit the main Ghostty config instead.
+const GHOSTTY_MANAGED_BASE: &str = r#"# Managed by `tweb doctor --fix`; edit the main Ghostty config instead.
 # Private CSI sequences preserve browser shortcuts through tmux.
 keybind = ctrl+comma=text:\x1b[5009~
 keybind = ctrl+shift+semicolon=text:\x1b[5010~
@@ -31,24 +31,9 @@ keybind = ctrl+minus=text:\x1b[5003~
 keybind = ctrl+zero=text:\x1b[5004~
 keybind = shift+enter=text:\x1b[5008~
 
-# Cmd shortcuts still cannot reach the page, and the reason is in the terminal
-# rather than in this config. Ghostty produces no PTY encoding at all for Cmd
-# combinations: a key probe showed Cmd-K and Cmd-A emitting nothing in plain,
-# modifyOtherKeys=2 and Kitty-flag modes alike. So there is nothing for the
-# tweb table to forward, and every table-level trick fails for its own reason:
-#
-#   * catch_all only matches keys that are not otherwise bound, and inner-table
-#     lookup falls back to the default table, so super+k=clear_screen wins.
-#   * `unbind` removes a binding rather than adding one, so inside a table it is
-#     a no-op that Ghostty drops — tweb/super+k=unbind never even registers.
-#   * `ignore` registers but black-holes the input by definition.
-#   * Unbinding at the root does free the trigger, but Ghostty only passes a
-#     freed key through "if it is printable", which Cmd-K is not — so the key
-#     still never arrives, while Cmd-V/Cmd-C stop working everywhere.
-#
-# Delivering Cmd needs the key carried as an explicit sequence (as Ctrl-; is
-# below), and tmux must be taught that sequence via user-keys, or it re-encodes
-# the leading ESC and mangles it: ESC[5199~ arrived as ESC[91;3u5199~.
+# Cmd combinations are delivered by CMD_PASSTHROUGH_KEYS below, appended to
+# this block: Ghostty emits no PTY encoding of its own for them, so the tweb
+# table carries each one as a private sequence instead.
 
 # Ctrl-; toggles the tweb key table and emits the private 5001 sequence so the
 # engine toggles browser shortcuts reliably regardless of the active keyboard
@@ -71,12 +56,87 @@ keybind = tweb/unconsumed:super+alt+ctrl+catch_all=ignore
 keybind = tweb/unconsumed:super+shift+alt+ctrl+catch_all=ignore
 "#;
 
-const TMUX_MANAGED_CONFIG: &str = r#"# Managed by `tweb doctor --fix`; edit the main tmux config instead.
+const TMUX_MANAGED_BASE: &str = r#"# Managed by `tweb doctor --fix`; edit the main tmux config instead.
 set-option -g allow-passthrough all
 set-option -g mouse on
 set-option -s extended-keys on
 set-option -s extended-keys-format csi-u
 "#;
+
+/// Cmd combinations forwarded to the page, as (Ghostty trigger, private code,
+/// tmux user-keys slot).
+///
+/// Ghostty emits no PTY encoding at all for Cmd — a key probe showed Cmd-K and
+/// Cmd-A producing zero bytes in plain, modifyOtherKeys=2 and Kitty-flag modes
+/// alike — so the key has to be carried as an explicit private sequence, the
+/// way Ctrl-; already is. Three things must line up for one to arrive:
+///
+///   1. a `tweb/<trigger>=text:` binding, so the sequence is only emitted while
+///      the tweb key table is active and Ghostty's own shortcut is untouched
+///      everywhere else;
+///   2. a tmux `user-keys` entry, or tmux re-encodes the leading ESC of a
+///      sequence it does not recognise (ESC[5199~ arrived as ESC[91;3u5199~);
+///   3. a matching entry in the engine's CMD_PRIVATE_KEYS, which turns the code
+///      back into a real Cmd key event.
+///
+/// Codes start at 5020 and slots at 120 to stay clear of the existing 5001-5010
+/// shortcuts and the tmux-chrome bridge on slots 100/101.
+const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[("super+k", 5020, 120)];
+
+fn cmd_passthrough_ghostty_bindings() -> String {
+    CMD_PASSTHROUGH_KEYS
+        .iter()
+        .map(|(trigger, code, _)| format!("keybind = tweb/{trigger}=text:\\x1b[{code}~\n"))
+        .collect()
+}
+
+fn cmd_passthrough_tmux_config() -> String {
+    let mut config = String::new();
+    for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
+        config.push_str(&format!(
+            "set-option -s user-keys[{slot}] \"\\033[{code}~\"\n"
+        ));
+    }
+    for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
+        let hex = private_sequence_hex(*code);
+        // Both tables: root covers Shortcuts mode, tweb-pass covers passthrough
+        // and must re-arm itself the way its other bindings do.
+        config.push_str(&format!("bind-key -T root User{slot} send-keys -H {hex}\n"));
+        config.push_str(&format!(
+            "bind-key -T tweb-pass User{slot} send-keys -H {hex} \\; switch-client -T tweb-pass\n"
+        ));
+    }
+    config
+}
+
+fn run_tmux(args: &[&str]) -> bool {
+    Command::new("tmux")
+        .args(args)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn ghostty_managed_config() -> String {
+    format!(
+        "{GHOSTTY_MANAGED_BASE}\n# Cmd combinations Ghostty never encodes on its own.\n{}",
+        cmd_passthrough_ghostty_bindings()
+    )
+}
+
+fn tmux_managed_config() -> String {
+    format!(
+        "{TMUX_MANAGED_BASE}\n# Teach tmux the private sequences the tweb key table emits.\n{}",
+        cmd_passthrough_tmux_config()
+    )
+}
+
+/// `ESC [ <code> ~` as the space-separated hex bytes `send-keys -H` expects.
+fn private_sequence_hex(code: u16) -> String {
+    let mut bytes = vec!["1b".to_string(), "5b".to_string()];
+    bytes.extend(code.to_string().bytes().map(|digit| format!("{digit:02x}")));
+    bytes.push("7e".to_string());
+    bytes.join(" ")
+}
 
 /// 진단 항목 결과.
 struct Check {
@@ -352,7 +412,7 @@ fn check_ghostty_cmd_passthrough() -> Check {
     let managed = fs::read_to_string(&managed_path).unwrap_or_default();
     let installed = managed_block(&content, GHOSTTY_BEGIN, GHOSTTY_END)
         .is_some_and(|block| block.trim() == expected.trim())
-        && managed == GHOSTTY_MANAGED_CONFIG
+        && managed == ghostty_managed_config()
         && !content.lines().any(is_legacy_ghostty_binding);
     let conflict = command_output("ghostty", &["+show-config"])
         .is_some_and(|config| config.contains("keybind = super+k=clear_screen"));
@@ -389,7 +449,7 @@ fn apply_tmux_fix() -> Result<String> {
     let managed_path = managed_config_dir().join("tmux.conf");
     let include = tmux_include_block(&managed_path);
     let managed_original = fs::read(&managed_path).ok();
-    let managed_changed = write_managed_config(&managed_path, TMUX_MANAGED_CONFIG, None)?;
+    let managed_changed = write_managed_config(&managed_path, &tmux_managed_config(), None)?;
     let main_changed = match install_managed_block(
         &path,
         TMUX_BEGIN,
@@ -418,6 +478,27 @@ fn apply_tmux_fix() -> Result<String> {
             .args(args)
             .status()
             .is_ok_and(|status| status.success());
+    }
+    // The config file only takes effect on a fresh server, and the Cmd keys are
+    // useless until tmux knows them, so apply them to the running one as well.
+    for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
+        let sequence = format!("\\033[{code}~");
+        live &= run_tmux(&["set-option", "-s", &format!("user-keys[{slot}]"), &sequence]);
+        let hex = private_sequence_hex(*code);
+        let mut root = vec!["bind-key", "-T", "root"];
+        let user_key = format!("User{slot}");
+        root.push(&user_key);
+        root.extend(["send-keys", "-H"]);
+        let bytes: Vec<&str> = hex.split(' ').collect();
+        root.extend(bytes.iter().copied());
+        live &= run_tmux(&root);
+
+        let mut pass = vec!["bind-key", "-T", "tweb-pass", &user_key, "send-keys", "-H"];
+        pass.extend(bytes.iter().copied());
+        // Escaped so tmux treats it as a command separator rather than an
+        // argument to send-keys.
+        pass.extend(["\\;", "switch-client", "-T", "tweb-pass"]);
+        live &= run_tmux(&pass);
     }
 
     Ok(format!(
@@ -448,7 +529,7 @@ fn apply_ghostty_fix() -> Result<String> {
     let managed_original = fs::read(&managed_path).ok();
     let managed_changed = write_managed_config(
         &managed_path,
-        GHOSTTY_MANAGED_CONFIG,
+        &ghostty_managed_config(),
         Some(validate_ghostty_config),
     )?;
     let main_changed = match install_managed_block(
@@ -812,14 +893,61 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ghostty_include_block, ghostty_version_supported, managed_block,
-        migrate_legacy_ghostty_config, migrate_legacy_tmux_config, select_ghostty_config_candidate,
-        tmux_include_block, upsert_managed_block, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN,
+        cmd_passthrough_ghostty_bindings, cmd_passthrough_tmux_config, ghostty_include_block,
+        ghostty_managed_config, ghostty_version_supported, managed_block,
+        migrate_legacy_ghostty_config, migrate_legacy_tmux_config, private_sequence_hex,
+        select_ghostty_config_candidate, tmux_include_block, tmux_managed_config,
+        upsert_managed_block, CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN,
         LEGACY_TMUX_END, TMUX_BEGIN, TMUX_END,
     };
 
     fn ghostty_include() -> String {
         ghostty_include_block(Path::new("/home/user/.config/tweb/ghostty.conf"))
+    }
+
+    #[test]
+    fn private_sequence_hex_matches_the_escape_bytes() {
+        assert_eq!(private_sequence_hex(5020), "1b 5b 35 30 32 30 7e");
+    }
+
+    #[test]
+    fn every_cmd_key_is_configured_on_all_three_layers() {
+        // A Cmd key only arrives when Ghostty emits it, tmux recognises it, and
+        // the engine maps it back — so a missing layer is a silent no-op.
+        let ghostty = ghostty_managed_config();
+        let tmux = tmux_managed_config();
+        let engine = include_str!("../../../electron/main.cjs");
+        for (trigger, code, slot) in CMD_PASSTHROUGH_KEYS {
+            assert!(
+                ghostty.contains(&format!("keybind = tweb/{trigger}=text:\\x1b[{code}~")),
+                "{trigger} missing its Ghostty binding"
+            );
+            assert!(
+                tmux.contains(&format!("user-keys[{slot}] \"\\033[{code}~\"")),
+                "{trigger} missing its tmux user-key"
+            );
+            assert!(
+                tmux.contains(&format!("bind-key -T tweb-pass User{slot}")),
+                "{trigger} missing its passthrough binding"
+            );
+            assert!(
+                engine.contains(&format!("[{code}, ")),
+                "{trigger} missing from the engine CMD_PRIVATE_KEYS table"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_bindings_stay_inside_the_tweb_table() {
+        // A root-level Cmd binding would take the shortcut away from Ghostty
+        // everywhere, which is how Cmd-V once stopped pasting.
+        for line in cmd_passthrough_ghostty_bindings().lines() {
+            assert!(
+                line.starts_with("keybind = tweb/"),
+                "{line} escapes the table"
+            );
+        }
+        assert!(cmd_passthrough_tmux_config().contains("switch-client -T tweb-pass"));
     }
 
     #[test]

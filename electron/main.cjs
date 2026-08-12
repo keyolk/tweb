@@ -2587,7 +2587,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // through the renderer arrives untrusted, and sites gate their shortcuts on
   // that. Escape still reaches TWeb: the preload's capture listener sees the
   // native key first and leaves insert mode.
-  if (!browserShortcutsEnabled || pageInsertMode) {
+  // Cmd combinations always go native: they exist only because the user wants
+  // the web app's own shortcut, and those are exactly the handlers that check
+  // isTrusted.
+  if (!browserShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
     dispatchNativeKey(win.webContents, key, text, modifiers, eventKind);
     return;
   }
@@ -2655,6 +2658,15 @@ function dispatchText(buffer) {
   }
 }
 
+// Cmd 조합은 Ghostty가 PTY encoding을 만들지 않는다 (plain/modifyOtherKeys/Kitty
+// 모두 아무 byte도 보내지 않는 것을 key probe로 확인). 그래서 tweb key table이
+// 사설 sequence로 실어 보내고 여기서 원래 키로 되돌린다. 5020부터가 Cmd 영역이며
+// tmux user-keys[120+]에 등록돼 있어야 ESC가 재인코딩되지 않는다.
+// doctor의 CMD_PASSTHROUGH_KEYS와 code가 일치해야 한다.
+const CMD_PRIVATE_KEYS = new Map([
+  [5020, "k"],
+]);
+
 function dispatchPrivateShortcut(code) {
   if (debugLogging) console.error(`tweb: private key ${code}`);
   if (code === 5001) {
@@ -2663,6 +2675,13 @@ function dispatchPrivateShortcut(code) {
   }
   if (code === 5011 || code === 5012) {
     setBrowserShortcutsEnabled(code === 5012);
+    return;
+  }
+  const cmdKey = CMD_PRIVATE_KEYS.get(code);
+  if (cmdKey) {
+    // 1 + meta(8). browserShortcutsEnabled와 무관하게 페이지로 보낸다 — 사용자가
+    // 누른 것은 어느 mode에서나 그 웹앱의 Cmd 단축키다.
+    dispatchNamedKey(cmdKey, 9);
     return;
   }
   if (browserShortcutsEnabled) {
