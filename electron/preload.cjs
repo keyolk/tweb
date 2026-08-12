@@ -406,12 +406,15 @@ const { ipcRenderer } = require("electron");
   function modeIndicator() {
     if (vimiumEnabled && !bypassEnabled) return "shortcuts";
     if (!vimiumEnabled && bypassEnabled) return "bypass";
-    if (vimiumEnabled && bypassEnabled) return "shortcuts+bypass";
+    if (vimiumEnabled && bypassEnabled) return "shortcuts and bypass";
     return "web-only";
   }
 
   function normalMode() {
-    if (!vimiumEnabled) setMode("passthrough");
+    // bypass가 켜져 있으면 vimium 여부와 무관하게 bypass 상태로 표시.
+    // 사용자가 "지금 Cmd가 페이지로 가는 상태인지"를 indicator로 보게 하려는 것.
+    if (bypassEnabled) setMode("bypass");
+    else if (!vimiumEnabled) setMode("passthrough");
     else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
     else if (panSurface()) setMode("normal", "↔ pan · Esc");

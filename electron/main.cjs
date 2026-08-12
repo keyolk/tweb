@@ -1204,7 +1204,7 @@ function modeLabel() {
   const b = cmdBypassEnabled;
   if (v && !b) return "bypass OFF";
   if (!v && b) return "web bypass ON";
-  if (v && b) return "shortcuts + bypass ON";
+  if (v && b) return "shortcuts and bypass ON";
   return "web only ON";
 }
 
