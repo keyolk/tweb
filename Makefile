@@ -63,11 +63,6 @@ install: release ## tweb을 PREFIX에 설치 (기본 ~/.local)
 	install -m 0755 target/release/tweb "$(DESTDIR)$(PREFIX)/bin/tweb"
 	@test ! -f target/release/tweb-tauri \
 		|| install -m 0755 target/release/tweb-tauri "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
-	@# Copying over an existing binary invalidates its macOS signature, and the
-	@# kernel then SIGKILLs it on exec — the failure looks like a silent no-op.
-	@test "$$(uname)" != Darwin || codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb"
-	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
-		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb"
 
 uninstall: ## install이 놓은 파일 제거 (cache는 그대로 둔다)
