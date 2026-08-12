@@ -11,7 +11,11 @@ const { ipcRenderer } = require("electron");
     }
   }
   const shortcutFrame = topFrame || sameOriginFrame;
-  let shortcutsEnabled = true;
+  // engine의 두 flag와 대응: vimium normal-mode 키와 Cmd bypass.
+  let vimiumEnabled = true;
+  let bypassEnabled = false;
+  // 기존 shortcutsEnabled는 vimiumEnabled로 통합 — bypass는 preload 게이트에
+  // 직접 관여하지 않으므로 (Cmd는 engine이 native로 전달), vimium만 본다.
   let insertMode = false;
   let mediaHoverTimer = null;
   let mediaHoverNudge = 0;
@@ -398,8 +402,16 @@ const { ipcRenderer } = require("electron");
     renderIndicator();
   }
 
+  // dataset.twebInputMode에 들어갈 값. 두 flag 조합으로 mode를 표시한다.
+  function modeIndicator() {
+    if (vimiumEnabled && !bypassEnabled) return "shortcuts";
+    if (!vimiumEnabled && bypassEnabled) return "bypass";
+    if (vimiumEnabled && bypassEnabled) return "shortcuts+bypass";
+    return "web-only";
+  }
+
   function normalMode() {
-    if (!shortcutsEnabled) setMode("passthrough");
+    if (!vimiumEnabled) setMode("passthrough");
     else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
     else if (panSurface()) setMode("normal", "↔ pan · Esc");
@@ -1616,7 +1628,8 @@ const { ipcRenderer } = require("electron");
         return {
           mode: document.documentElement?.dataset.twebMode || null,
           detail: document.documentElement?.dataset.twebModeDetail || "",
-          shortcutsEnabled,
+          vimiumEnabled,
+          bypassEnabled,
           insertMode,
           picker: pickerState ? { mode: pickerState.mode, items: pickerState.items.length, typed: pickerState.typed } : null,
           visual: visualState ? { kind: visualState.kind, caret: Boolean(visualState.caret) } : null,
@@ -2684,7 +2697,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function handleNormalKey(event) {
-    if (!shortcutsEnabled || !shortcutFrame) return;
+    if (!vimiumEnabled || !shortcutFrame) return;
     const key = physicalKey(event);
 
     // The Escape we asked the main process to deliver belongs to the page. Let
@@ -2821,14 +2834,19 @@ const { ipcRenderer } = require("electron");
     }
   }
 
-  ipcRenderer.on("tweb-shortcuts-enabled", (_event, enabled) => {
-    shortcutsEnabled = Boolean(enabled);
+  ipcRenderer.on("tweb-shortcuts-mode", (_event, mode) => {
+    const next = mode || {};
+    vimiumEnabled = Boolean(next.vimium);
+    bypassEnabled = Boolean(next.bypass);
     const root = document.documentElement;
-    if (root) root.dataset.twebInputMode = shortcutsEnabled ? "shortcuts" : "passthrough";
+    if (root) {
+      root.dataset.twebInputMode = modeIndicator();
+      root.dataset.twebBypass = bypassEnabled ? "on" : "off";
+    }
     // The global toggle supersedes the page-local one; leaving both on would
     // make Escape mean two different things.
     insertMode = false;
-    if (!shortcutsEnabled) cancelTransient(false);
+    if (!vimiumEnabled) cancelTransient(false);
     normalMode();
   });
 
@@ -2897,7 +2915,7 @@ const { ipcRenderer } = require("electron");
   });
 
   ipcRenderer.on("tweb-terminal-text", (_event, text) => {
-    if (!shortcutsEnabled || insertMode || !shortcutFrame || typeof text !== "string" || [...text].length !== 1) return;
+    if (!vimiumEnabled || insertMode || !shortcutFrame || typeof text !== "string" || [...text].length !== 1) return;
     const mapped = commandKey(text);
     if (!mapped || eventIsEditable({ composedPath: () => [] })) return;
     // Only the frame that owns focus handles terminal text. The main frame
@@ -2923,7 +2941,7 @@ const { ipcRenderer } = require("electron");
     const editable = isEditable(active);
     // Insert mode must not rewrite Korean keys to their Latin command letters —
     // the page is receiving them as text, not as TWeb commands.
-    const mapped = shortcutsEnabled && shortcutFrame && !editable && !insertMode
+    const mapped = vimiumEnabled && shortcutFrame && !editable && !insertMode
       ? commandKey(payload.key, Boolean(payload.shiftKey))
       : payload.key;
     let prevented = false;
@@ -2962,7 +2980,7 @@ const { ipcRenderer } = require("electron");
 
   addEventListener("keydown", handleNormalKey, true);
   addEventListener("focusin", (event) => {
-    if (shortcutsEnabled && isEditable(event.target) && !searchState && !promptHost) setMode("insert");
+    if (vimiumEnabled && isEditable(event.target) && !searchState && !promptHost) setMode("insert");
     reportCaret();
   }, true);
   addEventListener("focusout", () => queueMicrotask(() => {
@@ -2986,7 +3004,7 @@ const { ipcRenderer } = require("electron");
   });
 
   const initializeDocument = () => {
-    document.documentElement.dataset.twebInputMode = shortcutsEnabled ? "shortcuts" : "passthrough";
+    document.documentElement.dataset.twebInputMode = modeIndicator();
     if (shortcutFrame) {
       ensureIndicator();
       normalMode();

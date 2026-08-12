@@ -51,7 +51,16 @@ const tabs = [];
 const closedTabs = [];
 let activeTabIndex = -1;
 let quitting = false;
-let browserShortcutsEnabled = true;
+// 독립 토글: bypass(P)와 vimium은 각각 켜고 끈다.
+//   Ctrl-;  → bypass 토글 (Cmd-K/A/...를 페이지로 보낼지)
+//   Ctrl-:  → vimium 토글 (f/j/k/... normal-mode 키)
+// 조합이 mode indicator를 만든다:
+//   vimium on  + bypass off = N (normal)
+//   vimium off + bypass on  = P (passthrough)
+//   vimium on  + bypass on  = N-vim (둘 다)
+//   vimium off + bypass off = D (순수 웹)
+let vimiumShortcutsEnabled = true;
+let cmdBypassEnabled = false;
 let terminalVisible = true;
 let visibilityCheckRunning = false;
 let visibleClientTtys = new Set();
@@ -290,6 +299,8 @@ function configureTmuxRootBindings() {
   privateKey("User115", "5004");
   privateKey("User116", "5007");
   privateKey("C-\\;", "5011");
+  // Ctrl-: → 5014 (vimium toggle). Slot 117.
+  privateKey("User117", "5014");
   ensureTmuxRootBinding(
     "User112",
     ["detach-client"],
@@ -311,6 +322,7 @@ function ensureTmuxPassthroughTable() {
     ["set-option", "-s", "user-keys[110]", "\x1b[5001~"],
     ["set-option", "-s", "user-keys[111]", "\x1b[5009~"],
     ["set-option", "-s", "user-keys[112]", "\x1b[5010~"],
+    ["set-option", "-s", "user-keys[117]", "\x1b[5014~"],
     [
       "bind-key", "-T", passthroughTable, "User110",
       "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
@@ -335,6 +347,7 @@ function ensureTmuxPassthroughTable() {
     ["User100", "35", "30", "30", "35"],
     ["User101", "35", "30", "30", "36"],
     ["User111", "35", "30", "30", "39"],
+    ["User117", "35", "30", "31", "34"],
   ]) {
     commands.push([
       "bind-key", "-T", passthroughTable, key,
@@ -391,13 +404,18 @@ function switchTmuxClientTable(tty, table) {
   }
 }
 
+// passthrough table은 vimium이 꺼졌을 때만 켠다. bypass(Cmd)는 engine이
+// mode 무관으로 native 전달하므로 tmux table과 무관하고, vimium이 켜져 있으면
+// normal-mode 키가 먹어야 하므로 table을 끈다. 이래야 "bypass on + vimium on"
+// 조합에서 vimium도 Cmd도 둘 다 동작한다.
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
   if (!process.env.TMUX_PANE) return;
   const paneId = process.env.TMUX_PANE;
+  const passthroughArmed = !vimiumShortcutsEnabled;
 
   for (const [tty, originalTable] of [...passthroughClientTables]) {
     const state = states.get(tty);
-    if (browserShortcutsEnabled || !state || state.paneId !== paneId) {
+    if (!passthroughArmed || !state || state.paneId !== paneId) {
       if (state) switchTmuxClientTable(tty, originalTable);
       passthroughClientTables.delete(tty);
       if (debugLogging) {
@@ -406,7 +424,7 @@ function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
     }
   }
 
-  if (browserShortcutsEnabled) return;
+  if (!passthroughArmed) return;
   for (const [tty, state] of states) {
     if (state.paneId !== paneId || passthroughClientTables.has(tty)) continue;
     const originalTable = state.keyTable === passthroughTable ? "root" : state.keyTable;
@@ -1152,30 +1170,56 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
   }
 }
 
+// preload는 두 flag를 따로 받아 mode indicator와 각 게이트를 독립적으로 처리한다.
 function broadcastShortcutMode() {
   for (const tab of tabs) {
-    sendToTabFrames(tab, "tweb-shortcuts-enabled", browserShortcutsEnabled);
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   }
 }
 
-function setBrowserShortcutsEnabled(enabled) {
-  browserShortcutsEnabled = enabled;
-  // The preload drops insert mode on this signal; keep the mirror in step.
+// 두 flag를 올바른 조합으로 설정하고 후속 처리를 한 번에 돌린다.
+function applyShortcutMode() {
   pageInsertMode = false;
   broadcastShortcutMode();
-  if (!browserShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
-  // Reconcile even when the mode was already correct: Ghostty config reloads and
-  // pane restarts can reset one side of the terminal/engine state independently.
+  // passthrough이 arm되면(vimium off) 페이지가 키 입력을 받을 수 있도록 focus.
+  if (!vimiumShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
+  // Ghostty config reload나 pane restart가 한쪽 상태만 초기화할 수 있으므로
+  // 값이 이미 맞아도 reconcile은 항상 돌린다.
   reconcileTmuxPassthrough();
   updatePaneTitle();
   if (debugLogging) {
-    console.error(`tweb: input mode ${browserShortcutsEnabled ? "shortcuts" : "passthrough"}`);
+    console.error(`tweb: mode vimium=${vimiumShortcutsEnabled} bypass=${cmdBypassEnabled}`);
   }
-  notify(browserShortcutsEnabled ? "browser shortcuts ON" : "web passthrough ON");
+  const label = modeLabel();
+  notify(label);
+}
+
+function modeLabel() {
+  const v = vimiumShortcutsEnabled;
+  const b = cmdBypassEnabled;
+  if (v && !b) return "browser shortcuts ON";
+  if (!v && b) return "web bypass ON";
+  if (v && b) return "shortcuts + bypass ON";
+  return "web only ON";
+}
+
+function setCmdBypassEnabled(enabled) {
+  cmdBypassEnabled = enabled;
+  applyShortcutMode();
+}
+
+function setVimiumShortcutsEnabled(enabled) {
+  vimiumShortcutsEnabled = enabled;
+  applyShortcutMode();
+}
+
+// 5001(Ctrl-;)과 legacy 강제 시퀀스는 bypass만 토글/설정한다.
+function setBrowserShortcutsEnabled(enabled) {
+  setCmdBypassEnabled(enabled);
 }
 
 function toggleBrowserShortcuts() {
-  setBrowserShortcutsEnabled(!browserShortcutsEnabled);
+  setCmdBypassEnabled(!cmdBypassEnabled);
 }
 
 function activateTab(index) {
@@ -1377,7 +1421,7 @@ function sendTabState(tab = win) {
 }
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  if (!browserShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
+  if (!vimiumShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
   switch (action) {
@@ -1546,7 +1590,7 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
   if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
-  event.reply("tweb-shortcuts-enabled", browserShortcutsEnabled);
+  event.reply("tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   if (tab === win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
@@ -1652,7 +1696,8 @@ function agentDiagnostics() {
       imageId,
     },
     input: {
-      shortcutsEnabled: browserShortcutsEnabled,
+      vimiumShortcuts: vimiumShortcutsEnabled,
+      cmdBypass: cmdBypassEnabled,
       pageInsertMode,
       terminalVisible,
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
@@ -2103,7 +2148,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     readyFrameKeys(tab).delete(frameKey(details.frame));
   });
   contents.on("context-menu", (_event, params) => {
-    if (browserShortcutsEnabled) showBrowserContextMenu(tab, params);
+    if (vimiumShortcutsEnabled) showBrowserContextMenu(tab, params);
   });
   contents.on("media-started-playing", () => {
     if (debugLogging) {
@@ -2149,7 +2194,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
       if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
     }
     installPageEnhancements(tab);
-    sendToTabFrames(tab, "tweb-shortcuts-enabled", browserShortcutsEnabled);
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
     if (debugLogging) {
       console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
     }
@@ -2425,7 +2470,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
 
   if (wheel) {
     const direction = buttonCode === 0 ? 1 : buttonCode === 1 ? -1 : 0;
-    if (browserShortcutsEnabled && direction !== 0 && hasZoomModifier(modifiers)) {
+    if (vimiumShortcutsEnabled && direction !== 0 && hasZoomModifier(modifiers)) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
@@ -2561,12 +2606,12 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
 
   // Browser shortcut mode에서만 Ctrl-C를 pane 종료로 사용한다. Web passthrough
   // mode에서는 페이지의 KeyboardEvent로 그대로 전달한다.
-  if (browserShortcutsEnabled && key.toLowerCase() === "c" && control) {
+  if (vimiumShortcutsEnabled && key.toLowerCase() === "c" && control) {
     if (pressed) app.quit();
     return;
   }
 
-  if (browserShortcutsEnabled) {
+  if (vimiumShortcutsEnabled) {
     const tabCycle = control && (key === "Tab" || key === "PageDown" || key === "PageUp");
     const tabClose = control && key.toLowerCase() === "w";
     const zoom = hasZoomModifier(modifiers) && ["+", "=", "-", "0"].includes(key);
@@ -2598,7 +2643,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // Cmd combinations always go native: they exist only because the user wants
   // the web app's own shortcut, and those are exactly the handlers that check
   // isTrusted.
-  if (!browserShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
+  if (!vimiumShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
     dispatchNativeKey(win.webContents, key, text, modifiers, eventKind);
     return;
   }
@@ -2677,22 +2722,29 @@ const CMD_PRIVATE_KEYS = new Map([
 
 function dispatchPrivateShortcut(code) {
   if (debugLogging) console.error(`tweb: private key ${code}`);
+  // Ctrl-; — bypass 토글. vimium은 건드리지 않는다.
   if (code === 5001) {
     toggleBrowserShortcuts();
     return;
   }
+  // Ctrl-: — vimium 토글. bypass는 건드리지 않는다.
+  if (code === 5014) {
+    setVimiumShortcutsEnabled(!vimiumShortcutsEnabled);
+    return;
+  }
+  // 기존 강제 ON/OFF 시퀀스 — 새 flag 구조에서는 bypass를 강제한다.
   if (code === 5011 || code === 5012) {
-    setBrowserShortcutsEnabled(code === 5012);
+    setCmdBypassEnabled(code === 5012);
     return;
   }
   const cmdKey = CMD_PRIVATE_KEYS.get(code);
   if (cmdKey) {
-    // 1 + meta(8). browserShortcutsEnabled와 무관하게 페이지로 보낸다 — 사용자가
+    // 1 + meta(8). cmdBypassEnabled와 무관하게 페이지로 보낸다 — 사용자가
     // 누른 것은 어느 mode에서나 그 웹앱의 Cmd 단축키다.
     dispatchNamedKey(cmdKey, 9);
     return;
   }
-  if (browserShortcutsEnabled) {
+  if (vimiumShortcutsEnabled) {
     if (code === 5002 || code === 5007) setBrowserZoom("in");
     else if (code === 5003) setBrowserZoom("out");
     else if (code === 5004) setBrowserZoom("reset");
@@ -2750,8 +2802,8 @@ function consumeRawInput() {
       continue;
     }
 
-    // 5001-5012는 기존 shortcut, 5020부터는 Cmd 조합 (CMD_PRIVATE_KEYS).
-    let match = /^\x1b\[(50(?:0[1-9]|1[0-2]|[2-9][0-9]))~/.exec(input);
+    // 5001-5012는 기존 shortcut, 5013-5019는 mode 토글(5014=Ctrl-:), 5020부터는 Cmd 조합.
+    let match = /^\x1b\[(50(?:0[1-9]|1[0-9]|[2-9][0-9]))~/.exec(input);
     if (match) {
       dispatchPrivateShortcut(Number(match[1]));
       rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
