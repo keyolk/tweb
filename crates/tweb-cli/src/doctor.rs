@@ -31,85 +31,96 @@ keybind = ctrl+minus=text:\x1b[5003~
 keybind = ctrl+zero=text:\x1b[5004~
 keybind = shift+enter=text:\x1b[5008~
 
-# Default Cmd shortcuts (super+k=clear_screen, super+t=new_tab, ...) win over
-# the catch-all below: Ghostty's catch_all only matches keys that are *not
-# otherwise bound*, and inner-table lookup falls back to the default table, so
-# Cmd-K never reached the page. `unbind` cannot fix this either — it removes a
-# binding rather than adding one, so inside a table it is a no-op and does not
-# register at all. Bind each key explicitly inside the tweb table instead:
-# `ignore` claims the trigger so the default action never runs, and
-# `unconsumed:` still sends the key's terminal encoding down the PTY. Outside
-# the tweb table (Shortcuts mode) the defaults come back untouched.
-keybind = tweb/unconsumed:super+a=ignore
-keybind = tweb/unconsumed:super+b=ignore
-keybind = tweb/unconsumed:super+c=ignore
-keybind = tweb/unconsumed:super+d=ignore
-keybind = tweb/unconsumed:super+e=ignore
-keybind = tweb/unconsumed:super+f=ignore
-keybind = tweb/unconsumed:super+g=ignore
-keybind = tweb/unconsumed:super+h=ignore
-keybind = tweb/unconsumed:super+i=ignore
-keybind = tweb/unconsumed:super+j=ignore
-keybind = tweb/unconsumed:super+k=ignore
-keybind = tweb/unconsumed:super+l=ignore
-keybind = tweb/unconsumed:super+m=ignore
-keybind = tweb/unconsumed:super+n=ignore
-keybind = tweb/unconsumed:super+o=ignore
-keybind = tweb/unconsumed:super+p=ignore
-keybind = tweb/unconsumed:super+q=ignore
-keybind = tweb/unconsumed:super+r=ignore
-keybind = tweb/unconsumed:super+s=ignore
-keybind = tweb/unconsumed:super+t=ignore
-keybind = tweb/unconsumed:super+u=ignore
-keybind = tweb/unconsumed:super+v=ignore
-keybind = tweb/unconsumed:super+w=ignore
-keybind = tweb/unconsumed:super+x=ignore
-keybind = tweb/unconsumed:super+y=ignore
-keybind = tweb/unconsumed:super+z=ignore
-keybind = tweb/unconsumed:super+1=ignore
-keybind = tweb/unconsumed:super+2=ignore
-keybind = tweb/unconsumed:super+3=ignore
-keybind = tweb/unconsumed:super+4=ignore
-keybind = tweb/unconsumed:super+5=ignore
-keybind = tweb/unconsumed:super+6=ignore
-keybind = tweb/unconsumed:super+7=ignore
-keybind = tweb/unconsumed:super+8=ignore
-keybind = tweb/unconsumed:super+9=ignore
-keybind = tweb/unconsumed:super+0=ignore
-keybind = tweb/unconsumed:super+enter=ignore
-keybind = tweb/unconsumed:super+backspace=ignore
-keybind = tweb/unconsumed:super+comma=ignore
-keybind = tweb/unconsumed:super+period=ignore
-keybind = tweb/unconsumed:super+slash=ignore
-keybind = tweb/unconsumed:super+left_bracket=ignore
-keybind = tweb/unconsumed:super+right_bracket=ignore
-keybind = tweb/unconsumed:super+equal=ignore
-keybind = tweb/unconsumed:super+minus=ignore
-keybind = tweb/unconsumed:super+home=ignore
-keybind = tweb/unconsumed:super+end=ignore
-keybind = tweb/unconsumed:super+page_up=ignore
-keybind = tweb/unconsumed:super+page_down=ignore
-keybind = tweb/unconsumed:super+arrow_up=ignore
-keybind = tweb/unconsumed:super+arrow_down=ignore
-keybind = tweb/unconsumed:super+arrow_left=ignore
-keybind = tweb/unconsumed:super+arrow_right=ignore
-keybind = tweb/unconsumed:super+shift+a=ignore
-keybind = tweb/unconsumed:super+shift+c=ignore
-keybind = tweb/unconsumed:super+shift+d=ignore
-keybind = tweb/unconsumed:super+shift+e=ignore
-keybind = tweb/unconsumed:super+shift+f=ignore
-keybind = tweb/unconsumed:super+shift+g=ignore
-keybind = tweb/unconsumed:super+shift+k=ignore
-keybind = tweb/unconsumed:super+shift+n=ignore
-keybind = tweb/unconsumed:super+shift+p=ignore
-keybind = tweb/unconsumed:super+shift+t=ignore
-keybind = tweb/unconsumed:super+shift+v=ignore
-keybind = tweb/unconsumed:super+shift+w=ignore
-keybind = tweb/unconsumed:super+shift+z=ignore
-keybind = tweb/unconsumed:super+shift+enter=ignore
-keybind = tweb/unconsumed:super+shift+comma=ignore
-keybind = tweb/unconsumed:super+shift+left_bracket=ignore
-keybind = tweb/unconsumed:super+shift+right_bracket=ignore
+# Ghostty's default Cmd shortcuts (super+k=clear_screen, super+t=new_tab, ...)
+# consume the key before it can reach the page. Neither an inner-table
+# catch_all nor an inner-table unbind can take them back:
+#
+#   * catch_all only matches keys that are *not otherwise bound*, and
+#     inner-table lookup falls back to the default table, so super+k=clear_screen
+#     keeps winning.
+#   * `unbind` removes a binding rather than adding one, so inside a table it is
+#     a no-op that Ghostty drops entirely — tweb/super+k=unbind never registers.
+#   * `ignore` does register, but it black-holes the input by definition, so the
+#     key stops at Ghostty even with the `unconsumed:` prefix.
+#
+# Only a root-level `unbind` frees the trigger, after which the key falls
+# through to the terminal encoding (and, inside the tweb table, to the
+# catch-all below). The cost is that these stop being Ghostty shortcuts
+# everywhere, not just in TWeb panes — Cmd-K no longer clears the terminal.
+# Cmd-Q is deliberately left bound so quitting Ghostty still works.
+keybind = super+a=unbind
+keybind = super+c=unbind
+keybind = super+d=unbind
+keybind = super+e=unbind
+keybind = super+f=unbind
+keybind = super+g=unbind
+keybind = super+j=unbind
+keybind = super+k=unbind
+keybind = super+n=unbind
+keybind = super+t=unbind
+keybind = super+v=unbind
+keybind = super+w=unbind
+keybind = super+z=unbind
+keybind = super+0=unbind
+keybind = super+1=unbind
+keybind = super+2=unbind
+keybind = super+3=unbind
+keybind = super+4=unbind
+keybind = super+5=unbind
+keybind = super+6=unbind
+keybind = super+7=unbind
+keybind = super+8=unbind
+keybind = super+9=unbind
+keybind = super+digit_1=unbind
+keybind = super+digit_2=unbind
+keybind = super+digit_3=unbind
+keybind = super+digit_4=unbind
+keybind = super+digit_5=unbind
+keybind = super+digit_6=unbind
+keybind = super+digit_7=unbind
+keybind = super+digit_8=unbind
+keybind = super+comma=unbind
+keybind = super+left_bracket=unbind
+keybind = super+right_bracket=unbind
+keybind = super+backspace=unbind
+keybind = super+enter=unbind
+keybind = super+home=unbind
+keybind = super+end=unbind
+keybind = super+page_up=unbind
+keybind = super+page_down=unbind
+keybind = super+arrow_up=unbind
+keybind = super+arrow_down=unbind
+keybind = super+arrow_left=unbind
+keybind = super+arrow_right=unbind
+keybind = super+shift+comma=unbind
+keybind = super+shift+left_bracket=unbind
+keybind = super+shift+right_bracket=unbind
+keybind = super+shift+d=unbind
+keybind = super+shift+enter=unbind
+keybind = super+shift+f=unbind
+keybind = super+shift+g=unbind
+keybind = super+shift+j=unbind
+keybind = super+shift+p=unbind
+keybind = super+shift+t=unbind
+keybind = super+shift+v=unbind
+keybind = super+shift+w=unbind
+keybind = super+shift+z=unbind
+keybind = super+shift+arrow_up=unbind
+keybind = super+shift+arrow_down=unbind
+keybind = super+alt+i=unbind
+keybind = super+alt+w=unbind
+keybind = super+alt+arrow_up=unbind
+keybind = super+alt+arrow_down=unbind
+keybind = super+alt+arrow_left=unbind
+keybind = super+alt+arrow_right=unbind
+keybind = super+alt+shift+j=unbind
+keybind = super+alt+shift+w=unbind
+keybind = super+ctrl+f=unbind
+keybind = super+ctrl+shift+j=unbind
+keybind = super+ctrl+arrow_up=unbind
+keybind = super+ctrl+arrow_down=unbind
+keybind = super+ctrl+arrow_left=unbind
+keybind = super+ctrl+arrow_right=unbind
 
 # Ctrl-; toggles the tweb key table and emits the private 5001 sequence so the
 # engine toggles browser shortcuts reliably regardless of the active keyboard
@@ -650,6 +661,8 @@ fn is_legacy_ghostty_binding(line: &str) -> bool {
         // tmux — unreliable across keyboard encodings. Migrate to chain=.
         r"keybind = unconsumed:ctrl+semicolon=activate_key_table:tweb",
         r"keybind = tweb/unconsumed:ctrl+semicolon=deactivate_key_table",
+        // Hand-rolled Cmd-A passthrough, now covered by the managed unbinds.
+        r"keybind = super+a=unbind",
     ]
     .iter()
     .any(|binding| line.eq_ignore_ascii_case(binding))
