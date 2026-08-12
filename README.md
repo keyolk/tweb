@@ -176,6 +176,8 @@ macOS 또는 terminal emulator가 PTY보다 먼저 소비하는 application shor
 
 `Cmd` 조합은 항상 native key event로 전달합니다. 이 단축키를 쓰는 이유가 웹앱 자신의 handler이고, 그 handler들이 바로 `isTrusted`를 확인하는 쪽이기 때문입니다. 새 조합을 추가하려면 `CMD_PASSTHROUGH_KEYS`에 한 줄, engine의 `CMD_PRIVATE_KEYS`에 한 줄을 더하면 되고, 층이 어긋나면 test가 잡습니다.
 
+`Cmd` 전달은 **mode와 무관합니다**. Ghostty key table과 engine의 N/P mode는 같은 스위치가 아니며, key table은 `Cmd` 조합을 encoding할지만 결정합니다. 웹앱의 `Cmd-K`는 TWeb의 한 글자 단축키와 겹칠 일이 없으므로 Shortcuts mode에서도 그대로 페이지에 전달되어야 합니다. 그래서 `Ctrl-;`는 처음 눌렀을 때 table에 들어간 뒤 계속 머물고, 매번 5001을 보내 engine의 N ↔ P만 전환합니다. Ghostty는 이미 최상위인 table을 다시 activate하는 것을 거부하므로 table 안쪽 binding을 따로 둡니다. terminal에서 table을 끌 방법은 없으므로 이탈은 Ghostty 자신의 키인 `Ctrl-Shift-;`가 맡습니다.
+
 ### Mode indicator
 
 화면 우하단에 현재 mode를 한 글자로 표시합니다: `N` normal, `E` editable/insert, `H` hint, `/` search, `V` visual, `I` inspect, `T` tab 목록, `O` omnibox, `?` shortcut 도움말, `P` web passthrough. 대상 수나 선택 종류처럼 필요한 정보만 옆에 짧게 붙습니다.
@@ -250,7 +252,7 @@ omnibox의 방문 기록은 profile 단위 파일에 append되므로 pane과 재
 
 video의 control bar는 hover에 가려 있으므로, hint 수집 전에 가장 큰 video 위로 pointer를 옮겨 **사이트가 직접 그리는 control**을 띄운 뒤 그 실제 버튼에 hint를 붙입니다. YouTube처럼 자체 control을 쓰는 사이트에서 hint가 가리키는 위치와 모양이 평소 보던 control과 같습니다. 별도 proxy는 script로 접근할 수 없는 브라우저 기본 control(`<video controls>`)에만 사용합니다.
 
-입력이 완전히 멈춘 경우 `Ctrl-Shift-;`로 현재 tmux client만 안전하게 detach한 뒤 `tmux attach`하면 됩니다. tmux server와 다른 client는 유지됩니다. TWeb은 tmux 내부에서 tmux가 추적하는 `modifyOtherKeys`를 사용하며 실행 중 `pane_key_mode=Ext 2`, 종료 후 `VT10x`로 복원됩니다. Ghostty에만 Kitty keyboard mode가 남고 tmux는 `VT10x`인 protocol 불일치가 기존 입력 고착의 원인이었습니다.
+입력이 완전히 멈춘 경우 `Ctrl-Shift-;`로 현재 tmux client만 안전하게 detach한 뒤 `tmux attach`하면 됩니다. tmux server와 다른 client는 유지됩니다. 같은 키가 Ghostty의 `tweb` key table에서도 빠져나오므로, terminal 쪽 상태와 tmux 쪽 상태를 한 번에 되돌립니다. TWeb은 tmux 내부에서 tmux가 추적하는 `modifyOtherKeys`를 사용하며 실행 중 `pane_key_mode=Ext 2`, 종료 후 `VT10x`로 복원됩니다. Ghostty에만 Kitty keyboard mode가 남고 tmux는 `VT10x`인 protocol 불일치가 기존 입력 고착의 원인이었습니다.
 
 ## 구성요소
 

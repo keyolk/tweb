@@ -35,15 +35,26 @@ keybind = shift+enter=text:\x1b[5008~
 # this block: Ghostty emits no PTY encoding of its own for them, so the tweb
 # table carries each one as a private sequence instead.
 
-# Ctrl-; toggles the tweb key table and emits the private 5001 sequence so the
-# engine toggles browser shortcuts reliably regardless of the active keyboard
-# encoding (modifyOtherKeys ESC[27;5;59~ vs Kitty CSI-u ESC[59;5u). chain sends
-# 5001 after the table action; the key is consumed because the private sequence
-# carries the toggle, not the raw Ctrl-; encoding.
+# Ctrl-; carries the mode toggle as the private 5001 sequence rather than
+# relying on the raw Ctrl-; encoding, which differs between modifyOtherKeys
+# (ESC[27;5;59~) and Kitty CSI-u (ESC[59;5u).
+#
+# The Ghostty key table and the engine's N/P mode are deliberately *not* the
+# same switch. The table only decides whether Cmd combinations get encoded at
+# all, and those should reach the page in either mode — a web app's Cmd-K has
+# nothing to do with TWeb's own single-letter shortcuts. So Ctrl-; enters the
+# table on the first press and then stays there, while every press sends 5001
+# and lets the engine flip N <-> P. (Re-activating the innermost table is
+# refused by Ghostty, hence the separate in-table binding.)
+#
+# Leaving the table needs Ghostty's own key, since nothing in the terminal can
+# deactivate it: Ctrl-Shift-; drops back to the default table, which is also
+# the emergency detach key, so a wedged pane recovers with one chord.
 keybind = ctrl+semicolon=activate_key_table:tweb
 keybind = chain=text:\x1b[5001~
-keybind = tweb/ctrl+semicolon=deactivate_key_table
-keybind = chain=text:\x1b[5001~
+keybind = tweb/ctrl+semicolon=text:\x1b[5001~
+keybind = tweb/ctrl+shift+semicolon=deactivate_key_table
+keybind = chain=text:\x1b[5010~
 # Inner-table catch-all bindings shadow Ghostty application shortcuts while
 # unconsumed preserves each key's terminal encoding for TWeb.
 keybind = tweb/unconsumed:super+catch_all=ignore
