@@ -2578,10 +2578,11 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
     contents.sendInputEvent({ ...event, type: "keyUp" });
     return;
   }
-  // keyDown (not rawKeyDown) so Chromium runs its keyboard-shortcut path — the one a web
-  // app's Cmd handler is listening on. rawKeyDown bypasses that and the page never
-  // sees the key as a shortcut, which is why Cmd-K was arriving but Slack ignored it.
-  contents.sendInputEvent({ ...event, type: "keyDown" });
+  // Cmd 조합은 keyDown으로 보내 Chromium의 shortcut path를 태운다. rawKeyDown은
+  // shortcut 처리를 건너뛰어 페이지가 key를 shortcut으로 안 본다.
+  // keyCode는 Accelerator 이름(KeyK)가 아니라 웹 표준 "k"를 쓴다 —
+  // Chromium의 keyDown이 "KeyK"를 모르는 경우가 있어 "k"가 안정적이다.
+  contents.sendInputEvent({ type: "keyDown", keyCode: key, modifiers });
   if (text && !modifiers.includes("control") && !modifiers.includes("meta")) {
     contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
   }
