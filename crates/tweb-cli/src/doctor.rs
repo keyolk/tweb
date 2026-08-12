@@ -32,8 +32,8 @@ keybind = ctrl+zero=text:\x1b[5004~
 keybind = shift+enter=text:\x1b[5008~
 
 # Cmd combinations are delivered by CMD_PASSTHROUGH_KEYS below, appended to
-# this block: Ghostty emits no PTY encoding of its own for them, so the tweb
-# table carries each one as a private sequence instead.
+# this block: Ghostty emits no PTY encoding of its own for them, so each one
+# is carried as a private sequence instead.
 
 # Ctrl-; carries the mode toggle as the private 5001 sequence rather than
 # relying on the raw Ctrl-; encoding, which differs between modifyOtherKeys
@@ -82,9 +82,7 @@ set-option -s extended-keys-format csi-u
 /// alike — so the key has to be carried as an explicit private sequence, the
 /// way Ctrl-; already is. Three things must line up for one to arrive:
 ///
-///   1. a `tweb/<trigger>=text:` binding, so the sequence is only emitted while
-///      the tweb key table is active and Ghostty's own shortcut is untouched
-///      everywhere else;
+///   1. a `<trigger>=text:` binding that emits the sequence;
 ///   2. a tmux `user-keys` entry, or tmux re-encodes the leading ESC of a
 ///      sequence it does not recognise (ESC[5199~ arrived as ESC[91;3u5199~);
 ///   3. a matching entry in the engine's CMD_PRIVATE_KEYS, which turns the code
@@ -93,22 +91,24 @@ set-option -s extended-keys-format csi-u
 /// Codes start at 5020 and slots at 120 to stay clear of the existing 5001-5010
 /// shortcuts and the tmux-chrome bridge on slots 100/101.
 ///
-/// Cmd-A/C/V/X matter most while typing (mode `E`): the engine turns them into
-/// select-all, copy, paste and cut against the focused field. Without an entry
-/// here Ghostty keeps them for itself — its own copy/paste act on the terminal
-/// selection, not on the page, so an input box never sees them.
-const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[
-    ("super+k", 5020, 120),
-    ("super+a", 5021, 121),
-    ("super+c", 5022, 122),
-    ("super+v", 5023, 123),
-    ("super+x", 5024, 124),
-];
+/// These are bound at the Ghostty root, not inside the tweb key table. A table
+/// can only be entered by pressing its binding — Ghostty exposes no action, IPC
+/// or escape sequence to activate one — so a table-scoped binding leaves a
+/// freshly opened pane unable to deliver Cmd until the user presses Ctrl-;
+/// first. Binding at the root costs the key everywhere in Ghostty, which is
+/// why the list is kept to shortcuts whose terminal meaning is expendable:
+/// Cmd-K only clears the screen, and Ctrl-L still does that.
+///
+/// Cmd-C/V/X are deliberately absent. They would matter most while typing
+/// (mode `E`), but taking them at the root removes terminal copy and paste from
+/// every Ghostty surface, which is too much to pay — inside a page, selection
+/// copy is still reachable through the visual mode shortcuts.
+const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[("super+k", 5020, 120)];
 
 fn cmd_passthrough_ghostty_bindings() -> String {
     CMD_PASSTHROUGH_KEYS
         .iter()
-        .map(|(trigger, code, _)| format!("keybind = tweb/{trigger}=text:\\x1b[{code}~\n"))
+        .map(|(trigger, code, _)| format!("keybind = {trigger}=text:\\x1b[{code}~\n"))
         .collect()
 }
 
@@ -123,8 +123,8 @@ fn cmd_passthrough_tmux_config() -> String {
     }
     for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
         let hex = private_sequence_hex(*code);
-        // Both tables: root covers Shortcuts mode, tweb-pass covers passthrough
-        // and must re-arm itself the way its other bindings do.
+        // Both tables: root covers ordinary panes and Shortcuts mode, tweb-pass
+        // covers passthrough and must re-arm itself like its other bindings.
         config.push_str(&format!("bind-key -T root User{slot} send-keys -H {hex}\n"));
         config.push_str(&format!(
             "bind-key -T tweb-pass User{slot} send-keys -H {hex} \\; switch-client -T tweb-pass\n"
@@ -149,7 +149,7 @@ fn ghostty_managed_config() -> String {
 
 fn tmux_managed_config() -> String {
     format!(
-        "{TMUX_MANAGED_BASE}\n# Teach tmux the private sequences the tweb key table emits.\n{}",
+        "{TMUX_MANAGED_BASE}\n# Teach tmux the private sequences Ghostty emits for Cmd keys.\n{}",
         cmd_passthrough_tmux_config()
     )
 }
@@ -996,7 +996,7 @@ mod tests {
         let engine = include_str!("../../../electron/main.cjs");
         for (trigger, code, slot) in CMD_PASSTHROUGH_KEYS {
             assert!(
-                ghostty.contains(&format!("keybind = tweb/{trigger}=text:\\x1b[{code}~")),
+                ghostty.contains(&format!("keybind = {trigger}=text:\\x1b[{code}~")),
                 "{trigger} missing its Ghostty binding"
             );
             assert!(
@@ -1040,13 +1040,23 @@ mod tests {
     }
 
     #[test]
-    fn cmd_bindings_stay_inside_the_tweb_table() {
-        // A root-level Cmd binding would take the shortcut away from Ghostty
-        // everywhere, which is how Cmd-V once stopped pasting.
-        for line in cmd_passthrough_ghostty_bindings().lines() {
+    fn cmd_passthrough_spares_the_editing_shortcuts() {
+        // Root bindings take the key from every Ghostty surface, so the list has
+        // to stay narrow. Claiming Cmd-C/V/X here would remove terminal copy and
+        // paste everywhere — that regression already happened once.
+        for (trigger, _, _) in CMD_PASSTHROUGH_KEYS {
             assert!(
-                line.starts_with("keybind = tweb/"),
-                "{line} escapes the table"
+                !matches!(*trigger, "super+c" | "super+v" | "super+x"),
+                "{trigger} would cost terminal copy/paste across all of Ghostty"
+            );
+        }
+        for line in cmd_passthrough_ghostty_bindings().lines() {
+            // Table-scoped bindings cannot work: a key table is only enterable by
+            // pressing its binding, so a new pane would deliver nothing until the
+            // user pressed Ctrl-; first.
+            assert!(
+                !line.starts_with("keybind = tweb/"),
+                "{line} is table-scoped and would not reach a fresh pane"
             );
         }
         assert!(cmd_passthrough_tmux_config().contains("switch-client -T tweb-pass"));

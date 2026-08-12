@@ -167,16 +167,18 @@ focus가 cross-origin iframe(광고·embed)에 들어가면 그 frame의 preload
 
 macOS 또는 terminal emulator가 PTY보다 먼저 소비하는 application shortcut은 별도 설정 없이는 웹에 전달할 수 없습니다. `tweb doctor`는 Ghostty의 `Cmd-K` 같은 충돌과 tmux CSI-u/mouse/passthrough 설정을 진단합니다. `tweb doctor --fix`는 기존 파일을 backup하고 사용자 Ghostty/tmux config에는 marker로 구분된 include 한 줄만 설치하며, 실제 TWeb 설정은 `${XDG_CONFIG_HOME:-~/.config}/tweb/ghostty.conf`와 `tmux.conf`에서 관리합니다. 기존 inline doctor block과 식별 가능한 legacy TWeb binding은 자동으로 migration합니다. 변경 시 실행 중인 Ghostty에도 reload signal을 보냅니다.
 
-`Cmd` 조합은 Ghostty가 **PTY encoding 자체를 만들지 않습니다** — key probe로 확인한 결과 `Cmd-K`/`Cmd-A`는 plain·modifyOtherKeys·Kitty flag 어느 mode에서도 단 한 byte도 보내지 않습니다. 그래서 key table 설정만으로는 전달이 불가능하고, `Ctrl-;`와 같은 방식으로 **사설 sequence에 실어 보냅니다**. doctor의 `CMD_PASSTHROUGH_KEYS`가 단일 정의이며 네 층이 모두 맞아야 키 하나가 도착합니다.
+`Cmd` 조합은 Ghostty가 **PTY encoding 자체를 만들지 않습니다** — key probe로 확인한 결과 `Cmd-K`/`Cmd-A`는 plain·modifyOtherKeys·Kitty flag 어느 mode에서도 단 한 byte도 보내지 않습니다. 그래서 `Ctrl-;`와 같은 방식으로 **사설 sequence에 실어 보냅니다**. doctor의 `CMD_PASSTHROUGH_KEYS`가 단일 정의이며 네 층이 모두 맞아야 키 하나가 도착합니다.
 
-1. `keybind = tweb/super+k=text:\x1b[5020~` — `tweb` key table이 켜져 있을 때만 보내므로, mode를 끄면 Ghostty 기본 `Cmd-K`가 그대로 동작합니다. root에서 `unbind`하면 TWeb pane 밖에서도 단축키가 사라지므로 쓰지 않습니다.
+1. `keybind = super+k=text:\x1b[5020~` — Ghostty가 sequence를 emit합니다.
 2. tmux `user-keys[120]`과 root/`tweb-pass` binding — 등록하지 않으면 tmux가 모르는 sequence의 앞 ESC를 재인코딩해 `ESC[5020~`가 `ESC[91;3u5020~`로 깨집니다.
 3. engine의 `CMD_PRIVATE_KEYS` — code를 원래 `Cmd` key event로 되돌립니다.
 4. engine의 private sequence parser — 이 code 대역을 인식해야 합니다.
 
-`Cmd` 조합은 항상 native key event로 전달합니다. 이 단축키를 쓰는 이유가 웹앱 자신의 handler이고, 그 handler들이 바로 `isTrusted`를 확인하는 쪽이기 때문입니다. 새 조합을 추가하려면 `CMD_PASSTHROUGH_KEYS`에 한 줄, engine의 `CMD_PRIVATE_KEYS`에 한 줄을 더하면 되고, 층이 어긋나면 test가 잡습니다.
+binding은 key table 안이 아니라 **Ghostty root**에 둡니다. key table은 그 binding을 눌러야만 들어갈 수 있고 — action·IPC·escape sequence 어느 것으로도 밖에서 켤 수 없습니다 — table 안에 두면 새로 연 pane이 `Ctrl-;`를 누르기 전까지 `Cmd`를 전달하지 못합니다. 대신 root binding은 Ghostty 전체에서 그 키를 가져가므로, terminal에서의 의미를 포기해도 되는 단축키로만 목록을 제한합니다. `Cmd-K`는 화면을 지울 뿐이고 `Ctrl-L`이 그 일을 대신합니다.
 
-`Cmd` 전달은 **mode와 무관합니다**. Ghostty key table과 engine의 N/P mode는 같은 스위치가 아니며, key table은 `Cmd` 조합을 encoding할지만 결정합니다. 웹앱의 `Cmd-K`는 TWeb의 한 글자 단축키와 겹칠 일이 없으므로 Shortcuts mode에서도 그대로 페이지에 전달되어야 합니다. 그래서 `Ctrl-;`는 처음 눌렀을 때 table에 들어간 뒤 계속 머물고, 매번 5001을 보내 engine의 N ↔ P만 전환합니다. Ghostty는 이미 최상위인 table을 다시 activate하는 것을 거부하므로 table 안쪽 binding을 따로 둡니다. terminal에서 table을 끌 방법은 없으므로 이탈은 Ghostty 자신의 키인 `Ctrl-Shift-;`가 맡습니다.
+`Cmd-C/V/X`는 일부러 넣지 않았습니다. 입력 중(`E` mode)에 가장 쓸모 있겠지만 root에서 가져가면 Ghostty 모든 surface에서 terminal 복사·붙여넣기가 사라집니다. 실제로 한 번 그렇게 만들어 `Cmd-V`가 동작하지 않는 문제를 겪었습니다.
+
+`Cmd` 조합은 항상 native key event로 전달하며 mode와 무관합니다. 이 단축키를 쓰는 이유가 웹앱 자신의 handler이고, 그 handler들이 바로 `isTrusted`를 확인하는 쪽이기 때문입니다. 새 조합을 추가하려면 `CMD_PASSTHROUGH_KEYS`에 한 줄, engine의 `CMD_PRIVATE_KEYS`에 한 줄을 더하면 되고, 층이 어긋나면 test가 잡습니다.
 
 ### Mode indicator
 

@@ -2673,10 +2673,6 @@ function dispatchText(buffer) {
 // doctor의 CMD_PASSTHROUGH_KEYS와 code가 일치해야 한다.
 const CMD_PRIVATE_KEYS = new Map([
   [5020, "k"],
-  [5021, "a"],
-  [5022, "c"],
-  [5023, "v"],
-  [5024, "x"],
 ]);
 
 function dispatchPrivateShortcut(code) {
