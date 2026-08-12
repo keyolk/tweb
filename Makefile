@@ -63,6 +63,11 @@ install: release ## tweb을 PREFIX에 설치 (기본 ~/.local)
 	install -m 0755 target/release/tweb "$(DESTDIR)$(PREFIX)/bin/tweb"
 	@test ! -f target/release/tweb-tauri \
 		|| install -m 0755 target/release/tweb-tauri "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
+	@# 기존 binary 위에 덮어쓰면 macOS 서명이 깨지고 kernel이 exec 시 SIGKILL한다.
+	@# 조용한 no-op처럼 보여서 원인을 찾기 어렵다.
+	@test "$$(uname)" != Darwin || codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb"
+	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
+		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb"
 
 uninstall: ## install이 놓은 파일 제거 (cache는 그대로 둔다)

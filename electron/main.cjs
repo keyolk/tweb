@@ -2522,6 +2522,9 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   const pressed = eventKind !== 3;
   const control = modifiers.includes("control");
   const shift = modifiers.includes("shift");
+  if (debugLogging && modifiers.length) {
+    console.error(`tweb: key ${key} [${modifiers.join("+")}] kind=${eventKind}`);
+  }
 
   // tmux가 modifier를 제거하지 않는 환경에서는 표준 CSI-u도 지원한다.
   // release도 소비해 웹페이지에 orphan keyUp이 전달되지 않게 한다.
@@ -2832,6 +2835,9 @@ process.stdin.on("data", (chunk) => {
         clearTimeout(rawInputFlushTimer);
         rawInputFlushTimer = null;
       }
+      // Raw bytes, before any decoding: the only way to tell "the terminal
+      // never sent the key" apart from "we decoded it into nothing".
+      if (debugLogging && input[1]) console.error(`tweb: input ${input[1]}`);
       rawInput = Buffer.concat([rawInput, Buffer.from(input[1], "hex")]);
       consumeRawInput();
     }
