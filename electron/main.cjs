@@ -2556,10 +2556,22 @@ function keyName(codepoint) {
 const ACCELERATOR_KEYS = new Map([
   ["ArrowUp", "Up"], ["ArrowDown", "Down"], ["ArrowLeft", "Left"], ["ArrowRight", "Right"],
 ]);
+// Chromium's sendInputEvent expects Accelerator key codes. A single lowercase letter
+// under a Cmd modifier is one place the two disagree: the web KeyboardEvent.key
+// is "k" but Accelerator wants "KeyK". Without this, Cmd-K arrives at the
+// page as keyCode "k" with meta, which Slack's keydown handler ignores. Apply
+// the letter→KeyX mapping only when meta is held, so plain typing is unaffected.
+const META_LETTER_KEYS = new Map(
+  [..."abcdefghijklmnopqrstuvwxyz"].map((c) => [c, `Key${c.toUpperCase()}`]),
+);
 
 function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
+  const hasMeta = modifiers.includes("meta");
+  const keyCode = ACCELERATOR_KEYS.get(key)
+    || (hasMeta ? META_LETTER_KEYS.get(key) : null)
+    || key;
   const event = {
-    keyCode: ACCELERATOR_KEYS.get(key) || key,
+    keyCode,
     modifiers,
   };
   if (eventKind === 3) {
