@@ -298,9 +298,9 @@ function configureTmuxRootBindings() {
   privateKey("User114", "5003");
   privateKey("User115", "5004");
   privateKey("User116", "5007");
-  privateKey("C-\\;", "5011");
-  // Ctrl-: → 5014 (vimium toggle). Slot 117.
-  privateKey("User117", "5014");
+  // Ctrl-; → 5001 (bypass toggle). Ctrl-/ → 5014 (vimium toggle).
+  privateKey("C-\\;", "5001");
+  privateKey("C-/", "5014");
   ensureTmuxRootBinding(
     "User112",
     ["detach-client"],
@@ -330,8 +330,13 @@ function ensureTmuxPassthroughTable() {
     ],
     [
       "bind-key", "-T", passthroughTable, "C-\\;",
-      "send-keys", "-H", "1b", "5b", "35", "30", "31", "32", "7e",
+      "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
       "\\;", "switch-client", "-T", "root",
+    ],
+    [
+      "bind-key", "-T", passthroughTable, "C-/",
+      "send-keys", "-H", "1b", "5b", "35", "30", "31", "34", "7e",
+      "\\;", "switch-client", "-T", passthroughTable,
     ],
   ];
   for (const [_index, key, code] of zoomUserKeys) {

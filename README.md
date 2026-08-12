@@ -154,10 +154,10 @@ Electron과 Tauri 모두 열린 tab URL, active tab, tab별 zoom을 tmux window 
 
 다음 modal shortcut과 mode indicator는 Electron과 Tauri engine이 같은 preload runtime을 공유해 동일하게 동작합니다. engine별 차이는 DevTools 뿐이며, Electron은 detached Chromium DevTools를, Tauri는 Safari Web Inspector를 엽니다.
 
-`Ctrl-;`와 `Ctrl-:`는 각각 독립적인 토글입니다.
+`Ctrl-;`와 `Ctrl-/`는 각각 독립적인 토글입니다.
 
 - **`Ctrl-;` — bypass**: `Cmd` 조합을 페이지로 보낼지 결정합니다. 켜면 tmux가 현재 pane을 보는 client를 `tweb-pass` table로 전환해 tmux prefix/root binding을 우회하고 키·modifier·mouse를 page에 전달합니다.
-- **`Ctrl-:` — vimium**: Vimium-style normal mode와 TWeb browser shortcut을 켜고 끕니다. 입력 요소에 focus가 없을 때 `f`/`j`/`k` 등이 동작하며, 입력 중에는 가로채지 않고 `Esc`로 focus를 해제합니다.
+- **`Ctrl-/` — vimium**: Vimium-style normal mode와 TWeb browser shortcut을 켜고 끕니다. 입력 요소에 focus가 없을 때 `f`/`j`/`k` 등이 동작하며, 입력 중에는 가로채지 않고 `Esc`로 focus를 해제합니다.
 
 두 토글이 독립이므로 조합이 mode가 됩니다:
 
@@ -168,7 +168,7 @@ Electron과 Tauri 모두 열린 tab URL, active tab, tab별 zoom을 tmux window 
 
 bypass가 켜져도 vimium이 켜져 있으면 normal-mode 키가 동작합니다 — `Cmd`는 engine이 mode 무관으로 native 전달하므로 tmux table과 무관합니다. passthrough table은 vimium이 꺼졌을 때만 arm됩니다.
 
-bypass 상태에서 `Ctrl-C`는 페이지로 전달되므로 TWeb을 종료하려면 `Ctrl-:`로 vimium을 켜거나 `Ctrl-;`로 bypass를 끈 뒤 `Ctrl-C`를 누릅니다. TWeb pane을 떠나거나 프로세스가 종료되면 해당 client의 이전 tmux key table을 복원합니다.
+bypass 상태에서 `Ctrl-C`는 페이지로 전달되므로 TWeb을 종료하려면 `Ctrl-/`로 vimium을 켜거나 `Ctrl-;`로 bypass를 끈 뒤 `Ctrl-C`를 누릅니다. TWeb pane을 떠나거나 프로세스가 종료되면 해당 client의 이전 tmux key table을 복원합니다.
 
 페이지 자체 단축키(피드의 `j`/`k`, player의 `m`)를 잠깐 쓰려면 normal mode에서 `i`로 **insert mode**에 들어갑니다. `Esc`를 제외한 모든 키가 engine이 만든 실제 key event로 페이지에 전달되므로 `isTrusted`를 확인하는 사이트의 단축키도 동작하고, 한글 키도 command 문자로 변환하지 않습니다. `Esc`로 즉시 normal mode로 돌아오며 tmux 설정은 건드리지 않습니다.
 

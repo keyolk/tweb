@@ -55,9 +55,9 @@ keybind = chain=text:\x1b[5001~
 keybind = tweb/ctrl+semicolon=text:\x1b[5001~
 keybind = tweb/ctrl+shift+semicolon=deactivate_key_table
 keybind = chain=text:\x1b[5010~
-# Ctrl-: toggles vimium shortcuts independently of bypass. Root binding —
+# Ctrl-/ toggles vimium shortcuts independently of bypass. Root binding —
 # vimium on/off is useful in every mode, not only inside the tweb table.
-keybind = ctrl+:=text:\x1b[5014~
+keybind = ctrl+slash=text:\x1b[5014~
 # Inner-table catch-all bindings shadow Ghostty application shortcuts while
 # unconsumed preserves each key's terminal encoding for TWeb.
 keybind = tweb/unconsumed:super+catch_all=ignore
