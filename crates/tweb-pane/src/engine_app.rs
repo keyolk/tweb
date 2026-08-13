@@ -31,6 +31,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/mouse-click-state.cjs"),
     ),
     (
+        "paste-state.cjs",
+        include_str!("../../../electron/paste-state.cjs"),
+    ),
+    (
         "tmux-visibility.cjs",
         include_str!("../../../electron/tmux-visibility.cjs"),
     ),

@@ -183,11 +183,15 @@ macOS 또는 terminal emulator가 PTY보다 먼저 소비하는 application shor
 3. engine의 `CMD_PRIVATE_KEYS` — code를 원래 `Cmd` key event로 되돌립니다.
 4. engine의 private sequence parser — 이 code 대역을 인식해야 합니다.
 
-binding은 key table 안이 아니라 **Ghostty root**에 둡니다. key table은 그 binding을 눌러야만 들어갈 수 있고 — action·IPC·escape sequence 어느 것으로도 밖에서 켤 수 없습니다 — table 안에 두면 새로 연 pane이 `Ctrl-;`를 누르기 전까지 `Cmd`를 전달하지 못합니다. 대신 root binding은 Ghostty 전체에서 그 키를 가져가므로, terminal에서의 의미를 포기해도 되는 단축키로만 목록을 제한합니다. `Cmd-K`는 화면을 지울 뿐이고 `Ctrl-L`이 그 일을 대신합니다.
+binding은 key table 안이 아니라 **Ghostty root**에 둡니다. key table은 그 binding을 눌러야만 들어갈 수 있고 — action·IPC·escape sequence 어느 것으로도 밖에서 켤 수 없습니다 — table 안에 두면 새로 연 pane이 `Ctrl-;`를 누르기 전까지 `Cmd`를 전달하지 못합니다. 대신 root binding은 Ghostty 전체에서 그 키를 가져가므로, terminal에서의 의미를 포기해도 되는 단축키로만 목록을 제한합니다. `Cmd-K`는 화면을 지울 뿐이고 `Ctrl-L`이 그 일을 대신합니다. `Cmd-A`는 scrollback 선택이라 복사할 때만 쓸모 있는데, tweb pane은 그 자리에 웹페이지를 그리므로 선택할 것이 없습니다.
 
-`Cmd-C/V/X`는 일부러 넣지 않았습니다. 입력 중(`E` mode)에 가장 쓸모 있겠지만 root에서 가져가면 Ghostty 모든 surface에서 terminal 복사·붙여넣기가 사라집니다. 실제로 한 번 그렇게 만들어 `Cmd-V`가 동작하지 않는 문제를 겪었습니다.
+`Cmd-V`는 이 목록에 없어도 동작합니다 — 다른 경로를 쓰기 때문입니다. Ghostty의 `paste_from_clipboard`가 clipboard 내용을 PTY에 그대로 쓰고, pane이 `DECSET 2004`(bracketed paste)를 켜 두었으므로 그 내용이 `ESC[200~ … ESC[201~`로 감싸여 도착합니다. engine은 여는 bracket을 만나면 닫는 bracket까지의 byte를 전부 모아 한 번의 paste로 처리합니다(`electron/paste-state.cjs`). body는 ESC를 포함한 임의 byte이고 여러 read chunk에 걸쳐 오므로 key sequence parser로는 처리할 수 없어 별도 state machine을 둡니다. 내용이 clipboard와 같으면 `webContents.paste()`를 써서 진짜 paste event를 발생시킵니다 — Slack 같은 페이지는 그 event를 보고 서식과 첨부를 처리합니다. bracketing이 없으면 clipboard가 한 글자씩 타이핑되고, 줄바꿈이 `Enter`로 나가 여러 줄 붙여넣기 도중에 메시지가 전송돼 버립니다.
+
+`Cmd-C/X`는 일부러 넣지 않았습니다. 입력 중(`E` mode)에 가장 쓸모 있겠지만 root에서 가져가면 Ghostty 모든 surface에서 terminal 복사가 사라집니다. 실제로 한 번 그렇게 만들어 `Cmd-V`가 동작하지 않는 문제를 겪었습니다. 페이지 안에서는 visual mode 단축키로 선택 복사가 가능합니다.
 
 `Cmd` 조합은 항상 native key event로 전달하며 mode와 무관합니다. 이 단축키를 쓰는 이유가 웹앱 자신의 handler이고, 그 handler들이 바로 `isTrusted`를 확인하는 쪽이기 때문입니다. 새 조합을 추가하려면 `CMD_PASSTHROUGH_KEYS`에 한 줄, engine의 `CMD_PRIVATE_KEYS`에 한 줄을 더하면 되고, 층이 어긋나면 test가 잡습니다.
+
+> Ghostty는 config reload signal을 받고도 재파싱하지 않는 경우가 있습니다. `doctor --fix` 후 새 `Cmd` binding이 듣지 않으면 Ghostty를 완전히 종료(`Cmd-Q`)했다가 다시 실행하세요.
 
 ### Mode indicator
 

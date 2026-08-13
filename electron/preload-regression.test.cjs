@@ -600,25 +600,52 @@ test("large canvas and SVG surfaces can be panned with scroll keys", () => {
   assert.match(browser, /fn dispatch_native_drag\(/);
 });
 
-test("Ghostty mode commands set passthrough explicitly", () => {
+// Ctrl-; and Ctrl-/ are independent toggles: bypass (Cmd to the page) and
+// vimium shortcuts. A single flag used to drive both, and collapsing them again
+// makes one key silently move the other mode.
+test("the mode toggles stay independent across tmux and the engine", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /privateKey\("C-\\\\;", "5011"\)/);
-  assert.match(main, /passthroughTable, "C-\\\\;"[\s\S]*"35", "30", "31", "32"/);
+  assert.match(main, /privateKey\("C-\\\\;", "5001"\)/);
+  assert.match(main, /privateKey\("C-\/", "5014"\)/);
+  // In the passthrough table Ctrl-; must return the client to root, or the
+  // table keeps re-arming itself after the mode it guards is gone.
+  assert.match(main, /passthroughTable, "C-\\\\;"[\s\S]*?switch-client", "-T", "root"/);
+  assert.match(main, /code === 5014[\s\S]*?setVimiumShortcutsEnabled\(!vimiumShortcutsEnabled\)/);
   assert.match(main, /code === 5011 \|\| code === 5012/);
-  assert.match(main, /setBrowserShortcutsEnabled\(code === 5012\)/);
-  assert.match(main, /50\(\?:0\[1-9\]\|1\[0-2\]\)/);
+  assert.match(main, /setCmdBypassEnabled\(code === 5012\)/);
+  // The private-sequence regex has to cover the Cmd codes at 5020+; a code
+  // outside its range is dropped before any table is consulted.
+  assert.match(main, /50\(\?:0\[1-9\]\|1\[0-9\]\|\[2-9\]\[0-9\]\)/);
 });
 
 // A site's own shortcuts (m to mute, j/k on a feed) check isTrusted, so insert
 // mode has to bypass the renderer round-trip that makes keys synthetic.
 test("insert mode delivers native keys to the page", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /if \(!browserShortcutsEnabled \|\| pageInsertMode\) \{/);
+  assert.match(main, /if \(!vimiumShortcutsEnabled \|\| pageInsertMode \|\| modifiers\.includes\("meta"\)\) \{/);
   assert.match(main, /case "insert-mode":/);
   assert.match(electron, /send\("insert-mode", true\)/);
   assert.match(electron, /send\("insert-mode", false\)/);
   // The mirror must reset wherever the preload's own flag would.
   assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) pageInsertMode = false;/);
+});
+
+// Cmd-V never arrives as a key — Ghostty emits no PTY encoding for Cmd combos,
+// so paste_from_clipboard writing the clipboard into the PTY is the whole
+// event. Losing either the DECSET or the reassembly types the clipboard
+// character by character, and a multiline body sends Enter mid-paste.
+test("Cmd-V arrives as a bracketed paste rather than typed characters", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const terminal = fs.readFileSync(path.join(root, "crates/tweb-pane/src/terminal.rs"), "utf8");
+  assert.match(terminal, /\\x1b\[\?2004h/);
+  assert.match(terminal, /\\x1b\[\?2004l/);
+  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{/);
+  assert.match(main, /if \(paste\.active\) \{/);
+  // The ESC-disambiguation timer must not fire into a paste body.
+  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{[\s\S]*?clearTimeout\(rawInputFlushTimer\)/);
+  assert.match(main, /function dispatchPaste\(text\)/);
+  // A real paste event carries formatting that insertText cannot.
+  assert.match(main, /normalize\(clipboard\.readText\(\)\) === body[\s\S]*?contents\.paste\(\)/);
 });
 
 // Clicking an ad or embed moves focus into a cross-origin subframe whose preload

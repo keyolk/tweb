@@ -73,13 +73,17 @@ set-option -s extended-keys-format csi-u
 /// freshly opened pane unable to deliver Cmd until the user presses Ctrl-;
 /// first. Binding at the root costs the key everywhere in Ghostty, which is
 /// why the list is kept to shortcuts whose terminal meaning is expendable:
-/// Cmd-K only clears the screen, and Ctrl-L still does that.
+/// Cmd-K only clears the screen, and Ctrl-L still does that. Cmd-A selects the
+/// terminal scrollback, which is only useful for copying it — and the pane under
+/// tweb draws a webpage there, so there is nothing to select.
 ///
-/// Cmd-C/V/X are deliberately absent. They would matter most while typing
-/// (mode `E`), but taking them at the root removes terminal copy and paste from
-/// every Ghostty surface, which is too much to pay — inside a page, selection
-/// copy is still reachable through the visual mode shortcuts.
-const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[("super+k", 5020, 120)];
+/// Cmd-V is absent because it needs no entry: `paste_from_clipboard` already
+/// writes the clipboard to the PTY, and the engine reads it as a bracketed
+/// paste (see dispatchPaste). Cmd-C/X are absent by choice — they would matter
+/// while typing (mode `E`), but taking them at the root removes terminal copy
+/// from every Ghostty surface, which is too much to pay. Inside a page,
+/// selection copy is still reachable through the visual mode shortcuts.
+const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[("super+k", 5020, 120), ("super+a", 5021, 121)];
 
 fn cmd_passthrough_ghostty_bindings() -> String {
     // Root only. No tweb table binding — the table is gone (see GHOSTTY_MANAGED_BASE),
@@ -1021,7 +1025,9 @@ mod tests {
     fn cmd_passthrough_spares_the_editing_shortcuts() {
         // Root bindings take the key from every Ghostty surface, so the list has
         // to stay narrow. Claiming Cmd-C/V/X here would remove terminal copy and
-        // paste everywhere — that regression already happened once.
+        // paste everywhere — that regression already happened once. Cmd-V needs
+        // no entry anyway: paste_from_clipboard already writes the clipboard to
+        // the PTY and the engine reads it as a bracketed paste.
         for (trigger, _, _) in CMD_PASSTHROUGH_KEYS {
             assert!(
                 !matches!(*trigger, "super+c" | "super+v" | "super+x"),

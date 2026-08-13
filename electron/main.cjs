@@ -24,6 +24,7 @@ const { Worker } = require("node:worker_threads");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
+const { PasteState, PASTE_START } = require("./paste-state.cjs");
 const { startAgentServer } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
@@ -2403,6 +2404,7 @@ function createWindow(url) {
 
 let rawInput = Buffer.alloc(0);
 let rawInputFlushTimer = null;
+const paste = new PasteState();
 const utf8Decoder = new StringDecoder("utf8");
 const mouseClicks = new MouseClickState();
 
@@ -2708,6 +2710,23 @@ function dispatchControlByte(byte, extraModifierBits = 0) {
   return false;
 }
 
+// Cmd-V. Ghostty의 paste_from_clipboard가 PTY에 쓴 bracketed paste body를 페이지에
+// 붙여넣는다. clipboard와 내용이 같으면 webContents.paste()를 쓴다 — Slack 같은
+// 페이지는 진짜 paste event를 보고 서식·첨부를 처리하므로 insertText보다 낫다.
+// terminal은 paste에서 \n을 \r로 바꾸는 일이 흔하므로 비교 전에 정규화한다.
+function dispatchPaste(text) {
+  if (!win || !text) return;
+  const contents = win.webContents;
+  const normalize = (value) => value.replace(/\r\n?/g, "\n");
+  const body = normalize(text);
+  if (normalize(clipboard.readText()) === body) {
+    contents.paste();
+    return;
+  }
+  // Clipboard가 다르면 (tmux buffer paste 등) 텍스트 그대로 넣는다.
+  contents.insertText(body);
+}
+
 function dispatchText(buffer) {
   let offset = 0;
   while (offset < buffer.length) {
@@ -2739,6 +2758,7 @@ function dispatchText(buffer) {
 // doctor의 CMD_PASSTHROUGH_KEYS와 code가 일치해야 한다.
 const CMD_PRIVATE_KEYS = new Map([
   [5020, "k"],
+  [5021, "a"],
 ]);
 
 function dispatchPrivateShortcut(code) {
@@ -2801,6 +2821,23 @@ function scheduleRawInputFlush() {
 function consumeRawInput() {
   for (;;) {
     if (rawInput.length === 0) return;
+
+    // Paste body는 escape sequence로 파싱하지 않는다. ESC를 포함한 임의 byte가
+    // 올 수 있고, 닫는 bracket까지는 전부 붙여넣을 텍스트다.
+    if (paste.active) {
+      const chunk = rawInput;
+      rawInput = Buffer.alloc(0);
+      const done = paste.push(chunk);
+      if (!done) return;
+      if (done.dropped) {
+        if (debugLogging) console.error("tweb: paste exceeded limit, dropped");
+        return;
+      }
+      rawInput = done.rest;
+      dispatchPaste(done.text);
+      continue;
+    }
+
     const escape = rawInput.indexOf(0x1b);
     if (escape > 0) {
       dispatchText(rawInput.subarray(0, escape));
@@ -2814,6 +2851,21 @@ function consumeRawInput() {
     }
 
     const input = rawInput.toString("utf8");
+
+    // Bracketed paste 시작. Cmd-V는 Ghostty가 key로 encoding하지 않고
+    // paste_from_clipboard로 clipboard 내용을 PTY에 쓰는 것이 전부다. 열린
+    // bracket을 만나면 뒤따르는 body를 모아 한 번의 paste로 처리한다.
+    if (paste.begins(rawInput)) {
+      // ESC 판별 timer가 paste 도중에 발화해 body 첫 byte를 Escape key로
+      // 확정해 버리는 것을 막는다.
+      if (rawInputFlushTimer) {
+        clearTimeout(rawInputFlushTimer);
+        rawInputFlushTimer = null;
+      }
+      paste.start();
+      rawInput = rawInput.subarray(PASTE_START.length);
+      continue;
+    }
 
     // Focus reporting은 사용하지 않는다. 이전 실행이나 tmux/terminal 상태에서
     // 남아 들어온 ESC[I/ESC[O도 browser text 또는 shell 문자열로 보내지 않는다.
