@@ -872,3 +872,18 @@ test("the terminal cursor is hidden until a caret is parked on it", () => {
     main.indexOf("// The page draws the IME composition surface"));
   assert.match(unpark, /if \(caretHidden\) return;/);
 });
+
+// The page draws its own caret bar, separate from the terminal cursor, and it was
+// positioned from the collapsed range's bounding rect. That measures 0x0 whenever the
+// range's container is an element rather than a text node — the usual case after
+// collapsing to a selection start — so the bar was drawn at the viewport's top-left
+// corner. Two bars appeared: one on the caret, one in the corner.
+test("the page's caret bar is measured the same way as the terminal cursor", () => {
+  const update = electron.slice(electron.indexOf("function updateVisualSelection()"),
+    electron.indexOf("// The caret starts where the selection starts"));
+  assert.match(update, /const range = selection\.getRangeAt\(0\);/);
+  assert.match(update, /rect\.width \|\| rect\.height \? rect : firstCharacterRect\(range\)/);
+  // The same helper the terminal cursor uses, so the two can never disagree about where
+  // the caret is.
+  assert.match(electron, /function firstCharacterRect\(range\)/);
+});
