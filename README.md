@@ -354,6 +354,7 @@ composition area and the terminal cursor are removed with it.
 | `r` | Reload |
 | `zi` / `zo` / `zz` | Zoom in / out / reset |
 | `i` | insert mode: use the page's own shortcuts (`Esc` returns) |
+| `m` | Take audio back for this pane (only one TWeb pane is audible at a time) |
 | `Esc` | Cancel hint/search/visual/inspect/omnibox · clear input focus · leave fullscreen |
 | `Esc` (normal) | Close site autocomplete and popups as an outside click |
 
@@ -361,6 +362,18 @@ Each TWeb pane shows a `current/total` tab badge in the bottom right, separate f
 The second of five tabs reads `N  2/5`. Hovering or clicking the badge opens that pane's list of tab
 titles, and clicking a title switches to that tab. Tab state is per-pane and is never published to the
 pane title in the tmux status line.
+
+### Audio
+
+Only one TWeb pane is audible at a time. When a page starts making noise, that pane claims the
+speakers and every other pane mutes — muted, not paused, so a video keeps playing and keeps its
+position. A muted pane shows a `🔇 %<pane>` badge next to its mode indicator naming the pane that
+owns audio; `m` takes it back, which mutes the previous owner instead.
+
+Ownership is a claim file in the runtime directory (`audio-owner.json`), refreshed by the owner and
+re-read by every pane a few times a second. A pane that is killed rather than closed therefore does
+not leave the others muted: the claim stops being refreshed and its pid stops existing, and the next
+pane to notice clears it. `tweb diag --json` reports the whole state under `audio`.
 
 After picking a text target in Visual, or selecting the whole page's text with `V` from normal mode,
 `h`/`l` adjust the active edge by character, `b`/`w`/`e` by word, `k`/`j` by line, `0`/`$` by line
