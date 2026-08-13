@@ -23,6 +23,8 @@ shipping configuration, which does not set that switch.
 | `worker-encode.cjs` | Whether moving the PNG encode to a worker thread helps (it does not) |
 | `gfxprobe.py` | Whether the terminal really reads a `t=s` shm transfer, and whether a patch image can be placed over a base and deleted independently |
 | `stacking.py` | Whether a patch placed after a base actually draws *on top* of it (judged by eye — the protocol only reports lifetime) |
+| `shm-through-tmux.py` | Whether `t=s` survives tmux passthrough, with a temp-file transfer as the control |
+| `raw-render.py` | Whether `f=32` raw pixels render correctly over the file medium (judged by eye) |
 
 `gfxprobe.py` is the odd one out: it talks to a terminal, not to Electron, and **must run on a bare
 tty**. Graphics responses do not come back through tmux DCS passthrough — which is why the shipping
@@ -33,9 +35,15 @@ open -na /Applications/Ghostty.app --args \
   -e /bin/sh -c "python3 bench/gfxprobe.py /tmp/gfxprobe.txt; sleep 2"
 ```
 
-`stacking.py` is the opposite: it belongs *inside* tmux, since drawing order is exactly what
-passthrough might disturb. It leaves a red base with a green patch on it and returns; look at the
-pane, then run `stacking-cleanup.py` on the same tty to delete both images.
+The other three belong *inside* tmux, since passthrough and pane geometry are exactly what they test.
+They take the tty of a **visible** pane — `tmux display-message -p '#{pane_tty}'` — and that matters
+more than it sounds: Ghostty does not read an image for a pane it is not drawing, so in a hidden pane
+nothing is transferred and every probe looks like a protocol failure when it is only a visibility
+one. `shm-through-tmux.py` sends a temp-file transfer alongside the shm one for exactly that reason;
+read the control first.
+
+`stacking.py` and `raw-render.py` leave an image on screen to be looked at, and each has a
+`-cleanup.py` companion that removes it.
 
 The fixture pages fill their canvases with deterministic pseudo-random noise, so a compressor cannot
 find structure that a real page would not have. `photo` is the adversarial case: a full viewport of

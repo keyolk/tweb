@@ -561,9 +561,18 @@ change than the one this measurement justifies.
 Two constraints on when raw can be used:
 
 - **It needs the file medium.** 20MB does not fit an escape sequence, and `t=d` is the fallback for
-  when a frame file cannot be written — so `TWEB_FRAME_TRANSPORT=direct` keeps PNG.
+  when a frame file cannot be written — so `TWEB_FRAME_TRANSPORT=direct` keeps PNG. A raw frame has
+  no such fallback inside the worker, which holds pixels rather than an encoder, so repeated write
+  failures switch raw off for the session and let the PNG path take over.
 - **Raw and PNG use separate paths.** The terminal is told the format in the header, not by
   extension, so a stale file of the wrong kind would be read as whatever the header claimed.
+
+What raw costs, and why `t=s` is still worth doing: the wire carries a path, but the disk carries
+the whole frame. At 20MB per frame that is ~20MB/s for an idle animation at 1fps and several hundred
+MB/s during a scroll — roughly 13x the PNG path's bytes. Shared memory removes that write entirely,
+and section 8.2 already established the terminal supports it; what stops it here is that macOS has
+no `/dev/shm`, so `shm_open` needs a native module, and the file medium reaches the same
+main-thread number without one.
 
 Probed before implementing, since both were assumptions:
 

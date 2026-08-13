@@ -179,7 +179,11 @@ const patchIdBase = imageId + 1;
 const frameTransport = process.env.TWEB_FRAME_TRANSPORT === "direct" ? "direct" : "file";
 const frameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.png`);
 // Raw frames go to their own path so a stale PNG can never be read as pixels, or the other
-// way round — the terminal is told the format out of band, not by extension.
+// way round — the terminal is told the format out of band, not by extension. Unlike a PNG,
+// a raw file carries no dimensions of its own: the `s=`/`v=` in the escape sequence supply
+// them. A resize can therefore shear one frame, if the terminal reads the file after the
+// next frame has already overwritten it at a new size. The window is a single frame and the
+// one after it corrects the pane, so this is left alone.
 const rawFrameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.rgba`);
 // Whole frames can travel as raw pixels rather than PNG. The encode is what the main thread
 // was paying for — 28ms on an ordinary page, 101ms on a photo, against ~2ms to hand the
@@ -187,8 +191,9 @@ const rawFrameFilePath = path.join(app.getPath("userData"), `tweb-frame-${proces
 //
 // It needs the file medium: 20MB does not go through an escape sequence, and the direct
 // transport is the fallback for when a frame file cannot be written. So raw is off whenever
-// frames are not going through files.
-const rawFramesEnabled = frameTransport === "file"
+// frames are not going through files, and it switches itself off if writing raw keeps
+// failing — see `noteRawFrameFailure`.
+let rawFramesEnabled = frameTransport === "file"
   && process.env.TWEB_RAW_FRAMES !== "0";
 let lastViewport = null;
 let viewportGeneration = 0;
@@ -636,9 +641,31 @@ function handleGfxWorkerReady() {
   if (frame && frame.generation === viewportGeneration) dispatchGfxFrame(frame);
 }
 
+// The PNG path degrades to `t=d` when a frame file cannot be written, but a raw frame has
+// nowhere to degrade to inside the worker — 20MB does not fit an escape sequence, and the
+// worker holds pixels, not an encoder. So a persistent failure (a full disk, an unwritable
+// userData) would drop every whole frame and leave the pane frozen on its last one.
+//
+// Fall back here instead: after a couple of consecutive failures, give up raw for the rest
+// of the session and repaint, which comes back through the PNG path and its own fallbacks.
+const RAW_FRAME_FAILURE_LIMIT = 3;
+let rawFrameFailures = 0;
+
+function noteRawFrameFailure() {
+  if (!rawFramesEnabled) return;
+  rawFrameFailures += 1;
+  if (rawFrameFailures < RAW_FRAME_FAILURE_LIMIT) return;
+  rawFramesEnabled = false;
+  console.error(`tweb: raw frames failed ${rawFrameFailures}x, falling back to PNG`);
+  if (win && !win.isDestroyed() && terminalVisible) win.webContents.invalidate();
+}
+
 gfxWorker.on("message", (message) => {
   if (message?.type === "error") {
     console.error(`tweb: graphics writer failed: ${message.message}`);
+    noteRawFrameFailure();
+  } else {
+    rawFrameFailures = 0;
   }
   handleGfxWorkerReady();
 });
