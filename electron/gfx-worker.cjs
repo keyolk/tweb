@@ -51,17 +51,55 @@ async function writeFileFrame(message, png) {
   await writeGfx(`${message.header},t=f,q=2`, payload, message.tmux, message.origin);
 }
 
+// Raw pixels, no PNG container. `f=32` is independent of the transfer medium, so the same
+// file transport carries them — and the encode the main thread used to pay for disappears:
+// measured 101ms for a photo, against ~2ms to hand the bitmap over.
+//
+// Chromium's bitmap is BGRA on macOS and the protocol wants RGBA, so the channels are
+// swapped here rather than on the main thread. This is the one CPU pass over the frame, and
+// at ~10ms for 20MB it is the obvious candidate for SIMD in the native crate later.
+async function writeRawFrame(message, bgra) {
+  const rgba = Buffer.allocUnsafe(bgra.length);
+  for (let i = 0; i < bgra.length; i += 4) {
+    rgba[i] = bgra[i + 2];
+    rgba[i + 1] = bgra[i + 1];
+    rgba[i + 2] = bgra[i];
+    rgba[i + 3] = bgra[i + 3];
+  }
+  const stagingPath = `${message.filePath}.tmp`;
+  mkdirSync(path.dirname(message.filePath), { recursive: true });
+  writeFileSync(stagingPath, rgba);
+  renameSync(stagingPath, message.filePath);
+  frameFiles.add(message.filePath);
+  const payload = Buffer.from(message.filePath).toString("base64");
+  await writeGfx(
+    `${message.header},f=32,s=${message.width},v=${message.height},t=f,q=2`,
+    payload, message.tmux, message.origin
+  );
+}
+
 async function writeFrame(message) {
-  const png = Buffer.from(message.buffer, message.byteOffset, message.byteLength);
+  const pixels = Buffer.from(message.buffer, message.byteOffset, message.byteLength);
+  if (message.format === "raw") {
+    try {
+      await writeRawFrame(message, pixels);
+      return;
+    } catch (error) {
+      // Raw needs a file: there is no escape-sequence fallback for 20MB of pixels, and the
+      // caller only sends raw where it knows the terminal takes it. Report and drop the
+      // frame; the next one will try again.
+      throw error;
+    }
+  }
   if (message.transport === "file") {
     try {
-      await writeFileFrame(message, png);
+      await writeFileFrame(message, pixels);
       return;
     } catch {
       // Direct transfer is slower but keeps rendering if the frame file cannot be written.
     }
   }
-  await writeDirect(message, png);
+  await writeDirect(message, pixels);
 }
 
 function cleanup() {

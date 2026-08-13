@@ -229,6 +229,54 @@ test("the caret starts inside the part of the selection that is on screen", () =
   assert.match(scroll, /const rect = focusRect\(selection\);/);
 });
 
+// The terminal cursor followed the web caret only inside form fields and
+// contenteditable, because that is where a caret normally lives. Visual caret mode
+// puts one on ordinary text, so nothing reported a position and the cursor stayed
+// where it was last parked — which read as the caret always starting in the pane's
+// top-left corner, wherever the selection actually was.
+test("the terminal cursor follows the visual caret on an ordinary page", () => {
+  assert.match(electron, /function visualCaretPoint\(\)/);
+  const visual = electron.slice(electron.indexOf("function visualCaretPoint()"),
+    electron.indexOf("function caretPoint()"));
+  // Only in caret mode, and from the collapsed selection — that is the caret.
+  assert.match(visual, /if \(!visualState\?\.caret\) return null;/);
+  assert.match(visual, /range\.collapse\(true\);/);
+  assert.match(visual, /getBoundingClientRect\(\)/);
+
+  // A collapsed range measures 0x0 whenever its container is an element rather than a
+  // text node, which is the normal case here: selecting an element's contents and
+  // collapsing lands on the element at offset 0. Measured on a real page, that is what
+  // made the position unreportable, so the descent to a text node is the actual fix.
+  assert.match(visual, /if \(!box\.width && !box\.height\)/);
+  assert.match(visual, /firstCharacterRect\(range\)/);
+  const measure = electron.slice(electron.indexOf("function firstCharacterRect(range)"),
+    electron.indexOf("function caretPoint()"));
+  assert.match(measure, /while \(node && node\.nodeType !== Node\.TEXT_NODE && node\.childNodes\?\.length\)/);
+  assert.match(measure, /node\.childNodes\[Math\.min\(offset, node\.childNodes\.length - 1\)\]/);
+  assert.match(measure, /probe\.setEnd\(node, start \+ 1\)/);
+
+  // caretPoint consults it before the editable paths, which bail on a plain page.
+  const point = electron.slice(electron.indexOf("function caretPoint()"),
+    electron.indexOf("function reportCaret()"));
+  assert.match(point, /const visual = visualCaretPoint\(\);\n\s+if \(visual\) return visual;/);
+  assert.match(point, /if \(!isEditable\(element\)/,
+    "the editable guard must stay: it is what made the visual caret invisible");
+
+  // The IME slot reserves cells and paints over the page for composition. Nothing is
+  // composed at a visual caret, so blanking text there would be pure loss.
+  const report = electron.slice(electron.indexOf("function reportCaret()"),
+    electron.indexOf("// Suggestion panels and popovers close on Escape"));
+  assert.match(report, /const composing = !visualState\?\.caret;/);
+  assert.match(report, /point && composing \? imeSlotRect/);
+
+  // Leaving visual mode has to release the cursor, since no other reporter covers a
+  // plain page and it would otherwise stay parked on the last caret.
+  const cancel = electron.slice(electron.indexOf("function cancelVisual(restoreMode = true)"),
+    electron.indexOf("function enterVisual(item)"));
+  assert.match(cancel, /const hadCaret = Boolean\(visualState\.caret\);/);
+  assert.match(cancel, /if \(hadCaret\) reportCaret\(\);/);
+});
+
 test("the caret mode keys are mirrored into the Tauri preload", () => {
   const tauri = fs.readFileSync(
     path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8");

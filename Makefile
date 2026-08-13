@@ -49,6 +49,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/tmux-visibility.cjs
 	node --check electron/window-session.cjs
 	node --check electron/url-normalization.cjs
+	node --check electron/patch-geometry.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"
