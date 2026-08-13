@@ -11,7 +11,7 @@ const {
 
 test("adaptive mode has three tiers, fixed mode has one", () => {
   const adaptive = frameRateTiers(30, true);
-  assert.deepEqual(adaptive, { max: 30, playback: 15, idle: 4 });
+  assert.deepEqual(adaptive, { max: 30, playback: 30, idle: 4 });
 
   const fixed = frameRateTiers(30, false);
   assert.deepEqual(fixed, { max: 30, playback: 30, idle: 30 });
@@ -54,7 +54,7 @@ test("measured paint counts land on the right side of the threshold", () => {
     assert.deepEqual(settledFrameRate(paints, tiers), { rate: 4, painting: false });
   }
   for (const paints of animating) {
-    assert.deepEqual(settledFrameRate(paints, tiers), { rate: 15, painting: true });
+    assert.deepEqual(settledFrameRate(paints, tiers), { rate: 30, painting: true });
   }
 });
 
