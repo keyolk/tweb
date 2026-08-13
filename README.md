@@ -283,8 +283,10 @@ is then simply out of the way.
 IME composition (Korean and the like) is drawn by the terminal emulator in its own layer. Putting the
 Kitty placement above the text (`z >= 0`) hides that layer behind the page image and the syllable being
 composed becomes invisible, so the image goes **below** the text (`z=-1`) — tmux's default background
-cells that fill the pane are transparent, so the page still shows through. With an input element
-focused, the terminal cursor moves to the web caret position; otherwise it is hidden. If some terminal
+cells that fill the pane are transparent, so the page still shows through. The terminal cursor follows
+the web caret — a focused input, or the caret in visual caret mode — and is hidden whenever there is
+no caret to sit on, including at startup: a pane inherits the shell's cursor, and left in the corner it
+reads as a caret that started in the wrong place. If some terminal
 paints those cells opaque, `TWEB_IMAGE_Z=0` returns to the old layering.
 
 The first tab shows a placeholder until the real page commits. Chromium paints nothing until the page
