@@ -159,17 +159,18 @@ tmux server restart. Renaming the session or changing the window index is treate
 
 `--frame-rate N` is the maximum frame rate during the active window right after user input or a resize,
 in the range 1–60. Adaptive mode, the default, uses the maximum for 700ms after terminal input or a
-resize, then settles into one of two lower rates: **15fps while the page is still painting on its own**
-— video, an animation, a canvas — and 4fps once it stops. Playback is detected by counting paints over
+resize, then settles by what the page is doing: it **keeps the full rate while the page is still
+painting on its own** — video, an animation, a canvas — and drops to 4fps once it stops. Playback is detected by counting paints over
 a window rather than by watching for a keystroke, so a video holds a watchable rate without anyone
 touching the keyboard, and a page that merely finished loading still falls all the way to idle.
 
-Playback is deliberately not the full rate. It is the one case that runs unbounded, and while the
-Kitty stream only carries a file path, every frame is still written to disk. PNG frames travel over
-that same local file transport, leaving only a small Kitty graphics command on the tmux/Ghostty
+Playback held a lower cap when this tier was introduced, on the theory that it is the one workload
+running unbounded. Measured on YouTube, the pipeline carries 28fps against a 30fps cap with nothing
+dropped, so the cap was only ever a worse picture; the saving comes from the idle rate instead. Frames
+travel over a local file transport, leaving only a small Kitty graphics command on the tmux/Ghostty
 stream, and when the writer falls behind, intermediate frames are dropped and only the latest is kept.
-`--no-adaptive-frame-rate` pins the given value — the right choice for watching something at 30fps or
-better; `--adaptive-frame-rate` states the default policy explicitly. `tweb diag` reports which tier is
+`--no-adaptive-frame-rate` pins the given value, holding it even on a still page;
+`--adaptive-frame-rate` states the default policy explicitly. `tweb diag` reports which tier is
 in force as `frames.rateKind`.
 
 On the same 80×24 tmux pane with a local fixture and debug builds, the median time to first Kitty frame

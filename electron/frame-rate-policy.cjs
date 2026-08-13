@@ -27,13 +27,21 @@ const PLAYBACK_MIN_PAINTS = 4;
 /**
  * Rates for a given configuration.
  *
+ * Playback gets the full rate. It was capped at 15 when this tier was introduced, on the
+ * theory that continuous playback is the one workload that runs unbounded and should stay
+ * bounded under the interactive path. Measured on YouTube afterwards, the pipeline carries
+ * 28.2fps against a 30fps cap with nothing dropped — so the cap was not protecting against
+ * a limit that exists, it was just a worse picture. The tier still matters: it is what
+ * separates a page that is painting from one that has stopped, and the idle rate is where
+ * the saving actually comes from.
+ *
  * @param {number} maxRate the configured maximum, 1-60
  * @param {boolean} adaptive false pins everything to the maximum
  */
 function frameRateTiers(maxRate, adaptive) {
   const max = Math.min(60, Math.max(1, Math.round(maxRate) || 1));
   if (!adaptive) return { max, playback: max, idle: max };
-  return { max, playback: Math.min(max, 15), idle: Math.min(max, 4) };
+  return { max, playback: max, idle: Math.min(max, 4) };
 }
 
 /**
