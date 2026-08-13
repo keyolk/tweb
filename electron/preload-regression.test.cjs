@@ -705,3 +705,20 @@ test("native keys go out under the names Chromium accepts", () => {
   assert.doesNotMatch(main, /META_LETTER_KEYS/,
     "rewriting a Cmd letter to KeyX makes the page see an empty key");
 });
+
+// With a focused input now armed for native delivery, the physical Escape
+// already arrives as a real key. dismissPageOverlay must not turn that into a
+// second one: measured end to end, one physical Escape reaches the page exactly
+// once (trusted), then focus clears and the mode returns to normal.
+test("Escape stays a single delivery once a focused input goes native", () => {
+  // The pass-through branch consumes the native Escape instead of re-sending it.
+  assert.match(electron, /if \(key === "Escape" && passThroughEscape\) \{[\s\S]*?passThroughEscape = false;/);
+  // The editable branch is what asks the engine for it, and only when TWeb has
+  // not already got one in flight.
+  const handler = electron.slice(electron.indexOf("if (eventIsEditable(event)) {"),
+    electron.indexOf("if (pendingG) {"));
+  assert.match(handler, /dismissPageOverlay\(\);/);
+  // Only the top frame mirrors the flag; pageInsertMode is one flag per tab, so a
+  // subframe blurring must not disarm the main frame's focused input.
+  assert.match(electron, /if \(!topFrame \|\| enabled === engineNativeKeys\) return;/);
+});

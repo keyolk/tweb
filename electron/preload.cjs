@@ -392,9 +392,13 @@ const { ipcRenderer } = require("electron");
 
   // Mirrors "the page should get real key events" to the engine, deduplicated so
   // a mode set on every focus change does not spam IPC.
+  //
+  // Only the top frame reports. `pageInsertMode` is one flag for the whole tab,
+  // so a subframe blurring would otherwise disarm native delivery while the main
+  // frame's input still holds focus.
   let engineNativeKeys = false;
   function setEngineNativeKeys(enabled) {
-    if (enabled === engineNativeKeys) return;
+    if (!topFrame || enabled === engineNativeKeys) return;
     engineNativeKeys = enabled;
     send("insert-mode", enabled);
   }
