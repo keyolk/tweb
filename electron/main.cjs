@@ -31,6 +31,11 @@ const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
 const {
+  frameRateTiers,
+  playbackWindowMs,
+  settledFrameRate,
+} = require("./frame-rate-policy.cjs");
+const {
   isRestorableUrl,
   normalizeWindowSession,
   windowSessionForSave,
@@ -130,6 +135,11 @@ const adaptiveFrameRate = configuredAdaptiveFrameRate !== undefined
   ? configuredAdaptiveFrameRate !== "0"
   : process.env.TWEB_ADAPTIVE_FRAME_RATE !== "0";
 const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxActiveFrameRate;
+// See frame-rate-policy.cjs for why playback is its own tier and how it is detected.
+const frameRates = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
+const playbackFrameRate = frameRates.playback;
+const playbackWindow = playbackWindowMs(idleFrameRate);
+let paintsSinceSettle = 0;
 let activeFrameRate = maxActiveFrameRate;
 let frameIntervalMs = Math.ceil(1000 / activeFrameRate);
 let frameIdleTimer = null;
@@ -797,18 +807,48 @@ function markInteractionActivity() {
   applyActiveFrameRate(maxActiveFrameRate);
   if (wasIdle && win && !win.isDestroyed() && terminalVisible) win.webContents.invalidate();
   if (frameIdleTimer) clearTimeout(frameIdleTimer);
-  frameIdleTimer = setTimeout(() => {
-    frameIdleTimer = null;
-    // Dropping the rate while a page is still loading stops offscreen painting
-    // almost entirely: measured on google.com, the page committed at 1.4s and the
-    // next frame did not go out until 5.4s. Stay at the active rate until the load
-    // settles — that is precisely when the screen is changing anyway.
-    if (win && !win.isDestroyed() && win.webContents.isLoading()) {
-      markInteractionActivity();
-      return;
-    }
-    applyActiveFrameRate(idleFrameRate);
-  }, 700);
+  // The paints this interaction is about to cause say nothing about whether the page
+  // paints on its own, which is the only thing the settle decides — so the count starts
+  // fresh. It does not need a handicap beyond that: over a 700ms window, echoing a
+  // keystroke is one or two paints while an animating page is dozens, and the threshold
+  // sits between them.
+  paintsSinceSettle = 0;
+  frameIdleTimer = setTimeout(settleFrameRate, 700);
+}
+
+// Where the rate lands once the active window expires: the playback rate while the page is
+// still painting by itself, the idle rate once it stops. Re-armed rather than left alone,
+// so a video that ends drops the rest of the way and a static page that starts an animation
+// picks up without needing a keystroke.
+function settleFrameRate() {
+  frameIdleTimer = null;
+  // Dropping the rate while a page is still loading stops offscreen painting
+  // almost entirely: measured on google.com, the page committed at 1.4s and the
+  // next frame did not go out until 5.4s. Stay at the active rate until the load
+  // settles — that is precisely when the screen is changing anyway.
+  if (win && !win.isDestroyed() && win.webContents.isLoading()) {
+    markInteractionActivity();
+    return;
+  }
+  // Judge against the paints that arrived over the window just ended, then reset the
+  // count. Reading a timestamp instead would count the paint that changing the rate
+  // itself provokes, and a static page would hold the playback rate forever.
+  const settled = settledFrameRate(paintsSinceSettle, frameRates);
+  paintsSinceSettle = 0;
+  applyActiveFrameRate(settled.rate);
+  if (settled.painting) {
+    frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
+  }
+}
+
+// A page can start painting long after the last keystroke — a video begins, an animation
+// runs — and at the idle rate nothing would raise it again. Arm the timer so the next
+// settle sees the paints and moves up to the playback rate.
+function notePaintActivity() {
+  paintsSinceSettle += 1;
+  if (!adaptiveFrameRate || frameIdleTimer) return;
+  if (activeFrameRate >= playbackFrameRate) return;
+  frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
 }
 
 // A placement the next frame will not fully cover has to be deleted, but the
@@ -1955,6 +1995,12 @@ function agentDiagnostics() {
       expected: lastViewport ? renderedFrameSize(lastViewport) : null,
       rate: activeFrameRate,
       adaptive: adaptiveFrameRate,
+      // Which of the three adaptive rates is in force. `playback` means the page is
+      // painting on its own — a video, an animation — which is what separates "the pane
+      // is throttled" from "the page has nothing new to show".
+      rateKind: !adaptiveFrameRate ? "fixed"
+        : activeFrameRate >= maxActiveFrameRate ? "active"
+          : activeFrameRate >= playbackFrameRate ? "playback" : "idle",
       droppedByBackpressure: droppedGfxFrames,
       imageId,
       // How the damage split between the two paths. A pane that feels slow while typing
@@ -2390,6 +2436,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.setBackgroundThrottling(true);
   contents.setFrameRate(1);
   contents.on("paint", (_event, dirty, image) => {
+    // A page painting on its own is what separates video from a static screen, and the
+    // frame-rate policy reads it to decide whether to fall all the way to idle.
+    if (tab === win) notePaintActivity();
     const size = image.getSize();
     const expected = lastViewport && renderedFrameSize(lastViewport);
     if (loggedFrameGeneration !== viewportGeneration && !image.isEmpty()
@@ -3316,7 +3365,9 @@ app.whenReady().then(() => {
   // has settled.
   scheduleTrackedKeyboardModeRestore();
   notify(
-    `bypass OFF — toggle: Ctrl-; · frame: ${adaptiveFrameRate ? `adaptive 4-${maxActiveFrameRate}` : `${maxActiveFrameRate}`}fps`
+    `bypass OFF — toggle: Ctrl-; · frame: ${adaptiveFrameRate
+      ? `adaptive ${idleFrameRate}/${playbackFrameRate}/${maxActiveFrameRate}`
+      : `${maxActiveFrameRate}`}fps`
     + ` · zoom: Ctrl +/-/0 · default: ${Math.round(defaultZoomFactor * 100)}%`
   );
 });

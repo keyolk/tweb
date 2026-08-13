@@ -52,6 +52,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/patch-geometry.cjs"),
     ),
     (
+        "frame-rate-policy.cjs",
+        include_str!("../../../electron/frame-rate-policy.cjs"),
+    ),
+    (
         "agent-server.cjs",
         include_str!("../../../electron/agent-server.cjs"),
     ),
