@@ -390,11 +390,27 @@ const { ipcRenderer } = require("electron");
     renderIndicator();
   }
 
+  // Mirrors "the page should get real key events" to the engine, deduplicated so
+  // a mode set on every focus change does not spam IPC.
+  let engineNativeKeys = false;
+  function setEngineNativeKeys(enabled) {
+    if (enabled === engineNativeKeys) return;
+    engineNativeKeys = enabled;
+    send("insert-mode", enabled);
+  }
+
   function setMode(mode, detail = "") {
     const root = document.documentElement;
     if (!root) return;
     root.dataset.twebMode = mode;
     root.dataset.twebModeDetail = detail;
+    // A focused input needs native keys just as much as an explicit insert mode
+    // does. Renderer-built KeyboardEvents always carry keyCode 0 — the
+    // constructor cannot set it — and sites that branch on `e.keyCode === 40`
+    // rather than `e.key` (search suggestion lists among them) then see nothing,
+    // so ArrowDown in a suggestion box did nothing. Mirror the editable state to
+    // the engine so those keys arrive natively, with their real key codes.
+    setEngineNativeKeys(mode === "insert");
     if (!topFrame) {
       if (document.hasFocus()) send("frame-mode", { mode, detail });
       return;
@@ -2684,17 +2700,17 @@ const { ipcRenderer } = require("electron");
   function enterInsertMode() {
     insertMode = true;
     cancelTransient(false);
-    // Tell the main process to deliver keys natively. A page's own shortcuts
+    // setMode tells the engine to deliver keys natively. A page's own shortcuts
     // (m to mute, j/k on a feed) ignore synthetic events, so routing them
     // through the renderer would make insert mode look like it does nothing.
-    send("insert-mode", true);
     setMode("insert", "Esc");
   }
 
   function leaveInsertMode() {
     if (!insertMode) return;
     insertMode = false;
-    send("insert-mode", false);
+    // normalMode picks the mode that fits the current focus, and setMode tells
+    // the engine whether keys still need to go out natively.
     normalMode();
   }
 
@@ -2852,6 +2868,10 @@ const { ipcRenderer } = require("electron");
     // The global toggle supersedes the page-local one; leaving both on would
     // make Escape mean two different things.
     insertMode = false;
+    // The engine clears its own native-key mirror whenever it broadcasts this,
+    // so drop the dedupe cache — otherwise a focused input would never re-arm
+    // native delivery and its arrow keys would go back to being ignored.
+    engineNativeKeys = false;
     if (!vimiumEnabled) cancelTransient(false);
     normalMode();
   });

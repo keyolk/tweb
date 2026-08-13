@@ -1240,6 +1240,11 @@ function activateTab(index) {
   win = tabs[normalized];
   mouseClicks.reset();
   pageInsertMode = false;
+  // The preload mirrors this flag and skips redundant IPC, so tell the tab we
+  // just cleared it. Without this its focused input keeps thinking native
+  // delivery is armed and its keys go back through the renderer, where they
+  // arrive with keyCode 0.
+  sendToTabFrames(win, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   // The other tab's caret says nothing about this one, and its preload only
   // reports on focus — which switching tabs does not fire.
   moveTerminalCaret(null);
@@ -2560,20 +2565,12 @@ function keyName(codepoint) {
 const ACCELERATOR_KEYS = new Map([
   ["ArrowUp", "Up"], ["ArrowDown", "Down"], ["ArrowLeft", "Left"], ["ArrowRight", "Right"],
 ]);
-// Chromium's sendInputEvent expects Accelerator key codes. A single lowercase letter
-// under a Cmd modifier is one place the two disagree: the web KeyboardEvent.key
-// is "k" but Accelerator wants "KeyK". Without this, Cmd-K arrives at the
-// page as keyCode "k" with meta, which Slack's keydown handler ignores. Apply
-// the letter→KeyX mapping only when meta is held, so plain typing is unaffected.
-const META_LETTER_KEYS = new Map(
-  [..."abcdefghijklmnopqrstuvwxyz"].map((c) => [c, `Key${c.toUpperCase()}`]),
-);
-
+// A letter under Cmd must NOT be rewritten to its "KeyX" Accelerator name.
+// Measured in offscreen Chromium: keyDown with "KeyK" reaches the page as
+// key="" keyCode=0, while "k" arrives as key="k" keyCode=75. Only the arrow
+// keys genuinely need translating.
 function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
-  const hasMeta = modifiers.includes("meta");
-  const keyCode = ACCELERATOR_KEYS.get(key)
-    || (hasMeta ? META_LETTER_KEYS.get(key) : null)
-    || key;
+  const keyCode = ACCELERATOR_KEYS.get(key) || key;
   const event = {
     keyCode,
     modifiers,
@@ -2584,9 +2581,11 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
   }
   // Cmd combinations go out as keyDown so Chromium runs its shortcut path.
   // rawKeyDown skips shortcut handling, leaving the page blind to the shortcut.
-  // keyCode uses the web-standard "k" rather than the Accelerator name (KeyK) —
-  // Chromium's keyDown does not always recognise "KeyK", while "k" is reliable.
-  contents.sendInputEvent({ type: "keyDown", keyCode: key, modifiers });
+  //
+  // keyDown gets the same resolved keyCode as keyUp. Passing the raw web name
+  // here instead sent "ArrowDown", which Chromium does not recognise, so arrow
+  // keys silently did nothing while a suggestion list was open.
+  contents.sendInputEvent({ ...event, type: "keyDown" });
   if (text && !modifiers.includes("control") && !modifiers.includes("meta")) {
     contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
   }

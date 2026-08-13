@@ -620,14 +620,25 @@ test("the mode toggles stay independent across tmux and the engine", () => {
 
 // A site's own shortcuts (m to mute, j/k on a feed) check isTrusted, so insert
 // mode has to bypass the renderer round-trip that makes keys synthetic.
+// A site's own shortcuts (m to mute, j/k on a feed) check isTrusted, so insert
+// mode has to bypass the renderer round-trip that makes keys synthetic. A
+// focused input needs the same treatment for a different reason: renderer-built
+// KeyboardEvents always carry keyCode 0, and sites branching on
+// `e.keyCode === 40` — suggestion lists among them — then ignore ArrowDown.
 test("insert mode delivers native keys to the page", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /if \(!vimiumShortcutsEnabled \|\| pageInsertMode \|\| modifiers\.includes\("meta"\)\) \{/);
   assert.match(main, /case "insert-mode":/);
-  assert.match(electron, /send\("insert-mode", true\)/);
-  assert.match(electron, /send\("insert-mode", false\)/);
+  // setMode is the single place that mirrors the state, so an editable focus
+  // arms native delivery just like an explicit `i` does.
+  assert.match(electron, /function setEngineNativeKeys\(enabled\)[\s\S]*?send\("insert-mode", enabled\)/);
+  assert.match(electron, /setEngineNativeKeys\(mode === "insert"\)/);
   // The mirror must reset wherever the preload's own flag would.
   assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) pageInsertMode = false;/);
+  // The preload skips redundant IPC, so every engine-side reset has to tell the
+  // page — otherwise native delivery never re-arms after a tab switch.
+  assert.match(electron, /engineNativeKeys = false;/);
+  assert.match(main, /pageInsertMode = false;\s*\/\/ The preload mirrors this flag[\s\S]*?sendToTabFrames\(win, "tweb-shortcuts-mode"/);
 });
 
 // Cmd-V never arrives as a key — Ghostty emits no PTY encoding for Cmd combos,
@@ -672,4 +683,25 @@ test("agent socket refuses a path longer than sun_path", () => {
   const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
   assert.match(server, /Buffer\.byteLength\(target\) > 100/);
   assert.match(server, /agent-\$\{pane\.replace/);
+});
+
+// Chromium's sendInputEvent takes Accelerator key codes, and it silently drops
+// names it does not know: measured in offscreen Chromium, keyDown with
+// "ArrowDown" arrives as key="" keyCode=0 while "Down" arrives as
+// key="ArrowDown" keyCode=40. The same measurement rules out rewriting a letter
+// under Cmd — "KeyK" arrives empty, "k" as keyCode 75. keyDown once sent the raw
+// name while only keyUp used the resolved one, which broke every arrow key.
+test("native keys go out under the names Chromium accepts", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /\["ArrowUp", "Up"\], \["ArrowDown", "Down"\]/);
+  const fn = main.slice(main.indexOf("function dispatchNativeKey("),
+    main.indexOf("function dispatchNamedKey("));
+  assert.match(fn, /const keyCode = ACCELERATOR_KEYS\.get\(key\) \|\| key;/);
+  // Both edges must use the resolved code, not the raw web name.
+  assert.match(fn, /contents\.sendInputEvent\(\{ \.\.\.event, type: "keyDown" \}\)/);
+  assert.match(fn, /contents\.sendInputEvent\(\{ \.\.\.event, type: "keyUp" \}\)/);
+  assert.doesNotMatch(fn, /type: "keyDown", keyCode: key/,
+    "keyDown must not bypass the Accelerator resolution");
+  assert.doesNotMatch(main, /META_LETTER_KEYS/,
+    "rewriting a Cmd letter to KeyX makes the page see an empty key");
 });
