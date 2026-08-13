@@ -2763,6 +2763,8 @@ function dispatchText(buffer) {
 const CMD_PRIVATE_KEYS = new Map([
   [5020, "k"],
   [5021, "a"],
+  [5022, "c"],
+  [5023, "x"],
 ]);
 
 function dispatchPrivateShortcut(code) {

@@ -79,11 +79,21 @@ set-option -s extended-keys-format csi-u
 ///
 /// Cmd-V is absent because it needs no entry: `paste_from_clipboard` already
 /// writes the clipboard to the PTY, and the engine reads it as a bracketed
-/// paste (see dispatchPaste). Cmd-C/X are absent by choice — they would matter
-/// while typing (mode `E`), but taking them at the root removes terminal copy
-/// from every Ghostty surface, which is too much to pay. Inside a page,
-/// selection copy is still reachable through the visual mode shortcuts.
-const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[("super+k", 5020, 120), ("super+a", 5021, 121)];
+/// paste (see dispatchPaste).
+///
+/// Cmd-X has no Ghostty default binding at all, so claiming it costs nothing.
+/// Cmd-C does cost `copy_to_clipboard`, but Ghostty's `copy-on-select` defaults
+/// to true on macOS: selecting terminal text already puts it on the clipboard,
+/// and middle-click paste stays enabled regardless. That leaves Cmd-C worth far
+/// less at the root than it first appears, and a page cannot copy at all
+/// without it while typing. Both are taken, and doctor warns when a user has
+/// turned `copy-on-select` off — that is the one setup where this trade is bad.
+const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[
+    ("super+k", 5020, 120),
+    ("super+a", 5021, 121),
+    ("super+c", 5022, 122),
+    ("super+x", 5023, 123),
+];
 
 fn cmd_passthrough_ghostty_bindings() -> String {
     // Root only. No tweb table binding — the table is gone (see GHOSTTY_MANAGED_BASE),
@@ -193,6 +203,7 @@ pub async fn run(fix: bool) -> Result<()> {
         check_tmux_mouse(),
         check_ghostty_version(),
         check_ghostty_cmd_passthrough(),
+        check_ghostty_terminal_copy(),
         check_pixel_size_query(),
     ];
 
@@ -447,6 +458,47 @@ fn check_pixel_size_query() -> Check {
         name: "pixel size query (CSI 14t)",
         status: CheckStatus::Warn,
         detail: "not yet probed (TODO)".to_string(),
+    }
+}
+
+/// Whether `+show-config` output leaves Ghostty's copy-on-select on.
+///
+/// The setting only appears in the output when it was set explicitly, so an
+/// absent line means the default — true on macOS and Linux.
+fn ghostty_copy_on_select_enabled(config: &str) -> bool {
+    config
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .rfind(|(key, _)| key.trim() == "copy-on-select")
+        .is_none_or(|(_, value)| !matches!(value.trim(), "false"))
+}
+
+/// Taking Cmd-C at the root is only a fair trade while copy-on-select is on:
+/// selecting terminal text then already puts it on the clipboard. With it off,
+/// the user loses their only keyboard route to copying terminal text.
+fn check_ghostty_terminal_copy() -> Check {
+    let Some(config) = command_output("ghostty", &["+show-config"]) else {
+        return Check {
+            name: "Ghostty terminal copy",
+            status: CheckStatus::Warn,
+            detail: "ghostty command not found (skip if another terminal is used)".to_string(),
+        };
+    };
+    let enabled = ghostty_copy_on_select_enabled(&config);
+    Check {
+        name: "Ghostty terminal copy",
+        status: if enabled {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        detail: if enabled {
+            "copy-on-select on, so Cmd-C can go to the page".to_string()
+        } else {
+            "copy-on-select is off and tweb takes Cmd-C for the page; \
+             select-to-copy or a super+shift+c binding restores terminal copy"
+                .to_string()
+        },
     }
 }
 
@@ -952,12 +1004,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        cmd_passthrough_ghostty_bindings, cmd_passthrough_tmux_config, ghostty_include_block,
-        ghostty_managed_config, ghostty_version_supported, managed_block,
-        migrate_legacy_ghostty_config, migrate_legacy_tmux_config, private_sequence_hex,
-        select_ghostty_config_candidate, tmux_include_block, tmux_managed_config,
-        upsert_managed_block, CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN,
-        LEGACY_TMUX_END, TMUX_BEGIN, TMUX_END,
+        cmd_passthrough_ghostty_bindings, cmd_passthrough_tmux_config,
+        ghostty_copy_on_select_enabled, ghostty_include_block, ghostty_managed_config,
+        ghostty_version_supported, managed_block, migrate_legacy_ghostty_config,
+        migrate_legacy_tmux_config, private_sequence_hex, select_ghostty_config_candidate,
+        tmux_include_block, tmux_managed_config, upsert_managed_block, CMD_PASSTHROUGH_KEYS,
+        GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END, TMUX_BEGIN, TMUX_END,
     };
 
     fn ghostty_include() -> String {
@@ -1022,16 +1074,38 @@ mod tests {
     }
 
     #[test]
-    fn cmd_passthrough_spares_the_editing_shortcuts() {
-        // Root bindings take the key from every Ghostty surface, so the list has
-        // to stay narrow. Claiming Cmd-C/V/X here would remove terminal copy and
-        // paste everywhere — that regression already happened once. Cmd-V needs
-        // no entry anyway: paste_from_clipboard already writes the clipboard to
-        // the PTY and the engine reads it as a bracketed paste.
+    fn copy_on_select_is_read_as_on_unless_turned_off() {
+        // Ghostty only prints the setting when it was set explicitly, so an
+        // absent line is the macOS default of true — reading that as "off"
+        // would warn every user who never touched it.
+        assert!(ghostty_copy_on_select_enabled("font-size = 12"));
+        assert!(ghostty_copy_on_select_enabled("copy-on-select = true"));
+        assert!(ghostty_copy_on_select_enabled("copy-on-select = clipboard"));
+        assert!(!ghostty_copy_on_select_enabled("copy-on-select = false"));
+        // A later line wins, the way Ghostty resolves repeated settings.
+        assert!(!ghostty_copy_on_select_enabled(
+            "copy-on-select = true\ncopy-on-select = false"
+        ));
+        assert!(ghostty_copy_on_select_enabled(
+            "copy-on-select = false\ncopy-on-select = true"
+        ));
+    }
+
+    #[test]
+    fn cmd_passthrough_never_claims_paste() {
+        // Cmd-V must never be taken at the root. That regression happened once
+        // and left Ghostty unable to paste anywhere. It also gains nothing:
+        // paste_from_clipboard already writes the clipboard to the PTY and the
+        // engine reads it back as a bracketed paste, so a binding here would
+        // replace a working path with a broken one.
+        //
+        // Cmd-C and Cmd-X are allowed. Cmd-X has no Ghostty default at all, and
+        // copy-on-select (true by default on macOS) already puts selected
+        // terminal text on the clipboard, so Cmd-C costs far less than it looks.
         for (trigger, _, _) in CMD_PASSTHROUGH_KEYS {
-            assert!(
-                !matches!(*trigger, "super+c" | "super+v" | "super+x"),
-                "{trigger} would cost terminal copy/paste across all of Ghostty"
+            assert_ne!(
+                *trigger, "super+v",
+                "super+v would break paste across all of Ghostty and replace a path that already works"
             );
         }
         // Each Cmd key needs a root binding. No tweb table is used — a table is

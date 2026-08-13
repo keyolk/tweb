@@ -187,7 +187,9 @@ binding은 key table 안이 아니라 **Ghostty root**에 둡니다. key table�
 
 `Cmd-V`는 이 목록에 없어도 동작합니다 — 다른 경로를 쓰기 때문입니다. Ghostty의 `paste_from_clipboard`가 clipboard 내용을 PTY에 그대로 쓰고, pane이 `DECSET 2004`(bracketed paste)를 켜 두었으므로 그 내용이 `ESC[200~ … ESC[201~`로 감싸여 도착합니다. engine은 여는 bracket을 만나면 닫는 bracket까지의 byte를 전부 모아 한 번의 paste로 처리합니다(`electron/paste-state.cjs`). body는 ESC를 포함한 임의 byte이고 여러 read chunk에 걸쳐 오므로 key sequence parser로는 처리할 수 없어 별도 state machine을 둡니다. 내용이 clipboard와 같으면 `webContents.paste()`를 써서 진짜 paste event를 발생시킵니다 — Slack 같은 페이지는 그 event를 보고 서식과 첨부를 처리합니다. bracketing이 없으면 clipboard가 한 글자씩 타이핑되고, 줄바꿈이 `Enter`로 나가 여러 줄 붙여넣기 도중에 메시지가 전송돼 버립니다.
 
-`Cmd-C/X`는 일부러 넣지 않았습니다. 입력 중(`E` mode)에 가장 쓸모 있겠지만 root에서 가져가면 Ghostty 모든 surface에서 terminal 복사가 사라집니다. 실제로 한 번 그렇게 만들어 `Cmd-V`가 동작하지 않는 문제를 겪었습니다. 페이지 안에서는 visual mode 단축키로 선택 복사가 가능합니다.
+`Cmd-V`만은 root에 **절대 바인딩하지 않습니다.** 한 번 그렇게 만들어 Ghostty 전체에서 붙여넣기가 죽은 적이 있고, 위 경로가 이미 동작하므로 얻을 것도 없습니다. test가 이를 강제합니다.
+
+`Cmd-C`/`Cmd-X`는 전달합니다. `super+x`는 Ghostty 기본 바인딩이 아예 없어 비용이 0이고, `Cmd-C`가 가져가는 `copy_to_clipboard`는 **`copy-on-select`가 macOS에서 기본 `true`**라 대부분 중복입니다 — terminal에서 텍스트를 선택하면 이미 clipboard에 들어갑니다. 반면 페이지 입력 중에는 `Cmd-C` 없이는 복사할 방법이 없습니다. `copy-on-select`를 끈 사용자에게는 이 교환이 손해이므로 doctor가 `Ghostty terminal copy` 항목으로 경고하고, 그 경우 `super+shift+c`에 `copy_to_clipboard`를 직접 바인딩하면 됩니다.
 
 `Cmd` 조합은 항상 native key event로 전달하며 mode와 무관합니다. 이 단축키를 쓰는 이유가 웹앱 자신의 handler이고, 그 handler들이 바로 `isTrusted`를 확인하는 쪽이기 때문입니다. 새 조합을 추가하려면 `CMD_PASSTHROUGH_KEYS`에 한 줄, engine의 `CMD_PRIVATE_KEYS`에 한 줄을 더하면 되고, 층이 어긋나면 test가 잡습니다.
 
