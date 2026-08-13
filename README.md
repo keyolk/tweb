@@ -270,9 +270,15 @@ a test catches a layer that falls out of step.
 ### Mode indicator
 
 The current mode shows as a single character in the lower right: `N` normal, `E` editable/insert,
-`H` hint, `/` search, `V` visual, `I` inspect, `T` tab list, `O` omnibox, `?` shortcut help,
-`P` web passthrough. Only what matters — a target count, the kind of selection — is appended briefly
-beside it.
+`H` hint, `/` search, `V` visual, `I` inspect, `T` tab list, `O` omnibox, `?` shortcut help. Only what
+matters — a target count, the kind of selection — is appended briefly beside it.
+
+The two input toggles are a separate badge beside it, not a mode, because they are settings rather
+than something the keyboard is doing: with a mode label reporting them, focusing an input showed the
+toggle state instead of `E`. The badge appears **only when a toggle is away from its default** — one
+that is always lit says nothing — and reads `⌘` when Cmd combinations go to the page, or `web` when
+TWeb's shortcuts are off. With both off there is a single `web` badge rather than two, since the pane
+is then simply out of the way.
 
 IME composition (Korean and the like) is drawn by the terminal emulator in its own layer. Putting the
 Kitty placement above the text (`z >= 0`) hides that layer behind the page image and the syllable being

@@ -786,3 +786,36 @@ test("Escape stays a single delivery once a focused input goes native", () => {
   // subframe blurring must not disarm the main frame's focused input.
   assert.match(electron, /if \(!topFrame \|\| enabled === engineNativeKeys\) return;/);
 });
+
+// The mode label used to carry three unrelated things: the page mode (normal/editing), the
+// shortcuts toggle, and the Cmd bypass toggle. Because the toggles were checked first,
+// focusing an input showed `P` instead of `E` — the mode label hid the one state it exists
+// to report. The toggles are settings, not modes, so they moved to their own badge.
+test("the input toggles are a badge, not a mode", () => {
+  const normal = electron.slice(electron.indexOf("function normalMode()"),
+    electron.indexOf("const koreanLangmap"));
+  assert.doesNotMatch(normal, /setMode\("bypass"\)/);
+  assert.doesNotMatch(normal, /setMode\("passthrough"\)/);
+  // What is left is the page mode alone, editing first.
+  assert.match(normal, /if \(insertMode\) setMode\("insert", "Esc"\);/);
+  assert.match(normal, /isEditable\(activeElement\(\)\)\) setMode\("insert"\)/);
+  // And nothing renders a mode label for them any more.
+  assert.doesNotMatch(electron, /passthrough: "P"/);
+
+  const badge = electron.slice(electron.indexOf("function inputBadgeState()"),
+    electron.indexOf("function renderIndicator()"));
+  // Silent when both toggles are at their defaults — a badge that is always lit says
+  // nothing — and one badge, not two, when both are off.
+  assert.match(badge, /return \{ text: "", title: "" \};/);
+  assert.match(badge, /if \(!vimiumEnabled && bypassEnabled\)/);
+  assert.match(badge, /if \(!vimiumEnabled\)/);
+  assert.match(badge, /if \(bypassEnabled\)/);
+
+  // The badge is hidden rather than emptied, so it takes no space when it has nothing
+  // to say.
+  const render = electron.slice(electron.indexOf("function renderIndicator()"),
+    electron.indexOf("function updateTabState(model)"));
+  assert.match(render, /inputBadge\.style\.display = input\.text \? "" : "none";/);
+  // The mode label keeps its own colours, minus the one the toggles used.
+  assert.doesNotMatch(render, /indicatorMode === "passthrough"/);
+});

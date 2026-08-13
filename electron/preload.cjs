@@ -38,6 +38,7 @@ const { ipcRenderer } = require("electron");
   let contextMenuReturnFocus = null;
   let indicatorHost = null;
   let indicatorLabel = null;
+  let inputBadge = null;
   let tabBadge = null;
   let tabPopover = null;
   let tabPopoverPinned = false;
@@ -58,7 +59,6 @@ const { ipcRenderer } = require("electron");
     tabs: "T",
     omnibox: "O",
     help: "?",
-    passthrough: "P",
   };
 
   function send(action, value) {
@@ -328,6 +328,15 @@ const { ipcRenderer } = require("electron");
       "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace", "cursor:pointer",
       "white-space:nowrap", "pointer-events:auto", "backdrop-filter:blur(3px)",
     ].join(";");
+    // The input badge is muted on purpose: it reports a setting, not what the pane is
+    // doing, so it should read as an aside next to the mode rather than compete with it.
+    const input = document.createElement("span");
+    input.style.cssText = [
+      "box-sizing:border-box", "display:none", "height:18px", "padding:1px 6px",
+      "border:1px solid #9aa0a666", "border-radius:4px", "background:#111d", "color:#9aa0a6",
+      "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "white-space:nowrap", "backdrop-filter:blur(3px)",
+    ].join(";");
     const popover = document.createElement("div");
     popover.setAttribute("role", "menu");
     popover.style.cssText = [
@@ -346,12 +355,36 @@ const { ipcRenderer } = require("electron");
     };
     popover.onmouseenter = () => clearTimeout(tabPopoverTimer);
     popover.onmouseleave = scheduleTabPopoverHide;
-    shadow.append(label, badge, popover);
+    shadow.append(label, input, badge, popover);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
+    inputBadge = input;
     tabBadge = badge;
     tabPopover = popover;
+  }
+
+  // What the input badge says, or "" for nothing to say.
+  //
+  // Two independent toggles: whether TWeb's shortcuts are on (Ctrl-/), and whether Cmd
+  // combinations reach the page (Ctrl-;). Both are the default, so the badge only appears
+  // when one is not — an indicator that is always lit says nothing. With both off, one
+  // badge covers them: the pane is then simply out of the way, and two badges saying so
+  // is noise.
+  //
+  // Neither belongs in the mode label. The mode is what the keyboard does on the page,
+  // and folding these in meant a focused input showed the toggle state instead of `E`.
+  function inputBadgeState() {
+    if (!vimiumEnabled && bypassEnabled) {
+      return { text: "web", title: "Shortcuts off, Cmd to the page — every key goes to the web page" };
+    }
+    if (!vimiumEnabled) {
+      return { text: "web", title: "TWeb shortcuts off (Ctrl-/ to turn them back on)" };
+    }
+    if (bypassEnabled) {
+      return { text: "⌘", title: "Cmd combinations go to the page (Ctrl-; to keep them in tmux)" };
+    }
+    return { text: "", title: "" };
   }
 
   function renderIndicator() {
@@ -360,10 +393,13 @@ const { ipcRenderer } = require("electron");
     const short = modeLabels[indicatorMode] || indicatorMode.slice(0, 1).toUpperCase();
     indicatorLabel.textContent = indicatorDetail ? `${short} ${indicatorDetail}` : short;
     indicatorLabel.title = `TWeb ${indicatorMode}${indicatorDetail ? ` — ${indicatorDetail}` : ""}`;
-    indicatorLabel.style.color = indicatorMode === "passthrough" ? "#9aa0a6"
-      : indicatorMode === "normal" ? "#8ab4f8"
+    indicatorLabel.style.color = indicatorMode === "normal" ? "#8ab4f8"
       : indicatorMode === "insert" ? "#81c995"
       : "#fdd663";
+    const input = inputBadgeState();
+    inputBadge.textContent = input.text;
+    inputBadge.title = input.title;
+    inputBadge.style.display = input.text ? "" : "none";
     const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
     tabBadge.textContent = `${active}/${tabState.count}`;
     tabBadge.title = `Tab ${active}/${tabState.count} in this pane · hover/click for the list`;
@@ -433,11 +469,11 @@ const { ipcRenderer } = require("electron");
   }
 
   function normalMode() {
-    // With bypass on, show the bypass state regardless of vimium. The point of the
-    // indicator is to answer "are Cmd keys going to the page right now?".
-    if (bypassEnabled) setMode("bypass");
-    else if (!vimiumEnabled) setMode("passthrough");
-    else if (insertMode) setMode("insert", "Esc");
+    // The mode says what the keyboard is doing on the page — normal or editing. Whether
+    // TWeb's own shortcuts are on, and whether Cmd goes to the page, are separate facts
+    // with their own badge: folding them in here meant a focused input showed `P` instead
+    // of `E`, hiding the one thing the mode was there to say.
+    if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
     else if (panSurface()) setMode("normal", "↔ pan · Esc");
     else setMode("normal", scrollSurface() ? "⇅ inner · Esc" : "");
