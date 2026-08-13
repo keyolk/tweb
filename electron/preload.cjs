@@ -2265,9 +2265,14 @@ const { ipcRenderer } = require("electron");
     if (!visualState?.selectionMade) return;
     const selection = visualSelection();
     if (!selection?.rangeCount) return;
-    const rect = selection.getRangeAt(0).getBoundingClientRect();
+    const range = selection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
     if (visualState.caret) {
-      updateCaretBar(rect);
+      // A collapsed range measures 0x0 when its container is an element rather than a text
+      // node, which is the usual case after collapsing to a selection start — so the bar
+      // was drawn at the viewport's top-left corner instead of on the caret. Measure the
+      // character the caret sits in front of, the same way the terminal cursor does.
+      updateCaretBar(rect.width || rect.height ? rect : firstCharacterRect(range) || rect);
       setMode("visual", "caret v·h·j·k·l·w·b·e·{·}");
     } else {
       removeCaretBar();
