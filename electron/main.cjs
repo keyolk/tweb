@@ -13,6 +13,7 @@ const {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -21,11 +22,12 @@ const {
 } = require("node:fs");
 const { execFile, execFileSync } = require("node:child_process");
 const { Worker } = require("node:worker_threads");
+const net = require("node:net");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
-const { startAgentServer } = require("./agent-server.cjs");
+const { startAgentServer, runtimeDir } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
@@ -36,11 +38,26 @@ const {
   settledFrameRate,
 } = require("./frame-rate-policy.cjs");
 const {
+  parseClaim,
+  claimExpired,
+  audioDecision,
+  shouldReleaseClaim,
+  heartbeatOwns,
+  HEARTBEAT_MS: AUDIO_HEARTBEAT_MS,
+} = require("./audio-owner.cjs");
+const {
   isRestorableUrl,
   normalizeWindowSession,
   windowSessionForSave,
   windowSessionKeys,
 } = require("./window-session.cjs");
+const {
+  parseHistoryLines,
+  historyDays,
+  removeEntries,
+  appendedSince,
+  compactLines,
+} = require("./history-view.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
@@ -546,8 +563,40 @@ function initializeTmuxVisibility() {
     if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
   }
   syncTmuxVisibility();
-  const timer = setInterval(syncTmuxVisibility, 150);
-  timer.unref();
+  scheduleVisibilityCheck();
+}
+
+// Visibility is polled because tmux has no way to push it — but polling every 150ms means
+// two `tmux` child processes a second-and-a-bit, per pane, for the life of the process,
+// almost all of them reporting that nothing changed. (Measured: two tmux processes resident
+// at all times.) So the interval backs off while the answer keeps coming back the same and
+// snaps back the moment it does not, which is the only time latency matters.
+//
+// DESIGN.md 5.2 puts this lifecycle in the Rust frontend, which already owns $TMUX_PANE and
+// SIGWINCH; pushing it over the existing stdin control channel would remove the poll
+// entirely. This is the cheap half of that fix.
+const VISIBILITY_POLL_MIN_MS = 150;
+const VISIBILITY_POLL_MAX_MS = 1200;
+let visibilityPollMs = VISIBILITY_POLL_MIN_MS;
+let visibilityPollTimer = null;
+
+function scheduleVisibilityCheck() {
+  if (visibilityPollTimer) clearTimeout(visibilityPollTimer);
+  visibilityPollTimer = setTimeout(() => {
+    visibilityPollTimer = null;
+    syncTmuxVisibility();
+    scheduleVisibilityCheck();
+  }, visibilityPollMs);
+  visibilityPollTimer.unref();
+}
+
+// Called by the poll with whether this round saw anything move.
+function noteVisibilityPollResult(changed) {
+  if (changed) {
+    visibilityPollMs = VISIBILITY_POLL_MIN_MS;
+    return;
+  }
+  visibilityPollMs = Math.min(VISIBILITY_POLL_MAX_MS, Math.ceil(visibilityPollMs * 1.5));
 }
 
 function syncTmuxVisibility() {
@@ -591,6 +640,8 @@ function syncTmuxVisibility() {
               if (!next.has(tty)) deleteImageFromClientTty(tty);
             }
             const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
+            const lostClient = [...visibleClientTtys].some((tty) => !next.has(tty));
+            noteVisibilityPollResult(becameVisible || lostClient);
             visibleClientTtys = next;
             terminalVisible = next.size > 0;
             reconcileTmuxPassthrough();
@@ -1057,10 +1108,17 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
     }
     return;
   }
-  // The frame cache always takes the whole image, patch or not: a tab switch and a
-  // visibility repaint re-place a complete frame, and a crop would leave them with a
-  // fragment of the page.
-  tabFrames.set(tab, { image, generation });
+  // The frame cache always takes the whole image, patch or not: a visibility repaint
+  // re-places a complete frame, and a crop would leave it with a fragment of the page.
+  //
+  // Only the active tab's frame is kept. A NativeImage of a 2880x1800 frame is 20.7MB
+  // (DETAIL.md 8.1), so caching every tab put N x that in the main process for the life of
+  // the window — against DESIGN.md 6.5, which gates on a hidden page's buffers converging
+  // to zero. Nothing reads a background tab's frame: `repaintActiveTab` only ever asks for
+  // `win`, and `activateTab` calls `invalidate()`, so a switched-to tab paints fresh either
+  // way. Dropping the entry is what makes it converge.
+  if (tab === win) tabFrames.set(tab, { image, generation });
+  else tabFrames.delete(tab);
   if (tab !== win || !terminalVisible) return;
   // Small damage goes out immediately as a patch instead of waiting for the frame
   // interval — the wait exists to pace whole-frame encodes, and a patch costs a
@@ -1282,13 +1340,6 @@ function scheduleWindowSessionSave() {
   windowSessionSaveTimer.unref();
 }
 
-function notify(message) {
-  if (process.env.TMUX && process.env.TMUX_PANE) {
-    execFile("tmux", ["display-message", "-t", process.env.TMUX_PANE, message], () => {});
-  }
-  if (debugLogging) console.error(`tweb: ${message}`);
-}
-
 function updatePaneTitle() {
   if (!process.env.TMUX_PANE) return;
   // Tab state belongs to this pane's in-page badge. Putting it in tmux's pane
@@ -1316,6 +1367,187 @@ function updatePaintingState() {
     if (active) tab.webContents.startPainting();
     else tab.webContents.stopPainting();
   }
+}
+
+// === Audio ownership across panes ===================================================
+//
+// Every pane is its own Electron process, so only a shared file can arbitrate between
+// them. See electron/audio-owner.cjs for why the claim is judged rather than trusted.
+
+const audioClaimPath = path.join(runtimeDir(), "audio-owner.json");
+// null while this instance is making noise; otherwise when the silence started.
+let audioSilentSince = Date.now();
+let audioMutedByOther = false;
+let audioOwnerPane = null;
+let audioTimer = null;
+
+function readAudioClaim() {
+  try {
+    return parseClaim(readFileSync(audioClaimPath, "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT" && debugLogging) {
+      console.error(`tweb: audio claim read failed: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+// Signal 0 only checks that the pid exists, which is what separates "the owner crashed"
+// from "the owner is quiet right now". Not being able to signal it (EPERM) still means
+// something is there, so only ESRCH counts as gone.
+function processAlive(pid) {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function writeAudioClaim() {
+  const claim = { pane: process.env.TMUX_PANE || null, pid: process.pid, at: Date.now() };
+  const temporary = `${audioClaimPath}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.dirname(audioClaimPath), { recursive: true, mode: 0o700 });
+    writeFileSync(temporary, `${JSON.stringify(claim)}\n`, { mode: 0o600 });
+    // Rename so a reader never sees a half-written claim and treats a live owner as gone.
+    renameSync(temporary, audioClaimPath);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: audio claim write failed: ${error.message}`);
+    try { unlinkSync(temporary); } catch (_) {}
+  }
+  return claim;
+}
+
+function clearAudioClaim() {
+  const claim = readAudioClaim();
+  // Only our own claim is ours to delete: another pane may have taken over between the
+  // decision to release and this call.
+  if (!heartbeatOwns(claim, process.pid)) return;
+  try {
+    unlinkSync(audioClaimPath);
+  } catch (error) {
+    if (error.code !== "ENOENT" && debugLogging) {
+      console.error(`tweb: audio claim clear failed: ${error.message}`);
+    }
+  }
+}
+
+function anyTabAudible() {
+  for (const tab of tabs) {
+    if (tab.isDestroyed()) continue;
+    // A muted tab reports itself as not audible, so the instance that gave audio up
+    // would never notice it is still playing. Its own claim state answers instead.
+    if (tab.webContents.audioMuted) continue;
+    if (tab.webContents.isCurrentlyAudible()) return true;
+  }
+  return false;
+}
+
+// Mute, never pause: the page keeps playing and keeps its position, so taking audio
+// back is one keypress rather than a re-seek.
+function applyAudioMute(muted) {
+  for (const tab of tabs) {
+    if (!tab.isDestroyed()) tab.webContents.setAudioMuted(muted);
+  }
+}
+
+function broadcastAudioState() {
+  for (const tab of tabs) {
+    sendToTabFrames(tab, "tweb-audio-state", { muted: audioMutedByOther, owner: audioOwnerPane });
+  }
+}
+
+/**
+ * Re-read the claim and settle this instance's audio against it.
+ *
+ * Runs on a timer in every instance whatever its state, not only while muted. The socket
+ * nudge is best-effort, so a missed one would otherwise leave two panes playing forever;
+ * with an unconditional poll, a missed nudge and a crashed owner recover the same way.
+ */
+function reconcileAudio({ claiming = false } = {}) {
+  const now = Date.now();
+  // A muted tab is not audible by definition, so this only ever reports the noise this
+  // instance is actually allowed to make.
+  const audible = anyTabAudible();
+  if (audible) audioSilentSince = null;
+  else if (audioSilentSince === null) audioSilentSince = now;
+
+  let claim = readAudioClaim();
+  const weHoldIt = heartbeatOwns(claim, process.pid);
+  const vacant = !claim || claimExpired(claim, now) || !processAlive(claim.pid);
+
+  if (claiming || (weHoldIt && audible) || (vacant && audible)) {
+    // Refresh only a claim that is still ours, or take one nobody live holds. A blind
+    // rewrite would stamp over another pane's reclaim and both panes would play. Two
+    // panes starting together can still both write; last-write-wins and the loser learns
+    // it lost on its next poll, which is the same path a missed nudge takes.
+    claim = writeAudioClaim();
+  } else if (weHoldIt && shouldReleaseClaim({ silentSince: audioSilentSince, now })) {
+    clearAudioClaim();
+    claim = null;
+  }
+
+  const decision = audioDecision({
+    claim,
+    selfPid: process.pid,
+    now: Date.now(),
+    ownerAlive: claim ? processAlive(claim.pid) : false,
+  });
+  if (decision.stale && claim && !decision.mine) {
+    // Whoever notices first cleans up, so a crashed owner's file does not sit there
+    // being re-judged by every instance on every tick.
+    try { unlinkSync(audioClaimPath); } catch (_) {}
+    console.error(`tweb: audio claim from pid ${claim.pid} was stale, cleared`);
+  }
+
+  const changed = decision.muted !== audioMutedByOther || decision.owner !== audioOwnerPane;
+  const tookOver = decision.mine && !weHoldIt;
+  audioMutedByOther = decision.muted;
+  audioOwnerPane = decision.owner;
+  applyAudioMute(decision.muted);
+  if (changed) {
+    broadcastAudioState();
+    console.error(`tweb: audio ${decision.muted ? "muted" : "free"}`
+      + ` (owner ${decision.owner || "none"})`);
+  }
+  // Only on the transition: a nudge every tick would be a poll by another name.
+  if (tookOver) nudgeOtherPanes();
+  return decision;
+}
+
+// Take the speakers for this pane, silencing whoever holds them.
+function claimAudio() {
+  audioSilentSince = null;
+  return reconcileAudio({ claiming: true });
+}
+
+// Tell the other panes to re-read the claim now rather than on their next tick. Purely a
+// latency optimisation — nothing is retried and no failure is reported, because the poll
+// already covers every case this could miss.
+function nudgeOtherPanes() {
+  let entries;
+  try {
+    entries = readdirSync(runtimeDir());
+  } catch (_) {
+    return;
+  }
+  const ours = path.basename(agentServer?.path || "");
+  for (const entry of entries) {
+    if (!entry.startsWith("agent-") || !entry.endsWith(".sock") || entry === ours) continue;
+    const socket = net.connect(path.join(runtimeDir(), entry), () => {
+      socket.end(`${JSON.stringify({ id: 0, method: "audio-sync", params: {} })}\n`);
+    });
+    socket.setTimeout(500, () => socket.destroy());
+    socket.on("error", () => socket.destroy());
+  }
+}
+
+function startAudioCoordination() {
+  reconcileAudio();
+  audioTimer = setInterval(() => reconcileAudio(), AUDIO_HEARTBEAT_MS);
+  audioTimer.unref();
 }
 
 function installPageEnhancements(tab = win) {
@@ -1440,8 +1672,16 @@ function sendToTabFrames(tab, channel, ...args) {
       liveKeys.add(key);
       if (readyKeys.has(key)) frame.send(channel, ...args);
     }
+    // Both maps are keyed by frame, so both go stale the same way — but only the ready set
+    // was ever pruned. A tab whose ad or embed iframes reload keeps one dead
+    // "processId:frameToken" per navigation forever, and `diag` reports that count as
+    // `shortcutFrames`, so the diagnostic reads high for a tab with one live frame.
+    const shortcutKeys = shortcutFrameKeys(tab);
     for (const key of readyKeys) {
       if (!liveKeys.has(key)) readyKeys.delete(key);
+    }
+    for (const key of shortcutKeys) {
+      if (!liveKeys.has(key)) shortcutKeys.delete(key);
     }
   } catch (error) {
     if (debugLogging) console.error(`tweb: frame broadcast failed: ${error.message}`);
@@ -1500,11 +1740,13 @@ function applyShortcutMode() {
   // always runs even when the value already matches.
   reconcileTmuxPassthrough();
   updatePaneTitle();
+  // The mode belongs to this pane, so it is reported by this pane's in-page indicator.
+  // It used to also flash `tmux display-message`, which writes to the status line the
+  // whole session shares — one pane's mode change interrupting every other pane.
   if (debugLogging) {
-    console.error(`tweb: mode vimium=${vimiumShortcutsEnabled} bypass=${cmdBypassEnabled}`);
+    console.error(`tweb: mode ${modeLabel()}`
+      + ` (vimium=${vimiumShortcutsEnabled} bypass=${cmdBypassEnabled})`);
   }
-  const label = modeLabel();
-  notify(label);
 }
 
 function modeLabel() {
@@ -1614,6 +1856,10 @@ function normalizeOmniboxInput(input) {
 // Append-only keeps concurrent panes from clobbering each other's writes.
 const historyLimit = 200;
 let lastHistoryAppend = { url: "", title: "" };
+// Compaction reads and rewrites the whole file, so it is not free — but it is cheap next to
+// how often visits happen, and letting the file grow all session was the actual bug.
+const COMPACT_EVERY_APPENDS = 50;
+let appendsSinceCompaction = 0;
 
 function historyPath() {
   return path.join(app.getPath("userData"), "history.jsonl");
@@ -1642,6 +1888,15 @@ function recordNavigationHistory(url, title = "") {
     appendFileSync(historyPath(), line, { encoding: "utf8", mode: 0o600 });
   } catch (error) {
     if (debugLogging) console.error(`tweb: history append failed: ${error.message}`);
+  }
+  appendsSinceCompaction += 1;
+  // Compaction used to run only at startup, so a long-lived pane grew its history file for
+  // as long as it stayed open and only ever shrank it on the next launch. Checking here
+  // costs one counter until the threshold, and the check inside compactHistory is what
+  // decides whether a rewrite is actually warranted.
+  if (appendsSinceCompaction >= COMPACT_EVERY_APPENDS) {
+    appendsSinceCompaction = 0;
+    compactHistory();
   }
 }
 
@@ -1673,14 +1928,92 @@ function readGlobalHistory(limit = historyLimit) {
   return [...seen.values()];
 }
 
-// Rewrite atomically so a pane reading mid-compaction still sees a whole file.
-function compactHistory(keep = 600) {
+/// Every line, timestamps intact — what the history page needs and readGlobalHistory drops.
+function readHistoryEntries() {
   try {
-    const lines = readFileSync(historyPath(), "utf8").split("\n").filter((line) => line.trim());
-    if (lines.length <= keep * 3) return;
+    return parseHistoryLines(readFileSync(historyPath(), "utf8").split("\n"));
+  } catch (error) {
+    if (error.code !== "ENOENT" && debugLogging) {
+      console.error(`tweb: history read failed: ${error.message}`);
+    }
+    return [];
+  }
+}
+
+// The file is small enough (hundreds of lines) that re-reading it per keystroke costs
+// nothing, and skipping a cache means a delete can never leave a stale view behind.
+function historyPageModel(query = "") {
+  const model = historyDays(readHistoryEntries(), { query: String(query || "") });
+  return { ...model, query: String(query || "") };
+}
+
+// Deleting rewrites the file, which races every other pane's appendFileSync: a visit
+// recorded between the read and the rename would be silently lost. compactHistory has the
+// same shape but fires once at startup; this fires whenever the user presses a key, so the
+// window is far easier to hit. Re-read just before the rename and carry across whatever
+// arrived, and back out entirely if another pane rewrote the file underneath us.
+function deleteHistoryEntries(targets, query = "") {
+  const rows = (Array.isArray(targets) ? targets : []).filter(
+    (target) => target?.url && Number.isFinite(Number(target.dayStart)),
+  );
+  if (rows.length === 0) return historyPageModel(query);
+  try {
+    const before = readFileSync(historyPath(), "utf8");
+    const { lines: kept, removed } = removeEntries(before.split("\n"), rows);
+    if (removed > 0) {
+      const { diverged, lines: arrived } = appendedSince(before, readFileSync(historyPath(), "utf8"));
+      if (diverged) {
+        if (debugLogging) console.error("tweb: history delete skipped; the file was rewritten underneath");
+        return historyPageModel(query);
+      }
+      // A concurrent append can land on a row being deleted, so it is filtered too —
+      // otherwise the row would reappear the moment the model was rebuilt.
+      const carried = removeEntries(arrived, rows).lines;
+      const final = [...kept, ...carried];
+      const temporary = `${historyPath()}.${process.pid}.tmp`;
+      writeFileSync(temporary, final.length ? `${final.join("\n")}\n` : "", { encoding: "utf8", mode: 0o600 });
+      renameSync(temporary, historyPath());
+      // The in-process omnibox list mirrors the file; leaving it would offer a URL the
+      // user just deleted for the rest of this session.
+      for (const row of rows) {
+        const stale = navigationHistory.findIndex((entry) => entry.url === row.url);
+        if (stale >= 0) navigationHistory.splice(stale, 1);
+      }
+      if (rows.some((row) => row.url === lastHistoryAppend.url)) lastHistoryAppend = { url: "", title: "" };
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT" && debugLogging) {
+      console.error(`tweb: history delete failed: ${error.message}`);
+    }
+  }
+  return historyPageModel(query);
+}
+
+// Compaction used to keep "the last N lines", which is the wrong unit: the file is
+// append-per-visit, so a user who revisits the same pages loses history fastest. Measured
+// on a real file, 824 lines held 267 distinct URLs and a 600-line trim would have kept 182
+// of them. `compactLines` keeps the newest visit per URL instead.
+//
+// The rewrite races every other pane's appendFileSync — anything landing between the read
+// and the rename goes to the old inode and dies there. So the file is re-read immediately
+// before the rename and any arrivals are carried across, and if another pane rewrote it in
+// the meantime this backs out entirely rather than clobbering that pane's work. Same shape
+// as `deleteHistoryEntries`, which faces the identical race on a much shorter fuse.
+function compactHistory() {
+  try {
+    const before = readFileSync(historyPath(), "utf8");
+    const compacted = compactLines(before.split("\n"));
+    if (!compacted) return;
+    const arrived = appendedSince(before, readFileSync(historyPath(), "utf8"));
+    if (arrived.diverged) return;
+    const body = [...compacted, ...arrived.lines];
     const temporary = `${historyPath()}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${lines.slice(-keep).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+    writeFileSync(temporary, `${body.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temporary, historyPath());
+    if (debugLogging) {
+      const was = before.split("\n").filter((line) => line.trim()).length;
+      console.error(`tweb: history compacted ${was} -> ${body.length} lines`);
+    }
   } catch (error) {
     if (error.code !== "ENOENT" && debugLogging) {
       console.error(`tweb: history compaction failed: ${error.message}`);
@@ -1756,6 +2089,14 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "omnibox-model":
       sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
+      break;
+    // The page re-asks on every keystroke so the filter runs over the whole file rather
+    // than over a slice the renderer happens to be holding.
+    case "history-model":
+      sendToFocusedTabFrame(tab, "tweb-history", historyPageModel(value?.query));
+      break;
+    case "history-delete":
+      sendToFocusedTabFrame(tab, "tweb-history", deleteHistoryEntries(value?.rows, value?.query));
       break;
     case "activate-tab":
       if (Number.isInteger(value) && value >= 0 && value < tabs.length) activateTab(value);
@@ -1837,6 +2178,11 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     }
     case "insert-mode":
       pageInsertMode = Boolean(value);
+      break;
+    // Take the speakers back from whichever pane holds them. Only ever a deliberate
+    // keypress: a page starting playback in a muted pane does not get to do this.
+    case "reclaim-audio":
+      claimAudio();
       break;
     // An overlay just went up. Painting is driven by Chromium's frame clock, so
     // without a nudge the hints would wait for the next tick to reach the pane.
@@ -2010,6 +2356,9 @@ function agentDiagnostics() {
       expected: lastViewport ? renderedFrameSize(lastViewport) : null,
       rate: activeFrameRate,
       adaptive: adaptiveFrameRate,
+      // All three resolved rates, not just the one in force. The startup banner was the
+      // only place they were stated together, and it wrote into tmux's shared status line.
+      tiers: { idle: idleFrameRate, playback: playbackFrameRate, max: maxActiveFrameRate },
       // Which of the three adaptive rates is in force. `playback` means the page is
       // painting on its own — a video, an animation — which is what separates "the pane
       // is throttled" from "the page has nothing new to show".
@@ -2039,6 +2388,16 @@ function agentDiagnostics() {
       caret: { cell: caretCell, point: lastCaretPoint },
     },
     tabs: { active: activeTabIndex, count: tabs.length },
+    // Which pane owns the speakers, and whether this one is making noise. `audible` is
+    // read live rather than cached because Chromium is the only thing that knows, and
+    // "muted but still playing" is exactly the state this feature has to produce.
+    audio: {
+      owner: audioOwnerPane,
+      mutedByOther: audioMutedByOther,
+      muted: tab ? tab.webContents.audioMuted : null,
+      audible: tab ? tab.webContents.isCurrentlyAudible() : null,
+      claimPath: audioClaimPath,
+    },
   };
 }
 
@@ -2202,6 +2561,10 @@ async function handleAgentCommand(method, params) {
         pane: process.env.TMUX_PANE || null,
         tabs: agentTabList(),
       };
+    // A peer says the claim changed. Nothing is returned and nothing is trusted — the
+    // claim file is still the truth, this only saves waiting for the next poll.
+    case "audio-sync":
+      return { ok: true, ...reconcileAudio() };
     default:
       throw new Error(`unknown method ${JSON.stringify(method)}`);
   }
@@ -2443,6 +2806,10 @@ function showBrowserContextMenu(tab, inputParams) {
   if (debugLogging) console.error("tweb: context menu shown");
 }
 
+// Windows that have already had the setter-only invariants applied. A WeakSet so a closed
+// window is not kept alive by the bookkeeping that hides it.
+const hiddenWindowLatched = new WeakSet();
+
 function keepWindowHidden(tab) {
   if (!tab || tab.isDestroyed()) return;
   const bounds = tab.getBounds();
@@ -2451,8 +2818,14 @@ function keepWindowHidden(tab) {
   }
   if (tab.getOpacity() !== 0) tab.setOpacity(0);
   if (tab.isFocusable()) tab.setFocusable(false);
-  tab.setSkipTaskbar(true);
-  tab.setIgnoreMouseEvents(true);
+  // Every other line here reads before it writes, but these two have no getter — so the
+  // watchdog was issuing them for every window, twenty times a second, forever. They are
+  // set once at creation and nothing else changes them, so a latch is enough.
+  if (!hiddenWindowLatched.has(tab)) {
+    hiddenWindowLatched.add(tab);
+    tab.setSkipTaskbar(true);
+    tab.setIgnoreMouseEvents(true);
+  }
   if (tab.isFocused()) tab.blur();
   if (tab.isVisible()) tab.hide();
 }
@@ -2476,6 +2849,8 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.setZoomFactor(initialZoomFactor);
   contents.setBackgroundThrottling(true);
   contents.setFrameRate(1);
+  // A muted instance opening a tab must not leak audio through the new one.
+  contents.setAudioMuted(audioMutedByOther);
   contents.on("paint", (_event, dirty, image) => {
     // A page painting on its own is what separates video from a static screen, and the
     // frame-rate policy reads it to decide whether to fall all the way to idle.
@@ -2515,16 +2890,24 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     if (vimiumShortcutsEnabled) showBrowserContextMenu(tab, params);
   });
   contents.on("media-started-playing", () => {
-    if (debugLogging) {
-      setTimeout(() => {
-        if (!contents.isDestroyed()) {
-          console.error(`tweb: media playing audible=${contents.isCurrentlyAudible()} muted=${contents.audioMuted}`);
-        }
-      }, 250);
-    }
+    // Audibility is not known at the moment playback starts — a track whose output has
+    // not opened yet reports silent — so the claim is left to the poll, which asks again
+    // every tick. This only shortens the wait when the answer is already in.
+    setTimeout(() => {
+      if (contents.isDestroyed()) return;
+      if (debugLogging) {
+        console.error(`tweb: media playing audible=${contents.isCurrentlyAudible()} muted=${contents.audioMuted}`);
+      }
+      // reconcileAudio, not claimAudio: a page starting playback is not consent to take
+      // the speakers from a pane that is already using them. Only `m` does that.
+      reconcileAudio();
+    }, 250);
   });
   contents.on("media-paused", () => {
     if (debugLogging) console.error("tweb: media paused");
+    // The release itself is debounced in reconcileAudio; this only makes the pane
+    // notice its own silence on the next tick rather than several ticks later.
+    reconcileAudio();
   });
   contents.on("found-in-page", (_event, result) => {
     sendToTabFrames(tab, "tweb-find-result", result);
@@ -3374,7 +3757,11 @@ app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
 app.whenReady().then(() => {
   if (process.platform === "darwin") app.dock?.hide();
   configureDownloads();
-  hiddenWindowWatchdog = setInterval(enforceHiddenWindows, 50);
+  // A backstop, not the mechanism: `browser-window-created` above and the per-tab
+  // show/focus/move listeners in `configureTab` are what actually keep a window hidden.
+  // This caught anything they missed, twenty times a second, forever — a second is plenty
+  // for a safety net whose job is to correct a window nobody can see anyway.
+  hiddenWindowWatchdog = setInterval(enforceHiddenWindows, 1000);
   hiddenWindowWatchdog.unref();
   enforceHiddenWindows();
   getTmuxPaneOrigin();
@@ -3405,12 +3792,15 @@ app.whenReady().then(() => {
   // frontend enabled it. Re-declare it from the PTY-owning parent once startup
   // has settled.
   scheduleTrackedKeyboardModeRestore();
-  notify(
-    `bypass OFF — toggle: Ctrl-; · frame: ${adaptiveFrameRate
-      ? `adaptive ${idleFrameRate}/${playbackFrameRate}/${maxActiveFrameRate}`
-      : `${maxActiveFrameRate}`}fps`
-    + ` · zoom: Ctrl +/-/0 · default: ${Math.round(defaultZoomFactor * 100)}%`
-  );
+  startAudioCoordination();
+  // The resolved settings used to be flashed into tmux's status line at startup, which
+  // belongs to the session rather than to this pane. They are reachable where they are
+  // asked for instead: `tweb diag` reports `frames.tiers` and the zoom, and the line
+  // below goes to the engine log.
+  console.error(`tweb: started ${modeLabel()} — toggle Ctrl-; · frame ${adaptiveFrameRate
+    ? `adaptive ${idleFrameRate}/${playbackFrameRate}/${maxActiveFrameRate}`
+    : `fixed ${maxActiveFrameRate}`}fps`
+    + ` · zoom ${Math.round(defaultZoomFactor * 100)}%`);
 });
 
 function cleanupFrameFiles() {
@@ -3434,6 +3824,13 @@ app.on("before-quit", () => {
     agentServer.close();
     agentServer = null;
   }
+  // A clean exit hands audio back immediately rather than making the survivors wait out
+  // the TTL. The TTL is what covers the exit that is not clean.
+  if (audioTimer) {
+    clearInterval(audioTimer);
+    audioTimer = null;
+  }
+  clearAudioClaim();
   if (hiddenWindowWatchdog) {
     clearInterval(hiddenWindowWatchdog);
     hiddenWindowWatchdog = null;
