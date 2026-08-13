@@ -755,7 +755,16 @@ function writeGfxChunked(header, payload, prefix = "", suffix = "") {
 // Cell-based placement keeps the image confined to the pane's own area.
 
 function terminalSetup() {
-  // Nothing to do. The image shows up in the pane on its own.
+  // The image shows up in the pane on its own, but the cursor does not: the pane inherits
+  // whatever the shell left behind, which is a visible block in the top-left corner. There
+  // is nothing for it to mean until a caret is parked on one — and sitting in the corner it
+  // reads as the caret having started there. Hide it until something parks it.
+  caretHidden = true;
+  try {
+    writeSync(1, `${CSI("?25l")}${CARET_SHAPE_RESET}`);
+  } catch (error) {
+    void error;
+  }
 }
 
 function requestTrackedKeyboardModeRestore() {
@@ -2215,9 +2224,14 @@ const CARET_SHAPE_RESET = CSI("0 q");
 // cell *centres* floated a composing syllable a row above tall page text.
 const CARET_BASELINE = 0.78;
 
+let caretHidden = false;
+
 function unparkTerminalCaret() {
   caretCell = null;
   lastCaretPoint = null;
+  // Reported on every frame with no caret, so it writes only on the transition.
+  if (caretHidden) return;
+  caretHidden = true;
   try { writeSync(1, `${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
 }
 
@@ -2257,7 +2271,10 @@ function reparkTerminalCaret() {
 function moveTerminalCaret(point) {
   const vp = lastViewport;
   if (!point || !vp || !win || win.isDestroyed()) {
-    if (caretCell) unparkTerminalCaret();
+    // Unconditionally, not just when a caret was parked: a frame's cursor anchoring can
+    // leave a visible cursor at the pane origin even when TWeb never put one there, and in
+    // the corner that reads as a caret sitting in the wrong place.
+    unparkTerminalCaret();
     return;
   }
   const logical = logicalContentSize(vp);
@@ -2277,6 +2294,7 @@ function moveTerminalCaret(point) {
 }
 
 function writeTerminalCaret(row, col) {
+  caretHidden = false;
   try {
     writeSync(1, `${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
   } catch (error) {

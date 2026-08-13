@@ -846,3 +846,29 @@ test("the caret is re-asserted after anything that moves the cursor", () => {
     main.indexOf("function noteRawFrameFailure()"));
   assert.match(ready, /reassertTerminalCaret\(\);/);
 });
+
+// The pane inherits the shell's cursor: a visible block in the top-left corner. Nothing
+// hid it until a caret was parked, so from load through picking a visual target the cursor
+// sat in the corner — which reads as the caret having started there, since the corner is
+// exactly where a mis-placed caret would be.
+test("the terminal cursor is hidden until a caret is parked on it", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // Startup hides it rather than leaving whatever the shell had.
+  const setup = main.slice(main.indexOf("function terminalSetup()"),
+    main.indexOf("function requestTrackedKeyboardModeRestore()"));
+  assert.match(setup, /CSI\("\?25l"\)/);
+  assert.match(setup, /caretHidden = true;/);
+
+  // And a report with no caret hides it unconditionally — a frame's cursor anchoring can
+  // leave one visible at the pane origin even when TWeb never placed it.
+  const move = main.slice(main.indexOf("function moveTerminalCaret(point)"),
+    main.indexOf("function writeTerminalCaret(row, col)"));
+  assert.match(move, /unparkTerminalCaret\(\);/);
+  assert.doesNotMatch(move, /if \(caretCell\) unparkTerminalCaret\(\)/,
+    "hiding must not be conditional on TWeb having parked the caret itself");
+
+  // That runs on every caret-less report, so the write happens only on the transition.
+  const unpark = main.slice(main.indexOf("function unparkTerminalCaret()"),
+    main.indexOf("// The page draws the IME composition surface"));
+  assert.match(unpark, /if \(caretHidden\) return;/);
+});
