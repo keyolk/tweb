@@ -29,6 +29,7 @@ const { startAgentServer } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
+const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
 const {
   isRestorableUrl,
   normalizeWindowSession,
@@ -170,6 +171,11 @@ const configuredImageId = Number.parseInt(process.env.TWEB_IMAGE_ID || "", 10);
 const imageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
   ? configuredImageId
   : 1;
+// Damage patches are placed as their own images over the base frame, so they need image ids
+// of their own. A small fixed pool, cycled: the ids only have to outlive the frame they
+// patch, and the terminal took 64 of them in a row without complaint.
+const PATCH_ID_COUNT = 8;
+const patchIdBase = imageId + 1;
 const frameTransport = process.env.TWEB_FRAME_TRANSPORT === "direct" ? "direct" : "file";
 const frameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.png`);
 let lastViewport = null;
@@ -229,7 +235,13 @@ function graphicsPassthrough(sequence) {
 }
 
 function rawKittyDelete() {
-  return `${ESC}_Ga=d,d=I,i=${imageId},q=2${ESC}\\`;
+  // The base image plus every damage patch slot. A client that stopped showing this pane
+  // keeps whatever was placed on it, so leaving the patches would strand them there.
+  let raw = `${ESC}_Ga=d,d=I,i=${imageId},q=2${ESC}\\`;
+  for (let slot = 0; slot < PATCH_ID_COUNT; slot++) {
+    raw += `${ESC}_Ga=d,d=I,i=${patchIdBase + slot},q=2${ESC}\\`;
+  }
+  return raw;
 }
 
 function deleteImageFromClientTty(tty) {
@@ -647,6 +659,38 @@ function writeGfx(header, payload) {
   } catch (e) {}
 }
 
+// The Kitty protocol caps one escape sequence's payload, so anything larger arrives as a
+// run of `m=1` continuation chunks. The gfx worker does this for whole frames; a patch is
+// written inline, so it needs its own.
+//
+// `prefix`/`suffix` walk the cursor to the patch's cell and back. They have to travel
+// inside the same passthrough wrapper as the graphics command — the wrapper is what parks
+// the cursor at the pane origin, and a separate write would start from wherever the cursor
+// happens to be. Only the first chunk carries the prefix; the continuations follow at the
+// same spot.
+const GFX_CHUNK = 3072;
+
+function writeGfxChunked(header, payload, prefix = "", suffix = "") {
+  if (!payload || payload.length === 0) {
+    writeGfx(header, "");
+    return;
+  }
+  let raw = "";
+  let first = true;
+  for (let offset = 0; offset < payload.length; offset += GFX_CHUNK) {
+    const chunk = payload.slice(offset, offset + GFX_CHUNK);
+    const more = offset + GFX_CHUNK < payload.length;
+    const chunkHeader = first
+      ? `${header}${more ? ",m=1" : ""}`
+      : `${more ? "m=1," : ""}q=2`;
+    first = false;
+    raw += `${ESC}_G${chunkHeader};${chunk}${ESC}\\`;
+  }
+  try {
+    writeSync(1, graphicsPassthrough(`${prefix}${raw}${suffix}`));
+  } catch (e) {}
+}
+
 // --- terminal setup ---
 // Note: inside tmux, the alternate screen (1049h) and clear screen (2J) can affect other
 // panes, so neither is used.
@@ -678,8 +722,12 @@ function scheduleTrackedKeyboardModeRestore() {
 
 function terminalCleanup() {
   try {
-    // Delete the image, nothing else.
+    // Delete the base image and any damage patches still placed over it. A patch left
+    // behind would outlive the pane as a stale image in the terminal's cache.
     writeGfx(`a=d,d=I,i=${imageId}`, "");
+    for (let slot = 0; slot < PATCH_ID_COUNT; slot++) {
+      writeGfx(`a=d,d=I,i=${patchIdBase + slot}`, "");
+    }
   } catch (e) {}
   // Caret parking leaves the cursor shape as a bar, so restore the terminal default.
   try {
@@ -748,13 +796,114 @@ function replacePlacement() {
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2", "");
 }
 
+// --- damage patches ---
+//
+// Encoding a whole frame is what a frame costs: measured on this pane geometry, 23ms for a
+// document, 28ms for an ordinary page, 101ms for a photo — all of it synchronous on this
+// thread, so it stalls input for that long too. But the damage behind most of those frames
+// is a caret: a 30x30 rect. Cropping to the damage first drops the encode to 0.02ms.
+//
+// A patch is a second image placed over the base frame. The terminal keeps both, and later
+// placement wins within one z, so the patch covers the stale pixels underneath without
+// touching the base — which stays valid, re-placeable on resize, and is what the next whole
+// frame replaces. See DETAIL.md sections 8.1 and 8.2 for the measurements and the terminal
+// probe behind this.
+//
+// Patches deliberately bypass the gfx worker. That queue is one frame deep, which is right
+// for whole frames but would leave a 0.4KB patch waiting behind a 1.5MB one; a patch is
+// small enough to write inline for the same reason `replacePlacement` does.
+let nextPatchSlot = 0;
+let livePatchIds = [];
+// The damage every live patch covers between them. A patch repaints this whole region, so
+// a later, smaller one still erases what an earlier, larger one drew.
+let patchedDamage = null;
+let patchFramesSent = 0;
+let wholeFramesSent = 0;
+
+function nextPatchId() {
+  const id = patchIdBase + nextPatchSlot;
+  nextPatchSlot = (nextPatchSlot + 1) % PATCH_ID_COUNT;
+  return id;
+}
+
+// `d=I` frees the image data as well as the placement. Unlike the base image a patch is
+// never re-placed, so keeping its pixels around would only consume the terminal's image
+// budget — and leaving them behind at exit is exactly the stale-image case DESIGN.md
+// section 7.7 gates on.
+function deletePatches() {
+  patchedDamage = null;
+  if (livePatchIds.length === 0) return;
+  for (const id of livePatchIds) writeGfx(`a=d,d=I,i=${id},q=2`, "");
+  livePatchIds = [];
+}
+
+// Kitty places an image at the cursor. Patches address their cell against the pane's own
+// origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
+function patchPlacementSequence(id, place) {
+  const header = `a=T,f=100,i=${id},C=1,c=${place.cols},r=${place.rows}`
+    + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
+  return { header, ...patchCursorMove(place, tmuxOrigin, paneCells, ESC) };
+}
+
+// Returns true when the damage was sent as a patch, false when the caller should fall back
+// to transferring the whole frame.
+function sendPatch(image, dirty, generation) {
+  if (!lastViewport || generation !== viewportGeneration) return false;
+  // Addressing a patch's cell needs to know where the pane sits on screen. Without tmux
+  // there is no pane offset to resolve — the whole terminal is the pane — but the cursor is
+  // then wherever the page last parked it, so the origin has to be known either way.
+  if (process.env.TMUX && !tmuxOrigin) return false;
+  // A patch only makes sense over an already-correct base frame. With nothing on screen
+  // yet, or a base from an older generation, the whole frame is what is needed.
+  if (!imageTransferred || pendingImageDelete) return false;
+  // Cover everything patched since the last whole frame, not just this frame's damage.
+  // Without this a narrower patch leaves the previous, wider one showing around it — a
+  // deleted character stays on screen until something forces a whole frame.
+  const damage = unionDamage(dirty, patchedDamage);
+  // The dirty rect and the crop are in the frame's own pixels, so the cell grid has to be
+  // measured against the frame rather than the pane: the two can differ by a rounding step,
+  // and the terminal is already scaling the frame into the pane's cell box.
+  const size = image.getSize();
+  const geometry = patchGeometry(damage, paneCells, size);
+  if (!geometry) return false;
+
+  let png;
+  try {
+    png = image.crop(geometry.crop).toPNG();
+  } catch (error) {
+    console.error(`tweb: patch encode failed: ${error.message}`);
+    return false;
+  }
+  if (!png || png.length === 0) return false;
+
+  const id = nextPatchId();
+  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place);
+  // The id may still hold an older patch from a previous cycle through the pool.
+  writeGfx(`a=d,d=I,i=${id},q=2`, "");
+  writeGfxChunked(header, png.toString("base64"), prefix, suffix);
+  if (!livePatchIds.includes(id)) livePatchIds.push(id);
+  patchedDamage = damage;
+  patchFramesSent += 1;
+  if (patchFramesSent <= 12) {
+    console.error(`tweb: patch sent #${patchFramesSent} `
+      + `cells=${geometry.place.cols}x${geometry.place.rows}`
+      + `@${geometry.place.col},${geometry.place.row} bytes=${png.length}`);
+  }
+  return true;
+}
+
 function transferFrame(png, generation) {
   if (pendingImageDelete) deletePlacement();
+  // Any patch on screen describes damage this frame already contains, so it goes out with
+  // the frame that supersedes it. Dropping them earlier would bare the stale pixels
+  // underneath for as long as the encode takes.
+  deletePatches();
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
   // whose pixel size no longer matches still covers exactly the pane.
   const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(png, header, generation);
+  wholeFramesSent += 1;
   // Only the first few: enough to see when a page actually reached the pane, which
   // is what separates "the engine is behind" from "the site is slow", and quiet
   // after that.
@@ -787,7 +936,7 @@ function flushPendingFrame() {
   sendFrameNow(frame.image, frame.generation);
 }
 
-function queueFrame(tab, image, immediate = false) {
+function queueFrame(tab, image, immediate = false, dirty = null) {
   const generation = viewportGeneration;
   const viewport = lastViewport;
   const size = image?.getSize();
@@ -799,8 +948,18 @@ function queueFrame(tab, image, immediate = false) {
     }
     return;
   }
+  // The frame cache always takes the whole image, patch or not: a tab switch and a
+  // visibility repaint re-place a complete frame, and a crop would leave them with a
+  // fragment of the page.
   tabFrames.set(tab, { image, generation });
   if (tab !== win || !terminalVisible) return;
+  // Small damage goes out immediately as a patch instead of waiting for the frame
+  // interval — the wait exists to pace whole-frame encodes, and a patch costs a
+  // thousandth of one. A caret keeping up with the keyboard is the whole point.
+  if (dirty && !pendingFrameTimer && sendPatch(image, dirty, generation)) {
+    lastFrameSentAt = Date.now();
+    return;
+  }
   pendingFrame = { tab, image, generation };
   if (pendingFrameTimer) return;
   const elapsed = Date.now() - lastFrameSentAt;
@@ -1744,6 +1903,12 @@ function agentDiagnostics() {
       adaptive: adaptiveFrameRate,
       droppedByBackpressure: droppedGfxFrames,
       imageId,
+      // How the damage split between the two paths. A pane that feels slow while typing
+      // but shows `patches` climbing is slow somewhere other than the frame pipeline;
+      // one stuck at 0 during typing means the damage never qualified for a patch.
+      whole: wholeFramesSent,
+      patches: patchFramesSent,
+      patchesPlaced: livePatchIds.length,
     },
     input: {
       vimiumShortcuts: vimiumShortcutsEnabled,
@@ -2167,7 +2332,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.setZoomFactor(initialZoomFactor);
   contents.setBackgroundThrottling(true);
   contents.setFrameRate(1);
-  contents.on("paint", (_event, _dirty, image) => {
+  contents.on("paint", (_event, dirty, image) => {
     const size = image.getSize();
     const expected = lastViewport && renderedFrameSize(lastViewport);
     if (loggedFrameGeneration !== viewportGeneration && !image.isEmpty()
@@ -2181,7 +2346,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
         );
       }
     }
-    queueFrame(tab, image);
+    // The dirty rect used to be discarded, so a blinking caret cost the same whole-frame
+    // encode as a page load. It decides the patch path now.
+    queueFrame(tab, image, false, dirty);
   });
 
   // Before Electron attaches our custom offscreen child, it can surface the macOS OffScreenView
@@ -2386,6 +2553,10 @@ function applyViewport(vp, origin = tmuxOrigin) {
   pendingFrame = null;
   pendingGfxFrame = null;
   tabFrames.clear();
+  // A patch is positioned in cells of the pane it was cut for. Once the grid changes it
+  // describes the wrong region, and unlike the base image it cannot be re-placed into the
+  // new one — so it goes now rather than waiting for the next whole frame.
+  deletePatches();
   // A moved pane leaves a placement at the old anchor, and a shrunk one leaves
   // the rows it gave up still covered — usually hiding the pane that just
   // appeared there. Neither is fixed by replacement, so both need a delete;

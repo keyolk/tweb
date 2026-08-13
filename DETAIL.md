@@ -397,6 +397,135 @@ extension
 └── 1Password native messaging connects
 ```
 
+### 8.1 Addendum — measured frame costs (2026-08-14)
+
+Sections 1–3 were designed against research, not measurement. These numbers come from the shipping
+Electron path on an M-series mac, Electron 43.2.0, a 1440×900 pane at `deviceScaleFactor: 2`
+(2880×1800 frame, 20.7MB raw), with **no** `disable-gpu-compositing` — the flag the shipping
+`main.cjs` does not set, so this is the production configuration. Three page profiles: `text` (a
+code-like document), `mixed` (cards plus noise canvases), `photo` (a full-viewport noise canvas).
+
+```text
+whole-frame encode, on the Electron main thread (the current path)
+├── image.toPNG()      text 23ms | mixed 28ms | photo 101ms
+├── image.toBitmap()   1.4–5.9ms   (the copy, not the encode)
+└── image.getBitmap()  1.4–2.0ms   (a view; no copy)
+
+partial encode, after image.crop() — crop itself is 0.00–0.01ms
+├── crop   64×32  + toPNG   0.02–0.04ms      0.4–5.2KB
+├── crop  400×200 + toPNG   0.15–0.49ms     10–198KB
+└── crop 1440×120 + toPNG   0.22–1.02ms     10–426KB
+
+raw RGBA, no PNG (f=32 territory)
+├── whole frame, BGRA→RGBA in JS + write   16–37ms      19.8MB
+└── one 512×512 tile, same in JS + write   1.5–1.9ms     1.0MB
+```
+
+The damage measured during interaction, sampled from the `paint` event's dirty rect:
+
+```text
+typing/caret   p50 dirty ≈ 30×30 px          — the frame after it is whole-frame
+scroll         p50/p90/max all whole-frame   — no partial damage at all
+hover          no frames
+```
+
+Three conclusions, each of which changes what section 3's tile strategy should optimize for:
+
+1. **The dominant cost is a whole-frame PNG encode running synchronously on the main thread.** At
+   28ms for an ordinary page it already exceeds a 30fps budget on its own, and it blocks input
+   handling for that whole time. Section 2.1 attributed awrit's bottleneck to copies and syscalls;
+   for TWeb, as shipped, the encode alone outweighs all of them.
+2. **`crop` is free and partial encodes are 100–1000× cheaper.** A caret blink costs 0.02ms of
+   encode against 28ms today. This is the single largest available win, and it needs nothing outside
+   `main.cjs` and `gfx-worker.cjs`.
+3. **Damage is bimodal — tiny or whole-frame.** The 256×256 adaptive tile grid in section 3.1 is
+   sized for a middle case the measurements do not show. A tiny-damage patch path plus a whole-frame
+   path covers what actually happens; the tile grid is an optimization for a workload still to be
+   demonstrated.
+
+Two API facts worth recording, both contradicting section 1:
+
+- **`beginFrameSubscription(true, …)` does not honour `onlyDirty` on Electron 43.** The callback
+  receives the whole frame with the dirty rect equal to the full size, and measured *slower* than
+  the `paint` event (83–100ms vs 23–101ms). Section 1.2's dirty-only subscription is not available.
+- **Encoding PNG on a worker thread is a regression, not a fix.** Handing raw pixels to a worker
+  costs ~4–5ms of main-thread time (`getBitmap` plus a transferable copy), but a hand-rolled
+  zlib PNG encode there takes 60ms (text) to 1256ms (photo) — far worse than Chromium's native
+  encoder. The way off the main thread is to encode *less*, not to encode elsewhere.
+
+### 8.2 Addendum — terminal capability probe (Ghostty 1.3.1, 2026-08-14)
+
+Both remaining unknowns were probed against a real Ghostty tty. The probes had to run outside tmux:
+graphics responses (`q=0`) do not travel back through DCS passthrough, which is why the shipping code
+sends everything with `q=2`. `bench/gfxprobe.py` reproduces them.
+
+**`t=s` shared memory works, and Ghostty really reads it.** An `a=T,f=32,t=s` transfer of a correctly
+sized POSIX shm object answers `OK`, and the object is **unlinked afterwards** — reopening it without
+`O_CREAT` fails. Only a terminal that opened and consumed the object can do that, so this is a real
+transfer, not an acknowledgement of a name it ignored. Section 2.2's SHM ring has a working consumer
+on the default terminal.
+
+One caveat for whoever implements it: **Ghostty does not size-check the shm object.** An object at
+half the size implied by `s=`/`v=` is still answered `OK` on `a=T` (and `a=q` never reads the payload
+at all, so it answers `OK` regardless — `a=q` cannot be used to validate a transfer). The binary does
+carry a `shared memory size too small expected= actual=` string, but nothing tripped it here, so do
+not rely on it: the producer owns the size contract, and getting it wrong yields garbage pixels
+rather than an error.
+
+**The patch-overlay mechanism is supported.** The measured plan for tiny damage — leave the base
+frame in place, transmit the damaged region as its own image, place it over the base, and drop it
+later — was verified step by step through the protocol:
+
+```text
+base transmit + place (i=9110)         OK
+patch transmit + place over it (i=9111) OK
+re-place base while patch is up         OK   — both images coexist
+delete patch only (a=d,d=I,i=9111)
+re-place base                           OK   — the base survives the patch delete
+re-place patch                          ENOENT: image not found  — the patch is really gone
+64 independent image ids in sequence    64/64 accepted
+```
+
+The base and the patch are independent images at the same `z=-1`, and deleting one leaves the other
+intact — which is what a patch path needs, and it needs no `a=f` composition support.
+
+Those OK responses prove lifetime, not drawing order, so stacking was checked separately by eye: a
+red base placed in a tmux pane with a small green patch placed over it afterwards **shows the green
+patch on top**. Within one `z`, later placement wins, so base and patch can share `z=-1` and keep the
+IME layering that section 9's mode indicator depends on. Should a future terminal order them the
+other way, the fix is to split the levels — base at `z=-2`, patch at `z=-1` — which stays below the
+text either way. That check also exercised the patch path through tmux passthrough with two image
+ids; `replacePlacement()` only ever proved passthrough for re-placing a single id.
+
+Patch geometry — the one piece the terminal probes could not settle — was settled in
+implementation instead, and it turned on a unit question section 1.1 leaves unstated: **a
+`paint` dirty rect is in the frame's own pixels, not DIP.** A 637x189 DIP window at
+`deviceScaleFactor: 2` reports a 1274x378 frame and a whole-frame dirty rect of exactly
+1274x378, and `NativeImage.crop` takes the same space. Scaling a dirty rect by the device
+scale factor therefore scales it twice, pushing every patch toward the bottom-right of the
+pane where it clamps — a failure that reads as "the caret happens to be near the bottom"
+rather than as a units bug, and which unit tests will happily confirm if they were written
+against the same assumption. `electron/patch-geometry.cjs` works in frame pixels throughout,
+and derives the cell size from the frame rather than the pane, since `C=1,c=,r=` already
+makes the terminal scale the frame into the cell box.
+
+The other implementation constraint is where a patch is allowed to address. `CUD` stops at
+the last row of the **terminal**, not of the pane, so relative motion from the pane origin —
+the obvious fit, since `anchorTmuxGraphics` has already parked the cursor there — silently
+clamps for any pane low on a tall screen. Observed: a pane at `top=51` asking for row 21
+within itself walked to row 73, ran out of screen, and drew a full-width patch across
+whatever pane occupied the bottom of the terminal. Patch motion is therefore absolute,
+computed as the pane origin plus the patch's own cell and clamped to the pane's grid, so it
+can neither walk off the end nor address a cell it does not own. It still cannot use its own
+DECSC/DECRC — the terminal's single save slot already belongs to the wrapper — so the cursor
+is restored by addressing the origin again.
+
+A patch also has to repaint more than the frame that triggered it. Patches accumulate, and
+nothing restores what an earlier one painted outside a later one: typing lays down a wide
+patch, backspacing lays down a narrow one, and the deleted character survives in the strip
+the new patch does not reach. Each patch therefore covers the union of all damage since the
+last whole frame, which the whole-frame path resets.
+
 ## 9. A component and interface structure built for extension
 
 DESIGN.md proposed the `BrowserEngineAdapter`, `FrameTransport`, `BrowserRuntime` and `AgentBridge`

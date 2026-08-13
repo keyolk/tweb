@@ -48,6 +48,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/url-normalization.cjs"),
     ),
     (
+        "patch-geometry.cjs",
+        include_str!("../../../electron/patch-geometry.cjs"),
+    ),
+    (
         "agent-server.cjs",
         include_str!("../../../electron/agent-server.cjs"),
     ),
