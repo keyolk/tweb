@@ -42,10 +42,13 @@ electron-test: ## Run the Electron unit tests
 
 electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/main.cjs
+	node --check electron/context-menu.cjs
 	node --check electron/preload.cjs
 	node --check electron/gfx-worker.cjs
 	node --check electron/mouse-click-state.cjs
 	node --check electron/tmux-visibility.cjs
+	node --check electron/window-session.cjs
+	node --check electron/url-normalization.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"
@@ -60,6 +63,11 @@ install: release ## Install tweb into PREFIX (default ~/.local)
 	install -m 0755 target/release/tweb "$(DESTDIR)$(PREFIX)/bin/tweb"
 	@test ! -f target/release/tweb-tauri \
 		|| install -m 0755 target/release/tweb-tauri "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
+	@# 기존 binary 위에 덮어쓰면 macOS 서명이 깨지고 kernel이 exec 시 SIGKILL한다.
+	@# 조용한 no-op처럼 보여서 원인을 찾기 어렵다.
+	@test "$$(uname)" != Darwin || codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb"
+	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
+		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb"
 
 uninstall: ## Remove what install placed (the cache is left alone)

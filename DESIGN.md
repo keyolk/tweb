@@ -117,7 +117,7 @@ tweb snapshot --pane %3     drive a browser page
 tweb resource ...           inspect, hand off and materialize resources
 tweb profile ...            bootstrap and manage profiles
 tweb chrome ...             manage the managed Chrome handoff and bridge
-tweb doctor                 diagnose terminal/tmux/GPU/extension capabilities
+tweb doctor [--fix]         diagnose terminal/tmux/Ghostty capabilities and manage the settings
 ```
 
 The pane frontend's internal invocation is kept apart from the user-facing contract.

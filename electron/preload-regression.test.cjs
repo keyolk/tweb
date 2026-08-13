@@ -132,11 +132,16 @@ test("overlays ask for a paint instead of waiting for the frame clock", () => {
   assert.match(main, /const wasIdle = activeFrameRate !== maxActiveFrameRate;/);
   assert.match(main, /if \(wasIdle && win && !win\.isDestroyed\(\) && terminalVisible\) win\.webContents\.invalidate\(\);/);
   assert.match(electron, /function paintNow\(\)/);
-  // Every overlay mount must request it; the mode indicator rides along instead.
+  // Every transient overlay mount requests a paint. The persistent mode/tab
+  // indicator additionally repaints when its hover popover opens or closes.
   const mounts = electron.match(/document\.documentElement\.append\(host\);/g) || [];
   const requests = electron.match(/^ +paintNow\(\);$/gm) || [];
-  assert.equal(requests.length, mounts.length - 1,
-    "each overlay except the mode indicator should request a paint");
+  assert.ok(requests.length >= mounts.length - 1,
+    "each transient overlay should request a paint");
+  const tabPopover = electron.slice(electron.indexOf("function hideTabPopover()"),
+    electron.indexOf("function ensureIndicator()"));
+  assert.equal(tabPopover.match(/^ +paintNow\(\);$/gm)?.length, 2,
+    "opening and closing the tab popover should repaint immediately");
 });
 
 // Same hazard as the tab switch: a delete with no frame behind it shows the
@@ -155,6 +160,22 @@ test("a resize re-places the existing image instead of baring the pane", () => {
     main.indexOf("function transferFrame("));
   assert.match(replace, /a=d,d=i,i=\$\{imageId\}/);
   assert.match(replace, /a=p,i=\$\{imageId\}/);
+});
+
+test("bare open never restores or saves an internal blank page", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /require\("\.\/window-session\.cjs"\)/);
+  assert.match(main, /if \(showingLoadError \|\| !isRestorableUrl\(url\)\) return;/);
+  assert.match(main, /const state = windowSessionForSave\(/);
+  assert.match(main, /if \(!windowSessionPath \|\| tabs\.length === 0\) return;/);
+  assert.match(main, /function writeWindowSessionState\(state\)/);
+  assert.match(main, /if \(!windowSessionPath \|\| !state\) return;/);
+  assert.match(main, /windowSessionKeys\(tmuxIdentity\)/);
+  assert.match(main, /for \(const candidate of \[windowSessionPath, legacyWindowSessionPath\]\)/);
+  assert.match(main, /restoreWindowSession && !isRestorableUrl\(url\)/);
+  assert.match(main, /noWindowSessionPage\(\)/);
+  assert.match(main, /if \(!isRestorableUrl\(url\) \|\| url\.startsWith\("tweb-action:"\)\) return;/);
+  assert.match(main, /if \(isRestorableUrl\(entry\?\.url\) && !seen\.has\(entry\.url\)\)/);
 });
 
 // A client can still report this window while tmux has zoomed a different pane.
@@ -233,6 +254,74 @@ test("id reads survive a form whose control is named id", () => {
   }
 });
 
+test("browser context menu uses Chromium hit-test data and native commands", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /buildBrowserContextMenu\(params/);
+  assert.match(main, /contextMenuStateByTab\.set\(tab/);
+  assert.match(main, /actions: new Set\(items\.filter\(\(item\) => item\.enabled\)/);
+  assert.match(main, /case "paste-plain": contents\.pasteAndMatchStyle\(\)/);
+  assert.match(main, /case "copy-image":\s+contents\.copyImageAt/);
+  assert.match(main, /case "save-image":[\s\S]*downloadUrl\(contents, params\.srcURL\)/);
+  assert.match(main, /session\.defaultSession\.on\("will-download"/);
+  assert.match(main, /item\.setSavePath\(destination\)/);
+  assert.match(main, /configureDownloads\(\)/);
+  assert.match(main, /sendToMainTabFrame\(tab, "tweb-context-menu"/);
+  assert.doesNotMatch(main, /navigator\.clipboard\.writeText\(item\.value\)/);
+  assert.match(electron, /function showBrowserContextMenu\(model\)/);
+  assert.match(electron, /send\(action \? "context-menu-command" : "context-menu-dismiss", action\)/);
+  assert.match(electron, /returnFocus\?\.focus\?\.\(\{ preventScroll: true \}\)/);
+  assert.match(electron, /restoredContextFocus && isEditable\(activeElement\(\)\)/);
+  assert.match(electron, /menu\.onkeydown/);
+});
+
+test("each pane owns an interactive tab badge instead of publishing tabs in tmux", () => {
+  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+    assert.match(source, /let tabState = \{ activeIndex: 0, count: 1, tabs:/,
+      `${name} has no initial pane-local tab state`);
+    assert.match(source, /function showTabPopover\(pinned = false\)/,
+      `${name} has no hoverable tab-title popover`);
+    assert.match(source, /badge\.onmouseenter = \(\) => showTabPopover\(false\)/,
+      `${name} does not open tab titles on hover`);
+    assert.match(source, /button\.onclick = \(event\) => \{[\s\S]*send\("activate-tab", tab\.index\)/,
+      `${name} cannot switch tabs by clicking a title`);
+    assert.match(source, /tabBadge\.textContent = `\$\{active\}\/\$\{tabState\.count\}`/,
+      `${name} does not render current\/total in a separate badge`);
+    assert.match(source, /ipcRenderer\.on\("tweb-tab-state"/,
+      `${name} does not receive pane-local tab state updates`);
+  }
+
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /function tabStateModel\(\)[\s\S]*title: candidate\.webContents\.getTitle\(\)/);
+  assert.match(main, /event\.reply\("tweb-tab-state", tabStateModel\(\)\)/);
+  assert.match(main, /function activateTab\(index\)[\s\S]*sendTabState\(\)/);
+  const paneTitle = main.slice(main.indexOf("function updatePaneTitle()"),
+    main.indexOf("function restorePaneTitle()"));
+  assert.match(paneTitle, /"-T", "tweb"/);
+  assert.doesNotMatch(paneTitle, /tabLabel|activeTabIndex/);
+
+  const tauriBrowser = fs.readFileSync(path.join(root,
+    "crates/tweb-engine/tauri/src/browser.rs"), "utf8");
+  assert.match(tauriBrowser, /fn send_tab_state\(&self\)[\s\S]*"title": tab\.title/);
+  assert.match(tauriBrowser, /self\.emit_active\("tweb-tab-state", &model\)/);
+  assert.match(tauriBrowser, /fn sync_title\(&self\)[\s\S]*self\.tmux\.update_title\("tweb"\)/);
+});
+
+test("visual image actions copy pixels, copy current source, and download", () => {
+  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+    assert.match(source, /function imageSource\(image\)/, `${name} has no image source resolver`);
+    assert.match(source, /image\.currentSrc \|\| image\.src/);
+    assert.match(source, /imageURL: imageSource\(image\)/);
+    assert.match(source, /link\?\.querySelector\?\.\("img,picture,canvas,svg,video,\[role=img\]"\) \|\| null/,
+      `${name} does not preserve an image nested inside a link`);
+    const handler = source.slice(source.indexOf("function handleVisualKey(event, key)"),
+      source.indexOf("function cssSelector(element)"));
+    assert.match(handler, /visualState\.kind === "image" \? visualState\.imageURL/);
+    assert.match(handler, /key === "D" && visualState\.kind === "image" && visualState\.imageURL/);
+    assert.match(handler, /send\("download", visualState\.imageURL\)/);
+    assert.match(source, /send\("copy-image", \{/);
+  }
+});
+
 // A picked image or link has no selection, so `c` had nothing to collapse and did
 // nothing at all — the caret was unreachable from anything but a text target.
 test("c reaches a caret from a target that carries no text", () => {
@@ -257,10 +346,10 @@ test("the first tab shows something before the real page commits", () => {
   assert.match(main, /function placeholderPage\(target\)/);
   const open = main.slice(main.indexOf("const load = () => {"),
     main.indexOf("function placeholderPage(target)"));
-  assert.match(open, /tabs\.length === 1 && url !== "about:blank"/,
-    "the placeholder is not limited to the first tab");
-  // A later tab has the previous page on screen to hold, and about:blank is
-  // already immediate.
+  assert.match(open, /showInitialPlaceholder && isRestorableUrl\(url\) && !url\.startsWith\("file:"\)/,
+    "the placeholder must skip local files and respect the active startup tab");
+  // A later tab has the previous page on screen to hold, while the restored
+  // active tab explicitly opts into the placeholder.
   assert.match(open, /once\("did-finish-load", load\)/);
   // If the placeholder itself fails there still has to be a navigation.
   assert.match(open, /loadURL\(placeholderPage\(url\)\)\.catch\(load\)/);
@@ -321,7 +410,7 @@ test("a picked scroll surface survives use and can be left", () => {
   for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
     path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
     const surface = source.slice(source.indexOf("function scrollSurface()"),
-      source.indexOf("function scrollSurfaceBy("));
+      source.indexOf("function panSurface()"));
     // A scrolled document root sits above the viewport, so visibility is the wrong
     // test — it is what dropped the surface.
     assert.doesNotMatch(surface, /visibleRect/, `${name} still gates the surface on visibility`);
@@ -330,12 +419,12 @@ test("a picked scroll surface survives use and can be left", () => {
     const targets = source.slice(source.indexOf("function scrollableTargets()"),
       source.indexOf("function scrollSurface()"));
     assert.match(targets, /page: true/, `${name} offers no page candidate`);
-    assert.match(targets, /if \(scrollTarget\) targets\.unshift\(entry\)/,
+    assert.match(targets, /if \(picked\) targets\.unshift\(entry\)/,
       `${name} does not put the way out first`);
-    assert.match(source, /scrollTarget = item\.page \? null : item\.element;/,
+    assert.match(source, /scrollTarget = item\.page \|\| item\.pan \? null : item\.element;/,
       `${name} does not release the surface when the page is picked`);
     // Escape is the other way out.
-    assert.match(source, /if \(scrollSurface\(\)\) \{\n\s+scrollTarget = null;/,
+    assert.match(source, /if \(scrollSurface\(\) \|\| panSurface\(\)\) \{\n\s+scrollTarget = null;\n\s+panTarget = null;/,
       `${name} does not release the surface on Escape`);
     // The state is invisible without this: the indicator said nothing was picked.
     assert.match(source, /scrollSurface\(\) \? "⇅ inner · Esc" : ""/,
@@ -491,18 +580,72 @@ test("scroll keys can target a picked inner surface", () => {
       `${key} must scroll the picked surface`);
   }
   assert.doesNotMatch(electron, /case "j": scrollBy\(/);
+  assert.match(electron, /if \(key === "PageUp" \|\| key === "PageDown"\) \{\s*scrollSurfaceBy\(0, key === "PageUp" \? -90 : 90\);/);
+});
+
+test("large canvas and SVG surfaces can be panned with scroll keys", () => {
+  for (const source of [electron, tauri]) {
+    assert.match(source, /querySelectorAll\("canvas,svg"\)/);
+    assert.match(source, /rect\.width < 320 \|\| rect\.height < 220/);
+    assert.match(source, /function panSurfaceBy\(left, top\)/);
+    assert.match(source, /send\("native-drag", \{/);
+    assert.match(source, /scrollTarget = item\.page \|\| item\.pan \? null : item\.element/);
+    assert.match(source, /panTarget = item\.pan \? item\.element : null/);
+  }
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "native-drag":/);
+  assert.match(main, /type: "mouseDown"[\s\S]*type: "mouseMove"[\s\S]*type: "mouseUp"/);
+  const browser = fs.readFileSync(path.join(root, "crates/tweb-engine/tauri/src/browser.rs"), "utf8");
+  assert.match(browser, /"native-drag" =>/);
+  assert.match(browser, /fn dispatch_native_drag\(/);
+});
+
+// Ctrl-; and Ctrl-/ are independent toggles: bypass (Cmd to the page) and
+// vimium shortcuts. A single flag used to drive both, and collapsing them again
+// makes one key silently move the other mode.
+test("the mode toggles stay independent across tmux and the engine", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /privateKey\("C-\\\\;", "5001"\)/);
+  assert.match(main, /privateKey\("C-\/", "5014"\)/);
+  // In the passthrough table Ctrl-; must return the client to root, or the
+  // table keeps re-arming itself after the mode it guards is gone.
+  assert.match(main, /passthroughTable, "C-\\\\;"[\s\S]*?switch-client", "-T", "root"/);
+  assert.match(main, /code === 5014[\s\S]*?setVimiumShortcutsEnabled\(!vimiumShortcutsEnabled\)/);
+  assert.match(main, /code === 5011 \|\| code === 5012/);
+  assert.match(main, /setCmdBypassEnabled\(code === 5012\)/);
+  // The private-sequence regex has to cover the Cmd codes at 5020+; a code
+  // outside its range is dropped before any table is consulted.
+  assert.match(main, /50\(\?:0\[1-9\]\|1\[0-9\]\|\[2-9\]\[0-9\]\)/);
 });
 
 // A site's own shortcuts (m to mute, j/k on a feed) check isTrusted, so insert
 // mode has to bypass the renderer round-trip that makes keys synthetic.
 test("insert mode delivers native keys to the page", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /if \(!browserShortcutsEnabled \|\| pageInsertMode\) \{/);
+  assert.match(main, /if \(!vimiumShortcutsEnabled \|\| pageInsertMode \|\| modifiers\.includes\("meta"\)\) \{/);
   assert.match(main, /case "insert-mode":/);
   assert.match(electron, /send\("insert-mode", true\)/);
   assert.match(electron, /send\("insert-mode", false\)/);
   // The mirror must reset wherever the preload's own flag would.
   assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) pageInsertMode = false;/);
+});
+
+// Cmd-V never arrives as a key — Ghostty emits no PTY encoding for Cmd combos,
+// so paste_from_clipboard writing the clipboard into the PTY is the whole
+// event. Losing either the DECSET or the reassembly types the clipboard
+// character by character, and a multiline body sends Enter mid-paste.
+test("Cmd-V arrives as a bracketed paste rather than typed characters", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const terminal = fs.readFileSync(path.join(root, "crates/tweb-pane/src/terminal.rs"), "utf8");
+  assert.match(terminal, /\\x1b\[\?2004h/);
+  assert.match(terminal, /\\x1b\[\?2004l/);
+  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{/);
+  assert.match(main, /if \(paste\.active\) \{/);
+  // The ESC-disambiguation timer must not fire into a paste body.
+  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{[\s\S]*?clearTimeout\(rawInputFlushTimer\)/);
+  assert.match(main, /function dispatchPaste\(text\)/);
+  // A real paste event carries formatting that insertText cannot.
+  assert.match(main, /normalize\(clipboard\.readText\(\)\) === body[\s\S]*?contents\.paste\(\)/);
 });
 
 // Clicking an ad or embed moves focus into a cross-origin subframe whose preload

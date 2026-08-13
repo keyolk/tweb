@@ -270,6 +270,12 @@ impl InputModeGuard {
         // leak into another pane's shell.
         let _ =
             lock.write_all(b"\x1b[?1004l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+        // Bracketed paste (2004) is the only path by which Cmd-V reaches the page.
+        // Ghostty produces no PTY encoding for Cmd combinations, but
+        // paste_from_clipboard writes the clipboard content through as is. Only
+        // with 2004 on do tmux and Ghostty wrap it in ESC[200~ ... ESC[201~, which
+        // is what lets the engine see the boundaries and handle it as one paste.
+        let _ = lock.write_all(b"\x1b[?2004h");
         if inside_tmux {
             // Ask for modifyOtherKeys mode 2, which tmux tracks: it records this as
             // pane_key_mode=Ext 2 and keeps the terminal protocol in sync per client.
@@ -311,6 +317,7 @@ impl Drop for InputModeGuard {
         }
         let _ =
             lock.write_all(b"\x1b[?1004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+        let _ = lock.write_all(b"\x1b[?2004l");
         let _ = lock.flush();
     }
 }

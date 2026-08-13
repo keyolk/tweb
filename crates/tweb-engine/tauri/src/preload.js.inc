@@ -17,6 +17,7 @@
   let passThroughEscape = false;
   let passThroughEscapeTimer = null;
   let scrollTarget = null;
+  let panTarget = null;
   let tabListRefresh = false;
   let pendingG = false;
   let pendingGTimer = null;
@@ -31,6 +32,13 @@
   let helpHost = null;
   let indicatorHost = null;
   let indicatorLabel = null;
+  let tabBadge = null;
+  let tabPopover = null;
+  let tabPopoverPinned = false;
+  let tabPopoverTimer = null;
+  let indicatorMode = "normal";
+  let indicatorDetail = "";
+  let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "New tab" }] };
   let caretIndicator = null;
   let caretCanvas = null;
   let terminalEditable = null;
@@ -229,11 +237,7 @@
       return;
     }
     if (key === "PageUp" || key === "PageDown") {
-      if (isTag(active, "textarea") && active.scrollHeight > active.clientHeight) {
-        active.scrollBy({ top: (key === "PageUp" ? -1 : 1) * active.clientHeight * 0.9, behavior: "instant" });
-      } else {
-        scrollBy({ top: (key === "PageUp" ? -1 : 1) * innerHeight * 0.9, behavior: "instant" });
-      }
+      scrollSurfaceBy(0, key === "PageUp" ? -90 : 90);
       return;
     }
     if (editable && typeof payload.text === "string" && payload.text) {
@@ -243,11 +247,68 @@
     }
   }
 
+  function hideTabPopover() {
+    clearTimeout(tabPopoverTimer);
+    tabPopoverTimer = null;
+    tabPopoverPinned = false;
+    if (tabPopover) tabPopover.style.display = "none";
+    if (tabBadge) tabBadge.setAttribute("aria-expanded", "false");
+    if (document.documentElement) document.documentElement.dataset.twebTabPopover = "closed";
+    paintNow();
+  }
+
+  function scheduleTabPopoverHide() {
+    clearTimeout(tabPopoverTimer);
+    if (!tabPopoverPinned) tabPopoverTimer = setTimeout(hideTabPopover, 180);
+  }
+
+  function showTabPopover(pinned = false) {
+    if (!topFrame) return;
+    ensureIndicator();
+    clearTimeout(tabPopoverTimer);
+    tabPopoverTimer = null;
+    tabPopoverPinned = pinned;
+    tabPopover.replaceChildren();
+    for (const tab of tabState.tabs) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.style.cssText = [
+        "display:flex", "width:100%", "gap:7px", "align-items:center", "padding:5px 7px",
+        "border:0", "border-radius:4px", "background:transparent", "color:#e8eaed",
+        "font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace", "text-align:left",
+        "cursor:pointer", "white-space:nowrap",
+      ].join(";");
+      if (tab.index === tabState.activeIndex) button.style.background = "#8ab4f82b";
+      const number = document.createElement("span");
+      number.textContent = `${tab.index + 1}`;
+      number.style.cssText = "flex:0 0 18px;color:#8ab4f8;text-align:right";
+      const title = document.createElement("span");
+      title.textContent = tab.title || "New tab";
+      title.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis";
+      button.append(number, title);
+      button.onmouseenter = () => { button.style.background = "#ffffff18"; };
+      button.onmouseleave = () => {
+        button.style.background = tab.index === tabState.activeIndex ? "#8ab4f82b" : "transparent";
+      };
+      button.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        hideTabPopover();
+        if (tab.index !== tabState.activeIndex) send("activate-tab", tab.index);
+      };
+      tabPopover.append(button);
+    }
+    tabPopover.style.display = "block";
+    tabBadge.setAttribute("aria-expanded", "true");
+    if (document.documentElement) document.documentElement.dataset.twebTabPopover = "open";
+    paintNow();
+  }
+
   function ensureIndicator() {
     if (!topFrame || !document.documentElement || indicatorHost?.isConnected) return;
     const host = document.createElement("div");
     host.id = "__tweb_mode__";
-    host.style.cssText = "position:fixed;right:5px;bottom:5px;z-index:2147483647;pointer-events:none";
+    host.style.cssText = "position:fixed;right:5px;bottom:5px;z-index:2147483647;display:flex;gap:4px;align-items:flex-end;pointer-events:none";
     const shadow = host.attachShadow({ mode: "closed" });
     const label = document.createElement("div");
     label.style.cssText = [
@@ -256,10 +317,76 @@
       "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
       "text-align:center", "white-space:nowrap", "backdrop-filter:blur(3px)",
     ].join(";");
-    shadow.append(label);
+    const badge = document.createElement("button");
+    badge.type = "button";
+    badge.setAttribute("aria-haspopup", "menu");
+    badge.setAttribute("aria-expanded", "false");
+    badge.style.cssText = [
+      "box-sizing:border-box", "height:18px", "padding:1px 6px", "border:1px solid #8ab4f866",
+      "border-radius:4px", "background:#111d", "color:#8ab4f8", "box-shadow:0 1px 4px #0007",
+      "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace", "cursor:pointer",
+      "white-space:nowrap", "pointer-events:auto", "backdrop-filter:blur(3px)",
+    ].join(";");
+    const popover = document.createElement("div");
+    popover.setAttribute("role", "menu");
+    popover.style.cssText = [
+      "display:none", "position:absolute", "right:0", "bottom:22px", "width:min(300px,calc(100vw - 10px))",
+      "max-height:min(50vh,320px)", "overflow:auto", "box-sizing:border-box", "padding:5px",
+      "border:1px solid #5f6368", "border-radius:6px", "background:#202124f5", "color:#e8eaed",
+      "box-shadow:0 6px 22px #000a", "pointer-events:auto", "backdrop-filter:blur(5px)",
+    ].join(";");
+    badge.onmouseenter = () => showTabPopover(false);
+    badge.onmouseleave = scheduleTabPopoverHide;
+    badge.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (tabPopover.style.display !== "none" && tabPopoverPinned) hideTabPopover();
+      else showTabPopover(true);
+    };
+    popover.onmouseenter = () => clearTimeout(tabPopoverTimer);
+    popover.onmouseleave = scheduleTabPopoverHide;
+    shadow.append(label, badge, popover);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
+    tabBadge = badge;
+    tabPopover = popover;
+  }
+
+  function renderIndicator() {
+    if (!topFrame) return;
+    ensureIndicator();
+    const short = modeLabels[indicatorMode] || indicatorMode.slice(0, 1).toUpperCase();
+    indicatorLabel.textContent = indicatorDetail ? `${short} ${indicatorDetail}` : short;
+    indicatorLabel.title = `TWeb ${indicatorMode}${indicatorDetail ? ` — ${indicatorDetail}` : ""}`;
+    indicatorLabel.style.color = indicatorMode === "passthrough" ? "#9aa0a6"
+      : indicatorMode === "normal" ? "#8ab4f8"
+      : indicatorMode === "insert" ? "#81c995"
+      : "#fdd663";
+    const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
+    tabBadge.textContent = `${active}/${tabState.count}`;
+    tabBadge.title = `Tab ${active}/${tabState.count} in this pane · hover/click for the list`;
+    if (tabPopover.style.display !== "none") showTabPopover(tabPopoverPinned);
+  }
+
+  function updateTabState(model) {
+    const tabs = Array.isArray(model?.tabs) ? model.tabs.flatMap((tab, index) => {
+      if (!tab || !Number.isInteger(tab.index)) return [];
+      return [{ index: tab.index, title: String(tab.title || `Tab ${index + 1}`) }];
+    }) : [];
+    const count = tabs.length || (Number.isInteger(model?.count) && model.count > 0 ? model.count : 1);
+    const activeIndex = Number.isInteger(model?.activeIndex) ? model.activeIndex : 0;
+    tabState = {
+      activeIndex: Math.min(count - 1, Math.max(0, activeIndex)),
+      count,
+      tabs: tabs.length ? tabs : Array.from({ length: count }, (_, index) => ({ index, title: `Tab ${index + 1}` })),
+    };
+    const root = document.documentElement;
+    if (root) {
+      root.dataset.twebTabIndex = String(tabState.activeIndex);
+      root.dataset.twebTabCount = String(tabState.count);
+    }
+    renderIndicator();
   }
 
   function setMode(mode, detail = "") {
@@ -271,20 +398,16 @@
       if (document.hasFocus()) send("frame-mode", { mode, detail });
       return;
     }
-    ensureIndicator();
-    const short = modeLabels[mode] || mode.slice(0, 1).toUpperCase();
-    indicatorLabel.textContent = detail ? `${short} ${detail}` : short;
-    indicatorLabel.title = `TWeb ${mode}${detail ? ` — ${detail}` : ""}`;
-    indicatorLabel.style.color = mode === "passthrough" ? "#9aa0a6"
-      : mode === "normal" ? "#8ab4f8"
-      : mode === "insert" ? "#81c995"
-      : "#fdd663";
+    indicatorMode = mode;
+    indicatorDetail = detail;
+    renderIndicator();
   }
 
   function normalMode() {
     if (!shortcutsEnabled) setMode("passthrough");
     else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
+    else if (panSurface()) setMode("normal", "↔ pan · Esc");
     else setMode("normal", scrollSurface() ? "⇅ inner · Esc" : "");
   }
 
@@ -663,6 +786,26 @@
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
+  function resourceUrl(value, element) {
+    if (!value) return "";
+    try {
+      return new URL(value, element?.baseURI || document.baseURI).href;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function imageSource(image) {
+    if (!image) return "";
+    if (isTag(image, "img")) return resourceUrl(image.currentSrc || image.src, image);
+    if (isTag(image, "video")) return resourceUrl(image.poster || image.currentSrc || image.src, image);
+    const nested = image.querySelector?.("img,video");
+    if (nested) return imageSource(nested);
+    const background = ownerView(image).getComputedStyle(image).backgroundImage;
+    const match = background?.match(/url\((['"]?)(.*?)\1\)/);
+    return resourceUrl(match?.[2], image);
+  }
+
   function visualTargets() {
     const selector = [
       "a[href]", "img", "picture", "canvas", "svg", "video", "p", "li", "pre", "code", "blockquote",
@@ -673,14 +816,20 @@
       const link = element.closest("a[href]");
       const image = element.matches("img,picture,canvas,svg,video,[role=img]")
         ? element.querySelector?.("img,canvas,svg,video") || element
-        : null;
-      return { kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text", link, image };
+        : link?.querySelector?.("img,picture,canvas,svg,video,[role=img]") || null;
+      return {
+        kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text",
+        link,
+        image,
+        imageURL: imageSource(image),
+      };
     }).filter((item) => item.kind !== "text" || item.element.innerText?.trim());
   }
 
   // Comment panels, sidebars and chat logs scroll independently of the page and
   // only react to a wheel while the pointer is over them, so `j`/`k` on the
-  // document does nothing. Let the user pick which surface the scroll keys drive.
+  // document does nothing. Large canvas/SVG apps often pan only by mouse drag;
+  // expose both kinds through the same `s` picker.
   function scrollableTargets() {
     const roots = collectRoots();
     const scrollable = roots
@@ -714,21 +863,36 @@
       seen.add(element);
       targets.push({ element, rect });
     }
+
+    // Charts and maps commonly keep their viewport in a transform instead of DOM
+    // scroll offsets. Restrict this fallback to large root drawing surfaces so icon
+    // SVGs do not flood the picker. A real overflow container wins if it is both.
+    for (const element of roots.flatMap((root) => [...root.querySelectorAll("canvas,svg")])) {
+      if (seen.has(element) || ownId(element).startsWith("__tweb_")) continue;
+      if (element.parentElement?.closest("canvas,svg")) continue;
+      const rect = visibleRect(element);
+      if (!rect || rect.width < 320 || rect.height < 220) continue;
+      if (ownerView(element).getComputedStyle(element).pointerEvents === "none") continue;
+      seen.add(element);
+      targets.push({ element, rect, pan: true });
+    }
+
     // Without the page in the list there is no way back once an inner surface is
     // picked — and on a page whose content is one big frame, the only candidate
     // would be that frame forever.
+    const picked = Boolean(scrollTarget || panTarget);
     const page = document.scrollingElement;
-    if (page && (scrollTarget || scrollsAtAll(page))) {
+    if (page && (picked || scrollsAtAll(page))) {
       const entry = { element: page, page: true,
                       rect: { left: 2, top: 2, right: 40, bottom: 20, width: 38, height: 18, x: 2, y: 2 } };
       // Picked something already? Then getting back out is the likely intent.
-      if (scrollTarget) targets.unshift(entry);
+      if (picked) targets.unshift(entry);
       else targets.push(entry);
     }
 
     // Innermost first: that is usually the one under discussion.
     return targets.sort((left, right) => {
-      if (left.page !== right.page) return left.page ? (scrollTarget ? -1 : 1) : (scrollTarget ? 1 : -1);
+      if (left.page !== right.page) return left.page ? (picked ? -1 : 1) : (picked ? 1 : -1);
       const related = left.element.ownerDocument === right.element.ownerDocument
         && right.element.compareDocumentPosition(left.element) & Node.DOCUMENT_POSITION_CONTAINED_BY;
       if (related) return -1;
@@ -751,30 +915,74 @@
     return null;
   }
 
+  function panSurface() {
+    if (panTarget?.isConnected && visibleRect(panTarget)) return panTarget;
+    panTarget = null;
+    return null;
+  }
+
+  function panSurfaceBy(left, top) {
+    const target = panSurface();
+    if (!target) return false;
+    const rect = visibleRect(target);
+    const dx = Math.max(-rect.width * 0.35, Math.min(rect.width * 0.35, -left));
+    const dy = Math.max(-rect.height * 0.35, Math.min(rect.height * 0.35, -top));
+    if (!dx && !dy) return true;
+
+    // Prefer blank drawing surface so a card or map marker does not turn the pan
+    // into an activation. Fall back to any point inside the selected surface.
+    const ratios = [[.18, .18], [.82, .18], [.18, .82], [.82, .82], [.5, .5], [.5, .25], [.5, .75]];
+    let fallback = null;
+    let start = null;
+    for (const [rx, ry] of ratios) {
+      const point = { x: rect.left + rect.width * rx, y: rect.top + rect.height * ry };
+      const end = { x: point.x + dx, y: point.y + dy };
+      if (end.x < rect.left + 4 || end.x > rect.right - 4
+        || end.y < rect.top + 4 || end.y > rect.bottom - 4) continue;
+      const hit = target.ownerDocument.elementFromPoint(point.x, point.y);
+      if (!hit || !target.contains(hit)) continue;
+      fallback ||= point;
+      if (hit === target) {
+        start = point;
+        break;
+      }
+    }
+    start ||= fallback || { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    send("native-drag", {
+      from: topViewportPoint(start),
+      to: topViewportPoint({ x: start.x + dx, y: start.y + dy }),
+    });
+    return true;
+  }
+
   function scrollSurfaceBy(left, top) {
+    if (panSurfaceBy(left, top)) return;
     const target = scrollSurface();
     if (target) target.scrollBy({ left, top, behavior: "instant" });
     else scrollBy({ left, top, behavior: "instant" });
   }
 
   function scrollSurfaceTo(top) {
+    if (panSurface()) return;
     const target = scrollSurface();
     if (target) target.scrollTo({ top, behavior: "instant" });
     else scrollTo({ top, behavior: "instant" });
   }
 
   function scrollSurfaceHeight() {
-    return scrollSurface()?.clientHeight || innerHeight;
+    return visibleRect(panSurface())?.height || scrollSurface()?.clientHeight || innerHeight;
   }
 
   function scrollSurfaceEnd() {
+    if (panSurface()) return 0;
     return scrollSurface()?.scrollHeight ?? document.documentElement.scrollHeight;
   }
 
   function startScrollPicker() {
     startPicker(scrollableTargets(), "scroll", (item) => {
       // The page entry means "no inner surface", which is what null already is.
-      scrollTarget = item.page ? null : item.element;
+      scrollTarget = item.page || item.pan ? null : item.element;
+      panTarget = item.pan ? item.element : null;
       // Some panels also gate their wheel handling on hover, so move the pointer.
       send("native-hover", hintClickPoint(item));
       normalMode();
@@ -1087,15 +1295,15 @@
       ["J · K", "previous · next tab"],
       ["x · X", "close tab · restore recent tab"],
       ["r · gi", "reload · focus first input"],
-      ["s", "pick an inner area to scroll (Esc or s returns to page)"],
+      ["s", "pick a scroll/drag-pan area (Esc or s returns to page)"],
     ]],
     ["Search and selection", [
       ["/ · n · N", "search · next · previous match"],
       ["v · V", "visual picker · select whole page"],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
-      ["y · Y · u", "smart copy · text copy · URL copy"],
-      ["o/O · p · d", "open link · paste · inspect"],
+      ["y · Y · u", "smart copy · text copy · image/link URL copy"],
+      ["D · o/O · p · d", "image download · open target · paste · inspect"],
       ["I", "inspect picker"],
     ]],
     ["Browser and modes", [
@@ -1751,6 +1959,7 @@
     }
     visualState = { ...item, outline, selectionMade };
     if (selectionMade) updateVisualSelection();
+    else if (item.kind === "image") setMode("visual", "image y·Y·u·D·o");
     else setMode("visual", `${item.kind} y·Y·u·o·p`);
   }
 
@@ -1768,6 +1977,7 @@
       kind: "text",
       link: null,
       image: null,
+      imageURL: "",
       pageSelection: true,
     });
   }
@@ -1791,7 +2001,8 @@
       // same thing `v` then `y` has always done.
       const selectedText = item.selectionMade ? visualSelection()?.toString() || "" : "";
       const text = selectedText || (typeof item.element.value === "string" ? item.element.value
-        : item.element.innerText?.trim() || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
+        : item.element.innerText?.trim() || item.image?.getAttribute("alt")
+          || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
       if (text) send("copy-text", text);
     }
     cancelVisual(false);
@@ -1808,14 +2019,25 @@
     else if (key === "v" && visualState.caret) selectFromCaret();
     else if (key === "y") copyVisual(true);
     else if (key === "Y") copyVisual(false);
-    else if (key === "u" && visualState.link?.href) {
-      send("copy-text", visualState.link.href);
+    else if (key === "u") {
+      const url = visualState.kind === "image" ? visualState.imageURL : visualState.link?.href;
+      if (url) {
+        send("copy-text", url);
+        cancelVisual(false);
+        flash("url");
+      }
+    } else if (key === "D" && visualState.kind === "image" && visualState.imageURL) {
+      send("download", visualState.imageURL);
       cancelVisual(false);
-      flash("url");
-    } else if ((key === "o" || key === "O") && visualState.link?.href) {
-      const url = visualState.link.href;
-      cancelVisual();
-      send(key === "O" ? "new-tab" : "navigate", url);
+      flash("download");
+    } else if (key === "o" || key === "O") {
+      const url = visualState.kind === "image"
+        ? visualState.imageURL || visualState.link?.href
+        : visualState.link?.href;
+      if (url) {
+        cancelVisual();
+        send(key === "O" ? "new-tab" : "navigate", url);
+      }
     } else if (key === "p" && visualState.kind === "editable") {
       visualState.element.focus();
       send("paste");
@@ -2075,9 +2297,10 @@
       case "y": send("copy-url"); flash("URL"); break;
       case "r": send("reload"); break;
       case "Escape":
-        // Release a picked scroll surface before bothering the page.
-        if (scrollSurface()) {
+        // Release a picked scroll or pan surface before bothering the page.
+        if (scrollSurface() || panSurface()) {
           scrollTarget = null;
+          panTarget = null;
           normalMode();
         } else {
           handled = dismissPageOverlay();
@@ -2121,6 +2344,10 @@
 
   ipcRenderer.on("tweb-tabs", (_event, model) => {
     renderTabList(model);
+  });
+
+  ipcRenderer.on("tweb-tab-state", (_event, model) => {
+    updateTabState(model);
   });
 
   ipcRenderer.on("tweb-frame-mode", (_event, state) => {

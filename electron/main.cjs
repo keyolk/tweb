@@ -6,10 +6,11 @@
 // - frame files avoid flooding the terminal with bytes; direct transfer is the fallback
 // - alternate screen and raw mode are handled by tweb-pane (Rust)
 
-const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen } = require("electron");
+const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen, session } = require("electron");
 const {
   appendFileSync,
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -19,16 +20,28 @@ const {
   writeSync,
 } = require("node:fs");
 const { execFile, execFileSync } = require("node:child_process");
-const { createHash } = require("node:crypto");
 const { Worker } = require("node:worker_threads");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
+const { PasteState, PASTE_START } = require("./paste-state.cjs");
 const { startAgentServer } = require("./agent-server.cjs");
+const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
+const { normalizeUrl } = require("./url-normalization.cjs");
+const {
+  isRestorableUrl,
+  normalizeWindowSession,
+  windowSessionForSave,
+  windowSessionKeys,
+} = require("./window-session.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
+}
+if (process.env.TWEB_DOWNLOAD_DIR) {
+  mkdirSync(process.env.TWEB_DOWNLOAD_DIR, { recursive: true });
+  app.setPath("downloads", process.env.TWEB_DOWNLOAD_DIR);
 }
 if (process.platform === "darwin") {
   app.setActivationPolicy("prohibited");
@@ -39,7 +52,16 @@ const tabs = [];
 const closedTabs = [];
 let activeTabIndex = -1;
 let quitting = false;
-let browserShortcutsEnabled = true;
+// Independent toggles: bypass (P) and vimium turn on and off separately.
+//   Ctrl-;  → bypass toggle (whether Cmd-K/A/... go to the page)
+//   Ctrl-:  → vimium toggle (f/j/k/... normal-mode keys)
+// Their combination makes the mode indicator:
+//   vimium on  + bypass off = N (normal)
+//   vimium off + bypass on  = P (passthrough)
+//   vimium on  + bypass on  = N-vim (both)
+//   vimium off + bypass off = D (web only)
+let vimiumShortcutsEnabled = true;
+let cmdBypassEnabled = false;
 let terminalVisible = true;
 let visibilityCheckRunning = false;
 let visibleClientTtys = new Set();
@@ -53,6 +75,7 @@ const navigationHistory = [];
 let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
 let windowSessionPath = null;
+let legacyWindowSessionPath = null;
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let agentServer = null;
@@ -64,6 +87,9 @@ let refreshTabListAfterClose = false;
 // Electron logs an ipcNative error when frame.send races preload setup or navigation.
 // A frame opts in only after its preload has installed all IPC listeners.
 const readyFrameKeysByTab = new WeakMap();
+// Context-menu URLs come from Chromium's hit test, not renderer input. Keep them
+// here so a compromised page can only choose among the actions we displayed.
+const contextMenuStateByTab = new WeakMap();
 function commandLineValue(name) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -273,6 +299,9 @@ function configureTmuxRootBindings() {
   privateKey("User114", "5003");
   privateKey("User115", "5004");
   privateKey("User116", "5007");
+  // Ctrl-; → 5001 (bypass toggle). Ctrl-/ → 5014 (vimium toggle).
+  privateKey("C-\\;", "5001");
+  privateKey("C-/", "5014");
   ensureTmuxRootBinding(
     "User112",
     ["detach-client"],
@@ -294,9 +323,20 @@ function ensureTmuxPassthroughTable() {
     ["set-option", "-s", "user-keys[110]", "\x1b[5001~"],
     ["set-option", "-s", "user-keys[111]", "\x1b[5009~"],
     ["set-option", "-s", "user-keys[112]", "\x1b[5010~"],
+    ["set-option", "-s", "user-keys[117]", "\x1b[5014~"],
     [
       "bind-key", "-T", passthroughTable, "User110",
       "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
+      "\\;", "switch-client", "-T", passthroughTable,
+    ],
+    [
+      "bind-key", "-T", passthroughTable, "C-\\;",
+      "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
+      "\\;", "switch-client", "-T", "root",
+    ],
+    [
+      "bind-key", "-T", passthroughTable, "C-/",
+      "send-keys", "-H", "1b", "5b", "35", "30", "31", "34", "7e",
       "\\;", "switch-client", "-T", passthroughTable,
     ],
   ];
@@ -313,6 +353,7 @@ function ensureTmuxPassthroughTable() {
     ["User100", "35", "30", "30", "35"],
     ["User101", "35", "30", "30", "36"],
     ["User111", "35", "30", "30", "39"],
+    ["User117", "35", "30", "31", "34"],
   ]) {
     commands.push([
       "bind-key", "-T", passthroughTable, key,
@@ -369,13 +410,18 @@ function switchTmuxClientTable(tty, table) {
   }
 }
 
+// The passthrough table is armed only while vimium is off. Bypass (Cmd) does not
+// depend on the tmux table — the engine delivers it natively regardless of mode —
+// and with vimium on the normal-mode keys have to work, so the table stays off.
+// That is what makes "bypass on + vimium on" give both vimium and Cmd.
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
   if (!process.env.TMUX_PANE) return;
   const paneId = process.env.TMUX_PANE;
+  const passthroughArmed = !vimiumShortcutsEnabled;
 
   for (const [tty, originalTable] of [...passthroughClientTables]) {
     const state = states.get(tty);
-    if (browserShortcutsEnabled || !state || state.paneId !== paneId) {
+    if (!passthroughArmed || !state || state.paneId !== paneId) {
       if (state) switchTmuxClientTable(tty, originalTable);
       passthroughClientTables.delete(tty);
       if (debugLogging) {
@@ -384,7 +430,7 @@ function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
     }
   }
 
-  if (browserShortcutsEnabled) return;
+  if (!passthroughArmed) return;
   for (const [tty, state] of states) {
     if (state.paneId !== paneId || passthroughClientTables.has(tty)) continue;
     const originalTable = state.keyTable === passthroughTable ? "root" : state.keyTable;
@@ -415,16 +461,28 @@ function initializeTmuxVisibility() {
         "-p",
         "-t",
         process.env.TMUX_PANE,
-        "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{pane_title}",
+        "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_title}",
       ],
       { encoding: "utf8", timeout: 1000 }
     ).trim();
-    const [socketPath, serverStartedAt, session, windowId, ...titleParts] = output.split("\t");
-    if (socketPath && serverStartedAt && session && windowId) {
-      tmuxIdentity = { socketPath, serverStartedAt, session, windowId, paneId: process.env.TMUX_PANE };
-      const identity = [socketPath, serverStartedAt, windowId].join("\0");
-      const key = createHash("sha256").update(identity).digest("hex").slice(0, 24);
-      windowSessionPath = path.join(app.getPath("userData"), "window-sessions", `${key}.json`);
+    const [socketPath, serverStartedAt, session, windowId, windowIndex, ...titleParts] = output.split("\t");
+    if (socketPath && serverStartedAt && session && windowId && windowIndex !== "") {
+      tmuxIdentity = {
+        socketPath,
+        serverStartedAt,
+        session,
+        windowId,
+        windowIndex,
+        paneId: process.env.TMUX_PANE,
+      };
+      const keys = windowSessionKeys(tmuxIdentity);
+      if (keys) {
+        const directory = path.join(app.getPath("userData"), "window-sessions");
+        windowSessionPath = path.join(directory, `${keys.primary}.json`);
+        legacyWindowSessionPath = keys.legacy
+          ? path.join(directory, `${keys.legacy}.json`)
+          : null;
+      }
     }
     originalPaneTitle = titleParts.join("\t");
 
@@ -775,18 +833,6 @@ let paneCells = { cols: 80, rows: 24 };
 
 // --- browser window ---
 
-function normalizeUrl(input) {
-  const value = (input || "").trim();
-  if (!value) return "https://example.com";
-  if (/^(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(value)) {
-    return `http://${value}`;
-  }
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^(about|data|file):/i.test(value)) {
-    return value;
-  }
-  return `https://${value}`;
-}
-
 function errorPage(url, code, description) {
   const html = `<!doctype html><meta charset="utf-8"><style>
     :root{color-scheme:light dark}body{font:16px system-ui;margin:3rem;line-height:1.5}
@@ -869,45 +915,8 @@ function tabLabel(tab, index) {
   return `${index + 1}/${tabs.length} ${title}`;
 }
 
-function readWindowSession() {
-  if (!restoreWindowSession || !windowSessionPath) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(windowSessionPath, "utf8"));
-    if (parsed?.version !== 1 || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
-    const restoredTabs = parsed.tabs.slice(0, 50).flatMap((entry) => {
-      if (!entry || typeof entry.url !== "string" || !entry.url || entry.url.length > 2_000_000) return [];
-      const zoom = Number.isFinite(entry.zoom)
-        ? Math.min(2, Math.max(0.5, entry.zoom))
-        : defaultZoomFactor;
-      return [{ url: entry.url, zoom }];
-    });
-    if (restoredTabs.length === 0) return null;
-    const activeIndex = Number.isInteger(parsed.activeIndex)
-      ? Math.min(restoredTabs.length - 1, Math.max(0, parsed.activeIndex))
-      : 0;
-    return { tabs: restoredTabs, activeIndex };
-  } catch (error) {
-    if (error.code !== "ENOENT" && debugLogging) {
-      console.error(`tweb: window session restore failed: ${error.message}`);
-    }
-    return null;
-  }
-}
-
-function writeWindowSession() {
-  if (!windowSessionPath || tabs.length === 0) return;
-  const savedTabs = tabs.flatMap((tab) => {
-    if (tab.isDestroyed()) return [];
-    const url = tabSessionUrls.get(tab) || tab.webContents.getURL() || "about:blank";
-    const zoom = tabZoomFactors.get(tab) ?? defaultZoomFactor;
-    return [{ url, zoom }];
-  });
-  if (savedTabs.length === 0) return;
-  const state = {
-    version: 1,
-    activeIndex: Math.min(savedTabs.length - 1, Math.max(0, activeTabIndex)),
-    tabs: savedTabs,
-  };
+function writeWindowSessionState(state) {
+  if (!windowSessionPath || !state) return;
   const temporaryPath = `${windowSessionPath}.${process.pid}.tmp`;
   try {
     mkdirSync(path.dirname(windowSessionPath), { recursive: true });
@@ -917,6 +926,44 @@ function writeWindowSession() {
     try { unlinkSync(temporaryPath); } catch {}
     if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
   }
+}
+
+function readWindowSession() {
+  if (!restoreWindowSession || !windowSessionPath) return null;
+  for (const candidate of [windowSessionPath, legacyWindowSessionPath]) {
+    if (!candidate) continue;
+    try {
+      const session = normalizeWindowSession(
+        JSON.parse(readFileSync(candidate, "utf8")),
+        defaultZoomFactor
+      );
+      if (!session) continue;
+      if (candidate !== windowSessionPath) {
+        writeWindowSessionState({ version: 1, ...session });
+        if (debugLogging) console.error("tweb: migrated legacy window session");
+      }
+      return session;
+    } catch (error) {
+      if (error.code !== "ENOENT" && debugLogging) {
+        console.error(`tweb: window session restore failed: ${error.message}`);
+      }
+    }
+  }
+  return null;
+}
+
+function writeWindowSession() {
+  if (!windowSessionPath || tabs.length === 0) return;
+  const state = windowSessionForSave(tabs.flatMap((tab) => {
+    if (tab.isDestroyed()) return [];
+    return [{
+      url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
+      zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor,
+    }];
+  }), activeTabIndex, defaultZoomFactor);
+  // A bare startup used to replace the last useful session with about:blank
+  // after 100 ms. Preserve the existing file until a real page commits.
+  writeWindowSessionState(state);
 }
 
 function scheduleWindowSessionSave() {
@@ -937,12 +984,10 @@ function notify(message) {
 }
 
 function updatePaneTitle() {
-  if (!win || !process.env.TMUX_PANE) return;
-  execFile(
-    "tmux",
-    ["select-pane", "-t", process.env.TMUX_PANE, "-T", `tweb ${tabLabel(win, activeTabIndex)}`],
-    () => {}
-  );
+  if (!process.env.TMUX_PANE) return;
+  // Tab state belongs to this pane's in-page badge. Putting it in tmux's pane
+  // title makes one active pane look like the state of the whole window.
+  execFile("tmux", ["select-pane", "-t", process.env.TMUX_PANE, "-T", "tweb"], () => {});
 }
 
 function restorePaneTitle() {
@@ -1097,6 +1142,17 @@ function sendToTabFrames(tab, channel, ...args) {
   }
 }
 
+function sendToMainTabFrame(tab, channel, ...args) {
+  if (!tab || tab.isDestroyed()) return;
+  try {
+    const frame = tab.webContents.mainFrame;
+    if (frame && !frame.isDestroyed() && !frame.detached
+      && readyFrameKeys(tab).has(frameKey(frame))) frame.send(channel, ...args);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: main frame send failed: ${error.message}`);
+  }
+}
+
 function sendToFocusedTabFrame(tab, channel, ...args) {
   if (!tab || tab.isDestroyed()) return;
   try {
@@ -1120,24 +1176,57 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
   }
 }
 
+// The preload receives the two flags separately and drives the mode indicator and
+// each gate independently.
 function broadcastShortcutMode() {
   for (const tab of tabs) {
-    sendToTabFrames(tab, "tweb-shortcuts-enabled", browserShortcutsEnabled);
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   }
 }
 
-function toggleBrowserShortcuts() {
-  browserShortcutsEnabled = !browserShortcutsEnabled;
-  // The preload drops insert mode on this signal; keep the mirror in step.
+// Applies the correct combination of the two flags and runs the follow-up work once.
+function applyShortcutMode() {
   pageInsertMode = false;
   broadcastShortcutMode();
-  if (!browserShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
+  // Once passthrough is armed (vimium off), focus so the page can receive keys.
+  if (!vimiumShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
+  // A Ghostty config reload or a pane restart can reset one side only, so reconcile
+  // always runs even when the value already matches.
   reconcileTmuxPassthrough();
   updatePaneTitle();
   if (debugLogging) {
-    console.error(`tweb: input mode ${browserShortcutsEnabled ? "shortcuts" : "passthrough"}`);
+    console.error(`tweb: mode vimium=${vimiumShortcutsEnabled} bypass=${cmdBypassEnabled}`);
   }
-  notify(browserShortcutsEnabled ? "browser shortcuts ON" : "web passthrough ON");
+  const label = modeLabel();
+  notify(label);
+}
+
+function modeLabel() {
+  const v = vimiumShortcutsEnabled;
+  const b = cmdBypassEnabled;
+  if (v && !b) return "bypass OFF";
+  if (!v && b) return "web bypass ON";
+  if (v && b) return "shortcuts and bypass ON";
+  return "web only ON";
+}
+
+function setCmdBypassEnabled(enabled) {
+  cmdBypassEnabled = enabled;
+  applyShortcutMode();
+}
+
+function setVimiumShortcutsEnabled(enabled) {
+  vimiumShortcutsEnabled = enabled;
+  applyShortcutMode();
+}
+
+// 5001 (Ctrl-;) and the legacy forcing sequences toggle or set bypass only.
+function setBrowserShortcutsEnabled(enabled) {
+  setCmdBypassEnabled(enabled);
+}
+
+function toggleBrowserShortcuts() {
+  setCmdBypassEnabled(!cmdBypassEnabled);
 }
 
 function activateTab(index) {
@@ -1169,6 +1258,7 @@ function activateTab(index) {
   updatePaintingState();
   win.webContents.invalidate();
   updatePaneTitle();
+  sendTabState();
   scheduleWindowSessionSave();
   if (debugLogging) console.error(`tweb: tab active ${tabLabel(win, normalized)}`);
 }
@@ -1181,7 +1271,7 @@ function closeTab(index = activeTabIndex) {
   const tab = tabs[index];
   if (!tab || tab.isDestroyed()) return;
   const url = tab.webContents.getURL();
-  if (url && url !== "about:blank") {
+  if (isRestorableUrl(url)) {
     closedTabs.push(url);
     if (closedTabs.length > 25) closedTabs.shift();
   }
@@ -1219,7 +1309,7 @@ function historyPath() {
 }
 
 function recordNavigationHistory(url, title = "") {
-  if (typeof url !== "string" || !url || url === "about:blank" || url.startsWith("tweb-action:")) return;
+  if (!isRestorableUrl(url) || url.startsWith("tweb-action:")) return;
   const existing = navigationHistory.findIndex((entry) => entry.url === url);
   if (existing >= 0) navigationHistory.splice(existing, 1);
   navigationHistory.unshift({ url, title: String(title || url), recency: ++navigationSerial });
@@ -1262,7 +1352,7 @@ function readGlobalHistory(limit = historyLimit) {
     if (!line) continue;
     try {
       const entry = JSON.parse(line);
-      if (entry?.url && !seen.has(entry.url)) {
+      if (isRestorableUrl(entry?.url) && !seen.has(entry.url)) {
         seen.set(entry.url, { url: entry.url, title: entry.title || entry.url });
       }
     } catch (_) {
@@ -1322,8 +1412,23 @@ function tabListModel() {
   };
 }
 
+function tabStateModel() {
+  return {
+    activeIndex: activeTabIndex,
+    count: tabs.length,
+    tabs: tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
+      index,
+      title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "New tab",
+    }]),
+  };
+}
+
+function sendTabState(tab = win) {
+  sendToMainTabFrame(tab, "tweb-tab-state", tabStateModel());
+}
+
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  if (!browserShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
+  if (!vimiumShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
   switch (action) {
@@ -1397,8 +1502,17 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
         }, 0);
       }
       break;
+    case "download":
+      downloadUrl(contents, value);
+      break;
     case "paste":
       contents.paste();
+      break;
+    case "context-menu-command":
+      runBrowserContextMenuCommand(tab, value);
+      break;
+    case "context-menu-dismiss":
+      contextMenuStateByTab.delete(tab);
       break;
     case "caret": {
       // Every same-origin frame runs this preload. A frame that just lost focus can
@@ -1438,6 +1552,25 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
         contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
       }
       break;
+    case "native-drag": {
+      const from = value?.from;
+      const to = value?.to;
+      if (![from?.x, from?.y, to?.x, to?.y].every(Number.isFinite)) break;
+      const start = pageToWindowPoint(contents, from);
+      const end = pageToWindowPoint(contents, to);
+      contents.sendInputEvent({ type: "mouseMove", ...start });
+      contents.sendInputEvent({ type: "mouseDown", ...start, button: "left", clickCount: 1 });
+      for (const ratio of [0.34, 0.67, 1]) {
+        contents.sendInputEvent({
+          type: "mouseMove",
+          x: Math.round(start.x + (end.x - start.x) * ratio),
+          y: Math.round(start.y + (end.y - start.y) * ratio),
+          button: "left",
+        });
+      }
+      contents.sendInputEvent({ type: "mouseUp", ...end, button: "left", clickCount: 1 });
+      break;
+    }
     case "frame-mode":
       sendToTabFrames(tab, "tweb-frame-mode", value);
       break;
@@ -1464,8 +1597,11 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
   if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
-  event.reply("tweb-shortcuts-enabled", browserShortcutsEnabled);
-  if (tab === win) event.reply("tweb-cell-metrics", cellMetrics());
+  event.reply("tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+  if (tab === win && frame === tab.webContents.mainFrame) {
+    event.reply("tweb-cell-metrics", cellMetrics());
+    event.reply("tweb-tab-state", tabStateModel());
+  }
 });
 
 ipcMain.on("tweb-shortcut", (event, message) => {
@@ -1567,7 +1703,8 @@ function agentDiagnostics() {
       imageId,
     },
     input: {
-      shortcutsEnabled: browserShortcutsEnabled,
+      vimiumShortcuts: vimiumShortcutsEnabled,
+      cmdBypass: cmdBypassEnabled,
       pageInsertMode,
       terminalVisible,
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
@@ -1837,6 +1974,97 @@ function pageToWindowPoint(contents, point) {
   };
 }
 
+function isDownloadableUrl(value) {
+  try {
+    return ["http:", "https:", "file:", "data:", "blob:"].includes(new URL(String(value)).protocol);
+  } catch (_) {
+    return false;
+  }
+}
+
+function downloadUrl(contents, value) {
+  if (!isDownloadableUrl(value)) return;
+  try {
+    contents.downloadURL(value);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: download failed: ${error.message}`);
+  }
+}
+
+const pendingDownloadPaths = new Set();
+
+function availableDownloadPath(filename) {
+  const directory = app.getPath("downloads");
+  mkdirSync(directory, { recursive: true });
+  const safeName = path.basename(filename || "download") || "download";
+  const extension = path.extname(safeName);
+  const stem = safeName.slice(0, safeName.length - extension.length) || "download";
+  for (let suffix = 0; ; suffix += 1) {
+    const candidate = path.join(directory, suffix === 0 ? safeName : `${stem} (${suffix})${extension}`);
+    if (!existsSync(candidate) && !pendingDownloadPaths.has(candidate)) return candidate;
+  }
+}
+
+function configureDownloads() {
+  session.defaultSession.on("will-download", (_event, item) => {
+    const destination = availableDownloadPath(item.getFilename());
+    pendingDownloadPaths.add(destination);
+    item.setSavePath(destination);
+    item.once("done", (_doneEvent, state) => {
+      pendingDownloadPaths.delete(destination);
+      if (debugLogging) console.error(`tweb: download ${state} ${destination}`);
+    });
+  });
+}
+
+function runBrowserContextMenuCommand(tab, action) {
+  const state = contextMenuStateByTab.get(tab);
+  contextMenuStateByTab.delete(tab);
+  if (!state || tab !== win || tab.isDestroyed()) return;
+  if (!state.actions.has(action)) return;
+  const { params } = state;
+  const contents = tab.webContents;
+  switch (action) {
+    case "undo": contents.undo(); break;
+    case "redo": contents.redo(); break;
+    case "cut": contents.cut(); break;
+    case "copy": contents.copy(); break;
+    case "paste": contents.paste(); break;
+    case "paste-plain": contents.pasteAndMatchStyle(); break;
+    case "select-all": contents.selectAll(); break;
+    case "search-selection":
+      createTab(`https://www.google.com/search?q=${encodeURIComponent(params.selectionText)}`, true);
+      break;
+    case "open-link": createTab(params.linkURL, true); break;
+    case "open-link-here": void contents.loadURL(params.linkURL); break;
+    case "save-link": downloadUrl(contents, params.linkURL); break;
+    case "copy-link": clipboard.writeText(params.linkURL); break;
+    case "open-image":
+    case "open-media": createTab(params.srcURL, true); break;
+    case "save-image":
+    case "save-media": downloadUrl(contents, params.srcURL); break;
+    case "copy-image":
+      contents.copyImageAt(Math.round(params.x), Math.round(params.y));
+      // copyImageAt is Chromium's native behavior, but some offscreen paths do not
+      // update the pasteboard. Capture the rendered element as the same fallback
+      // used by visual mode when the target belongs to the main document.
+      sendToMainTabFrame(tab, "tweb-context-copy-image", { x: params.x, y: params.y });
+      break;
+    case "copy-image-url":
+    case "copy-media-url": clipboard.writeText(params.srcURL); break;
+    case "back":
+      if (contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+      break;
+    case "forward":
+      if (contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+      break;
+    case "reload": contents.reload(); break;
+    case "inspect":
+      sendToMainTabFrame(tab, "tweb-context-inspect", { x: params.x, y: params.y });
+      break;
+  }
+}
+
 function showBrowserContextMenu(tab, inputParams) {
   if (tab !== win || tab.isDestroyed()) return;
   const contents = tab.webContents;
@@ -1846,93 +2074,21 @@ function showBrowserContextMenu(tab, inputParams) {
     isEditable: false,
     selectionText: "",
     linkURL: "",
+    srcURL: "",
+    mediaType: "none",
     editFlags: {},
     ...inputParams,
   };
-  const items = [];
-  if (params.isEditable) {
-    items.push(
-      { label: "Undo", action: "undo", enabled: params.editFlags.canUndo },
-      { label: "Redo", action: "redo", enabled: params.editFlags.canRedo },
-      { separator: true },
-      { label: "Cut", action: "cut", enabled: params.editFlags.canCut },
-      { label: "Copy", action: "copy", enabled: params.editFlags.canCopy },
-      { label: "Paste", action: "paste", enabled: params.editFlags.canPaste },
-      { label: "Select all", action: "selectAll", enabled: params.editFlags.canSelectAll },
-    );
-  } else if (params.selectionText) {
-    items.push({ label: "Copy", action: "copy", enabled: true }, { separator: true });
-  }
-  if (params.linkURL) {
-    items.push(
-      { label: "Open link in new tab", action: "openLink", value: params.linkURL, enabled: true },
-      { label: "Copy link address", action: "copyLink", value: params.linkURL, enabled: true },
-      { separator: true },
-    );
-  }
-  items.push(
-    { label: "Back", action: "back", enabled: contents.navigationHistory.canGoBack() },
-    { label: "Forward", action: "forward", enabled: contents.navigationHistory.canGoForward() },
-    { label: "Reload", action: "reload", enabled: true },
-  );
-
-  const model = JSON.stringify({ x: params.x, y: params.y, items });
-  void contents.executeJavaScript(`(() => {
-    const model = ${model};
-    document.getElementById('__tweb_context_menu__')?.remove();
-    const host = document.createElement('div');
-    host.id = '__tweb_context_menu__';
-    host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none';
-    const shadow = host.attachShadow({mode:'closed'});
-    const backdrop = document.createElement('div');
-    backdrop.style.cssText = 'position:fixed;inset:0;pointer-events:auto';
-    const menu = document.createElement('div');
-    menu.setAttribute('role', 'menu');
-    menu.style.cssText = 'position:fixed;min-width:190px;padding:5px;background:#202124;color:#f1f3f4;border:1px solid #5f6368;border-radius:7px;box-shadow:0 8px 24px #0008;font:13px/1.35 system-ui,-apple-system,sans-serif;pointer-events:auto';
-    for (const item of model.items) {
-      if (item.separator) {
-        const separator = document.createElement('div');
-        separator.style.cssText = 'height:1px;margin:4px 2px;background:#5f6368';
-        menu.append(separator);
-        continue;
-      }
-      const button = document.createElement('button');
-      button.textContent = item.label;
-      button.disabled = !item.enabled;
-      button.style.cssText = 'display:block;width:100%;padding:6px 10px;border:0;border-radius:4px;background:transparent;color:inherit;text-align:left;font:inherit';
-      if (!item.enabled) button.style.opacity = '.45';
-      button.onmouseenter = () => { if (!button.disabled) button.style.background = '#3c4043'; };
-      button.onmouseleave = () => { button.style.background = 'transparent'; };
-      button.onclick = async () => {
-        host.remove();
-        switch (item.action) {
-          case 'undo': document.execCommand('undo'); break;
-          case 'redo': document.execCommand('redo'); break;
-          case 'cut': document.execCommand('cut'); break;
-          case 'copy': document.execCommand('copy'); break;
-          case 'paste': document.execCommand('paste'); break;
-          case 'selectAll': document.execCommand('selectAll'); break;
-          case 'openLink': window.open(item.value, '_blank'); break;
-          case 'copyLink': await navigator.clipboard.writeText(item.value); break;
-          case 'back': history.back(); break;
-          case 'forward': history.forward(); break;
-          case 'reload': location.reload(); break;
-        }
-      };
-      menu.append(button);
-    }
-    backdrop.onclick = () => host.remove();
-    backdrop.oncontextmenu = (event) => { event.preventDefault(); host.remove(); };
-    shadow.append(backdrop, menu);
-    document.documentElement.append(host);
-    const rect = menu.getBoundingClientRect();
-    menu.style.left = Math.max(4, Math.min(model.x, innerWidth - rect.width - 4)) + 'px';
-    menu.style.top = Math.max(4, Math.min(model.y, innerHeight - rect.height - 4)) + 'px';
-  })()`, true).then(() => {
-    if (debugLogging) console.error("tweb: context menu shown");
-  }).catch((error) => {
-    if (debugLogging) console.error(`tweb: context menu failed: ${error.message}`);
+  const items = buildBrowserContextMenu(params, {
+    canGoBack: contents.navigationHistory.canGoBack(),
+    canGoForward: contents.navigationHistory.canGoForward(),
   });
+  contextMenuStateByTab.set(tab, {
+    params,
+    actions: new Set(items.filter((item) => item.enabled).map((item) => item.action)),
+  });
+  sendToMainTabFrame(tab, "tweb-context-menu", { x: params.x, y: params.y, items });
+  if (debugLogging) console.error("tweb: context menu shown");
 }
 
 function keepWindowHidden(tab) {
@@ -1999,7 +2155,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     readyFrameKeys(tab).delete(frameKey(details.frame));
   });
   contents.on("context-menu", (_event, params) => {
-    if (browserShortcutsEnabled) showBrowserContextMenu(tab, params);
+    if (vimiumShortcutsEnabled) showBrowserContextMenu(tab, params);
   });
   contents.on("media-started-playing", () => {
     if (debugLogging) {
@@ -2019,7 +2175,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 
   let showingLoadError = false;
   const recordNavigation = (url) => {
-    if (showingLoadError || typeof url !== "string" || !url) return;
+    if (showingLoadError || !isRestorableUrl(url)) return;
     tabSessionUrls.set(tab, url);
     recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
@@ -2045,7 +2201,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
       if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
     }
     installPageEnhancements(tab);
-    sendToTabFrames(tab, "tweb-shortcuts-enabled", browserShortcutsEnabled);
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
     if (debugLogging) {
       console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
     }
@@ -2053,7 +2209,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   tab.on("page-title-updated", (_event, title) => {
     const url = tabSessionUrls.get(tab) || contents.getURL();
     recordNavigationHistory(url, title);
-    if (tab === win) updatePaneTitle();
+    sendTabState();
     if (debugLogging) console.error(`tweb: title ${title}`);
   });
   contents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
@@ -2086,7 +2242,10 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
       return;
     }
     if (wasActive) activateTab(Math.min(closedIndex, tabs.length - 1));
-    else if (closedIndex < activeTabIndex) activeTabIndex -= 1;
+    else {
+      if (closedIndex < activeTabIndex) activeTabIndex -= 1;
+      sendTabState();
+    }
     if (refreshTabListAfterClose) {
       refreshTabListAfterClose = false;
       sendToTabFrames(win, "tweb-tabs", tabListModel());
@@ -2095,7 +2254,10 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
   });
 
   if (activate) activateTab(index);
-  else scheduleWindowSessionSave();
+  else {
+    sendTabState();
+    scheduleWindowSessionSave();
+  }
   if (debugLogging) console.error(`tweb: tab opened ${index + 1} ${url}`);
   return tab;
 }
@@ -2103,7 +2265,8 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
 function createTab(
   url = "about:blank",
   activate = true,
-  initialZoomFactor = defaultZoomFactor
+  initialZoomFactor = defaultZoomFactor,
+  showInitialPlaceholder = tabs.length === 0
 ) {
   const tab = adoptTab(
     new BrowserWindow(browserWindowOptions()),
@@ -2123,7 +2286,10 @@ function createTab(
   // pane was simply black. A placeholder commits in about half of one second, and
   // paint holding keeps it up while the real page loads. Only the first tab needs
   // it — any later one has the previous page on screen to hold.
-  if (tabs.length === 1 && url !== "about:blank" && !process.env.TWEB_NO_PLACEHOLDER) {
+  // Local files commit immediately, and navigating away from the placeholder can
+  // race Chromium's file load into a spurious ERR_FILE_NOT_FOUND error page.
+  if (showInitialPlaceholder && isRestorableUrl(url) && !url.startsWith("file:")
+    && !process.env.TWEB_NO_PLACEHOLDER) {
     tab.webContents.once("did-finish-load", load);
     void tab.loadURL(placeholderPage(url)).catch(load);
   } else {
@@ -2148,6 +2314,15 @@ function placeholderPage(target) {
 <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
 background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace">
 Opening ${escaped}…</body>`)}`;
+}
+
+function noWindowSessionPage() {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html>
+<meta charset="utf-8"><title>TWeb</title>
+<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;
+flex-direction:column;gap:8px">
+<div>No previous page to restore</div><div style="color:#6f747c">Press t to enter an address</div></body>`)}`;
 }
 
 function applyViewport(vp, origin = tmuxOrigin) {
@@ -2209,10 +2384,15 @@ function createWindow(url) {
   lastViewport = vp;
 
   const session = readWindowSession();
-  if (!session) return createTab(url, true);
+  if (!session) {
+    const initialUrl = restoreWindowSession && !isRestorableUrl(url)
+      ? noWindowSessionPage()
+      : url;
+    return createTab(initialUrl, true);
+  }
 
-  for (const tab of session.tabs) {
-    createTab(tab.url, false, tab.zoom);
+  for (const [index, tab] of session.tabs.entries()) {
+    createTab(tab.url, false, tab.zoom, index === session.activeIndex);
   }
   activateTab(session.activeIndex);
   if (debugLogging) {
@@ -2225,6 +2405,7 @@ function createWindow(url) {
 
 let rawInput = Buffer.alloc(0);
 let rawInputFlushTimer = null;
+const paste = new PasteState();
 const utf8Decoder = new StringDecoder("utf8");
 const mouseClicks = new MouseClickState();
 
@@ -2297,7 +2478,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
 
   if (wheel) {
     const direction = buttonCode === 0 ? 1 : buttonCode === 1 ? -1 : 0;
-    if (browserShortcutsEnabled && direction !== 0 && hasZoomModifier(modifiers)) {
+    if (vimiumShortcutsEnabled && direction !== 0 && hasZoomModifier(modifiers)) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
@@ -2372,16 +2553,40 @@ function keyName(codepoint) {
   return null;
 }
 
+// The name sent to the preload is the web-standard KeyboardEvent.key, but
+// sendInputEvent's keyCode only accepts Electron Accelerator names. The arrow keys
+// are named differently in the two schemes, so passing them straight through makes
+// Chromium ignore them silently — why ArrowUp/Down did nothing in Slack's search box.
+const ACCELERATOR_KEYS = new Map([
+  ["ArrowUp", "Up"], ["ArrowDown", "Down"], ["ArrowLeft", "Left"], ["ArrowRight", "Right"],
+]);
+// Chromium's sendInputEvent expects Accelerator key codes. A single lowercase letter
+// under a Cmd modifier is one place the two disagree: the web KeyboardEvent.key
+// is "k" but Accelerator wants "KeyK". Without this, Cmd-K arrives at the
+// page as keyCode "k" with meta, which Slack's keydown handler ignores. Apply
+// the letter→KeyX mapping only when meta is held, so plain typing is unaffected.
+const META_LETTER_KEYS = new Map(
+  [..."abcdefghijklmnopqrstuvwxyz"].map((c) => [c, `Key${c.toUpperCase()}`]),
+);
+
 function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
+  const hasMeta = modifiers.includes("meta");
+  const keyCode = ACCELERATOR_KEYS.get(key)
+    || (hasMeta ? META_LETTER_KEYS.get(key) : null)
+    || key;
   const event = {
-    keyCode: key,
+    keyCode,
     modifiers,
   };
   if (eventKind === 3) {
     contents.sendInputEvent({ ...event, type: "keyUp" });
     return;
   }
-  contents.sendInputEvent({ ...event, type: "rawKeyDown" });
+  // Cmd combinations go out as keyDown so Chromium runs its shortcut path.
+  // rawKeyDown skips shortcut handling, leaving the page blind to the shortcut.
+  // keyCode uses the web-standard "k" rather than the Accelerator name (KeyK) —
+  // Chromium's keyDown does not always recognise "KeyK", while "k" is reliable.
+  contents.sendInputEvent({ type: "keyDown", keyCode: key, modifiers });
   if (text && !modifiers.includes("control") && !modifiers.includes("meta")) {
     contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
   }
@@ -2394,6 +2599,9 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   const pressed = eventKind !== 3;
   const control = modifiers.includes("control");
   const shift = modifiers.includes("shift");
+  if (debugLogging && modifiers.length) {
+    console.error(`tweb: key ${key} [${modifiers.join("+")}] kind=${eventKind}`);
+  }
 
   // Where tmux does not strip the modifiers, standard CSI-u is supported too.
   // The release is consumed as well, so no orphan keyUp reaches the page.
@@ -2407,9 +2615,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
     return;
   }
 
-  // Cmd-C/V/X reach us as CSI-u like Cmd-A does, but nothing acted on them, so
-  // copy and paste simply did nothing inside the page. Drive the editing
-  // commands directly: the renderer knows the selection and the focused field.
+  // Editing commands are driven directly rather than dispatched as key events:
+  // the renderer knows the selection and the focused field, so this works while
+  // typing (mode E) where it matters most. Ghostty's own Cmd-C/V act on the
+  // terminal selection instead, which is why these need a passthrough entry.
   if (modifiers.includes("meta") && ["c", "v", "x"].includes(key.toLowerCase())) {
     if (pressed) {
       const contents = win.webContents;
@@ -2422,12 +2631,12 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
 
   // Ctrl-C quits the pane only in browser shortcut mode. In web passthrough mode it goes to
   // the page as an ordinary KeyboardEvent.
-  if (browserShortcutsEnabled && key.toLowerCase() === "c" && control) {
+  if (vimiumShortcutsEnabled && key.toLowerCase() === "c" && control) {
     if (pressed) app.quit();
     return;
   }
 
-  if (browserShortcutsEnabled) {
+  if (vimiumShortcutsEnabled) {
     const tabCycle = control && (key === "Tab" || key === "PageDown" || key === "PageUp");
     const tabClose = control && key.toLowerCase() === "w";
     const zoom = hasZoomModifier(modifiers) && ["+", "=", "-", "0"].includes(key);
@@ -2456,7 +2665,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // through the renderer arrives untrusted, and sites gate their shortcuts on
   // that. Escape still reaches TWeb: the preload's capture listener sees the
   // native key first and leaves insert mode.
-  if (!browserShortcutsEnabled || pageInsertMode) {
+  // Cmd combinations always go native: they exist only because the user wants
+  // the web app's own shortcut, and those are exactly the handlers that check
+  // isTrusted.
+  if (!vimiumShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
     dispatchNativeKey(win.webContents, key, text, modifiers, eventKind);
     return;
   }
@@ -2500,6 +2712,28 @@ function dispatchControlByte(byte, extraModifierBits = 0) {
   return false;
 }
 
+// Cmd-V. Pastes into the page the bracketed-paste body that Ghostty's
+// paste_from_clipboard wrote to the PTY. When the content matches the clipboard it
+// uses webContents.paste() — pages like Slack read the real paste event to handle
+// formatting and attachments, which insertText cannot deliver. Terminals commonly
+// turn \n into \r on paste, so both sides are normalized before comparing.
+function dispatchPaste(text) {
+  if (!win || !text) return;
+  const contents = win.webContents;
+  const normalize = (value) => value.replace(/\r\n?/g, "\n");
+  const body = normalize(text);
+  const fromClipboard = normalize(clipboard.readText()) === body;
+  if (debugLogging) {
+    console.error(`tweb: paste ${body.length} chars clipboard=${fromClipboard}`);
+  }
+  if (fromClipboard) {
+    contents.paste();
+    return;
+  }
+  // A different clipboard (a tmux buffer paste, say) means inserting the text as is.
+  contents.insertText(body);
+}
+
 function dispatchText(buffer) {
   let offset = 0;
   while (offset < buffer.length) {
@@ -2524,13 +2758,43 @@ function dispatchText(buffer) {
   }
 }
 
+// Ghostty produces no PTY encoding for Cmd combinations (a key probe confirmed that
+// plain, modifyOtherKeys and Kitty modes all send zero bytes). They are carried as
+// private sequences instead and turned back into the original key here. 5020 and up
+// is the Cmd range, and each code must be registered in tmux user-keys[120+] or its
+// ESC gets re-encoded. The codes have to match doctor's CMD_PASSTHROUGH_KEYS.
+const CMD_PRIVATE_KEYS = new Map([
+  [5020, "k"],
+  [5021, "a"],
+  [5022, "c"],
+  [5023, "x"],
+]);
+
 function dispatchPrivateShortcut(code) {
   if (debugLogging) console.error(`tweb: private key ${code}`);
+  // Ctrl-; — bypass toggle. Leaves vimium alone.
   if (code === 5001) {
     toggleBrowserShortcuts();
     return;
   }
-  if (browserShortcutsEnabled) {
+  // Ctrl-: — vimium toggle. Leaves bypass alone.
+  if (code === 5014) {
+    setVimiumShortcutsEnabled(!vimiumShortcutsEnabled);
+    return;
+  }
+  // The legacy forced ON/OFF sequences — under the new flags they force bypass.
+  if (code === 5011 || code === 5012) {
+    setCmdBypassEnabled(code === 5012);
+    return;
+  }
+  const cmdKey = CMD_PRIVATE_KEYS.get(code);
+  if (cmdKey) {
+    // 1 + meta(8). Sent to the page regardless of cmdBypassEnabled — in any mode,
+    // what the user pressed is that web app's Cmd shortcut.
+    dispatchNamedKey(cmdKey, 9);
+    return;
+  }
+  if (vimiumShortcutsEnabled) {
     if (code === 5002 || code === 5007) setBrowserZoom("in");
     else if (code === 5003) setBrowserZoom("out");
     else if (code === 5004) setBrowserZoom("reset");
@@ -2566,6 +2830,23 @@ function scheduleRawInputFlush() {
 function consumeRawInput() {
   for (;;) {
     if (rawInput.length === 0) return;
+
+    // A paste body is never parsed as escape sequences. It can hold arbitrary bytes
+    // including ESC, and everything up to the closing bracket is text to paste.
+    if (paste.active) {
+      const chunk = rawInput;
+      rawInput = Buffer.alloc(0);
+      const done = paste.push(chunk);
+      if (!done) return;
+      if (done.dropped) {
+        if (debugLogging) console.error("tweb: paste exceeded limit, dropped");
+        return;
+      }
+      rawInput = done.rest;
+      dispatchPaste(done.text);
+      continue;
+    }
+
     const escape = rawInput.indexOf(0x1b);
     if (escape > 0) {
       dispatchText(rawInput.subarray(0, escape));
@@ -2580,6 +2861,21 @@ function consumeRawInput() {
 
     const input = rawInput.toString("utf8");
 
+    // Start of a bracketed paste. Ghostty never encodes Cmd-V as a key; the whole
+    // event is paste_from_clipboard writing the clipboard into the PTY. On the
+    // opening bracket, collect the body that follows and handle it as one paste.
+    if (paste.begins(rawInput)) {
+      // Stops the ESC-disambiguation timer from firing mid-paste and committing the
+      // body's first byte as an Escape key.
+      if (rawInputFlushTimer) {
+        clearTimeout(rawInputFlushTimer);
+        rawInputFlushTimer = null;
+      }
+      paste.start();
+      rawInput = rawInput.subarray(PASTE_START.length);
+      continue;
+    }
+
     // Focus reporting is not used. An ESC[I/ESC[O left over from a previous run or from
     // tmux/terminal state is never forwarded as browser text or a shell string either.
     const focus = /^\x1b\[[IO]/.exec(input);
@@ -2588,7 +2884,9 @@ function consumeRawInput() {
       continue;
     }
 
-    let match = /^\x1b\[(500[1-9])~/.exec(input);
+    // 5001-5012 are the existing shortcuts, 5013-5019 the mode toggles
+    // (5014 = Ctrl-:), and 5020 and up the Cmd combinations.
+    let match = /^\x1b\[(50(?:0[1-9]|1[0-9]|[2-9][0-9]))~/.exec(input);
     if (match) {
       dispatchPrivateShortcut(Number(match[1]));
       rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
@@ -2700,6 +2998,13 @@ process.stdin.on("data", (chunk) => {
         clearTimeout(rawInputFlushTimer);
         rawInputFlushTimer = null;
       }
+      // The escape sequence's raw bytes. Being pre-decoding, it separates "the
+      // terminal never sent it" from "it arrived but was not understood" — this log
+      // is how tmux re-encoding ESC[5020~ into ESC[91;3u5020~ was found. Logging
+      // ordinary typing too would drown it, so only sequences are kept.
+      if (debugLogging && input[1].startsWith("1b")) {
+        console.error(`tweb: input ${input[1]}`);
+      }
       rawInput = Buffer.concat([rawInput, Buffer.from(input[1], "hex")]);
       consumeRawInput();
     }
@@ -2713,6 +3018,7 @@ app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
 
 app.whenReady().then(() => {
   if (process.platform === "darwin") app.dock?.hide();
+  configureDownloads();
   hiddenWindowWatchdog = setInterval(enforceHiddenWindows, 50);
   hiddenWindowWatchdog.unref();
   enforceHiddenWindows();
@@ -2745,7 +3051,7 @@ app.whenReady().then(() => {
   // has settled.
   scheduleTrackedKeyboardModeRestore();
   notify(
-    `browser shortcuts ON — toggle: Ctrl-; · frame: ${adaptiveFrameRate ? `adaptive 4-${maxActiveFrameRate}` : `${maxActiveFrameRate}`}fps`
+    `bypass OFF — toggle: Ctrl-; · frame: ${adaptiveFrameRate ? `adaptive 4-${maxActiveFrameRate}` : `${maxActiveFrameRate}`}fps`
     + ` · zoom: Ctrl +/-/0 · default: ${Math.round(defaultZoomFactor * 100)}%`
   );
 });

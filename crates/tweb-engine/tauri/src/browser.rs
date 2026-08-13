@@ -284,6 +284,7 @@ impl BrowserRuntime {
             self.activate_by_label(&label);
         } else {
             self.sync_windows();
+            self.send_tab_state();
             self.write_window_session();
         }
         Ok(())
@@ -441,6 +442,7 @@ impl BrowserRuntime {
             "tweb-preload-ready" => {
                 self.update_page_meta(label, &action.value);
                 self.send_shortcut_mode();
+                self.send_tab_state();
             }
             "page-meta" => self.update_page_meta(label, &action.value),
             "history-back" => self.with_active_window(go_back),
@@ -481,6 +483,16 @@ impl BrowserRuntime {
                     self.with_active_window(|window| copy_image(window, rect));
                 }
             }
+            "download" => {
+                if let Some(url) = action.value.as_str().filter(|url| is_downloadable_url(url)) {
+                    let url = javascript_string(url);
+                    self.with_active_window(|window| {
+                        let _ = window.eval(format!(
+                            "(()=>{{const a=document.createElement('a');a.href={url};a.download='';a.style.display='none';document.documentElement.append(a);a.click();a.remove()}})()"
+                        ));
+                    });
+                }
+            }
             "paste" => {
                 if let Some(text) = read_text() {
                     let text = javascript_string(&text);
@@ -498,6 +510,11 @@ impl BrowserRuntime {
             "native-click" => {
                 if let Some(point) = CssPoint::from_value(&action.value) {
                     self.with_active_window(|window| dispatch_native_click(window, point));
+                }
+            }
+            "native-drag" => {
+                if let Some(drag) = CssDrag::from_value(&action.value) {
+                    self.with_active_window(|window| dispatch_native_drag(window, drag));
                 }
             }
             "inspect-devtools" => self.with_active_window(|window| {
@@ -605,6 +622,10 @@ impl BrowserRuntime {
     pub(crate) fn handle_private(self: &Arc<Self>, code: u32) {
         if code == 5001 {
             self.toggle_shortcuts();
+            return;
+        }
+        if matches!(code, 5011 | 5012) {
+            self.set_shortcuts_enabled(code == 5012);
             return;
         }
         let shortcuts = self.tabs.lock().is_ok_and(|tabs| tabs.shortcuts_enabled);
@@ -752,6 +773,7 @@ impl BrowserRuntime {
             }
         }
         self.sync_title();
+        self.send_tab_state();
     }
 
     fn page_loaded(&self, label: &str, url: &str) {
@@ -776,6 +798,7 @@ impl BrowserRuntime {
             self.snapshot.mark_interaction();
             self.send_shortcut_mode();
             self.sync_title();
+            self.send_tab_state();
             self.write_window_session();
         }
     }
@@ -788,12 +811,12 @@ impl BrowserRuntime {
         })
     }
 
-    fn toggle_shortcuts(&self) {
-        let enabled = {
-            let mut tabs = self.tabs.lock().unwrap();
-            tabs.shortcuts_enabled = !tabs.shortcuts_enabled;
-            tabs.shortcuts_enabled
-        };
+    fn set_shortcuts_enabled(&self, enabled: bool) {
+        if let Ok(mut tabs) = self.tabs.lock() {
+            tabs.shortcuts_enabled = enabled;
+        }
+        // Reconcile even when the engine mode was already correct: Ghostty reloads
+        // and pane restarts can reset the terminal side independently.
         self.tmux.set_shortcuts_enabled(enabled);
         self.send_shortcut_mode();
         if !enabled {
@@ -806,9 +829,30 @@ impl BrowserRuntime {
         });
     }
 
+    fn toggle_shortcuts(&self) {
+        let enabled = !self.tabs.lock().is_ok_and(|tabs| tabs.shortcuts_enabled);
+        self.set_shortcuts_enabled(enabled);
+    }
+
     fn send_shortcut_mode(&self) {
         let enabled = self.tabs.lock().is_ok_and(|tabs| tabs.shortcuts_enabled);
         self.emit_active("tweb-shortcuts-enabled", &Value::Bool(enabled));
+    }
+
+    fn send_tab_state(&self) {
+        let model = self.tabs.lock().ok().map(|tabs| {
+            json!({
+                "activeIndex": tabs.active,
+                "count": tabs.values.len(),
+                "tabs": tabs.values.iter().enumerate().map(|(index, tab)| json!({
+                    "index": index,
+                    "title": tab.title,
+                })).collect::<Vec<_>>(),
+            })
+        });
+        if let Some(model) = model {
+            self.emit_active("tweb-tab-state", &model);
+        }
     }
 
     fn send_tab_list(&self) {
@@ -901,6 +945,7 @@ impl BrowserRuntime {
         self.sync_windows();
         self.sync_title();
         self.send_shortcut_mode();
+        self.send_tab_state();
         self.write_window_session();
     }
 
@@ -946,6 +991,7 @@ impl BrowserRuntime {
             *self.snapshot.last_hash.lock().unwrap() = None;
             self.sync_windows();
             self.sync_title();
+            self.send_tab_state();
             self.write_window_session();
         }
     }
@@ -975,18 +1021,9 @@ impl BrowserRuntime {
     }
 
     fn sync_title(&self) {
-        let title = self.tabs.lock().ok().and_then(|tabs| {
-            let tab = tabs.values.get(tabs.active)?;
-            Some(format!(
-                "tweb {}/{} {}",
-                tabs.active + 1,
-                tabs.values.len(),
-                tab.title
-            ))
-        });
-        if let Some(title) = title {
-            self.tmux.update_title(&title);
-        }
+        // Tab state belongs to this pane's in-page badge. Putting it in tmux's
+        // pane title makes one active pane look like the state of the window.
+        self.tmux.update_title("tweb");
     }
 
     fn set_zoom(&self, action: ZoomAction) {
@@ -1081,6 +1118,9 @@ fn normalize_omnibox_input(input: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
+    if std::path::Path::new(value).is_absolute() {
+        return url::Url::from_file_path(value).ok().map(|url| url.into());
+    }
     let lower = value.to_ascii_lowercase();
     if lower.starts_with("localhost")
         || lower.starts_with("127.0.0.1")
@@ -1121,6 +1161,11 @@ fn has_scheme(value: &str) -> bool {
                 character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
             }
         })
+}
+
+fn is_downloadable_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file" | "data" | "blob"))
 }
 
 fn url_encode(value: &str) -> String {
@@ -1589,6 +1634,21 @@ impl CssPoint {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CssDrag {
+    from: CssPoint,
+    to: CssPoint,
+}
+
+impl CssDrag {
+    fn from_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            from: CssPoint::from_value(value.get("from")?)?,
+            to: CssPoint::from_value(value.get("to")?)?,
+        })
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn dispatch_native_hover(window: &WebviewWindow, point: CssPoint) {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
@@ -1688,6 +1748,82 @@ fn dispatch_native_click(window: &WebviewWindow, point: CssPoint) {
 
 #[cfg(not(target_os = "macos"))]
 fn dispatch_native_click(_window: &WebviewWindow, _point: CssPoint) {}
+
+#[cfg(target_os = "macos")]
+fn dispatch_native_drag(window: &WebviewWindow, drag: CssDrag) {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::NSPoint;
+    use objc2_web_kit::WKWebView;
+    use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static EVENT_NUMBER: AtomicIsize = AtomicIsize::new(1);
+    static EVENT_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+    let _ = window.with_webview(move |platform| unsafe {
+        let webview = &*(platform.inner() as *mut WKWebView);
+        let bounds = webview.bounds();
+        let clamp = |point: CssPoint| {
+            NSPoint::new(
+                point.x.clamp(0.0, (bounds.size.width - 1.0).max(0.0)),
+                point.y.clamp(0.0, (bounds.size.height - 1.0).max(0.0)),
+            )
+        };
+        let start = clamp(drag.from);
+        let end = clamp(drag.to);
+        let points = [
+            start,
+            NSPoint::new(
+                start.x + (end.x - start.x) * 0.34,
+                start.y + (end.y - start.y) * 0.34,
+            ),
+            NSPoint::new(
+                start.x + (end.x - start.x) * 0.67,
+                start.y + (end.y - start.y) * 0.67,
+            ),
+            end,
+        ];
+        let Some(native_window) = webview.window() else {
+            return;
+        };
+        let timestamp = EVENT_CLOCK.get_or_init(Instant::now).elapsed().as_secs_f64();
+        let events = [
+            (NSEventType::MouseMoved, points[0]),
+            (NSEventType::LeftMouseDown, points[0]),
+            (NSEventType::LeftMouseDragged, points[1]),
+            (NSEventType::LeftMouseDragged, points[2]),
+            (NSEventType::LeftMouseDragged, points[3]),
+            (NSEventType::LeftMouseUp, points[3]),
+        ];
+        for (event_type, point) in events {
+            let location = webview.convertPoint_toView(point, None);
+            let event_number = EVENT_NUMBER.fetch_add(1, AtomicOrdering::Relaxed);
+            let Some(event) = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                event_type,
+                location,
+                NSEventModifierFlags::empty(),
+                timestamp,
+                native_window.windowNumber(),
+                None,
+                event_number,
+                if event_type == NSEventType::MouseMoved { 0 } else { 1 },
+                if matches!(event_type, NSEventType::LeftMouseDown | NSEventType::LeftMouseDragged) { 1.0 } else { 0.0 },
+            ) else {
+                continue;
+            };
+            match event_type {
+                NSEventType::LeftMouseDown => webview.mouseDown(&event),
+                NSEventType::LeftMouseDragged => webview.mouseDragged(&event),
+                NSEventType::LeftMouseUp => webview.mouseUp(&event),
+                _ => webview.mouseMoved(&event),
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dispatch_native_drag(_window: &WebviewWindow, _drag: CssDrag) {}
 
 #[cfg(target_os = "macos")]
 fn copy_image(window: &WebviewWindow, rect: ImageRect) {
@@ -1803,6 +1939,10 @@ mod tests {
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(normalize_url("localhost:3000"), "http://localhost:3000");
         assert_eq!(normalize_url("about:blank"), "about:blank");
+        assert_eq!(
+            normalize_url("/private/tmp/TWeb 계획 #1.html"),
+            "file:///private/tmp/TWeb%20%EA%B3%84%ED%9A%8D%20%231.html"
+        );
         assert_eq!(
             normalize_omnibox_input("two words").as_deref(),
             Some("https://www.google.com/search?q=two%20words")

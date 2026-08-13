@@ -18,6 +18,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/package.json"),
     ),
     ("main.cjs", include_str!("../../../electron/main.cjs")),
+    (
+        "context-menu.cjs",
+        include_str!("../../../electron/context-menu.cjs"),
+    ),
     ("preload.cjs", include_str!("../../../electron/preload.cjs")),
     (
         "gfx-worker.cjs",
@@ -28,8 +32,20 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/mouse-click-state.cjs"),
     ),
     (
+        "paste-state.cjs",
+        include_str!("../../../electron/paste-state.cjs"),
+    ),
+    (
         "tmux-visibility.cjs",
         include_str!("../../../electron/tmux-visibility.cjs"),
+    ),
+    (
+        "window-session.cjs",
+        include_str!("../../../electron/window-session.cjs"),
+    ),
+    (
+        "url-normalization.cjs",
+        include_str!("../../../electron/url-normalization.cjs"),
     ),
     (
         "agent-server.cjs",

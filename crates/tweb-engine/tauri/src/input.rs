@@ -277,7 +277,7 @@ fn decode_csi(bytes: &[u8]) -> EscapeResult {
         let fields: Vec<&str> = body.split(';').collect();
         if fields.len() == 1 {
             if let Ok(code) = fields[0].parse::<u32>() {
-                if (5001..=5010).contains(&code) {
+                if (5001..=5012).contains(&code) {
                     return EscapeResult::Complete(consumed, Some(DecodedInput::Private(code)));
                 }
                 if let Some(key) = tilde_key(code) {
@@ -388,6 +388,10 @@ mod tests {
         assert_eq!(
             decoder.push(b"\x1b[5001~"),
             vec![DecodedInput::Private(5001)]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[5011~\x1b[5012~"),
+            vec![DecodedInput::Private(5011), DecodedInput::Private(5012)]
         );
         assert_eq!(decoder.push(b"\x1b[27;5;119~"), vec![key("w", 5)]);
     }

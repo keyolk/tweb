@@ -77,6 +77,9 @@ tweb profile bootstrap chrome
 
 # Diagnose the environment
 tweb doctor
+
+# Install the Ghostty Cmd passthrough and tmux CSI-u/mouse settings as a separate include file
+tweb doctor --fix
 ```
 
 ## Agent control (CLI · MCP)
@@ -148,9 +151,11 @@ every existing feature.
 
 Electron and Tauri both persist the open tab URLs, the active tab and each tab's zoom per tmux window.
 Omitting the URL — plain `tweb open` — restores the last state, while naming a URL ignores the stored
-state, starts fresh on that single URL and updates the stored state to match. The persistence key uses
-the tmux server start time and `window_id`, so it is unaffected by session renames or window index
-changes.
+state, starts fresh on that single URL and updates the stored state to match. Electron does not store
+`about:blank` or its internal loading/notice pages, so a valid previous session is never overwritten.
+With no URL to restore it shows an address prompt rather than a black screen. The Electron persistence
+key uses the tmux socket, the session name and the window index, so the same slot is restored across a
+tmux server restart. Renaming the session or changing the window index is treated as separate state.
 
 `--frame-rate N` is the maximum frame rate during the active window right after user input or a resize,
 in the range 1–60. Adaptive mode, the default, uses the maximum for 700ms after terminal input or a
@@ -170,19 +175,28 @@ The modal shortcuts and mode indicator below behave identically on the Electron 
 which share the same preload runtime. The only per-engine difference is DevTools: Electron opens
 detached Chromium DevTools, Tauri opens the Safari Web Inspector.
 
-`Ctrl-;` toggles between these two modes.
+`Ctrl-;` and `Ctrl-/` are two independent toggles.
 
-- **Shortcuts ON**: with no input element focused, Vimium-style normal mode and the TWeb browser shortcuts are active. While typing, normal-mode keys are not intercepted and `Esc` clears the focus. That `Esc` reaches the page first as a real engine-generated key event, so panels like search autocomplete close along with it and focus is cleared after the page has handled it. Other keys in Shortcuts mode reach the page as synthetic events, which sites checking `isTrusted` may ignore.
-- **Web passthrough ON**: turns every TWeb shortcut off and switches only the tmux client currently viewing this TWeb pane to the client-local `tweb-pass` table. tmux prefix/root bindings are bypassed and keys, modifiers and mouse events go to the page. Other tmux clients and ordinary panes keep their key tables.
+- **`Ctrl-;` — bypass**: decides whether `Cmd` combinations go to the page. When on, tmux switches the client viewing this pane to the `tweb-pass` table, bypassing tmux prefix/root bindings and delivering keys, modifiers and mouse events to the page.
+- **`Ctrl-/` — vimium**: turns Vimium-style normal mode and the TWeb browser shortcuts on and off. With no input element focused, `f`/`j`/`k` and friends work; while typing they are not intercepted and `Esc` clears the focus.
 
-Even in web passthrough, `Ctrl-;` remains the one escape hatch back to Shortcuts mode. `Ctrl-C` also
-goes to the page, so quitting TWeb means returning to Shortcuts mode with `Ctrl-;` first and then
-pressing `Ctrl-C`. Leaving the TWeb pane or ending the process restores that client's previous tmux
-key table.
+Because the two toggles are independent, their combination is the mode:
 
-Because `Ctrl-;` changes the tmux key table too, it suits staying inside a web app for a while. To use
-a page's own shortcuts briefly — `j`/`k` in a feed, `m` in a player — enter **insert mode** with `i`
-from normal mode. Every key except `Esc` reaches the page as a real engine-generated key event, so
+| vimium \| bypass | bypass on | bypass off |
+|---|---|---|
+| **vimium on** | N (normal) | shortcuts only |
+| **vimium off** | P (passthrough) | web only |
+
+Normal-mode keys keep working with bypass on as long as vimium is on — the engine delivers `Cmd`
+natively regardless of mode, so it does not depend on the tmux table. The passthrough table is armed
+only when vimium is off.
+
+With bypass on, `Ctrl-C` goes to the page, so quitting TWeb means turning vimium on with `Ctrl-/` or
+bypass off with `Ctrl-;` first, then pressing `Ctrl-C`. Leaving the TWeb pane or ending the process
+restores that client's previous tmux key table.
+
+To use a page's own shortcuts briefly — `j`/`k` in a feed, `m` in a player — enter **insert mode** with
+`i` from normal mode. Every key except `Esc` reaches the page as a real engine-generated key event, so
 shortcuts on sites that check `isTrusted` work and Korean keys are not converted into command
 characters. `Esc` returns to normal mode immediately, and the tmux configuration is left untouched.
 
@@ -190,10 +204,60 @@ When focus moves into a cross-origin iframe (an ad or an embed), that frame's pr
 shortcuts. TWeb tracks which frames can handle shortcuts and sends keys to the main frame in that case,
 so `?` and `f` keep working even after clicking an iframe.
 
-Application shortcuts consumed by macOS or by Ghostty itself before the PTY cannot be delivered to the
-page. The default `Cmd-T`, `Cmd-W` and `Cmd-+`, for example, stay Ghostty actions. Ordinary keys that
-reach the terminal, Ctrl/Alt/Shift combinations, navigation keys and mouse events are all
-passthrough-eligible.
+Application shortcuts that macOS or the terminal emulator consumes before the PTY cannot reach the web
+without extra configuration. `tweb doctor` diagnoses conflicts like Ghostty's `Cmd-K` along with the
+tmux CSI-u/mouse/passthrough settings. `tweb doctor --fix` backs up the existing file and installs only
+a single marker-delimited include line into the user's Ghostty/tmux config, keeping the actual TWeb
+settings in `${XDG_CONFIG_HOME:-~/.config}/tweb/ghostty.conf` and `tmux.conf`. Older inline doctor
+blocks and identifiable legacy TWeb bindings are migrated automatically. On a change it also sends a
+reload signal to running Ghostty processes.
+
+Ghostty **produces no PTY encoding at all** for `Cmd` combinations — a key probe confirmed that
+`Cmd-K`/`Cmd-A` send not a single byte in plain, modifyOtherKeys or Kitty-flag mode. So they are
+**carried as private sequences**, the same way `Ctrl-;` is. doctor's `CMD_PASSTHROUGH_KEYS` is the
+single definition, and all four layers have to line up for one key to arrive.
+
+1. `keybind = super+k=text:\x1b[5020~` — Ghostty emits the sequence.
+2. tmux `user-keys[120]` plus the root/`tweb-pass` bindings — without them tmux re-encodes the leading ESC of a sequence it does not recognise, turning `ESC[5020~` into `ESC[91;3u5020~`.
+3. the engine's `CMD_PRIVATE_KEYS` — turns the code back into the original `Cmd` key event.
+4. the engine's private sequence parser — it has to recognise this code range.
+
+The bindings live at the **Ghostty root**, not inside a key table. A table can only be entered by
+pressing its binding — no action, IPC or escape sequence activates one from outside — so a
+table-scoped binding leaves a freshly opened pane unable to deliver `Cmd` until `Ctrl-;` is pressed.
+A root binding instead costs the key across all of Ghostty, so the list is limited to shortcuts whose
+terminal meaning is expendable. `Cmd-K` only clears the screen, and `Ctrl-L` still does that. `Cmd-A`
+selects the scrollback, which is only useful for copying it — and a tweb pane draws a webpage there,
+so there is nothing to select.
+
+`Cmd-V` works without being on that list, because it takes a different path. Ghostty's
+`paste_from_clipboard` writes the clipboard straight into the PTY, and since the pane turns on
+`DECSET 2004` (bracketed paste) that content arrives wrapped in `ESC[200~ … ESC[201~`. On the opening
+bracket the engine collects every byte up to the closing one and handles it as a single paste
+(`electron/paste-state.cjs`). The body is arbitrary bytes including ESC and arrives across several read
+chunks, so it cannot go through the key sequence parser and gets its own state machine. When the
+content matches the clipboard, `webContents.paste()` is used so a real paste event fires — pages like
+Slack read that event to handle formatting and attachments. Without the bracketing the clipboard is
+typed one character at a time, and newlines go out as `Enter`, sending a message midway through a
+multi-line paste.
+
+`Cmd-V` alone is **never bound at the root.** Doing that once killed pasting across all of Ghostty, and
+there is nothing to gain since the path above already works. A test enforces this.
+
+`Cmd-C`/`Cmd-X` are passed through. `super+x` has no Ghostty default binding at all, so it costs
+nothing, and the `copy_to_clipboard` that `Cmd-C` takes is mostly redundant because **`copy-on-select`
+defaults to `true` on macOS** — selecting text in the terminal already puts it on the clipboard.
+Inside a page, meanwhile, there is no way to copy while typing without `Cmd-C`. For anyone who turned
+`copy-on-select` off this trade is a loss, so doctor warns about it under `Ghostty terminal copy`; in
+that case bind `copy_to_clipboard` to `super+shift+c` directly.
+
+`Cmd` combinations are always delivered as native key events, regardless of mode. The reason to press
+them is the web app's own handler, and those handlers are exactly the ones checking `isTrusted`. To add
+a new combination, add one line to `CMD_PASSTHROUGH_KEYS` and one to the engine's `CMD_PRIVATE_KEYS`;
+a test catches a layer that falls out of step.
+
+> Ghostty sometimes does not reparse its config even after receiving a reload signal. If a new `Cmd`
+> binding does not respond after `doctor --fix`, quit Ghostty entirely (`Cmd-Q`) and start it again.
 
 ### Mode indicator
 
@@ -277,13 +341,19 @@ composition area and the terminal cursor are removed with it.
 | `Esc` | Cancel hint/search/visual/inspect/omnibox · clear input focus · leave fullscreen |
 | `Esc` (normal) | Close site autocomplete and popups as an outside click |
 
+Each TWeb pane shows a `current/total` tab badge in the bottom right, separate from the mode indicator.
+The second of five tabs reads `N  2/5`. Hovering or clicking the badge opens that pane's list of tab
+titles, and clicking a title switches to that tab. Tab state is per-pane and is never published to the
+pane title in the tmux status line.
+
 After picking a text target in Visual, or selecting the whole page's text with `V` from normal mode,
 `h`/`l` adjust the active edge by character, `b`/`w`/`e` by word, `k`/`j` by line, `0`/`$` by line
 boundary and `{`/`}` by paragraph, while `o` switches which selection endpoint is being adjusted. Over
-that adjusted range, `y`/`Y` copy the selected text. On image/link/editable targets the existing
-behaviour holds: `y` is smart copy (image bitmap, link URL, text/value), `Y` copies the displayed text,
-`u` the link URL, `o`/`O` open the link in the current/a new tab, `p` pastes the clipboard into an
-editable target, and `d` runs DevTools inspect.
+that adjusted range, `y`/`Y` copy the selected text. On an image target, `y` copies the displayed
+bitmap, `Y` the alt text, `u` the image URL actually being displayed (`currentSrc`), `D` downloads the
+image and `o`/`O` open it in the current/a new tab. On link/editable targets, `y` smart-copies the link
+URL or the text/value, `u` gives the link URL, `o`/`O` open the link and `p` pastes the clipboard.
+`d` inspects the target.
 
 To move the selection's **start**, drop into caret mode with `c`. The selection collapses to a single
 caret and the motions above move the caret instead of extending a selection, so pressing `v` at the
