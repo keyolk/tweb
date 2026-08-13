@@ -67,6 +67,13 @@ let visibilityCheckRunning = false;
 let visibleClientTtys = new Set();
 const passthroughClientTables = new Map();
 let tmuxIdentity = null;
+// Where this pane lives *right now*. `tmuxIdentity` is the startup identity and
+// stays pinned because the window-session save path is derived from it, but a
+// pane moves: `break-pane` gives it a new window id and `join-pane` can change
+// its session too. Matching clients against the startup window then fails for
+// every client, the pane looks hidden, and painting stops — the pane freezes
+// after being moved. Visibility therefore tracks the live placement instead.
+let tmuxPlacement = null;
 let originalPaneTitle = null;
 const tabFrames = new Map();
 const tabZoomFactors = new Map();
@@ -483,16 +490,17 @@ function initializeTmuxVisibility() {
           ? path.join(directory, `${keys.legacy}.json`)
           : null;
       }
+      tmuxPlacement = { session, windowId, paneId: process.env.TMUX_PANE };
     }
     originalPaneTitle = titleParts.join("\t");
 
-    if (tmuxIdentity) {
+    if (tmuxPlacement) {
       const clients = execFileSync(
         "tmux",
         ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
         { encoding: "utf8", timeout: 1000 }
       );
-      visibleClientTtys = visibleTmuxClientTtys(clients, tmuxIdentity);
+      visibleClientTtys = visibleTmuxClientTtys(clients, tmuxPlacement);
       terminalVisible = visibleClientTtys.size > 0;
     }
   } catch (error) {
@@ -504,32 +512,62 @@ function initializeTmuxVisibility() {
 }
 
 function syncTmuxVisibility() {
-  if (!tmuxIdentity || visibilityCheckRunning) return;
+  if (!tmuxPlacement || visibilityCheckRunning) return;
   visibilityCheckRunning = true;
+  // Re-resolve where the pane is before matching clients. A pane that was moved
+  // by break-pane/join-pane keeps its id but changes window (and possibly
+  // session); matching against a stale window makes every client miss and the
+  // pane look hidden, which stops painting until the process restarts.
   execFile(
     "tmux",
-    ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
+    ["display-message", "-p", "-t", tmuxPlacement.paneId, "#{session_name}\t#{window_id}"],
     { encoding: "utf8", timeout: 1000 },
-    (error, stdout) => {
-      visibilityCheckRunning = false;
-      if (error) return;
-      const next = visibleTmuxClientTtys(stdout, tmuxIdentity);
-
-      const wasVisible = terminalVisible;
-      for (const tty of visibleClientTtys) {
-        if (!next.has(tty)) deleteImageFromClientTty(tty);
-      }
-      const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
-      visibleClientTtys = next;
-      terminalVisible = next.size > 0;
-      reconcileTmuxPassthrough();
-      if (wasVisible !== terminalVisible) {
-        updatePaintingState();
-        if (debugLogging) {
-          console.error(`tweb: visibility ${terminalVisible ? "visible" : "hidden"}`);
+    (placementError, placementOut) => {
+      if (!placementError) {
+        const [session, windowId] = String(placementOut).trim().split("\t");
+        if (session && windowId) {
+          if (debugLogging
+            && (session !== tmuxPlacement.session || windowId !== tmuxPlacement.windowId)) {
+            console.error(
+              `tweb: pane moved ${tmuxPlacement.session}:${tmuxPlacement.windowId} -> ${session}:${windowId}`
+            );
+          }
+          tmuxPlacement = { ...tmuxPlacement, session, windowId };
         }
       }
-      if (becameVisible) repaintActiveTab();
+      // The flag is cleared in the inner callback. If spawning it throws, clear
+      // it here instead — otherwise visibility polling stops for good.
+      try {
+        execFile(
+          "tmux",
+          ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
+          { encoding: "utf8", timeout: 1000 },
+          (error, stdout) => {
+            visibilityCheckRunning = false;
+            if (error) return;
+            const next = visibleTmuxClientTtys(stdout, tmuxPlacement);
+
+            const wasVisible = terminalVisible;
+            for (const tty of visibleClientTtys) {
+              if (!next.has(tty)) deleteImageFromClientTty(tty);
+            }
+            const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
+            visibleClientTtys = next;
+            terminalVisible = next.size > 0;
+            reconcileTmuxPassthrough();
+            if (wasVisible !== terminalVisible) {
+              updatePaintingState();
+              if (debugLogging) {
+                console.error(`tweb: visibility ${terminalVisible ? "visible" : "hidden"}`);
+              }
+            }
+            if (becameVisible) repaintActiveTab();
+          }
+        );
+      } catch (spawnError) {
+        visibilityCheckRunning = false;
+        if (debugLogging) console.error(`tweb: visibility poll failed: ${spawnError.message}`);
+      }
     }
   );
 }
