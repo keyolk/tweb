@@ -178,6 +178,18 @@ const PATCH_ID_COUNT = 8;
 const patchIdBase = imageId + 1;
 const frameTransport = process.env.TWEB_FRAME_TRANSPORT === "direct" ? "direct" : "file";
 const frameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.png`);
+// Raw frames go to their own path so a stale PNG can never be read as pixels, or the other
+// way round — the terminal is told the format out of band, not by extension.
+const rawFrameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.rgba`);
+// Whole frames can travel as raw pixels rather than PNG. The encode is what the main thread
+// was paying for — 28ms on an ordinary page, 101ms on a photo, against ~2ms to hand the
+// bitmap to the worker — and `f=32` costs the terminal nothing to decode.
+//
+// It needs the file medium: 20MB does not go through an escape sequence, and the direct
+// transport is the fallback for when a frame file cannot be written. So raw is off whenever
+// frames are not going through files.
+const rawFramesEnabled = frameTransport === "file"
+  && process.env.TWEB_RAW_FRAMES !== "0";
 let lastViewport = null;
 let viewportGeneration = 0;
 let loggedFrameGeneration = -1;
@@ -587,7 +599,7 @@ function syncTmuxVisibility() {
 // --- Kitty graphics ---
 
 function dispatchGfxFrame(frame) {
-  const png = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
+  const pixels = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
     ? frame.png
     : Buffer.from(frame.png);
   gfxWorkerBusy = true;
@@ -595,15 +607,18 @@ function dispatchGfxFrame(frame) {
   try {
     gfxWorker.postMessage({
       type: "frame",
-      buffer: png.buffer,
-      byteOffset: png.byteOffset,
-      byteLength: png.byteLength,
+      buffer: pixels.buffer,
+      byteOffset: pixels.byteOffset,
+      byteLength: pixels.byteLength,
       header: frame.header,
+      format: frame.format || "png",
+      width: frame.width,
+      height: frame.height,
       transport: frameTransport,
-      filePath: frameFilePath,
+      filePath: frame.format === "raw" ? rawFrameFilePath : frameFilePath,
       tmux: Boolean(process.env.TMUX),
       origin: tmuxOrigin,
-    }, [png.buffer]);
+    }, [pixels.buffer]);
   } catch (error) {
     gfxWorkerBusy = false;
     activeGfxGeneration = null;
@@ -634,9 +649,9 @@ gfxWorker.on("error", (error) => {
   console.error(`tweb: graphics writer crashed: ${error.stack || error.message}`);
 });
 
-function queueGfxFrame(png, header, generation) {
+function queueGfxFrame(png, header, generation, format = "png", size = null) {
   if (generation !== viewportGeneration) return;
-  const frame = { png, header, generation };
+  const frame = { png, header, generation, format, width: size?.width, height: size?.height };
   if (!gfxWorkerBusy) {
     dispatchGfxFrame(frame);
     return;
@@ -892,22 +907,25 @@ function sendPatch(image, dirty, generation) {
   return true;
 }
 
-function transferFrame(png, generation) {
+function transferFrame(pixels, generation, format = "png", size = null) {
   if (pendingImageDelete) deletePlacement();
   // Any patch on screen describes damage this frame already contains, so it goes out with
   // the frame that supersedes it. Dropping them earlier would bare the stale pixels
   // underneath for as long as the encode takes.
   deletePatches();
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
-  // whose pixel size no longer matches still covers exactly the pane.
-  const header = `a=T,f=100,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
+  // whose pixel size no longer matches still covers exactly the pane. `f=` is left to the
+  // worker, which knows whether it is writing a PNG or raw pixels.
+  const header = `a=T,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
-  queueGfxFrame(png, header, generation);
+  queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
   wholeFramesSent += 1;
   // Only the first few: enough to see when a page actually reached the pane, which
   // is what separates "the engine is behind" from "the site is slow", and quiet
   // after that.
-  if (framesSentCount < 12) console.error(`tweb: frame sent #${++framesSentCount}`);
+  if (framesSentCount < 12) {
+    console.error(`tweb: frame sent #${++framesSentCount} ${format}`);
+  }
   lastFrameSentAt = Date.now();
 }
 
@@ -918,11 +936,20 @@ function sendFrameNow(image, generation) {
   const expected = viewport && renderedFrameSize(viewport);
   if (!expected || size.width !== expected.width || size.height !== expected.height) return;
   try {
+    // Raw pixels skip the encode entirely; the worker swaps the channels and writes the
+    // file. `toBitmap` hands back an owned copy, which is what the worker needs anyway —
+    // the view `getBitmap` returns belongs to the frame and cannot be transferred.
+    if (rawFramesEnabled) {
+      const bitmap = image.toBitmap();
+      imageTransferred = true;
+      transferFrame(bitmap, generation, "raw", size);
+      return;
+    }
     // Hand the base64 conversion and the terminal write off to a worker once the PNG exists.
     // Even under stdout backpressure, the Electron main thread and keyboard input keep going.
     const png = image.toPNG();
     imageTransferred = true;
-    transferFrame(png, generation);
+    transferFrame(png, generation, "png", size);
   } catch (error) {
     console.error(`tweb: frame encode failed: ${error.message}`);
   }
@@ -1909,6 +1936,9 @@ function agentDiagnostics() {
       whole: wholeFramesSent,
       patches: patchFramesSent,
       patchesPlaced: livePatchIds.length,
+      // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
+      // main thread 28–101ms; PNG is the fallback when frames are not going through files.
+      wholeFormat: rawFramesEnabled ? "raw" : "png",
     },
     input: {
       vimiumShortcuts: vimiumShortcutsEnabled,
@@ -3265,7 +3295,9 @@ app.whenReady().then(() => {
 });
 
 function cleanupFrameFiles() {
-  for (const filePath of [frameFilePath, `${frameFilePath}.tmp`]) {
+  const paths = [frameFilePath, `${frameFilePath}.tmp`,
+    rawFrameFilePath, `${rawFrameFilePath}.tmp`];
+  for (const filePath of paths) {
     try { unlinkSync(filePath); } catch (error) {
       if (error.code !== "ENOENT" && debugLogging) {
         console.error(`tweb: frame file cleanup failed ${filePath}: ${error.message}`);

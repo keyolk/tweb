@@ -526,6 +526,54 @@ patch, backspacing lays down a narrow one, and the deleted character survives in
 the new patch does not reach. Each patch therefore covers the union of all damage since the
 last whole frame, which the whole-frame path resets.
 
+### 8.3 Addendum — the whole-frame path without PNG (2026-08-14)
+
+Section 8.1 found the whole-frame PNG encode dominating, and section 8.2 confirmed the terminal
+reads shared memory. The encode turned out not to need shared memory at all: **`f=32` is
+independent of the transfer medium**, so raw pixels travel over the same `t=f` file transport the
+shipping code already used, and the encode simply goes away. No native shm module, no ring buffer,
+no ACK protocol.
+
+Same pane and page profiles as section 8.1 (2880x1800 frame, 20.7MB raw):
+
+```text
+             main thread   worker   on the wire
+png   text        23.0ms    0.5ms         576KB
+      mixed       28.0ms    0.7ms        1478KB
+      photo      100.5ms    3.0ms       12780KB
+
+raw   text         1.3ms   12.5ms       20250KB
+      mixed        1.4ms   24.3ms       20250KB
+      photo        1.5ms   22.8ms       20250KB
+```
+
+Only the main-thread column decides input latency, and it collapses to a constant ~1.4ms — the cost
+of `toBitmap`, which is a copy rather than an encode, and so no longer depends on what is on the
+page. The worker pays more (a BGRA→RGBA pass plus a 20MB write against a 1.5MB one), but that time
+sits behind the one-deep queue that already drops superseded frames, and the wire size never reaches
+the terminal as escape-sequence bytes: the file medium sends a path.
+
+The ~9ms channel swap is the one remaining CPU pass over the frame, and the natural place for the
+SIMD conversion `tweb-native` already implements — the first piece of that crate with a measured
+reason to exist. It is left in JS here because moving it needs a Node↔Rust bridge, which is a larger
+change than the one this measurement justifies.
+
+Two constraints on when raw can be used:
+
+- **It needs the file medium.** 20MB does not fit an escape sequence, and `t=d` is the fallback for
+  when a frame file cannot be written — so `TWEB_FRAME_TRANSPORT=direct` keeps PNG.
+- **Raw and PNG use separate paths.** The terminal is told the format in the header, not by
+  extension, so a stale file of the wrong kind would be read as whatever the header claimed.
+
+Probed before implementing, since both were assumptions:
+
+- **`t=s` works through tmux passthrough** — the shm object is consumed when the pane is visible.
+  The control matters here: in a *hidden* pane neither `t=s` nor a temp-file transfer is consumed,
+  because Ghostty never draws it, so a probe run against a hidden pane reads as a protocol failure
+  when it is only a visibility one.
+- **`f=32` over `t=f` renders correctly**, verified by eye with a deliberately asymmetric test image
+  — a white band over a magenta/yellow split, where a channel swap or a stride error is obvious.
+
 ## 9. A component and interface structure built for extension
 
 DESIGN.md proposed the `BrowserEngineAdapter`, `FrameTransport`, `BrowserRuntime` and `AgentBridge`

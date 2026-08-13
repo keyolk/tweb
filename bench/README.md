@@ -18,6 +18,7 @@ shipping configuration, which does not set that switch.
 | script | what it answers |
 |---|---|
 | `encode.cjs` | What a whole-frame encode costs, against a cropped one and against a raw tile |
+| `whole-frame.cjs` | What the main thread pays per whole frame, PNG against raw pixels |
 | `damage.cjs` | How large the `paint` dirty rect actually is while typing, scrolling and hovering |
 | `worker-encode.cjs` | Whether moving the PNG encode to a worker thread helps (it does not) |
 | `gfxprobe.py` | Whether the terminal really reads a `t=s` shm transfer, and whether a patch image can be placed over a base and deleted independently |
