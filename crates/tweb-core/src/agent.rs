@@ -1,7 +1,7 @@
-//! AgentBridge — agent 전달 추상.
+//! AgentBridge — the agent delivery abstraction.
 //!
-//! ClaudeCode/Codex/Generic/ShellInbox가 각각 구현.
-//! DESIGN.md 섹션 12.6, DETAIL.md 섹션 9.2.
+//! Implemented separately for ClaudeCode/Codex/Generic/ShellInbox.
+//! DESIGN.md section 12.6, DETAIL.md section 9.2.
 
 use crate::resource::ResourceBroker;
 use crate::resource::ResourceDescriptor;
@@ -22,7 +22,7 @@ pub enum AgentError {
 
 pub type AgentResult<T> = Result<T, AgentError>;
 
-/// agent가 받을 수 있는 resource kind/mime.
+/// The resource kinds/mimes an agent can accept.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentCapability {
     pub accepted_kinds: Vec<ResourceKind>,
@@ -31,7 +31,7 @@ pub struct AgentCapability {
     pub supports_direct_attachment: bool,
 }
 
-/// resource 종류 (DESIGN.md 섹션 12.4).
+/// The kinds of resource (DESIGN.md section 12.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
@@ -47,7 +47,7 @@ pub enum ResourceKind {
     ClipboardPayload,
 }
 
-/// 전달 상태.
+/// The delivery status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
@@ -56,7 +56,7 @@ pub enum DeliveryStatus {
     Rejected,
 }
 
-/// agent endpoint (DESIGN.md 섹션 12.6).
+/// An agent endpoint (DESIGN.md section 12.6).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentEndpoint {
     pub agent_id: String,
@@ -68,19 +68,19 @@ pub struct AgentEndpoint {
 }
 
 /// AgentBridge trait.
-/// 구현체: ClaudeCodeBridge, CodexBridge, GenericTerminalAgentBridge, ShellInboxBridge.
+/// Implementations: ClaudeCodeBridge, CodexBridge, GenericTerminalAgentBridge, ShellInboxBridge.
 #[async_trait]
 pub trait AgentBridge: Send + Sync {
-    /// agent가 받을 수 있는 capability.
+    /// What this agent is able to accept.
     fn capability(&self) -> &AgentCapability;
 
-    /// resource 전달.
+    /// Delivers a resource.
     async fn deliver(
         &self,
         resource: &ResourceDescriptor,
         broker: &dyn ResourceBroker,
     ) -> AgentResult<DeliveryStatus>;
 
-    /// agent alive 확인.
+    /// Checks whether the agent is alive.
     async fn is_alive(&self) -> bool;
 }

@@ -1,7 +1,7 @@
-//! tweb-native — frame 전송 최적화 (SHM, tile, convert, kitty protocol).
+//! tweb-native — frame transfer optimizations (SHM, tile, convert, kitty protocol).
 //!
-//! awrit가 `awrit-native-rs`에 위임했던 부분. DESIGN.md 섹션 7.1 병목 회피.
-//! 매 paint shm_open 금지, dirty tile만 변환/전송, bounded pool.
+//! The part awrit delegated to `awrit-native-rs`. Avoids the bottleneck in DESIGN.md section 7.1.
+//! Never shm_open per paint, convert/transfer dirty tiles only, bounded pools.
 
 pub mod convert;
 pub mod kitty;

@@ -1,9 +1,9 @@
-//! Display — Kitty graphics 수신, Ghostty 표시.
+//! Display — receiving Kitty graphics, showing them in Ghostty.
 //!
-//! DESIGN.md 섹션 7. FrameTransport가 전송한 Kitty graphics를 terminal에 표시.
-//! tweb __pane은 frame stream을 소비.
+//! DESIGN.md section 7. Displays in the terminal the Kitty graphics FrameTransport sent.
+//! tweb __pane consumes the frame stream.
 
-/// frame 표시. TODO: FrameTransport.stream 소비.
+/// Displays a frame. TODO: consume FrameTransport.stream.
 pub fn display_frame(_data: &[u8]) {
     // placeholder.
 }

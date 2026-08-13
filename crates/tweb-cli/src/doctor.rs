@@ -1,6 +1,9 @@
-//! `tweb doctor` — terminal/tmux/GPU/extension capability 진단과 안전한 설정.
+//! `tweb doctor` — diagnoses terminal/tmux/GPU/extension capabilities and configures them safely.
 //!
-//! `--fix`는 사용자 설정에 managed include만 갱신하고 기존 파일을 backup한다.
+//! DESIGN.md section 4.1. Diagnoses whether the environment is supported.
+//! Decided by an actual capability query, never guessed from the terminal name.
+//!
+//! `--fix` only refreshes a managed include in the user's config, backing up the original file.
 
 use std::fs;
 use std::io::Write;
@@ -154,7 +157,7 @@ fn private_sequence_hex(code: u16) -> String {
     bytes.join(" ")
 }
 
-/// 진단 항목 결과.
+/// The result of one diagnostic check.
 struct Check {
     name: &'static str,
     status: CheckStatus,
@@ -178,7 +181,7 @@ impl CheckStatus {
     }
 }
 
-/// doctor 실행. `fix`가 false면 어떤 설정도 변경하지 않는다.
+/// Runs doctor. With `fix` false, nothing is configured.
 pub async fn run(fix: bool) -> Result<()> {
     println!("tweb doctor — environment diagnosis\n");
 
@@ -207,6 +210,7 @@ pub async fn run(fix: bool) -> Result<()> {
         check_pixel_size_query(),
     ];
 
+    // Output.
     for check in &checks {
         println!(
             "  [{:>4}] {}: {}",
@@ -216,6 +220,7 @@ pub async fn run(fix: bool) -> Result<()> {
         );
     }
 
+    // Summary.
     let ok = checks
         .iter()
         .filter(|check| matches!(check.status, CheckStatus::Ok))
@@ -256,6 +261,7 @@ fn check_terminal() -> Check {
     } else {
         format!("TERM={term}, TERM_PROGRAM={term_program}")
     };
+    // Kitty graphics support should be decided by a query rather than a name; doctor only hints here.
     let status = if term_program.to_ascii_lowercase().contains("ghostty")
         || term_program.contains("WezTerm")
         || term == "xterm-kitty"
@@ -454,6 +460,8 @@ fn check_ghostty_cmd_passthrough() -> Check {
 }
 
 fn check_pixel_size_query() -> Check {
+    // TODO: confirm the terminal pixel size with a real CSI 14t query.
+    // A placeholder for now.
     Check {
         name: "pixel size query (CSI 14t)",
         status: CheckStatus::Warn,

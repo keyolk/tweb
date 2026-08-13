@@ -1,8 +1,8 @@
-//! FrameTransport, SurfaceSource, FrameEvent — frame 전달/생산 추상.
+//! FrameTransport, SurfaceSource, FrameEvent — the frame delivery/production abstractions.
 //!
-//! KittyGraphics/NativeSurface/RemoteVideo가 FrameTransport를 각각 구현.
-//! engine이 SurfaceSource를 구현하여 frame을 생산.
-//! DETAIL.md 섹션 9.2.
+//! KittyGraphics/NativeSurface/RemoteVideo each implement FrameTransport.
+//! The engine implements SurfaceSource to produce frames.
+//! DETAIL.md section 9.2.
 
 use crate::geometry::{ColorSpace, Generation, PixelFormat, PixelSize, Rect};
 use crate::page::PageId;
@@ -24,57 +24,58 @@ pub enum TransportError {
 
 pub type TransportResult<T> = Result<T, TransportError>;
 
-/// terminal capability. graphics query(`a=q` + `ESC[c`) 결과.
-/// FrameTransport이 이 capability로 전송 전략을 판정.
+/// Terminal capabilities — the result of the graphics query (`a=q` + `ESC[c`).
+/// FrameTransport picks its transfer strategy from these capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalCapability {
-    /// Kitty graphics protocol 지원 여부.
+    /// Whether the Kitty graphics protocol is supported.
     pub kitty_graphics: bool,
-    /// animation frame + composite 지원.
+    /// animation frame + composite support.
     pub kitty_animation: bool,
-    /// independent image placement + replace 지원.
+    /// independent image placement + replace support.
     pub kitty_placement: bool,
-    /// shared memory 전송(`t=s`) 지원.
+    /// shared memory transfer (`t=s`) support.
     pub kitty_shared_memory: bool,
-    /// pixel mouse 좌표(SGR).
+    /// pixel mouse coordinates (SGR).
     pub pixel_mouse: bool,
     /// extended keyboard protocol.
     pub extended_keyboard: bool,
-    /// terminal pixel size (CSI 14t 결과).
+    /// terminal pixel size (the CSI 14t result).
     pub pixel_size: Option<PixelSize>,
     /// cell size.
     pub cell_size: Option<(u32, u32)>,
 }
 
 impl TerminalCapability {
-    /// 최소 Kitty graphics 지원 여부.
+    /// Whether the minimum Kitty graphics support is present.
     pub fn supports_kitty_basic(&self) -> bool {
         self.kitty_graphics
     }
 }
 
-/// frame 생산 추상. engine이 구현.
-/// `next_frame`으로 frame event를 하나씩 반환. backpressure는 구현체가 처리.
+/// The frame production abstraction, implemented by the engine.
+/// `next_frame` returns frame events one at a time; backpressure is the implementation's job.
 pub trait SurfaceSource: Send {
-    /// 다음 frame event. blocking 없이 현재 상태 반환.
-    /// backpressure: 구현체가 intermediate generation을 버리고 최신 complete frame만 반환.
+    /// The next frame event. Returns the current state without blocking.
+    /// Backpressure: the implementation drops intermediate generations and returns only the
+    /// latest complete frame.
     fn next_frame(&mut self) -> TransportResult<FrameEvent>;
 }
 
-/// frame event. SurfaceSource가 반환.
+/// A frame event, returned by SurfaceSource.
 #[derive(Debug)]
 pub enum FrameEvent {
-    /// dirty rect와 pixel data (CPU bitmap 경로, shared memory bitmap mode).
+    /// Dirty rects plus pixel data (the CPU bitmap path, shared memory bitmap mode).
     Dirty {
         rects: Vec<Rect>,
-        /// 전체 frame pixel data (BGRA 또는 RGBA).
+        /// The whole frame's pixel data (BGRA or RGBA).
         pixels: BitmapRef,
         size: PixelSize,
         format: PixelFormat,
         generation: Generation,
     },
     /// GPU texture handle (GPU fast path, shared texture mode).
-    /// handle은 platform별. RemoteVideoTransport는 handle을 보내지 않고 video encode.
+    /// The handle is platform-specific. RemoteVideoTransport does not send a handle; it encodes video.
     Gpu {
         handle: SurfaceHandle,
         size: PixelSize,
@@ -82,13 +83,13 @@ pub enum FrameEvent {
         color_space: ColorSpace,
         generation: Generation,
     },
-    /// page가 idle, frame 없음. static page.
+    /// The page is idle, no frame. A static page.
     Idle,
-    /// page 종료. stream 종료.
+    /// The page ended. The stream ends.
     End,
 }
 
-/// pixel data 참조. 소유하지 않고 slice.
+/// A reference to pixel data. Borrowed as a slice, not owned.
 pub struct BitmapRef {
     pub data: Bytes,
     pub format: PixelFormat,
@@ -103,7 +104,7 @@ impl std::fmt::Debug for BitmapRef {
     }
 }
 
-/// GPU surface handle. platform별.
+/// A GPU surface handle. Platform-specific.
 #[derive(Debug, Clone)]
 pub enum SurfaceHandle {
     /// macOS IOSurface.
@@ -115,22 +116,22 @@ pub enum SurfaceHandle {
 }
 
 /// FrameTransport trait.
-/// 구현체: KittyGraphicsTransport, NativeSurfaceTransport, RemoteVideoTransport.
+/// Implementations: KittyGraphicsTransport, NativeSurfaceTransport, RemoteVideoTransport.
 #[async_trait]
 pub trait FrameTransport: Send + Sync {
-    /// terminal capability로 transport 선택.
+    /// Selects a transport from the terminal capabilities.
     fn supports(&self, caps: &TerminalCapability) -> bool;
 
-    /// surface source에서 frame을 받아 terminal에 전달.
-    /// page lifetime 동안 stream 유지.
+    /// Takes frames from a surface source and delivers them to the terminal.
+    /// Keeps the stream alive for the page's lifetime.
     async fn stream(&self, page: PageId, source: Box<dyn SurfaceSource>) -> TransportResult<()>;
 
-    /// page visibility 변화. hidden page는 frame production 중지.
+    /// A change in page visibility. Hidden pages stop producing frames.
     async fn set_visible(&self, page: PageId, visible: bool) -> TransportResult<()>;
 
-    /// page resize. generation 증가.
+    /// A page resize. Bumps the generation.
     async fn resize(&self, page: PageId, size: PixelSize) -> TransportResult<()>;
 
-    /// page cleanup. surface/SHM 해제.
+    /// Page cleanup. Releases the surface/SHM.
     async fn close(&self, page: PageId) -> TransportResult<()>;
 }

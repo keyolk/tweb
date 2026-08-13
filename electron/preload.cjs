@@ -108,6 +108,8 @@ const { ipcRenderer } = require("electron");
       return true;
     }
     const container = element?.closest?.('[role="search"],search') || element?.parentElement;
+    // The Korean literal is match data, not prose: Korean-language pages label their
+    // search button in Korean, so translating it away would lose those matches.
     const submitter = container?.querySelector?.(
       'button[type="submit"]:not(:disabled),input[type="submit"]:not(:disabled),input[type="image"]:not(:disabled),button[aria-label*="Search" i]:not(:disabled),button[aria-label*="검색"]:not(:disabled)'
     );
@@ -418,7 +420,7 @@ const { ipcRenderer } = require("electron");
     else if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
     else if (panSurface()) setMode("normal", "↔ pan · Esc");
-    else setMode("normal", scrollSurface() ? "⇅ 내부 · Esc" : "");
+    else setMode("normal", scrollSurface() ? "⇅ inner · Esc" : "");
   }
 
   const koreanLangmap = new Map(Object.entries({
@@ -652,10 +654,10 @@ const { ipcRenderer } = require("electron");
   }
 
   const mediaControlPresentation = {
-    play: { label: "재생/일시정지" },
-    mute: { label: "음소거" },
-    fullscreen: { label: "전체화면" },
-    menu: { label: "메뉴" },
+    play: { label: "play/pause" },
+    mute: { label: "mute" },
+    fullscreen: { label: "fullscreen" },
+    menu: { label: "menu" },
   };
 
   // Sites that ship their own control bar (YouTube and friends) expose real
@@ -1045,10 +1047,10 @@ const { ipcRenderer } = require("electron");
   // "0" alone reads as a malfunction. Say which kind of target came up empty, and
   // stay up long enough to be read.
   const emptyPickerReason = {
-    hint: "클릭할 대상 없음",
-    visual: "text·link·image 없음",
-    scroll: "내부 scroll 영역 없음",
-    inspect: "대상 없음",
+    hint: "no clickable target",
+    visual: "no text·link·image",
+    scroll: "no inner scroll area",
+    inspect: "no target",
   };
 
   function startPicker(targets, mode, onPick) {
@@ -1655,39 +1657,39 @@ const { ipcRenderer } = require("electron");
   }
 
   const shortcutHelpSections = [
-    ["이동", [
-      ["h · j · k · l", "왼쪽 · 아래 · 위 · 오른쪽 스크롤"],
-      ["d · u", "반 페이지 아래 · 위"],
-      ["gg · G", "페이지 맨 위 · 맨 아래"],
-      ["H · L", "history 뒤로 · 앞으로"],
+    ["Motion", [
+      ["h · j · k · l", "scroll left · down · up · right"],
+      ["d · u", "half page down · up"],
+      ["gg · G", "top · bottom of page"],
+      ["H · L", "history back · forward"],
     ]],
-    ["열기와 탭", [
-      ["f · F", "hint로 열기 · 새 탭에서 열기"],
-      ["o · O / t", "현재 탭 · 새 탭 omnibox"],
-      ["b", "열린 탭 목록"],
-      ["J · K", "이전 · 다음 탭"],
-      ["x · X", "탭 닫기 · 최근 탭 복원"],
-      ["r · gi", "새로고침 · 첫 입력 요소 focus"],
-      ["s", "스크롤·drag-pan 영역 선택 (Esc 또는 s에서 page로 복귀)"],
+    ["Opening and tabs", [
+      ["f · F", "open via hint · open in new tab"],
+      ["o · O / t", "omnibox in current tab · new tab"],
+      ["b", "list open tabs"],
+      ["J · K", "previous · next tab"],
+      ["x · X", "close tab · restore recent tab"],
+      ["r · gi", "reload · focus first input"],
+      ["s", "pick a scroll/drag-pan area (Esc or s returns to page)"],
     ]],
-    ["검색과 선택", [
-      ["/ · n · N", "검색 · 다음 · 이전 결과"],
-      ["v · V", "visual picker · 페이지 전체 선택"],
-      ["h/l · b/w/e · j/k · 0/$ · {/}", "visual 선택 범위 조정 (블록 밖까지)"],
-      ["c · v", "caret로 내려가 시작점 옮기기 · 그 지점부터 선택"],
+    ["Search and selection", [
+      ["/ · n · N", "search · next · previous match"],
+      ["v · V", "visual picker · select whole page"],
+      ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
+      ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
-      ["D · o/O · p · d", "image download · 대상 열기 · 붙여넣기 · inspect"],
+      ["D · o/O · p · d", "image download · open target · paste · inspect"],
       ["I", "inspect picker"],
     ]],
-    ["Browser와 mode", [
-      ["zi · zo · zz", "확대 · 축소 · 기본 배율"],
+    ["Browser and modes", [
+      ["zi · zo · zz", "zoom in · out · reset"],
       ["Ctrl + / - / 0", "browser zoom"],
-      ["Ctrl-Tab / PgUp / PgDn", "browser tab 전환"],
-      ["Ctrl-W", "현재 browser tab 닫기"],
-      ["i", "insert mode — 페이지 자체 단축키 사용, Esc로 복귀"],
+      ["Ctrl-Tab / PgUp / PgDn", "switch browser tab"],
+      ["Ctrl-W", "close current browser tab"],
+      ["i", "insert mode — page's own shortcuts, Esc returns"],
       ["Ctrl-;", "Shortcuts ↔ web passthrough"],
-      ["Ctrl-C", "Shortcuts mode에서 TWeb 종료"],
-      ["Esc", "현재 mode · 전체화면 · 입력 focus 해제"],
+      ["Ctrl-C", "quit TWeb from Shortcuts mode"],
+      ["Esc", "clear current mode · fullscreen · input focus"],
     ]],
   ];
 
@@ -1713,10 +1715,10 @@ const { ipcRenderer } = require("electron");
     const header = document.createElement("header");
     header.style.cssText = "display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px";
     const heading = document.createElement("div");
-    heading.innerHTML = '<strong style="display:block;font-size:19px;color:#fff">TWeb shortcuts</strong><span style="color:#9aa0a6">Shortcuts mode · <kbd>?</kbd> 또는 <kbd>Esc</kbd>로 닫기</span>';
+    heading.innerHTML = '<strong style="display:block;font-size:19px;color:#fff">TWeb shortcuts</strong><span style="color:#9aa0a6">Shortcuts mode · close with <kbd>?</kbd> or <kbd>Esc</kbd></span>';
     const close = document.createElement("button");
     close.type = "button";
-    close.textContent = "닫기  Esc";
+    close.textContent = "close  Esc";
     close.style.cssText = "padding:5px 9px;border:1px solid #5f6368;border-radius:5px;background:#303134;color:#e8eaed;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer";
     close.onclick = () => cancelHelp();
     header.append(heading, close);
@@ -1751,7 +1753,7 @@ const { ipcRenderer } = require("electron");
     document.documentElement.append(host);
     paintNow();
     helpHost = host;
-    setMode("help", "?·Esc 닫기");
+    setMode("help", "?·Esc close");
     requestAnimationFrame(() => close.focus({ preventScroll: true }));
   }
 
@@ -1801,7 +1803,7 @@ const { ipcRenderer } = require("electron");
     input.type = "text";
     input.autocomplete = "off";
     input.spellcheck = false;
-    input.placeholder = newTab ? "새 탭에서 URL 또는 검색어 열기" : "URL 또는 검색어 열기";
+    input.placeholder = newTab ? "Open URL or search in a new tab" : "Open URL or search";
     input.style.cssText = "display:block;box-sizing:border-box;width:100%;padding:10px 13px;border:0;border-bottom:1px solid #5f6368;outline:0;background:#202124;color:#f8f9fa;font:16px/1.3 system-ui,-apple-system,sans-serif";
     const list = document.createElement("div");
     list.setAttribute("role", "listbox");
@@ -1908,7 +1910,7 @@ const { ipcRenderer } = require("electron");
     const input = document.createElement("input");
     input.type = "text";
     input.value = lastSearch;
-    input.placeholder = "페이지 검색";
+    input.placeholder = "Find in page";
     input.autocomplete = "off";
     input.style.cssText = "width:min(320px,55vw);padding:4px 6px;border:0;outline:0;background:#303134;color:#fff;font:13px system-ui";
     const result = document.createElement("span");
@@ -1995,7 +1997,7 @@ const { ipcRenderer } = require("electron");
     const panel = document.createElement("div");
     panel.style.cssText = "box-sizing:border-box;width:min(760px,calc(100vw - 32px));max-height:76vh;overflow:auto;padding:8px;border:1px solid #5f6368;border-radius:8px;background:#202124;color:#e8eaed;box-shadow:0 12px 36px #000b;font:13px/1.4 system-ui,-apple-system,sans-serif";
     const title = document.createElement("div");
-    title.textContent = `열린 탭 ${model.tabs.length}개 · j/k 이동 · Enter 열기 · x 닫기 · 1-9 바로 열기 · Esc`;
+    title.textContent = `${model.tabs.length} open tabs · j/k move · Enter open · x close · 1-9 jump · Esc`;
     title.style.cssText = "padding:4px 7px 8px;color:#bdc1c6;font-size:12px";
     panel.append(title);
     const items = model.tabs.map((tab, index) => {
@@ -2007,7 +2009,7 @@ const { ipcRenderer } = require("electron");
       number.style.cssText = "color:#8ab4f8;text-align:right";
       const text = document.createElement("span");
       const tabTitle = document.createElement("strong");
-      tabTitle.textContent = tab.title || "새 탭";
+      tabTitle.textContent = tab.title || "New tab";
       tabTitle.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500";
       const url = document.createElement("small");
       url.textContent = tab.url || "about:blank";
@@ -2182,8 +2184,9 @@ const { ipcRenderer } = require("electron");
     return fallback;
   }
 
-  // `c`는 text 대상에서만 쓸 수 있었다: link나 image를 고르면 selection 자체가 없어
-  // caret으로 내려갈 방법이 없었다. 그 자리에서 가장 가까운 text 위치를 caret으로 잡는다.
+  // `c` used to work on text targets only: picking a link or an image left no
+  // selection at all, so there was no way to drop into caret mode. Anchor the caret
+  // at the nearest text position to that spot instead.
   function firstTextNode(root) {
     if (!root || root.nodeType !== Node.ELEMENT_NODE) return null;
     const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -2225,7 +2228,7 @@ const { ipcRenderer } = require("electron");
     if (!visualState.selectionMade) {
       const range = caretRangeFor(visualState);
       if (!range) {
-        flash("caret 위치 없음");
+        flash("no caret position");
         return;
       }
       selection.removeAllRanges();

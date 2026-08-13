@@ -1,55 +1,55 @@
-//! Kitty graphics protocol 전송.
+//! Kitty graphics protocol transfer.
 //!
-//! DESIGN.md 섹션 7.3. `a=t`(transmit-only) + `a=p,U=1`(virtual placement).
-//! stable tile image ID 제자리 갱신. bounded pool로 image ID 재사용.
-//! 공식: https://sw.kovidgoyal.net/kitty/graphics-protocol/
+//! DESIGN.md section 7.3. `a=t` (transmit-only) + `a=p,U=1` (virtual placement).
+//! Stable tile image IDs updated in place. Image IDs are reused from a bounded pool.
+//! Spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
 use std::io::Write;
 use tweb_core::geometry::{PixelSize, Rect};
 
-/// Kitty graphics 전송 명령.
+/// A Kitty graphics transfer command.
 #[derive(Debug, Clone)]
 pub struct KittyCommand {
-    /// 전송할 pixel data (RGBA).
+    /// The pixel data to transfer (RGBA).
     pub data: Vec<u8>,
-    /// image 크기.
+    /// The image size.
     pub size: PixelSize,
-    /// source rect (부분 전송 시).
+    /// The source rect (for a partial transfer).
     pub src_rect: Option<Rect>,
-    /// image ID (bounded pool에서 재사용).
+    /// The image ID (reused from the bounded pool).
     pub image_id: u32,
-    /// 전송 방식.
+    /// How it is transferred.
     pub medium: KittyMedium,
     /// action.
     pub action: KittyAction,
 }
 
-/// 전송 방식.
+/// How data is transferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KittyMedium {
-    /// shared memory (`t=s`). 로컬 fast path.
+    /// shared memory (`t=s`). The local fast path.
     SharedMemory,
-    /// direct in escape sequence (`t=d`). small image용.
+    /// direct in escape sequence (`t=d`). For small images.
     Direct,
 }
 
 /// Kitty action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KittyAction {
-    /// transmit-only (`a=t`). placement 없이 image data만 전송.
+    /// transmit-only (`a=t`). Sends the image data alone, no placement.
     Transmit,
-    /// virtual placement (`a=p`, `U=1`). render rectangle 정의.
+    /// virtual placement (`a=p`, `U=1`). Defines the render rectangle.
     VirtualPlacement,
-    /// query (`a=q`). capability 확인.
+    /// query (`a=q`). Checks capabilities.
     Query,
-    /// delete (`a=d`). image 제거.
+    /// delete (`a=d`). Removes the image.
     Delete,
 }
 
-/// Kitty graphics escape sequence 생성.
+/// Builds a Kitty graphics escape sequence.
 ///
 /// format: `ESC _ G <key=value>,... <ESC> \`
-/// chunk size 4096 bytes (공식 권장).
+/// chunk size 4096 bytes (as the spec recommends).
 pub fn encode(cmd: &KittyCommand) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -75,9 +75,9 @@ pub fn encode(cmd: &KittyCommand) -> Vec<u8> {
                 let encoded = base64_encode(&cmd.data);
                 write_chunked(&mut out, &full_header, &encoded, cmd.data.is_empty());
             } else {
-                // shared memory: data는 SHM에 있고, escape는 metadata만.
-                // SHM name을 전송. (실제 SHM name은 shm module에서 생성)
-                // TODO: SHM name을 header에 포함.
+                // shared memory: the data lives in SHM and the escape carries metadata only.
+                // The SHM name is what gets sent. (The actual name is created by the shm module.)
+                // TODO: include the SHM name in the header.
                 write_chunked(&mut out, &full_header, "", true);
             }
         }
@@ -89,7 +89,7 @@ pub fn encode(cmd: &KittyCommand) -> Vec<u8> {
             out.extend_from_slice(b"\x1b\\");
         }
         KittyAction::Delete => {
-            // a=d, i=<image_id>. image 제거.
+            // a=d, i=<image_id>. Removes the image.
             let header = format!("a=d,i={}", cmd.image_id);
             out.extend_from_slice(b"\x1b_G");
             out.extend_from_slice(header.as_bytes());
@@ -100,8 +100,8 @@ pub fn encode(cmd: &KittyCommand) -> Vec<u8> {
     out
 }
 
-/// chunked 전송. 첫 chunk에 header, 이후 chunk는 `m=1` continuation.
-/// `q=2`로 failure response 억제 (production에서는 q=1로 OK만).
+/// Chunked transfer. The header rides on the first chunk; later chunks are `m=1` continuations.
+/// `q=2` suppresses failure responses (in production, q=1 suppresses only the OKs).
 fn write_chunked(out: &mut Vec<u8>, header: &str, data: &str, _empty: bool) {
     const CHUNK: usize = 4096;
 
@@ -144,7 +144,7 @@ fn write_chunked(out: &mut Vec<u8>, header: &str, data: &str, _empty: bool) {
     }
 }
 
-/// base64 encode (URL-safe 아님, 표준).
+/// base64 encode (standard alphabet, not URL-safe).
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -176,7 +176,7 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// image ID bounded pool. 무한 생성 금지, 재사용.
+/// A bounded pool of image IDs. IDs are reused rather than minted without limit.
 pub struct ImageIdPool {
     next: u32,
     free: Vec<u32>,
@@ -185,12 +185,12 @@ pub struct ImageIdPool {
 impl ImageIdPool {
     pub fn new() -> Self {
         Self {
-            next: 1, // 0은 사용하지 않음.
+            next: 1, // 0 is not used.
             free: Vec::new(),
         }
     }
 
-    /// image ID 할당.
+    /// Allocates an image ID.
     pub fn acquire(&mut self) -> u32 {
         self.free.pop().unwrap_or_else(|| {
             let id = self.next;
@@ -199,7 +199,7 @@ impl ImageIdPool {
         })
     }
 
-    /// image ID 반환 (재사용).
+    /// Returns an image ID to the pool (for reuse).
     pub fn release(&mut self, id: u32) {
         self.free.push(id);
     }
@@ -211,7 +211,7 @@ impl Default for ImageIdPool {
     }
 }
 
-/// stdout에 Kitty command 직접 write.
+/// Writes a Kitty command straight to stdout.
 pub fn write_to_stdout(cmd: &KittyCommand) -> std::io::Result<()> {
     let encoded = encode(cmd);
     let stdout = std::io::stdout();

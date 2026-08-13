@@ -1,8 +1,8 @@
-//! 공통 geometry type.
+//! Shared geometry types.
 
 use serde::{Deserialize, Serialize};
 
-/// pixel 단위 크기.
+/// A size in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PixelSize {
     pub width: u32,
@@ -14,20 +14,20 @@ impl PixelSize {
         Self { width, height }
     }
 
-    /// RGBA byte 수 (width × height × 4).
+    /// The RGBA byte count (width × height × 4).
     pub fn rgba_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 4
     }
 }
 
-/// pixel 단위 점.
+/// A point in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PixelPoint {
     pub x: i32,
     pub y: i32,
 }
 
-/// pixel 단위 사각형. dirty rect, tile, damage 영역에 공통 사용.
+/// A rectangle in pixels. Shared by dirty rects, tiles and damage areas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: i32,
@@ -46,7 +46,7 @@ impl Rect {
         }
     }
 
-    /// 다른 rect와 겹치는지.
+    /// Whether it overlaps another rect.
     pub fn intersects(&self, other: &Rect) -> bool {
         let self_right = self.x + self.width as i32;
         let self_bottom = self.y + self.height as i32;
@@ -58,7 +58,7 @@ impl Rect {
             && other.y < self_bottom
     }
 
-    /// 두 rect의 합집합.
+    /// The union of two rects.
     pub fn union(&self, other: &Rect) -> Rect {
         let x = self.x.min(other.x);
         let y = self.y.min(other.y);
@@ -68,15 +68,15 @@ impl Rect {
     }
 }
 
-/// surface 식별자. engine이 할당.
+/// A surface identifier, assigned by the engine.
 pub type SurfaceId = u64;
 
 /// pixel format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PixelFormat {
-    /// Blue, Green, Red, Alpha (macOS NativeImage 기본).
+    /// Blue, Green, Red, Alpha (the macOS NativeImage default).
     Bgra,
-    /// Red, Green, Blue, Alpha (Kitty graphics 요구).
+    /// Red, Green, Blue, Alpha (what Kitty graphics wants).
     Rgba,
 }
 
@@ -87,7 +87,7 @@ pub enum ColorSpace {
     DisplayP3,
 }
 
-/// frame generation. resize마다 증가. 이전 generation frame 표시 금지.
+/// The frame generation. Bumped on every resize; frames from an earlier generation are never displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct Generation(pub u64);
 

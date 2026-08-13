@@ -1,9 +1,9 @@
-//! page/pane identity와 상태.
+//! page/pane identity and state.
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// browser page 식별자. engine이 할당, opaque.
+/// A browser page identifier. Assigned by the engine, opaque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageId(pub uuid::Uuid);
 
@@ -25,7 +25,7 @@ impl std::fmt::Display for PageId {
     }
 }
 
-/// tmux pane 식별자. `%3` 같은 tmux pane ID.
+/// A tmux pane identifier. A tmux pane ID such as `%3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PaneId(pub i32);
 
@@ -35,18 +35,18 @@ impl std::fmt::Display for PaneId {
     }
 }
 
-/// page 상태.
+/// The page state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageSnapshot {
     pub page_id: PageId,
     pub url: Url,
     pub title: String,
     pub status: PageStatus,
-    /// accessibility/DOM 기반 semantic ref (agent automation용).
+    /// Semantic refs derived from accessibility/DOM (for agent automation).
     pub refs: Vec<SemanticRef>,
 }
 
-/// page lifecycle 상태.
+/// The page lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PageStatus {
     Loading,
@@ -55,10 +55,10 @@ pub enum PageStatus {
     Crashed,
 }
 
-/// agent automation용 semantic ref. document generation에 종속.
+/// A semantic ref for agent automation. Tied to a document generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticRef {
-    /// `d1-n13` 형태. document generation이 바뀌면 만료.
+    /// In the form `d1-n13`. Expires when the document generation changes.
     pub ref_id: String,
     pub role: String,
     pub tag: String,

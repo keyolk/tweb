@@ -1,11 +1,12 @@
-//! Electron app 코드를 binary에 담고 필요할 때 cache에 푼다.
+//! Embeds the Electron app code in the binary and unpacks it into the cache when needed.
 //!
-//! app이 require하는 것은 `electron`과 node 내장 module, 그리고 여기 담긴 자기 파일뿐이라
-//! node_modules 없이 돈다. 그래서 198KB짜리 app 코드만 binary에 넣어도 자급되고,
-//! 295MB짜리 Electron runtime은 따로 두면 된다.
+//! All the app requires is `electron`, node's built-in modules, and its own files embedded here,
+//! so it runs without node_modules. That makes the 198KB of app code self-sufficient on its own
+//! inside the binary, leaving the 295MB Electron runtime to live elsewhere.
 //!
-//! directory 이름에 내용 hash를 쓴다. binary와 preload가 어긋날 수 없고 (같은 build는
-//! 언제나 같은 directory), 같은 build를 다시 실행할 때 다시 풀지도 않는다.
+//! The directory name is a hash of the contents. The binary and the preload can never drift apart
+//! (the same build always maps to the same directory), and re-running the same build never unpacks
+//! it again.
 
 use std::path::{Path, PathBuf};
 
@@ -52,8 +53,8 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// 담긴 app 코드의 내용 hash. 별도 dependency를 끌어오지 않기 위해 FNV-1a를 쓴다.
-/// 충돌 저항성이 아니라 "내용이 바뀌면 directory도 바뀐다"만 필요하다.
+/// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.
+/// What is needed is not collision resistance but only "different contents, different directory".
 fn content_tag() -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for (name, body) in FILES {
@@ -87,20 +88,20 @@ fn write_app(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 담긴 app 코드를 푼 directory. 이미 있으면 그대로 쓴다.
+/// The directory the embedded app code was unpacked into. If it already exists, it is used as is.
 pub fn extracted_app_dir() -> Result<PathBuf> {
     let target = cache_root().join(format!("app-{}", content_tag()));
-    // main.cjs까지 있으면 완성된 것으로 본다. 아래에서 rename으로 갈아끼우므로
-    // 반쯤 쓰인 directory가 이 이름으로 보일 일이 없다.
+    // If main.cjs is there, treat it as complete. The swap below happens via rename, so a
+    // half-written directory never appears under this name.
     if target.join("main.cjs").exists() {
         return Ok(target);
     }
-    // 다른 process가 동시에 푸는 경우를 위해 pid별 staging directory에 쓰고 rename한다.
+    // In case another process unpacks concurrently, write into a per-pid staging directory and rename.
     let staging = cache_root().join(format!(".app-{}-{}", content_tag(), std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
     write_app(&staging)?;
     if std::fs::rename(&staging, &target).is_err() {
-        // 경쟁에서 졌다면 이긴 쪽 결과를 쓴다. 내용 hash가 같으므로 동일하다.
+        // Having lost the race, use the winner's result — the content hash matches, so it is identical.
         let _ = std::fs::remove_dir_all(&staging);
         if !target.join("main.cjs").exists() {
             anyhow::bail!("cannot place the engine app at {}", target.display());
@@ -109,7 +110,7 @@ pub fn extracted_app_dir() -> Result<PathBuf> {
     Ok(target)
 }
 
-/// `package.json`이 요구하는 Electron version. app 코드와 runtime을 한 곳에서 맞춘다.
+/// The Electron version `package.json` asks for. App code and runtime are pinned in one place.
 fn electron_version() -> Result<String> {
     let manifest = FILES
         .iter()
@@ -121,11 +122,11 @@ fn electron_version() -> Result<String> {
     let spec = parsed["dependencies"]["electron"]
         .as_str()
         .context("package.json does not depend on electron")?;
-    // "^43.2.0" → "43.2.0". range를 해석하지 않고 적힌 base version을 그대로 쓴다.
+    // "^43.2.0" → "43.2.0". The range is not interpreted; the base version as written is used.
     Ok(spec.trim_start_matches(['^', '~', '=', 'v']).to_string())
 }
 
-/// Electron 배포 파일 이름에 쓰는 platform-arch.
+/// The platform-arch used in Electron's release filenames.
 fn platform_tag() -> Result<String> {
     let platform = match std::env::consts::OS {
         "macos" => "darwin",
@@ -140,7 +141,7 @@ fn platform_tag() -> Result<String> {
     Ok(format!("{platform}-{arch}"))
 }
 
-/// 1회성 설치가 runtime을 놓는 directory.
+/// The directory a one-shot install puts the runtime in.
 pub fn runtime_dir() -> PathBuf {
     let version = electron_version().unwrap_or_else(|_| "unknown".to_string());
     cache_root().join(format!("electron-{version}"))
@@ -168,8 +169,8 @@ fn capture(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// 받은 zip이 Electron이 공개한 것과 같은지 확인한다. 실행할 binary이므로 크기만 보고
-/// 넘기지 않는다.
+/// Verifies the downloaded zip matches what Electron published. This is a binary we are about to
+/// execute, so the size alone is not enough to go on.
 fn verify_checksum(zip: &Path, sums: &str, name: &str) -> Result<()> {
     let expected = sums
         .lines()
@@ -197,14 +198,14 @@ fn verify_checksum(zip: &Path, sums: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Electron runtime을 한 번 받아 cache에 푼다.
+/// Downloads the Electron runtime once and unpacks it into the cache.
 ///
-/// runtime은 295MB여서 binary에 담지 않는다 (app 코드는 198KB라 담는다). 대신 정말 없을
-/// 때 한 번 가져오고, 그 뒤로는 cache에서 쓴다. `curl`/`unzip`은 두 platform 모두에
-/// 기본으로 있어 crate dependency를 늘리지 않는다.
+/// At 295MB the runtime is not embedded in the binary (the 198KB of app code is). Instead it is
+/// fetched once when it is genuinely missing, and used from the cache thereafter. `curl`/`unzip`
+/// ship by default on both platforms, so this adds no crate dependency.
 pub fn install_runtime() -> Result<PathBuf> {
     if std::env::var("TWEB_NO_AUTO_INSTALL").is_ok() {
-        anyhow::bail!("TWEB_NO_AUTO_INSTALL이 설정되어 있어 자동 설치를 건너뜁니다");
+        anyhow::bail!("TWEB_NO_AUTO_INSTALL is set, so the automatic install is skipped");
     }
     let version = electron_version()?;
     let target = runtime_dir();
@@ -218,7 +219,7 @@ pub fn install_runtime() -> Result<PathBuf> {
     let zip = staging.join(&name);
 
     eprintln!(
-        "tweb: Electron runtime {version}을 받습니다 (한 번만, {})",
+        "tweb: downloading Electron runtime {version} (once only, {})",
         target.display()
     );
     run(

@@ -1,12 +1,12 @@
-# TWeb Browser Runtime 설계
+# TWeb Browser Runtime design
 
-## 1. 문제 정의
+## 1. Problem statement
 
-Ghostty와 tmux를 그대로 사용하면서 tmux pane 안에서 실제 Chromium browser를 사용할 수 있어야 한다.
-Browser는 단순 preview image가 아니라 사람이 직접 조작하고 agent가 같은 page를 자동화할 수 있는
-persistent runtime이어야 한다.
+It has to be possible to use a real Chromium browser inside a tmux pane while continuing to use
+Ghostty and tmux as they are. The browser must not be a mere preview image but a persistent runtime a
+human can drive directly and an agent can automate on the same page.
 
-핵심 사용 경험은 다음과 같다.
+The core experience is this:
 
 ```text
 Ghostty
@@ -20,56 +20,57 @@ Ghostty
         └── pane %5: browser page
 ```
 
-`awrit`이 증명한 terminal graphics 모델과 `cliweb`이 확장한 tmux·agent shared-control 모델을
-기반으로 하되, 다음 문제를 처음부터 해결한다.
+It builds on the terminal graphics model `awrit` proved and the tmux/agent shared-control model
+`cliweb` extended, while solving the following from the start:
 
-- tmux/Ghostty를 compatibility hack이 아닌 first-class target으로 지원
-- shortcut ownership을 명시적인 Browser mode로 분리
-- full-frame CPU copy를 피하는 damage-aware rendering
-- browser process/profile을 pane frontend와 분리해 여러 pane이 공유
-- Google Chrome profile의 extension·일반 browsing state를 안전하고 쉽게 가져오기
-- enterprise-managed Chrome이 필요한 Okta/Device Trust URL은 실제 Chrome으로 handoff
-- 향후 remote transport와 native GPU presentation을 추가할 수 있는 구조
+- support tmux/Ghostty as a first-class target rather than a compatibility hack
+- split shortcut ownership out into an explicit Browser mode
+- damage-aware rendering that avoids full-frame CPU copies
+- separate the browser process/profile from the pane frontend so several panes can share it
+- import a Google Chrome profile's extensions and general browsing state safely and easily
+- hand off Okta/Device Trust URLs that need enterprise-managed Chrome to real Chrome
+- a structure that can gain remote transports and native GPU presentation later
 
-## 2. 목표
+## 2. Goals
 
-1. Browser page 하나를 tmux pane 하나로 취급한다.
-2. `split-window`, `resize-pane`, `swap-pane`, `join-pane`, `break-pane`, `kill-pane`, zoom이
-   browser에도 그대로 적용된다.
-3. Browser pane resize가 Chromium viewport와 CSS reflow에 즉시 반영된다.
-4. 사람과 agent가 동일한 page/profile을 공유하되 control 권한은 명시적으로 관리한다.
-5. tmux shortcut과 browser shortcut은 mode로 완전히 분리한다.
-6. 같은 tmux session의 browser page는 기본적으로 cookie와 site data를 공유한다.
-7. Chrome profile bootstrap을 제품 핵심 기능으로 제공한다.
-8. Cookie 값이나 credential이 CLI, log, tmux option에 노출되지 않는다.
-9. Renderer와 profile provider를 분리해 Ghostty, Kitty, remote, native presentation으로 확장한다.
-10. Browser에서 생성·관찰한 resource를 같은 tmux window의 agent에 typed attachment로 전달하고,
-    다른 pane/window/host에는 명시적 scope와 capability로 전달한다.
-11. Browser/Chromium security update를 지속적으로 빠르게 반영할 수 있어야 한다.
+1. Treat one browser page as one tmux pane.
+2. `split-window`, `resize-pane`, `swap-pane`, `join-pane`, `break-pane`, `kill-pane` and zoom apply to
+   the browser as they do to anything else.
+3. A browser pane resize is reflected in the Chromium viewport and CSS reflow immediately.
+4. A human and an agent share the same page/profile, with control authority managed explicitly.
+5. tmux shortcuts and browser shortcuts are separated completely by mode.
+6. Browser pages in the same tmux session share cookies and site data by default.
+7. Chrome profile bootstrap is a core product feature.
+8. No cookie value or credential is exposed in the CLI, in logs or in tmux options.
+9. The renderer and the profile provider are separable, so it extends to Ghostty, Kitty, remote and
+   native presentation.
+10. Resources created or observed in the browser are handed to agents in the same tmux window as typed
+    attachments, and to other panes/windows/hosts only under explicit scope and capability.
+11. Browser/Chromium security updates must be adoptable continuously and quickly.
 
-## 3. 비목표
+## 3. Non-goals
 
-- Google Chrome을 User-Agent spoofing으로 흉내 내지 않는다.
-- 실행 중인 Chrome profile directory를 Chromium과 동시에 공유하지 않는다.
-- Okta session cookie를 자동·상시 복제하지 않는다.
-- tmux와 별도의 pane/layout tree를 만들지 않는다.
-- 첫 구조를 Electron 또는 특정 terminal 구현에 영구 결합하지 않는다.
-- Terminal graphics가 표현할 수 없는 browser chrome 전체를 억지로 재현한다고 약속하지 않는다.
-- Agent에게 managed Chrome profile 전체에 대한 무제한 automation 권한을 주지 않는다.
+- Do not imitate Google Chrome by spoofing the User-Agent.
+- Do not share a running Chrome profile directory with Chromium concurrently.
+- Do not replicate Okta session cookies automatically or continuously.
+- Do not build a pane/layout tree separate from tmux's.
+- Do not bind the initial structure permanently to Electron or to a particular terminal implementation.
+- Do not promise to force-reproduce the whole of a browser chrome that terminal graphics cannot express.
+- Do not grant agents unlimited automation authority over an entire managed Chrome profile.
 
-## 4. 핵심 불변식
+## 4. Core invariants
 
 ```text
-Browser page identity     = BrowserPageID
-Browser page placement    = tmux pane ID
-Browser profile 기본 범위 = tmux server + session ID
-Agent workflow 기본 범위  = tmux window ID
-Resource 기본 범위        = tmux window ID
-Layout authority          = tmux
-Input authority           = tmux mode 또는 Browser mode 중 하나
+browser page identity     = BrowserPageID
+browser page placement    = tmux pane ID
+default browser profile scope = tmux server + session ID
+default agent workflow scope  = tmux window ID
+default resource scope        = tmux window ID
+layout authority          = tmux
+input authority           = either tmux mode or Browser mode
 ```
 
-Browser runtime과 presentation은 독립적이다.
+The browser runtime and the presentation are independent.
 
 ```text
 BrowserRuntime
@@ -83,53 +84,53 @@ FrameTransport
 └── RemoteVideoTransport
 ```
 
-### 4.1 이름과 command contract
+### 4.1 Names and the command contract
 
 ```text
-제품명                 TWeb
-공식 executable        tweb
-선택적 짧은 alias      twb
+product name           TWeb
+official executable    tweb
+optional short alias   twb
 runtime daemon         twebd
 Chrome extension       TWeb Profile Bridge
 resource URI scheme    tweb://
 tmux key table         tweb-browser
 ```
 
-`TWeb`은 사람이 읽는 제품명이고 `tweb`은 script와 shell에서 사용하는 안정된 명령이다. `twb`는
-`tweb`의 symlink/alias일 뿐 별도 command나 config namespace를 만들지 않는다. 문서와 오류 메시지는
-항상 `tweb`을 canonical command로 출력한다.
+`TWeb` is the human-readable product name and `tweb` the stable command used in scripts and shells.
+`twb` is only a symlink/alias for `tweb` and never creates a separate command or config namespace.
+Documentation and error messages always print `tweb` as the canonical command.
 
-Unscoped npm의 `tweb`은 이미 reserved package이고 `twb`도 다른 package가 사용한다. 배포 package는
-`@keyolk/tweb`처럼 organization scope를 사용하고, 설치된 executable만 `tweb`/`twb`로 제공한다.
-GitHub에도 기존 `tweb` 이름의 unrelated project가 있으므로 repository identity는 organization을 포함한
-`keyolk/tweb`을 canonical URL로 사용한다.
+The unscoped npm `tweb` is already a reserved package and `twb` belongs to another package. The
+published package therefore uses an organization scope, `@keyolk/tweb`, and only the installed
+executables are `tweb`/`twb`. GitHub also has an unrelated project named `tweb`, so the repository
+identity uses the organization-qualified `keyolk/tweb` as the canonical URL.
 
-`tweb`은 하나의 multi-call executable이다. Subcommand가 항상 동작보다 먼저 오고 target selector는 뒤에
-둔다(`tweb snapshot --pane %3`). 전역 selector와 subcommand별 selector가 섞인 두 문법을 동시에
-지원하지 않는다.
+`tweb` is a single multi-call executable. The subcommand always comes before the action and target
+selectors after (`tweb snapshot --pane %3`). Two syntaxes mixing global and per-subcommand selectors
+are never supported at once.
 
 ```text
-tweb open [URL]             현재 terminal/pane에서 browser frontend 실행
-tweb split [URL]            현재 tmux window에 browser pane 생성
-tweb navigate URL           resolve된 browser page 이동
-tweb snapshot --pane %3     browser page 제어
-tweb resource ...           resource 조회·전달·materialize
-tweb profile ...            profile bootstrap·관리
-tweb chrome ...             managed Chrome handoff·bridge 관리
-tweb doctor [--fix]         terminal/tmux/Ghostty capability 진단·관리 설정
+tweb open [URL]             run the browser frontend in the current terminal/pane
+tweb split [URL]            create a browser pane in the current tmux window
+tweb navigate URL           navigate the resolved browser page
+tweb snapshot --pane %3     drive a browser page
+tweb resource ...           inspect, hand off and materialize resources
+tweb profile ...            bootstrap and manage profiles
+tweb chrome ...             manage the managed Chrome handoff and bridge
+tweb doctor [--fix]         diagnose terminal/tmux/Ghostty capabilities and manage the settings
 ```
 
-Pane frontend의 내부 invocation은 사용자-facing contract와 분리한다.
+The pane frontend's internal invocation is kept apart from the user-facing contract.
 
 ```text
 tweb __pane --page <opaque-id>
 ```
 
-`__pane`은 tmux가 실행하는 internal subcommand이며 문서화된 automation API가 아니다. 같은 binary를
-사용하므로 별도 `tweb-browser` 설치·version skew가 생기지 않는다.
+`__pane` is an internal subcommand tmux launches and is not a documented automation API. Because it is
+the same binary, there is no separate `tweb-browser` install and no version skew.
 
-`TWEB_CONFIG_HOME`, `TWEB_DATA_HOME`, `TWEB_RUNTIME_DIR`로 경로를 override할 수 있다. 기본값은
-platform convention을 따른다.
+`TWEB_CONFIG_HOME`, `TWEB_DATA_HOME` and `TWEB_RUNTIME_DIR` override the paths. The defaults follow
+platform convention.
 
 ```text
 Linux config   $XDG_CONFIG_HOME/tweb
@@ -140,10 +141,10 @@ macOS data     ~/Library/Application Support/TWeb
 macOS runtime  $TMPDIR/tweb-$UID (0700)
 ```
 
-Runtime socket과 GPU handle broker는 runtime directory 밖에 만들지 않는다. Profile, resource object,
-cache는 각각 별도 하위 directory와 quota를 가진다.
+The runtime socket and the GPU handle broker are never created outside the runtime directory. Profiles,
+resource objects and caches each have their own subdirectory and quota.
 
-## 5. 프로세스 구조
+## 5. Process structure
 
 ```text
 Host
@@ -153,7 +154,7 @@ Host
 │           ├── terminal capability negotiation
 │           ├── keyboard/mouse decoding
 │           ├── SIGWINCH handling
-│           └── frame transport frontend
+│           └── the frame transport frontend
 │
 ├── twebd
 │   ├── Chromium process manager
@@ -171,47 +172,47 @@ Host
 │   └── profile bootstrap
 │
 └── Google Chrome
-    └── optional tweb Profile Bridge extension
+    └── the optional tweb Profile Bridge extension
 ```
 
 ### 5.1 `twebd`
 
-Host당 하나의 daemon을 기본으로 한다. Pane마다 Electron 전체 runtime을 띄우지 않는다.
+One daemon per host by default. A full Electron runtime is never started per pane.
 
-책임:
+Responsibilities:
 
-- Chromium browser process와 crash recovery
-- session별 persistent profile/context
-- page 생성·종료·navigation·history
+- the Chromium browser process and crash recovery
+- a persistent profile/context per session
+- page creation, closing, navigation and history
 - extension lifecycle
-- frame generation과 backpressure
-- semantic accessibility/DOM snapshot
-- agent action 직렬화
-- human/agent control lease
+- frame generation and backpressure
+- semantic accessibility/DOM snapshots
+- serializing agent actions
+- the human/agent control lease
 - profile import/export policy
 
-Daemon socket은 사용자 전용 runtime directory에 두고 peer credential을 확인한다. 요청에는 opaque
-ID만 사용하고 cookie/token 값을 반환하는 API는 만들지 않는다.
+The daemon socket lives in a user-private runtime directory and peer credentials are checked. Requests
+use opaque IDs only, and no API ever returns a cookie/token value.
 
-### 5.2 `tweb __pane` frontend
+### 5.2 The `tweb __pane` frontend
 
-각 tmux browser pane의 실제 foreground process다.
+The actual foreground process of every tmux browser pane.
 
-책임:
+Responsibilities:
 
-- `$TMUX`, `$TMUX_PANE`을 이용해 pane identity 등록
-- tmux server/session/window/pane stable ID 수집
-- terminal Kitty graphics·keyboard·mouse capability 탐지
-- raw terminal mode 관리 및 종료 시 원복
-- `SIGWINCH`를 pixel viewport resize로 변환
-- browserd page에 attach하고 frame 표시
-- keyboard/mouse를 browserd로 전달
-- pane visibility/focus lifecycle 전달
-- terminal이 graphics를 지원하지 않을 때 text fallback 표시
+- register pane identity using `$TMUX` and `$TMUX_PANE`
+- collect the stable tmux server/session/window/pane IDs
+- detect the terminal's Kitty graphics, keyboard and mouse capabilities
+- manage raw terminal mode and restore it on exit
+- turn `SIGWINCH` into a pixel viewport resize
+- attach to a browserd page and display frames
+- forward keyboard/mouse to browserd
+- forward the pane visibility/focus lifecycle
+- show a text fallback when the terminal does not support graphics
 
-### 5.3 `tweb` CLI
+### 5.3 The `tweb` CLI
 
-예시:
+Examples:
 
 ```sh
 tweb open https://localhost:5173
@@ -223,15 +224,15 @@ tweb fill --pane %3 --ref d1-n18 --value hello
 tweb profile bootstrap chrome
 ```
 
-Agent가 pane을 생략하면 자신의 `$TMUX_PANE`에서 같은 tmux window의 primary browser를 찾는다.
-여러 후보가 있으면 임의 선택하지 않고 명시적 target을 요구한다.
+When an agent omits the pane, it finds the primary browser in the same tmux window from its own
+`$TMUX_PANE`. With several candidates it demands an explicit target rather than choosing arbitrarily.
 
-## 6. Browser runtime
+## 6. The browser runtime
 
-### 6.1 Engine 선택
+### 6.1 Choosing the engine
 
-첫 구현 계열은 Chromium을 사용한다. Electron은 `awrit`/`cliweb`과 extension tooling을 빠르게
-재사용할 수 있지만 domain API가 Electron에 종속돼서는 안 된다.
+The first implementation line uses Chromium. Electron makes it fast to reuse `awrit`/`cliweb` and the
+extension tooling, but the domain API must not end up bound to Electron.
 
 ```text
 BrowserEngineAdapter
@@ -239,20 +240,20 @@ BrowserEngineAdapter
 └── ChromiumShellAdapter
 ```
 
-장기 판단 기준:
+The long-term criteria:
 
 - Chrome Extension API compatibility
-- offscreen GPU shared texture 지원
+- offscreen GPU shared texture support
 - security update cadence
-- process sandbox
-- IME·clipboard·WebAuthn 지원
-- custom browser chrome 구현 비용
+- the process sandbox
+- IME, clipboard and WebAuthn support
+- the cost of implementing a custom browser chrome
 
-Electron을 사용한다면 CPU `NativeImage.toBitmap()` 경로를 기본 renderer로 쓰지 않고
-`offscreen.useSharedTexture`를 우선 검증한다. 사용 버전은 알려진 shared-texture 보안 수정이 포함된
-release 이상으로 고정한다.
+If Electron is used, the CPU `NativeImage.toBitmap()` path is not the default renderer;
+`offscreen.useSharedTexture` is validated first. The version used is pinned at or above a release that
+includes the known shared-texture security fixes.
 
-### 6.2 Profile 모델
+### 6.2 The profile model
 
 ```text
 BrowserProfile
@@ -268,27 +269,27 @@ BrowserProfile
 └── auditMetadata
 ```
 
-기본 profile key는 다음을 조합한다.
+The default profile key combines:
 
 ```text
 hash(tmux server identity, tmux session ID)
 ```
 
-Session rename이나 window reorder로 profile identity가 바뀌지 않아야 한다.
+Renaming a session or reordering windows must not change the profile identity.
 
-### 6.3 구현 언어
+### 6.3 Implementation languages
 
-TWeb의 주 구현 언어는 **Rust**로 한다. Memory 효율을 위해 Rust를 선택하지만, 더 큰 효과는
-Electron/Node/V8를 daemon과 pane frontend에서 제거하고 buffer ownership을 명시적으로 통제하는 데서
-얻는다.
+TWeb's primary implementation language is **Rust**. Rust is chosen for memory efficiency, but the larger
+effect comes from removing Electron/Node/V8 from the daemon and the pane frontend and controlling buffer
+ownership explicitly.
 
 ```text
 Rust
-├── tweb CLI
-├── tweb __pane frontend
+├── the tweb CLI
+├── the tweb __pane frontend
 ├── twebd orchestration
-├── tmux/terminal protocol
-├── CDP/control protocol
+├── the tmux/terminal protocol
+├── the CDP/control protocol
 ├── ProfileManager
 ├── ResourceBroker
 ├── AgentBridge
@@ -296,104 +297,108 @@ Rust
 └── remote transport
 
 C++
-├── CEF/Chromium embedding adapter
+├── the CEF/Chromium embedding adapter
 ├── Chromium GPU surface export
 └── extension/browser host integration
 
 Rust platform modules
 ├── macOS IOSurface/Mach/XPC/Metal synchronization
 ├── Linux DMA-BUF/Unix descriptor passing
-├── Windows DXGI/shared handle/named pipe
-└── platform credential store와 Chrome Native Messaging host
+├── Windows DXGI/shared handles/named pipes
+└── the platform credential store and the Chrome Native Messaging host
 
-Objective-C++/C++ platform shim
-└── Rust crate가 직접 표현할 수 없는 좁은 OS/browser ABI만 담당
+An Objective-C++/C++ platform shim
+└── covers only the narrow OS/browser ABIs a Rust crate cannot express directly
 
 Zig
-└── 선택적 TWeb-enhanced Ghostty fork와 표준 Kitty protocol upstream 기여
+└── the optional TWeb-enhanced Ghostty fork and upstream contributions to the standard Kitty protocol
 
 TypeScript
-└── TWeb Profile Bridge Chrome extension
+└── the TWeb Profile Bridge Chrome extension
 ```
 
-언어 경계는 process 또는 좁은 C ABI로 제한한다. Rust와 Zig가 동일한 domain logic을 나눠 갖거나 동일
-object lifetime을 공동 소유하게 만들지 않는다.
+Language boundaries are limited to a process or a narrow C ABI. Rust and Zig never split the same domain
+logic between them or co-own the same object lifetime.
 
-#### Rust를 core로 선택하는 이유
+#### Why Rust is the core
 
-- Ownership/RAII가 frame, shared-memory mapping, GPU handle, resource lease의 회수를 강제하기 좋다.
-- Daemon의 async IPC, multi-client backpressure, encrypted remote transport 생태계가 성숙하다.
-- Terminal parser와 untrusted protocol에 memory-safe default를 제공한다.
-- SQLite/object store, serialization, observability, fuzzing 도구가 충분하다.
-- macOS/Linux/향후 Windows를 같은 core로 지원하기 쉽다.
-- `tweb`, `twebd`를 Node/V8 runtime 없이 작은 native executable로 배포할 수 있다.
+- Ownership/RAII is well suited to enforcing the reclamation of frames, shared-memory mappings, GPU
+  handles and resource leases.
+- The ecosystem for a daemon's async IPC, multi-client backpressure and encrypted remote transport is
+  mature.
+- It provides memory-safe defaults for terminal parsers and untrusted protocols.
+- The SQLite/object store, serialization, observability and fuzzing tooling is sufficient.
+- macOS, Linux and eventually Windows are easy to support from one core.
+- `tweb` and `twebd` can ship as small native executables with no Node/V8 runtime.
 
-Rust라고 자동으로 memory 효율이 좋아지는 것은 아니다. 무제한 `Arc`, clone, channel, `Vec<u8>`, JSON
-materialization을 허용하면 Zig/C++보다 더 많은 memory를 쓸 수 있다. 다음 규칙을 적용한다.
+Rust does not make memory efficiency automatic. Allowing unbounded `Arc`, clones, channels, `Vec<u8>`
+and JSON materialization can use more memory than Zig or C++ would. The following rules apply.
 
-- Frame payload를 Rust heap `Vec<u8>`로 복사하지 않고 borrowed/native handle로 전달한다.
-- Bounded channel만 사용하고 queue capacity를 protocol contract에 포함한다.
-- Resource body는 stream/file descriptor로 전달하고 전체 body를 memory에 올리지 않는다.
-- Metadata JSON은 control plane에만 사용하고 frame/input hot path는 binary protocol을 사용한다.
-- `Bytes`/slice와 scatter-gather I/O를 사용하고 불필요한 `String` 변환을 금지한다.
-- Task마다 독립 buffer를 만들지 않고 profile/page별 bounded pool을 사용한다.
-- Release build는 `panic = "abort"`, LTO 여부를 측정해 결정하고 debug allocator를 production에 넣지 않는다.
-- Global allocator 교체는 실제 fragmentation profile을 얻은 뒤 결정한다.
+- Never copy a frame payload into a Rust heap `Vec<u8>`; pass a borrowed/native handle.
+- Use bounded channels only and make the queue capacity part of the protocol contract.
+- Pass resource bodies as streams/file descriptors and never load a whole body into memory.
+- Use metadata JSON on the control plane only; the frame/input hot path uses a binary protocol.
+- Use `Bytes`/slices and scatter-gather I/O, and forbid unnecessary `String` conversions.
+- Do not create an independent buffer per task; use a bounded pool per profile/page.
+- For release builds, decide `panic = "abort"` and LTO by measurement, and keep debug allocators out of
+  production.
+- Decide on replacing the global allocator only after obtaining a real fragmentation profile.
 
-#### Zig를 core로 선택하지 않는 이유
+#### Why Zig is not the core
 
-Zig의 explicit allocator, 작은 runtime, C interop은 매력적이다. 그러나 TWeb core의 난점은 단순 buffer
-변환보다 장수 daemon의 concurrency, cancellation, IPC, remote transport, resource capability와 crash
-recovery다. 이 영역에서는 Rust의 type/ownership/concurrency 생태계가 memory safety와 개발 안정성 면에서
-유리하다.
+Zig's explicit allocators, small runtime and C interop are attractive. But the hard part of TWeb's core
+is less buffer conversion than a long-lived daemon's concurrency, cancellation, IPC, remote transport,
+resource capabilities and crash recovery. In that territory Rust's type/ownership/concurrency ecosystem
+is the advantage, both for memory safety and for development stability.
 
-Zig는 다음 범위에서 더 적합하다.
+Zig fits better in the following scope:
 
-- 선택적 TWeb-enhanced Ghostty fork의 renderer와 local-surface protocol
-- 표준 Kitty animation/composition 지원의 Ghostty upstream 기여
-- ABI가 작은 image/surface conversion helper
-- 독립 benchmark/probe
+- the renderer and local-surface protocol of the optional TWeb-enhanced Ghostty fork
+- upstream Ghostty contributions for standard Kitty animation/composition support
+- image/surface conversion helpers with a small ABI
+- standalone benchmarks and probes
 
-Core를 Rust와 Zig 두 언어로 반반 나누면 allocator ownership, async runtime, build, debugging이 복잡해져
-절감한 memory보다 유지보수 비용이 커진다.
+Splitting the core evenly between Rust and Zig complicates allocator ownership, the async runtime,
+building and debugging enough that the maintenance cost exceeds the memory saved.
 
-### 6.4 Chromium adapter 선택
+### 6.4 Choosing the Chromium adapter
 
-Memory 효율을 우선하면 Electron을 제품 core로 채택하지 않는다.
+Putting memory efficiency first means not adopting Electron as the product core.
 
 ```text
-우선 검증
-    Rust twebd + CEF/custom Chromium adapter
+validate first
+    Rust twebd + a CEF/custom Chromium adapter
 
-비교 baseline
-    Electron offscreen shared texture adapter
+comparison baseline
+    the Electron offscreen shared texture adapter
 
-호환 fallback
-    external Chrome/CDP screenshot adapter
+compatibility fallback
+    an external Chrome/CDP screenshot adapter
 ```
 
-CEF/custom Chromium adapter의 목표:
+The goals of a CEF/custom Chromium adapter:
 
-- Node/V8 main process 제거
-- Browser process 하나가 session/profile context와 여러 page를 관리
-- Page마다 별도 Electron `BrowserWindow` 대신 Chromium page/WebContents만 생성
-- GPU surface를 CPU bitmap으로 변환하지 않고 export
-- Chromium sandbox와 process isolation 유지
-- extension API는 capability registry로 검증
+- remove the Node/V8 main process
+- one browser process manages the session/profile context and many pages
+- create only Chromium pages/WebContents instead of a separate Electron `BrowserWindow` per page
+- export the GPU surface without converting it to a CPU bitmap
+- keep the Chromium sandbox and process isolation
+- validate the extension API through a capability registry
 
-CEF가 필요한 extension API나 GPU handle export를 제공하지 못하면 narrow patch를 유지한 custom Chromium
-shell adapter로 교체한다. 이 변경은 `BrowserEngineAdapter` 뒤에서 일어나며 profile/page/resource API를
-바꾸지 않는다.
+If CEF cannot provide the needed extension API or GPU handle export, it is replaced by a custom Chromium
+shell adapter maintained with a narrow patch. That change happens behind `BrowserEngineAdapter` and does
+not alter the profile/page/resource API.
 
-### 6.5 Memory ownership과 budget
+### 6.5 Memory ownership and budgets
 
-Memory budget은 `RSS` 하나로 판단하지 않는다. Chromium shared library와 shared GPU resource 때문에
-process별 RSS 합은 실제 physical memory를 과장할 수 있다. 최소한 다음을 분리해 측정한다.
+The memory budget is never judged by `RSS` alone. Because of Chromium's shared libraries and shared GPU
+resources, the sum of per-process RSS can overstate the real physical memory. At minimum the following
+are measured separately.
 
 ```text
 private dirty / PSS
 shared code pages
-Chromium JS/DOM heap
+the Chromium JS/DOM heap
 GPU process memory
 IOSurface/DMA-BUF bytes
 Kitty SHM ring bytes
@@ -401,13 +406,13 @@ terminal texture bytes
 ResourceBroker object/cache bytes
 ```
 
-Frame memory는 다음 공식으로 예측한다.
+Frame memory is predicted with this formula:
 
 ```text
 surface bytes = width × height × 4 × surface count
 ```
 
-예:
+For example:
 
 ```text
 1920×1080 RGBA
@@ -421,49 +426,50 @@ surface bytes = width × height × 4 × surface count
   3 surfaces ≈ 94.9 MiB
 ```
 
-따라서 무조건 triple buffering하지 않는다.
+Triple buffering is therefore not unconditional.
 
-- GPU fast path는 기본 2-surface mailbox를 사용하고 measured stall이 있을 때만 3개로 확장한다.
-- Enhanced Ghostty path에서는 동일 IOSurface를 직접 import해 producer와 consumer pixel memory를 중복 생성하지 않게 한다.
-- Vanilla Ghostty/Kitty path에서는 SHM ring과 terminal texture가 중복되므로 visible page별 budget을 더 낮게 둔다.
-- Hidden page는 present surface와 SHM tile pool을 해제하고 compressed thumbnail만 선택적으로 남긴다.
-- Background page는 Chromium lifecycle state를 frozen/discarded로 전환할 수 있게 한다.
-- Resource cache와 browser HTTP cache를 별도 quota로 관리한다.
-- Screenshot/PDF/HAR는 memory buffer가 아니라 object store로 stream한다.
-- Profile마다 page/renderer process 상한을 두되 active media/WebRTC page는 임의 discard하지 않는다.
+- The GPU fast path uses a 2-surface mailbox by default and extends to 3 only on a measured stall.
+- On the enhanced Ghostty path, the same IOSurface is imported directly so producer and consumer never duplicate pixel memory.
+- On the vanilla Ghostty/Kitty path the SHM ring and the terminal texture do duplicate, so the per-visible-page budget is set lower.
+- A hidden page releases its present surface and SHM tile pool, optionally keeping only a compressed thumbnail.
+- A background page can have its Chromium lifecycle state moved to frozen/discarded.
+- The resource cache and the browser HTTP cache are managed under separate quotas.
+- Screenshots/PDFs/HARs stream to the object store rather than into a memory buffer.
+- Each profile has a page/renderer process ceiling, but pages with active media/WebRTC are never discarded arbitrarily.
 
-초기 budget class:
+The initial budget classes:
 
 ```text
 CoreBudget
-    tweb pane frontend private memory
-    twebd private memory (Chromium 제외)
+    the tweb pane frontend's private memory
+    twebd's private memory (excluding Chromium)
 
 VisiblePageBudget
-    JS/DOM + renderer private memory
+    JS/DOM plus the renderer's private memory
     GPU surfaces
     transport buffers
 
 HiddenPageBudget
     frozen page state
-    optional thumbnail
+    an optional thumbnail
 
 ProfileBudget
-    cache/resource/object-store quota
+    the cache/resource/object-store quota
 ```
 
-구체적 MiB 상한은 기준 hardware에서 CEF/Chromium baseline을 측정한 뒤 확정한다. 다만 다음은 architecture
-release gate다.
+Concrete MiB ceilings are settled after measuring the CEF/Chromium baseline on reference hardware. The
+following, though, are architecture release gates.
 
-- `tweb` pane 수에 비례해 browser runtime/Node/V8가 중복되지 않는다.
-- Visible page를 추가하지 않은 idle pane frontend는 frame-sized buffer를 소유하지 않는다.
-- Hidden page의 GPU/SHM surface byte가 0으로 수렴한다.
-- Queue와 resource cache에 hard upper bound가 있다.
-- Page close, renderer crash, client detach 후 resource count와 private bytes가 baseline으로 돌아온다.
+- The browser runtime/Node/V8 are not duplicated in proportion to the `tweb` pane count.
+- An idle pane frontend that has added no visible page owns no frame-sized buffer.
+- A hidden page's GPU/SHM surface bytes converge to 0.
+- Queues and the resource cache have hard upper bounds.
+- After a page close, a renderer crash or a client detach, resource counts and private bytes return to baseline.
 
 ### 6.6 Platform abstraction
 
-macOS를 첫 구현·성능 기준 플랫폼으로 삼지만, core type과 protocol은 macOS API를 노출하지 않는다.
+macOS is the first implementation and performance reference platform, but the core types and protocols
+never expose macOS APIs.
 
 ```text
 Platform-neutral Rust core
@@ -477,7 +483,7 @@ Platform-neutral Rust core
 └── PlatformPaths
 ```
 
-#### Shared surface
+#### Shared surfaces
 
 ```rust
 trait SharedSurface: Send + Sync {
@@ -489,18 +495,18 @@ trait SharedSurface: Send + Sync {
 }
 ```
 
-Platform handle을 wire schema의 공용 integer/pointer로 만들지 않는다.
+Platform handles never become a shared integer/pointer in the wire schema.
 
 ```text
-macOS    IOSurface + Mach port/shared event
-Linux    DMA-BUF fd + sync file/explicit fence
-Windows  DXGI shared handle + D3D11/D3D12 fence
+macOS    IOSurface + a Mach port/shared event
+Linux    a DMA-BUF fd + a sync file/explicit fence
+Windows  a DXGI shared handle + a D3D11/D3D12 fence
 ```
 
-각 handle은 해당 platform adapter 안에서만 해석한다. Remote path에서는 shared surface handle을 보내지 않고
-video frame transport로 전환한다.
+Each handle is interpreted only inside its platform adapter. On the remote path, shared surface handles
+are not sent at all; it switches to a video frame transport.
 
-#### Platform service matrix
+#### The platform service matrix
 
 | Service | macOS | Linux | Windows |
 |---|---|---|---|
@@ -510,78 +516,79 @@ video frame transport로 전환한다.
 | Credential store | Keychain | Secret Service/KWallet | Credential Manager/DPAPI |
 | Browser discovery | Chrome app bundle | desktop entry/PATH | registry/App Paths |
 | Native messaging | Chrome macOS manifest | Chrome Linux manifest | Chrome registry manifest |
-| Runtime supervision | launchd-compatible child | systemd-compatible child | Job Object/service-compatible child |
+| Runtime supervision | a launchd-compatible child | a systemd-compatible child | a Job Object/service-compatible child |
 | Paths | `~/Library/...` | XDG directories | Known Folders/LocalAppData |
 
 #### Terminal/tmux topology
 
-macOS와 Linux에서는 tmux server와 `twebd`가 같은 host에 있는 구성을 기본으로 한다. Windows는 tmux가
-native Windows process가 아닐 수 있으므로 실행 위치를 명시적으로 분리한다.
+On macOS and Linux, the default arrangement has the tmux server and `twebd` on the same host. On Windows,
+tmux may not be a native Windows process, so where things run is separated explicitly.
 
 ```text
 Windows terminal client
 ├── WSL2 tmux + WSL2 twebd
 ├── SSH remote tmux + remote twebd
-└── Windows-local browser runtime + WSL/remote pane association
+└── a Windows-local browser runtime + a WSL/remote pane association
 ```
 
-Core identity에 OS path나 PID만 사용하지 않는다.
+Core identity never uses OS paths or PIDs alone.
 
 ```text
 HostID + TmuxServerID + SessionID + WindowID + PaneID
 ```
 
-WSL과 Windows host가 file path를 공유할 수 있다고 가정하지 않는다. ResourceBroker가 Windows path,
-WSL path, remote path 사이 materialization과 transfer를 담당한다.
+Do not assume WSL and the Windows host can share file paths. The ResourceBroker owns materialization and
+transfer between Windows paths, WSL paths and remote paths.
 
-#### 지원 순서와 contract
+#### Support order and the contract
 
 ```text
-Primary implementation   macOS + vanilla Ghostty + stock tmux
-Second platform          Linux + Ghostty/Kitty + stock tmux
-Third platform           Windows client + WSL/SSH tmux
-Optional optimized tier  platform별 enhanced terminal adapter
+primary implementation   macOS + vanilla Ghostty + stock tmux
+second platform          Linux + Ghostty/Kitty + stock tmux
+third platform           a Windows client + WSL/SSH tmux
+optional optimized tier  a per-platform enhanced terminal adapter
 ```
 
-Platform별 최적화가 core API에 새 기능 semantics를 만들면 안 된다. 예를 들어 Windows에서 DXGI fast path가
-없어도 page/profile/resource/Browser mode는 동일하게 동작하고 frame transport만 fallback해야 한다.
+A per-platform optimization must never introduce new feature semantics into the core API. Without the
+DXGI fast path on Windows, for instance, pages/profiles/resources/Browser mode still behave identically
+and only the frame transport falls back.
 
-CI는 적어도 다음을 분리한다.
+CI separates at least the following:
 
-- Platform-neutral Rust unit/property/fuzz tests
-- OS별 IPC/handle/path integration tests
-- Browser engine adapter conformance tests
-- Terminal/tmux 조합별 end-to-end tests
-- Cross-host resource transfer tests
+- platform-neutral Rust unit/property/fuzz tests
+- per-OS IPC/handle/path integration tests
+- browser engine adapter conformance tests
+- per-terminal/tmux-combination end-to-end tests
+- cross-host resource transfer tests
 
 ## 7. Rendering architecture
 
-TWeb은 vanilla terminal 호환성을 제품 baseline으로 보장하고, enhanced fork는 선택적 performance tier로만
-사용한다.
+TWeb guarantees vanilla terminal compatibility as the product baseline and uses an enhanced fork only as
+an optional performance tier.
 
 ```text
-Tier 1 — Vanilla baseline (필수)
-    vanilla Ghostty 또는 Kitty
+Tier 1 — vanilla baseline (required)
+    vanilla Ghostty or Kitty
     stock tmux
-    표준 Kitty graphics + 필요시 tmux passthrough
+    standard Kitty graphics plus tmux passthrough where needed
 
-Tier 2 — Standards enhanced (선택)
-    upstream Ghostty의 Kitty animation/composition 지원
-    upstream tmux의 native Kitty image lifecycle 지원
+Tier 2 — standards enhanced (optional)
+    upstream Ghostty's Kitty animation/composition support
+    upstream tmux's native Kitty image lifecycle support
 
-Tier 3 — TWeb enhanced (선택)
-    TWeb-enhanced Ghostty fork
-    필요시 TWeb-enhanced tmux branch
-    local GPU surface fast path
+Tier 3 — TWeb enhanced (optional)
+    the TWeb-enhanced Ghostty fork
+    a TWeb-enhanced tmux branch where needed
+    the local GPU surface fast path
 ```
 
-Release와 conformance test는 Tier 1에서 통과해야 한다. Tier 3가 설치돼 있지 않거나 negotiation에 실패해도
-browser page, profile, agent resource, shortcut 기능이 그대로 동작해야 한다. Tier 차이는 rendering
-performance와 일부 visual fidelity뿐이어야 한다.
+Release and conformance tests must pass on Tier 1. Even with Tier 3 absent or its negotiation failing,
+the browser page, profile, agent resource and shortcut functionality must all keep working. The tier
+difference must be rendering performance and some visual fidelity, nothing more.
 
-### 7.1 `awrit` 성능 gap
+### 7.1 `awrit`'s performance gap
 
-`awrit`의 병목은 Kitty graphics 자체 하나가 아니라 전체 frame pipeline에 있다.
+`awrit`'s bottleneck is not Kitty graphics alone but the whole frame pipeline.
 
 ```text
 Chromium GPU compositor
@@ -589,35 +596,36 @@ Chromium GPU compositor
 Electron NativeImage
     ↓ toBitmap()
 Node Buffer
-    ↓ BGRA → RGBA 변환 + copy
+    ↓ BGRA → RGBA conversion + copy
 POSIX shared memory
     ↓ Kitty graphics transfer
-Terminal image cache
+terminal image cache
     ↓ texture upload/composite
 GPU
 ```
 
-현재 구현에서 확인되는 비용:
+The costs visible in the current implementation:
 
-1. Paint마다 `NativeImage.toBitmap()`으로 전체 frame을 CPU memory에 만든다.
-2. Dirty rectangle을 받지만 renderer가 이를 사용하지 않고 전체 frame을 복사한다.
-3. Rust bridge가 paint마다 `shm_open`, `ftruncate`, `mmap`, `munmap`을 반복한다.
-4. BGRA→RGBA 변환을 전체 frame에 수행한다.
-5. Browser→Node→Rust→shared memory 사이에 중복 memory copy가 있다.
-6. Ghostty fallback은 image를 반복 transfer/display해 GPU upload와 placement churn을 만든다.
-7. tmux passthrough는 image visibility와 lifetime을 소유하지 않아 repaint, 잔상, cleanup 비용을 만든다.
+1. Every paint builds the whole frame in CPU memory via `NativeImage.toBitmap()`.
+2. The dirty rectangle is received but the renderer does not use it, copying the whole frame instead.
+3. The Rust bridge repeats `shm_open`, `ftruncate`, `mmap` and `munmap` on every paint.
+4. The BGRA→RGBA conversion runs over the whole frame.
+5. There are redundant memory copies between Browser→Node→Rust→shared memory.
+6. The Ghostty fallback transfers/displays the image repeatedly, producing GPU upload and placement churn.
+7. tmux passthrough does not own image visibility or lifetime, producing repaint, ghosting and cleanup costs.
 
-32-bit 1920×1080 frame은 약 7.9 MiB이고 60fps 전체 복사는 약 475 MiB/s다. Retina
-3840×2160은 frame당 약 31.6 MiB, 60fps 약 1.85 GiB/s다. 이는 protocol payload 외에 readback,
-색상 변환, shared-memory copy, terminal texture upload가 각각 추가되는 수치다.
+A 32-bit 1920×1080 frame is about 7.9 MiB, and copying it whole at 60fps is about 475 MiB/s. A Retina
+3840×2160 frame is about 31.6 MiB, about 1.85 GiB/s at 60fps. On top of the protocol payload, those
+figures each gain a readback, a color conversion, a shared-memory copy and a terminal texture upload.
 
-따라서 damage tiling만으로는 충분하지 않을 수 있다. Vanilla Ghostty/Kitty용 표준 Kitty 경로를 먼저
-최적화하고, 동일한 runtime 위에 선택적인 TWeb-enhanced Ghostty GPU surface fast path를 제공한다.
+Damage tiling alone may therefore not be enough. Optimize the standard Kitty path for vanilla
+Ghostty/Kitty first, and offer an optional TWeb-enhanced Ghostty GPU surface fast path on the same
+runtime.
 
-### 7.2 선택적 TWeb-enhanced Ghostty GPU surface fast path
+### 7.2 The optional TWeb-enhanced Ghostty GPU surface fast path
 
-이 경로는 별도 TWeb-enhanced Ghostty build가 있을 때만 활성화한다. Vanilla Ghostty 지원과 TWeb의
-기능 정확성은 이 경로에 의존하지 않는다.
+This path activates only when a separate TWeb-enhanced Ghostty build exists. Vanilla Ghostty support and
+TWeb's functional correctness never depend on it.
 
 ```text
 Chromium GPU compositor
@@ -627,11 +635,11 @@ Ghostty renderer
 Metal / OpenGL texture composition
 ```
 
-이 경로에서는 pixel을 CPU로 readback하지 않는다. PTY는 pixel payload가 아니라 frame ordering,
-placement, visibility, resize generation을 전달한다. 실제 GPU handle은 사용자 전용 local IPC로
-전달한다.
+On this path pixels are never read back to the CPU. The PTY carries frame ordering, placement, visibility
+and resize generation rather than a pixel payload. The actual GPU handle travels over user-private local
+IPC.
 
-개념적인 frame descriptor:
+The conceptual frame descriptor:
 
 ```text
 GpuFrameDescriptor
@@ -646,113 +654,113 @@ GpuFrameDescriptor
 └── synchronizationFence
 ```
 
-macOS 구현:
+The macOS implementation:
 
-1. Chromium/Electron offscreen shared texture에서 `IOSurface` backed frame을 받는다.
-2. Native bridge가 `IOSurface`를 Mach/XPC로 전달 가능한 handle로 export한다.
-3. Ghostty는 handle을 검증하고 `MTLTexture`로 import한다.
-4. BGRA/RGBA 차이는 CPU swizzle이 아니라 shader sampling으로 처리한다.
-5. Ghostty가 frame을 present하거나 drop한 뒤 release acknowledgement를 보낸다.
+1. Receive an `IOSurface`-backed frame from the Chromium/Electron offscreen shared texture.
+2. A native bridge exports the `IOSurface` as a handle transferable over Mach/XPC.
+3. Ghostty validates the handle and imports it as an `MTLTexture`.
+4. The BGRA/RGBA difference is handled by shader sampling, not a CPU swizzle.
+5. Ghostty sends a release acknowledgement after presenting or dropping the frame.
 
-Electron의 shared-texture handle은 받은 process에 국한되므로 JavaScript `Buffer`의 pointer 값을 다른
-process에 전달해서는 안 된다. Native bridge가 OS의 정식 cross-process resource transfer와 lifetime을
-소유해야 한다. 이 API가 안정성·성능 기준을 만족하지 못하면 동일 contract를 직접 제공하는
-Chromium shell adapter로 교체한다.
+Electron's shared-texture handle is confined to the receiving process, so a JavaScript `Buffer`'s pointer
+value must never be passed to another process. A native bridge has to own the OS's proper cross-process
+resource transfer and lifetime. If that API fails to meet the stability and performance criteria, it is
+replaced by a Chromium shell adapter that provides the same contract directly.
 
-Linux 구현은 DMA-BUF와 explicit synchronization을 사용한다. Import가 불가능한 GPU/driver에서는
-표준 Kitty backend로 내린다.
+The Linux implementation uses DMA-BUF and explicit synchronization. On GPUs/drivers where import is
+impossible, it falls back to the standard Kitty backend.
 
-#### Frame lifetime과 backpressure
+#### Frame lifetime and backpressure
 
-- Visible page마다 2~3개의 surface를 순환 사용한다.
-- Ghostty가 release하기 전에 producer가 surface를 덮어쓰지 않는다.
-- Queue가 밀리면 아직 present하지 않은 중간 frame을 버리고 최신 complete frame만 남긴다.
-- Damage rect는 rendering clip에 사용하되 surface 내용은 complete frame으로 취급한다.
-- Resize마다 generation을 올리고 이전 size/generation frame을 표시하지 않는다.
-- Hidden page는 compositor begin-frame을 중지하고 마지막 surface만 유지한다.
-- GPU process crash나 handle import 실패 시 page 단위로 Kitty backend로 전환한다.
+- 2–3 surfaces cycle per visible page.
+- The producer never overwrites a surface before Ghostty releases it.
+- When the queue falls behind, intermediate frames not yet presented are dropped and only the latest complete frame is kept.
+- Damage rects are used for the rendering clip, but the surface contents are treated as a complete frame.
+- The generation is bumped on every resize and frames of an earlier size/generation are never displayed.
+- A hidden page stops the compositor's begin-frame and keeps only the last surface.
+- On a GPU process crash or a handle import failure, it switches to the Kitty backend per page.
 
-#### PTY와 side channel의 역할
+#### The roles of the PTY and the side channel
 
 ```text
 PTY/tmux
-    → pane identity, placement, frame token, focus, visibility, delete
+    → pane identity, placement, frame tokens, focus, visibility, delete
 
-Local GPU channel
-    → texture handle, fence, release acknowledgement
+the local GPU channel
+    → texture handles, fences, release acknowledgements
 ```
 
-Vendor extension을 무조건 전송하지 않는다. Browser frontend, tmux, Ghostty가 capability negotiation으로
-동일한 local-surface protocol version을 확인한 경우에만 사용한다. 다른 terminal은 알 수 없는 handle을
-받지 않고 표준 Kitty frame을 받는다.
+Vendor extensions are never sent unconditionally. They are used only once the browser frontend, tmux and
+Ghostty have confirmed the same local-surface protocol version through capability negotiation. Other
+terminals never receive a handle they cannot understand; they receive standard Kitty frames.
 
-### 7.3 기본 local 경로: vanilla Ghostty/Kitty의 damage-aware Kitty graphics
+### 7.3 The default local path: damage-aware Kitty graphics on vanilla Ghostty/Kitty
 
-이 경로가 설치와 기능 correctness의 baseline이다. TWeb은 공식 Ghostty release와 stock Kitty에서 별도
-fork 없이 실행돼야 한다. Enhanced capability가 없어도 browser resize, input, profile 공유, agent resource
-exchange가 모두 동작한다.
+This path is the baseline for both installation and functional correctness. TWeb has to run on official
+Ghostty releases and stock Kitty with no fork. Even with no enhanced capability, browser resize, input,
+profile sharing and agent resource exchange all work.
 
 ```text
 Chromium compositor
     ↓ damage metadata
-Native frame bridge
+native frame bridge
     ↓ changed tiles/rectangles
-Persistent POSIX shared-memory ring
+a persistent POSIX shared-memory ring
     ↓ Kitty graphics commands
 Ghostty / Kitty
 ```
 
-GPU fast path를 지원하지 않는 terminal에서도 `awrit`보다 복사량과 syscall을 줄인다.
+Even on terminals without the GPU fast path, it reduces copies and syscalls compared to `awrit`.
 
-#### Memory pipeline
+#### The memory pipeline
 
-- Paint마다 shared memory를 열고 map하지 않는다.
-- Page 생성 시 2~3개의 persistent mapped buffer를 preallocate하고 resize 때만 교체한다.
-- Browser frame을 JavaScript `Buffer`로 왕복시키지 않고 native bridge에서 destination buffer로 쓴다.
-- GPU source인 경우 asynchronous readback을 사용하고 main/UI thread에서 기다리지 않는다.
-- 표준 Kitty의 RGBA 요구 때문에 변환이 필요할 때 변경 영역만 SIMD로 변환한다.
-- Terminal acknowledgement 전에는 같은 transfer buffer를 재사용하지 않는다.
-- Shared-memory name과 image ID를 무한 생성하지 않고 bounded pool에서 재사용한다.
+- Do not open and map shared memory per paint.
+- Preallocate 2–3 persistent mapped buffers when the page is created and swap them only on resize.
+- Do not round-trip a browser frame through a JavaScript `Buffer`; the native bridge writes into the destination buffer.
+- With a GPU source, use asynchronous readback and never wait on the main/UI thread.
+- When conversion is needed for standard Kitty's RGBA requirement, SIMD-convert only the changed area.
+- Never reuse the same transfer buffer before the terminal acknowledges it.
+- Reuse shared-memory names and image IDs from a bounded pool rather than minting them without limit.
 
-#### Damage와 tile 전략
+#### The damage and tile strategy
 
-- Chromium/Electron의 dirty rectangle을 보존한다.
-- 화면을 adaptive tile로 나눈다. 기본 후보는 256×256이며 workload에 따라 128~512 범위에서 조정한다.
-- Dirty rect와 겹치는 tile만 갱신한다.
-- 한 display interval 안의 여러 damage event를 union한다.
-- Scroll처럼 변경 면적이 큰 frame은 수백 개의 작은 command 대신 full-frame 또는 큰 stripe로 합친다.
-- Static page는 damage가 없으면 frame과 terminal command를 만들지 않는다.
-- Text/content update와 animation/video에 서로 다른 frame pacing을 적용한다.
-- Output queue가 밀리면 intermediate generation을 버린다.
+- Preserve Chromium's/Electron's dirty rectangle.
+- Divide the screen into adaptive tiles. The starting candidate is 256×256, adjusted in the 128–512 range by workload.
+- Update only the tiles a dirty rect overlaps.
+- Union the several damage events within one display interval.
+- Fold frames with a large changed area, such as a scroll, into a full frame or a large stripe instead of hundreds of small commands.
+- For a static page with no damage, produce neither a frame nor a terminal command.
+- Apply different frame pacing to text/content updates than to animation/video.
+- When the output queue falls behind, drop intermediate generations.
 
-Tile 크기는 고정된 상수가 아니라 다음 비용의 측정 결과로 선택한다.
+The tile size is not a fixed constant but a choice measured against these costs:
 
 ```text
-작은 tile  → command/image 수와 placement 비용 증가
-큰 tile    → 불필요한 pixel copy와 texture upload 증가
+smaller tiles → more commands/images and higher placement cost
+larger tiles  → more unnecessary pixel copies and texture uploads
 ```
 
-#### Kitty capability별 전략
+#### Strategy per Kitty capability
 
 ```text
 load + animation frame + composite
-    → base image에 damage frame composite
+    → composite the damage frame onto the base image
 
 independent image placement + replace
-    → stable tile image ID를 제자리 갱신
+    → update stable tile image IDs in place
 
 basic transfer/display only
-    → coalesced full-frame fallback + 낮은 frame cap
+    → a coalesced full-frame fallback plus a lower frame cap
 ```
 
-Capability는 terminal 이름으로 추측하지 않고 graphics query로 판정한다. Basic fallback을 정상 성능
-경로로 홍보하지 않으며 UI에 제한 상태를 표시한다.
+Capabilities are decided by a graphics query, never guessed from the terminal name. The basic fallback is
+never marketed as a normal performance path, and the restricted state is surfaced in the UI.
 
-### 7.4 tmux 지원 tier
+### 7.4 tmux support tiers
 
-#### Stock tmux baseline
+#### The stock tmux baseline
 
-Stock tmux에서는 표준 Kitty sequence를 passthrough로 전달한다.
+On stock tmux, standard Kitty sequences travel through passthrough.
 
 ```tmux
 set -g mouse on
@@ -760,37 +768,40 @@ set -g focus-events on
 set -g allow-passthrough all
 ```
 
-TWeb이 stock tmux에서 직접 책임지는 동작:
+What TWeb is directly responsible for on stock tmux:
 
-- pane 크기와 `SIGWINCH` 기반 viewport
-- image ID namespace
-- selected window visibility와 repaint reconciliation
-- pane 종료 전 deterministic delete
-- 비정상 종료 후 stale placement 복구
-- Browser mode key table
+- the pane size and the `SIGWINCH`-driven viewport
+- the image ID namespace
+- selected-window visibility and repaint reconciliation
+- a deterministic delete before the pane exits
+- recovering stale placements after an abnormal exit
+- the Browser mode key table
 
-Stock tmux가 image object를 이해하지 않는 한 visibility hook이나 repaint reconciliation이 필요할 수 있다.
-이는 baseline에서 지원해야 하는 compatibility cost이며, 설치 실패나 data loss로 이어져서는 안 된다.
+As long as stock tmux does not understand image objects, visibility hooks or repaint reconciliation may be
+needed. That is a compatibility cost the baseline has to carry, and it must never lead to a failed install
+or data loss.
 
-#### 선택적 enhanced tmux branch
+#### The optional enhanced tmux branch
 
-최고 성능 tier에서는 tmux가 다음 lifecycle을 native로 관리하는 branch를 염두에 둔다.
+For the highest performance tier, a branch is envisioned in which tmux manages the following lifecycle
+natively:
 
-- Kitty image와 local GPU frame-token sequence parse/cache
+- parsing/caching Kitty images and local GPU frame-token sequences
 - pane-relative placement
-- selected window에서만 image 표시
-- pane resize와 zoom 시 placement 갱신
-- pane/window 종료 시 image deterministic deletion
-- 여러 tmux client별 image capability와 visibility 관리
-- pane offset 보정
-- frame generation과 release acknowledgement 전달
-- 느린 client가 browser producer에 무제한 backpressure를 만들지 않도록 client별 최신 frame 유지
+- displaying images only in the selected window
+- updating placement on pane resize and zoom
+- deterministic image deletion when a pane/window ends
+- managing image capability and visibility per tmux client
+- correcting for the pane offset
+- carrying frame generations and release acknowledgements
+- keeping the latest frame per client so a slow client does not apply unbounded backpressure to the browser producer
 
-Tmux는 GPU handle 자체를 열 필요가 없다. Resource token의 pane/window lifecycle과 outer client 전달을
-관리하고, 실제 handle은 browserd와 Ghostty 사이의 authenticated local channel로 전달한다.
+tmux never needs to open a GPU handle itself. It manages the resource token's pane/window lifecycle and its
+delivery to outer clients, while the actual handle travels over an authenticated local channel between
+browserd and Ghostty.
 
-현재 tmux에서 native Kitty image support가 안정화되지 않은 경우 별도 integration branch를 유지하되,
-upstream 반영을 목표로 한다. Compatibility mode에서는 다음 설정을 사용할 수 있다.
+Where native Kitty image support in current tmux is not yet stable, a separate integration branch is
+maintained with upstreaming as the goal. In compatibility mode the following settings can be used.
 
 ```tmux
 set -g mouse on
@@ -798,156 +809,158 @@ set -g focus-events on
 set -g allow-passthrough all
 ```
 
-하지만 visibility hook과 stale-image cleanup을 최종 architecture의 정상 경로로 간주하지 않는다.
+Visibility hooks and stale-image cleanup are not regarded as normal paths in the final architecture, though.
 
 ### 7.5 Ghostty native integration
 
-Ghostty 쪽 목표:
+The goals on the Ghostty side:
 
 - Kitty image load/display/delete
-- animation frame과 frame composition
+- animation frames and frame composition
 - persistent shared-memory transfer
-- local `IOSurface`/DMA-BUF frame import extension
-- explicit synchronization과 release acknowledgement
+- a local `IOSurface`/DMA-BUF frame import extension
+- explicit synchronization and release acknowledgements
 - Unicode placeholder/placement semantics
-- image memory budget 및 deterministic eviction
-- tmux를 거친 좌표·visibility 처리
-- extended keyboard protocol
+- an image memory budget and deterministic eviction
+- coordinate and visibility handling through tmux
+- the extended keyboard protocol
 - SGR pixel mouse coordinates
 
-Ghostty renderer는 browser texture를 terminal cell texture atlas에 복사하지 않고 별도 image/surface layer로
-composition한다. Clip과 transform만 pane geometry에 맞게 갱신하고, resize 도중 불필요한 texture
-재할당을 피한다.
+The Ghostty renderer composites the browser texture as a separate image/surface layer rather than copying it
+into the terminal cell texture atlas. Only the clip and transform are updated to the pane geometry,
+avoiding unnecessary texture reallocation mid-resize.
 
-Ghostty에서 빠진 protocol 동작은 terminal 이름별 workaround를 계속 쌓기보다 upstream 구현으로 해결한다.
+Protocol behaviour missing in Ghostty is solved by an upstream implementation rather than by piling up more
+per-terminal-name workarounds.
 
-### 7.6 성능 경로 선택
+### 7.6 Choosing the performance path
 
 ```text
-Ghostty local-surface + tmux local-token 지원
-    → zero-readback GPU fast path
+Ghostty local-surface + tmux local-token support
+    → the zero-readback GPU fast path
 
-표준 Kitty shared memory + damage/composite 지원
-    → optimized compatibility path
+standard Kitty shared memory + damage/composite support
+    → the optimized compatibility path
 
 basic Kitty image only
-    → bounded full-frame fallback
+    → a bounded full-frame fallback
 
-remote browser
+a remote browser
     → hardware video transport
 ```
 
-선택은 browser page마다 독립적으로 이루어질 수 있으나 동일 page를 표시하는 client가 여럿이면 각 client가
-자신의 transport를 가진다. Producer는 가장 느린 client 때문에 block되지 않는다.
+The choice can be made independently per browser page, but when several clients display the same page each
+gets its own transport. The producer is never blocked by the slowest client.
 
-### 7.7 성능 release gate
+### 7.7 The performance release gate
 
-주 경로는 다음 기준을 충족하기 전까지 `performance-ready`로 표시하지 않는다.
+The main path is not marked `performance-ready` until it meets the following criteria.
 
-- GPU fast path에서 browser pixel의 CPU full-frame copy 0회
-- Static page가 idle일 때 frame transfer 0
-- Hidden tmux window에서 frame production 0
-- Queue depth가 설정한 surface ring 크기를 초과하지 않음
-- Resize 후 2 display frame 안에 새 generation만 표시
-- 1080p continuous scroll에서 60Hz display 기준 지속 가능한 frame pacing
-- 두 개의 visible browser pane에서 unbounded memory 증가 없음
-- 10분 animation/video 후 stale image·surface·shared-memory object 0
-- Producer, tmux client, Ghostty 중 하나가 crash해도 surface handle을 회수
+- 0 CPU full-frame copies of browser pixels on the GPU fast path
+- 0 frame transfers while a static page is idle
+- 0 frame production in a hidden tmux window
+- queue depth never exceeding the configured surface ring size
+- only the new generation displayed within 2 display frames after a resize
+- sustainable frame pacing at a 60Hz display during a 1080p continuous scroll
+- no unbounded memory growth with two visible browser panes
+- 0 stale images, surfaces or shared-memory objects after 10 minutes of animation/video
+- surface handles reclaimed even when the producer, a tmux client or Ghostty crashes
 
-Latency와 frame 수치는 기준 hardware를 정한 뒤 수치화한다. 최소 측정 항목은 다음과 같다.
+Latency and frame figures are quantified after fixing the reference hardware. The minimum measurement items:
 
 ```text
 input → Chromium event dispatch
 Chromium commit → frame available
 frame available → Ghostty present
-input → visible response end-to-end
+input → visible response, end to end
 GPU/CPU copy bytes per frame
 terminal command bytes per frame
 frame drop/coalesce count
 surface acquire/release latency
 ```
 
-표준 Kitty 경로가 workload별 목표를 만족하지 못해도 이를 숨기지 않는다. Ghostty GPU fast path를 주 경로로
-유지하고 Kitty path의 capability/성능 등급을 명시한다.
+If the standard Kitty path fails a workload's target, that is not hidden. The Ghostty GPU fast path remains
+the main path and the Kitty path's capability/performance grade is stated.
 
-### 7.8 향후 backend
+### 7.8 Future backends
 
 ```text
 NativeSurfaceTransport
-    Chromium shared GPU texture → tweb native compositor
+    a Chromium shared GPU texture → the tweb native compositor
 
 RemoteVideoTransport
     remote Chromium → hardware encode → client decode
 ```
 
-두 backend가 추가돼도 `BrowserPageID`, profile, automation API, tmux lifecycle은 유지한다.
+Adding either backend leaves `BrowserPageID`, the profile, the automation API and the tmux lifecycle
+unchanged.
 
-## 8. Resize와 visibility
+## 8. Resize and visibility
 
 ```text
 pane resize
     ↓ SIGWINCH
 terminal pixel query
     ↓
-viewport generation 증가
+bump the viewport generation
     ↓
 Chromium viewport resize
     ↓
 CSS resize / ResizeObserver
     ↓
-새 generation frame 표시
+display the new-generation frame
 ```
 
-- 100ms debounce를 사용하지 않는다.
-- Display frame 단위 coalescing만 사용한다.
-- Browser toolbar와 content viewport 크기를 별도로 계산한다.
-- Cell 크기, terminal padding, Retina scale을 capability query로 얻는다.
-- Pixel 크기를 알 수 없으면 cell 기반 추정치를 사용하되 상태를 표시한다.
+- Do not use a 100ms debounce.
+- Use coalescing per display frame only.
+- Compute the browser toolbar and the content viewport sizes separately.
+- Obtain the cell size, terminal padding and Retina scale from a capability query.
+- When the pixel size is unknown, use a cell-based estimate but surface that state.
 
-Window/session 변경은 tmux hook이 아니라 가능한 경우 client visibility notification으로 처리한다.
-Compatibility hook은 idempotent해야 하며 browserd가 재연결 후 전체 상태를 reconcile한다.
+Window/session changes are handled by client visibility notifications where possible rather than tmux hooks.
+Compatibility hooks must be idempotent, and browserd reconciles the full state after reconnecting.
 
-## 9. Shortcut와 입력 모델
+## 9. The shortcut and input model
 
-### 9.1 원칙
+### 9.1 Principles
 
-Shortcut은 동시에 해석하지 않는다.
+Shortcuts are never interpreted concurrently.
 
 ```text
 TMUX mode
-    모든 key → tmux key table
+    every key → the tmux key table
 
 BROWSER mode
-    reserved toggle → tmux mode
-    나머지 key → browser pane
+    the reserved toggle → tmux mode
+    every other key → the browser pane
 ```
 
-Mode는 tmux client별 상태다. 동일 session에 attach한 다른 client에게 영향을 주지 않는다.
-새 attach, session 전환, 오류 복구 시 TMUX mode로 시작한다.
+The mode is per-tmux-client state. It never affects other clients attached to the same session. A new
+attach, a session switch and error recovery all start in TMUX mode.
 
-### 9.2 tmux key table
+### 9.2 The tmux key table
 
-Pane option으로 browser surface를 식별한다.
+Pane options identify a browser surface.
 
 ```text
 @tweb_surface=browser
 @tweb_page_id=<opaque-id>
 ```
 
-Browser mode 진입 시 client를 custom key table로 전환한다.
+Entering Browser mode switches the client to a custom key table.
 
 ```tmux
 switch-client -T tweb-browser
 ```
 
-`tweb-browser` table의 동작:
+What the `tweb-browser` table does:
 
-- reserved toggle은 `root` table로 복귀
-- `Any`는 실제 key를 pane으로 보내고 다시 `tweb-browser` table을 arm
-- mouse border event는 tmux가 resize에 사용
-- pane interior mouse event는 browser process로 전달
+- the reserved toggle returns to the `root` table
+- `Any` sends the real key to the pane and re-arms the `tweb-browser` table
+- mouse border events are used by tmux for resize
+- pane interior mouse events go to the browser process
 
-개념 설정:
+The conceptual configuration:
 
 ```tmux
 bind-key -n C-g if-shell -F '#{==:#{@tweb_surface},browser}' \
@@ -958,162 +971,163 @@ bind-key -T tweb-browser C-g switch-client -T root
 bind-key -T tweb-browser Any send-keys \; switch-client -T tweb-browser
 ```
 
-정확한 `Any` forwarding, key-up/repeat, extended key, mouse 동작은 지원 tmux version별 conformance
-test로 확정한다. 동작하지 않는 version에서는 지원한다고 표시하지 않는다.
+The exact behaviour of `Any` forwarding, key-up/repeat, extended keys and mouse is settled by conformance
+tests per supported tmux version. Versions where it does not work are never marked as supported.
 
-기본 toggle은 `C-g`로 제안하되 configurable하다. 다른 pane에서는 원래 `C-g`가 그대로 전달된다.
-Literal `C-g`를 browser에 보내는 별도 binding을 제공한다.
+The default toggle is proposed as `C-g` but is configurable. In other panes the original `C-g` passes
+through as before. A separate binding is provided for sending a literal `C-g` to the browser.
 
-### 9.3 Browser mode 표시
+### 9.3 Surfacing Browser mode
 
-Mode는 항상 시각적으로 보여야 한다.
+The mode must always be visible.
 
 ```text
-[TMUX]    pane 조작 상태
-[BROWSER] Chromium direct input 상태
-[AGENT]   agent가 control lease를 가진 상태
+[TMUX]    the pane-manipulation state
+[BROWSER] the Chromium direct-input state
+[AGENT]   an agent holds the control lease
 ```
 
-표시 위치:
+Where it appears:
 
-- terminal title/OSC
-- tmux pane-border-format
-- browser toolbar badge
+- the terminal title/OSC
+- tmux's pane-border-format
+- a browser toolbar badge
 
-`client_key_table`과 실제 browser focus가 불일치하면 입력을 전달하지 않고 TMUX mode로 복구한다.
+When `client_key_table` and the real browser focus disagree, input is not forwarded and it recovers to
+TMUX mode.
 
-### 9.4 IME와 clipboard
+### 9.4 IME and clipboard
 
-반드시 별도 conformance 영역으로 취급한다.
+These must be treated as their own conformance area.
 
-- 한글 조합 중간 상태와 committed text
+- Korean intermediate composition state and committed text
 - Kitty keyboard protocol key-down/repeat/key-up
 - bracketed paste
 - OSC 52 clipboard
 - browser selection copy
-- file path drop와 upload
+- file path drop and upload
 
-Terminal protocol이 composition lifecycle을 전달하지 못하면 committed text 입력을 지원하고 제약을
-명시한다. 이를 숨기기 위해 global key event interception을 추가하지 않는다.
+Where the terminal protocol cannot carry the composition lifecycle, committed-text input is supported and
+the constraint is stated. Global key event interception is never added to hide it.
 
-## 10. Chrome profile bootstrap와 동기화
+## 10. Chrome profile bootstrap and synchronization
 
-### 10.1 목표
+### 10.1 Goal
 
-사용자가 기존 Chrome 환경을 빠르게 재구성할 수 있어야 한다.
+A user has to be able to reconstruct their existing Chrome environment quickly.
 
 ```text
-Chrome profile 선택
+pick a Chrome profile
     ↓
-profile inventory preview
+a profile inventory preview
     ↓
-사용자가 항목·site를 승인
+the user approves items and sites
     ↓
 tweb profile bootstrap
 ```
 
-지원 항목을 보안 수준별로 나눈다.
+The supported items are split by security level.
 
-| 데이터 | 기본 정책 | 방식 |
+| Data | Default policy | Mechanism |
 |---|---|---|
-| Extension 목록 | 가져오기 | ID/version/manifest inventory 후 재설치 |
-| Bookmarks | 가져오기 | snapshot import |
-| History | 선택적 가져오기 | credential 제거 후 import |
-| 일반 설정 | allowlist | homepage, locale 등 |
-| Cookie | origin별 명시적 승인 | Chrome Bridge를 통한 one-shot transfer |
-| Local storage | origin별 명시적 승인 | 지원 가능한 site만 adapter 사용 |
-| Extension storage | 기본 제외 | extension별 migration adapter |
-| Password/passkey | 제외 | 원래 provider에서 재인증 |
-| Okta/IdP session | 제외 | actual managed Chrome handoff |
+| The extension list | imported | inventory the IDs/versions/manifests, then reinstall |
+| Bookmarks | imported | a snapshot import |
+| History | optionally imported | imported with credentials stripped |
+| General settings | allowlisted | homepage, locale and the like |
+| Cookies | explicit per-origin approval | a one-shot transfer through the Chrome Bridge |
+| Local storage | explicit per-origin approval | an adapter, for supportable sites only |
+| Extension storage | excluded by default | a per-extension migration adapter |
+| Passwords/passkeys | excluded | re-authenticate with the original provider |
+| Okta/IdP sessions | excluded | the actual managed Chrome handoff |
 
-### 10.2 Profile DB 직접 접근 금지
+### 10.2 No direct profile DB access
 
-다음은 사용하지 않는다.
+The following are never used.
 
-- 실행 중인 Chrome `Cookies` SQLite 직접 읽기
-- Chrome Safe Storage key 추출
-- profile directory의 live copy
-- default Chrome profile을 Chromium `user-data-dir`로 재사용
-- cookie 값을 CLI/stdout/log에 출력
+- reading a running Chrome's `Cookies` SQLite directly
+- extracting the Chrome Safe Storage key
+- a live copy of the profile directory
+- reusing the default Chrome profile as Chromium's `user-data-dir`
+- printing cookie values to the CLI/stdout/logs
 
-대신 최소 권한의 Chrome Profile Bridge extension과 Native Messaging host를 사용한다.
+Instead, a least-privilege Chrome Profile Bridge extension and a Native Messaging host are used.
 
-### 10.3 Chrome Profile Bridge
+### 10.3 The Chrome Profile Bridge
 
-기본 권한:
+The default permissions:
 
 ```text
 nativeMessaging
 management
-bookmarks (선택)
-history (선택)
-cookies + per-origin host permission (요청 시에만)
+bookmarks (optional)
+history (optional)
+cookies + a per-origin host permission (only when requested)
 ```
 
-원칙:
+The principles:
 
-- Cookie 권한은 optional permission이다.
-- 사용자가 선택한 origin에 대해서만 runtime permission을 요청한다.
-- Transfer는 one-shot이며 background continuous sync가 아니다.
-- Native Messaging channel은 request ID, target profile, origin, expiry를 포함한다.
-- Cookie 값은 process memory와 암호화된 local IPC만 통과하고 저장 log를 남기지 않는다.
-- Import 결과는 개수와 속성만 보여주며 값은 보여주지 않는다.
-- Organization denylist와 IdP denylist를 먼저 적용한다.
-- `HttpOnly`, `Secure`, partitioned cookie는 정책과 browser support를 보존한다.
-- 충돌 시 임의 last-write-wins를 사용하지 않고 preview/replace 정책을 요청한다.
+- The cookie permission is an optional permission.
+- A runtime permission is requested only for the origins the user selected.
+- A transfer is one-shot, never a background continuous sync.
+- The Native Messaging channel carries a request ID, the target profile, the origin and an expiry.
+- Cookie values pass only through process memory and encrypted local IPC, leaving no stored log.
+- Import results show counts and attributes only, never values.
+- The organization denylist and the IdP denylist are applied first.
+- `HttpOnly`, `Secure` and partitioned cookies preserve their policy and browser support.
+- On a conflict, never arbitrary last-write-wins; request a preview/replace policy.
 
 ### 10.4 Sensitive domain policy
 
-기본 deny 예:
+Examples denied by default:
 
 ```text
 *.okta.com
-조직 Okta tenant
-AWS SSO/Teleport 등 organization-managed sensitive routes
-password manager 및 identity provider domain
+the organization's Okta tenant
+organization-managed sensitive routes such as AWS SSO/Teleport
+password manager and identity provider domains
 ```
 
-이 domain은 cookie sync 대신 실제 managed Google Chrome에서 연다.
+These domains open in real managed Google Chrome instead of syncing cookies.
 
 ```text
-embedded browser
-    ↓ sensitive route 감지
-managed Chrome handoff
+the embedded browser
+    ↓ detects a sensitive route
+the managed Chrome handoff
     ↓
-[Chrome에서 열림] 상태와 focus-return action 표시
+show an [opened in Chrome] state and a focus-return action
 ```
 
-Organization policy가 명시적으로 승인하지 않는 한 denylist를 사용자 설정으로 해제하지 않는다.
+The denylist is never overridable by user configuration unless organization policy explicitly approves it.
 
-### 10.5 Extension 동기화
+### 10.5 Extension synchronization
 
-Extension은 세 종류로 분류한다.
+Extensions fall into three classes.
 
 ```text
 compatible
-    자동 재설치 가능
+    can be reinstalled automatically
 
 needs-adapter
-    native messaging, toolbar, side panel 등 host 구현 필요
+    needs host support such as native messaging, a toolbar or a side panel
 
 managed-chrome-only
-    Device Trust, enterprise policy, Chrome identity에 의존
+    depends on Device Trust, enterprise policy or Chrome identity
 ```
 
-가져오기 과정:
+The import process:
 
-1. Chrome profile의 extension metadata만 읽는다.
-2. Web Store ID와 signing identity를 보존해 재설치한다.
-3. 지원하는 Chrome Extension API capability를 manifest와 runtime probe로 검사한다.
-4. 필요한 권한과 호환성 상태를 사용자에게 보여준다.
-5. Extension storage는 자동 복사하지 않고 extension-native sync 또는 adapter를 사용한다.
-6. 1Password, Okta Browser Plugin 같은 항목은 검증 전까지 `managed-chrome-only`다.
+1. Read only the extension metadata from the Chrome profile.
+2. Preserve the Web Store ID and signing identity, and reinstall.
+3. Check the supported Chrome Extension API capabilities via the manifest and a runtime probe.
+4. Show the user the required permissions and the compatibility state.
+5. Extension storage is never copied automatically; use extension-native sync or an adapter.
+6. Items such as 1Password and the Okta Browser Plugin are `managed-chrome-only` until validated.
 
-Extension compatibility 결과는 version별 registry로 관리하고 추측하지 않는다.
+Extension compatibility results are managed in a per-version registry, never guessed.
 
-## 11. Managed Chrome handoff
+## 11. The managed Chrome handoff
 
-실제 Google Chrome이 필요한 URL은 별도 trusted provider로 처리한다.
+URLs that need real Google Chrome are handled by a separate trusted provider.
 
 ```text
 BrowserRoutingPolicy
@@ -1123,86 +1137,86 @@ BrowserRoutingPolicy
 └── ask
 ```
 
-Managed Chrome Bridge의 최소 기능:
+The minimum functionality of the Managed Chrome Bridge:
 
-- URL 열기
-- tweb가 연 tab의 ID/title/URL 추적
-- tab focus
-- tweb로 focus 복귀
-- tab 종료 감지
+- opening a URL
+- tracking the ID/title/URL of tabs tweb opened
+- focusing a tab
+- returning focus to tweb
+- detecting a tab closing
 
-기본 Bridge에는 `debugger`, 광범위한 `scripting`, cookie access를 주지 않는다. Profile bootstrap을
-수행할 때만 별도의 명시적 permission flow를 사용한다.
+The basic Bridge is granted no `debugger`, no broad `scripting` and no cookie access. A separate explicit
+permission flow is used only when performing a profile bootstrap.
 
-## 12. Agent shared control과 resource exchange
+## 12. Agent shared control and resource exchange
 
-### 12.1 Automation loop
+### 12.1 The automation loop
 
-Automation API는 cookie 값을 노출하지 않는다.
+The automation API never exposes cookie values.
 
 ```text
 snapshot → semantic refs
 act      → click/fill/press/scroll/navigate
-wait     → load/network/selector/text 조건
-verify   → 새 snapshot/status/screenshot
+wait     → load/network/selector/text conditions
+verify   → a new snapshot/status/screenshot
 ```
 
-- Ref는 document generation에 종속된다.
-- Navigation 후 stale ref는 명시적 오류다.
-- Page별 command queue로 순서를 보장한다.
-- 사람이 browser input을 시작하면 agent lease를 일시 중단할 수 있다.
-- 외부 제출, 구매, 메시지 전송, upload, delete는 실행 직전 확인한다.
-- Managed Chrome profile은 기본적으로 agent automation 대상이 아니다.
+- Refs are tied to a document generation.
+- A stale ref after navigation is an explicit error.
+- A per-page command queue guarantees ordering.
+- Once a human starts giving the browser input, the agent lease can be suspended.
+- External submits, purchases, message sends, uploads and deletes are confirmed right before execution.
+- A managed Chrome profile is not an agent automation target by default.
 
-### 12.2 목표
+### 12.2 Goal
 
-Orca의 Design Mode처럼 browser에서 선택한 element context를 agent에게 하나의 attachment로 전달할 수
-있어야 한다. 이를 특정 agent 제품이나 동일 filesystem에 결합하지 않고 tmux scope와 resource handle로
-일반화한다.
+Like Orca's Design Mode, it has to be possible to hand an element context selected in the browser to an
+agent as a single attachment. That is generalized through tmux scopes and resource handles rather than
+being coupled to a particular agent product or to a shared filesystem.
 
-지원해야 하는 방향:
+The directions to support:
 
 ```text
 Browser → Agent
 ├── URL/title/selection
-├── DOM/accessibility snapshot
-├── element HTML + computed CSS + cropped screenshot
-├── source map 위치
-├── screenshot/PDF
-├── console/network trace
-├── download
-└── page-generated file/blob
+├── a DOM/accessibility snapshot
+├── element HTML + computed CSS + a cropped screenshot
+├── source map locations
+├── screenshots/PDFs
+├── console/network traces
+├── downloads
+└── page-generated files/blobs
 
 Agent → Browser
-├── navigation/input/action
-├── file upload
-├── clipboard payload
-├── JavaScript/CSS patch (승인된 개발 mode)
-└── workspace file preview
+├── navigation/input/actions
+├── file uploads
+├── clipboard payloads
+├── JavaScript/CSS patches (in an approved development mode)
+└── workspace file previews
 ```
 
 ### 12.3 ResourceBroker
 
-큰 payload를 tmux option, environment variable, terminal escape sequence 또는 agent prompt에 직접 넣지
-않는다. `twebd`와 별도 lifecycle을 가진 `ResourceBroker`가 immutable resource와 live handle을
-관리한다.
+Large payloads never go directly into tmux options, environment variables, terminal escape sequences or an
+agent prompt. A `ResourceBroker` with a lifecycle separate from `twebd` manages immutable resources and live
+handles.
 
 ```text
 BrowserPage
     ↓ publish
 ResourceBroker
-    ├── metadata index
-    ├── scoped object store
-    ├── live resource registry
-    ├── materializer
-    └── transfer service
+    ├── a metadata index
+    ├── a scoped object store
+    ├── a live resource registry
+    ├── a materializer
+    └── a transfer service
            ↓ deliver
        AgentBridge
            ↓
-       Agent pane
+       an agent pane
 ```
 
-Resource manifest:
+The resource manifest:
 
 ```text
 ResourceDescriptor
@@ -1229,75 +1243,75 @@ ResourceDescriptor
 └── capabilities
 ```
 
-Resource 본문은 다음 중 하나다.
+A resource's body is one of these:
 
 ```text
-inline-small     작은 JSON/text metadata
-object           immutable binary/text object
-file             host filesystem의 managed file
-live             현재 document/network stream 같은 유효기간 있는 handle
-bundle           여러 resource의 typed manifest
+inline-small     small JSON/text metadata
+object           an immutable binary/text object
+file             a managed file on the host filesystem
+live             a time-limited handle such as the current document/network stream
+bundle           a typed manifest of several resources
 ```
 
-Resource ID는 opaque하며 경로나 cookie 값을 포함하지 않는다. Object store는 사용자 전용 권한을 사용하고
-session/window policy에 따라 암호화·TTL·quota를 적용한다.
+Resource IDs are opaque and contain neither a path nor a cookie value. The object store uses user-private
+permissions and applies encryption, TTLs and quotas per session/window policy.
 
-### 12.4 Resource 종류
+### 12.4 Resource kinds
 
 ```text
 BrowserState
     URL, title, favicon, history position, viewport
 
 SemanticSnapshot
-    accessibility/DOM 기반 element refs
+    element refs derived from accessibility/DOM
 
 ElementContextBundle
-    element outer HTML
-    주변 DOM 일부
+    the element's outer HTML
+    part of the surrounding DOM
     computed CSS
-    cropped screenshot
-    source map file/line/column
-    current URL과 viewport
+    a cropped screenshot
+    the source map file/line/column
+    the current URL and viewport
 
 VisualCapture
-    viewport screenshot, full-page screenshot, PDF, short recording
+    a viewport screenshot, a full-page screenshot, a PDF, a short recording
 
 TextContext
-    selection, extracted text, Markdown, reader view
+    a selection, extracted text, Markdown, reader view
 
 DiagnosticTrace
-    console entries, page errors, network summary, performance trace
+    console entries, page errors, a network summary, a performance trace
 
 NetworkResource
-    request/response metadata, 승인된 body, HAR
+    request/response metadata, an approved body, a HAR
 
 BrowserFile
-    download, generated Blob, exported file
+    a download, a generated Blob, an exported file
 
 WorkspaceFile
-    upload 후보, browser에서 열 파일, source file
+    an upload candidate, a file to open in the browser, a source file
 
 ClipboardPayload
-    text, HTML, image, file references
+    text, HTML, images, file references
 ```
 
-Live `SemanticSnapshot`의 ref는 document generation이 바뀌면 만료된다. 반면 screenshot, PDF,
-`ElementContextBundle`처럼 materialize한 resource는 immutable하다.
+A live `SemanticSnapshot`'s refs expire when the document generation changes. Materialized resources such as
+a screenshot, a PDF or an `ElementContextBundle`, by contrast, are immutable.
 
-### 12.5 Scope와 기본 routing
+### 12.5 Scope and default routing
 
-Profile cookie 공유 범위와 resource visibility 범위를 분리한다.
+The profile cookie sharing scope and the resource visibility scope are separated.
 
 ```text
-Browser profile 기본 범위 = tmux session
-Resource 기본 범위        = tmux window
-Agent target 기본 범위    = tmux window
+default browser profile scope = the tmux session
+default resource scope        = the tmux window
+default agent target scope    = the tmux window
 ```
 
-즉 같은 session의 browser들이 login state를 공유하더라도 window A의 screenshot/download가 window B의
-agent에게 자동 노출되지는 않는다.
+That is, even when browsers in the same session share login state, a screenshot or download from window A is
+not automatically exposed to window B's agent.
 
-Pane role:
+Pane roles:
 
 ```text
 @tweb_role=agent
@@ -1306,15 +1320,15 @@ Pane role:
 @tweb_role=server
 ```
 
-기본 target resolution:
+The default target resolution:
 
-1. Resource를 만든 browser와 같은 tmux window를 선택한다.
-2. 해당 window에 등록된 active agent가 하나면 그 pane을 선택한다.
-3. Agent가 여러 개면 role/last-focus로 몰래 고르지 않고 selector를 보여준다.
-4. Agent가 없으면 resource inbox에 보관하고 badge를 표시한다.
-5. 다른 window/session 전달은 `--to-pane`, `--to-window`, `--to-session`으로 명시한다.
+1. Select the same tmux window as the browser that created the resource.
+2. If exactly one active agent is registered in that window, select its pane.
+3. With several agents, show a selector rather than quietly choosing by role/last-focus.
+4. With no agent, hold it in the resource inbox and show a badge.
+5. Delivery to another window/session is stated explicitly with `--to-pane`, `--to-window` or `--to-session`.
 
-예:
+Examples:
 
 ```sh
 tweb capture element --pane %3 --ref d8-n14 --send-to %1
@@ -1322,17 +1336,17 @@ tweb screenshot --pane %3 --send-to-window @2
 tweb resource share r_01K... --to-pane %7
 ```
 
-`join-pane`이나 `break-pane`으로 browser pane을 옮기면 이후 생성되는 resource의 기본 window scope가
-바뀐다. 이미 생성된 resource scope는 암묵적으로 바꾸지 않는다.
+Moving a browser pane with `join-pane` or `break-pane` changes the default window scope of resources created
+afterwards. The scope of already-created resources is never changed implicitly.
 
-### 12.6 Agent registration과 capability negotiation
+### 12.6 Agent registration and capability negotiation
 
-Agent pane의 process가 다음과 같이 등록한다.
+The process in an agent pane registers like this:
 
 ```text
 AgentEndpoint
 ├── agentID
-├── tmux pane/window/session
+├── the tmux pane/window/session
 ├── provider
 ├── workingDirectory
 ├── hostID
@@ -1343,7 +1357,7 @@ AgentEndpoint
 └── inboundEndpoint
 ```
 
-`AgentBridge` 구현 예:
+Example `AgentBridge` implementations:
 
 ```text
 ClaudeCodeBridge
@@ -1352,32 +1366,32 @@ GenericTerminalAgentBridge
 ShellInboxBridge
 ```
 
-전달 우선순위:
+The delivery priority:
 
-1. Agent가 attachment RPC를 제공하면 resource manifest/handle을 직접 전달한다.
-2. Agent가 local file attachment만 받으면 consumer host에 materialize하고 path와 metadata를 전달한다.
-3. Generic terminal agent에는 inbox notification과 짧은 `tweb://resource/<id>` reference를 전달한다.
-4. Adapter가 없으면 사용자가 `tweb resource materialize`로 꺼낼 수 있게 한다.
+1. If the agent offers an attachment RPC, pass the resource manifest/handle directly.
+2. If the agent accepts only local file attachments, materialize on the consumer host and pass the path plus metadata.
+3. For a generic terminal agent, pass an inbox notification and a short `tweb://resource/<id>` reference.
+4. With no adapter, let the user retrieve it via `tweb resource materialize`.
 
-큰 DOM, screenshot, HAR를 `tmux send-keys`로 붙여 넣지 않는다. Generic bridge가 terminal에 입력을
-삽입할 때도 shell-safe한 짧은 reference만 사용하며, 사용자가 활성화한 auto-delivery policy가 없는 한
-실행 중인 prompt를 임의로 submit하지 않는다.
+Never paste a large DOM, screenshot or HAR in with `tmux send-keys`. Even when a generic bridge inserts input
+into a terminal, it uses only a short shell-safe reference, and it never submits a running prompt on its own
+unless the user enabled an auto-delivery policy.
 
-### 12.7 Browser → Agent attachment flow
+### 12.7 The Browser → Agent attachment flow
 
-Orca Design Mode와 같은 element 전달:
+Element delivery like Orca's Design Mode:
 
 ```text
-1. Browser mode에서 Inspect/Attach mode 활성화
-2. element hover 및 선택
-3. browserd가 ElementContextBundle 생성
-4. ResourceBroker가 immutable bundle 저장
-5. 같은 tmux window의 AgentEndpoint resolve
-6. AgentBridge가 attachment 전달
-7. browser pane과 agent pane에 delivery 상태 표시
+1. Activate Inspect/Attach mode from Browser mode
+2. Hover and select an element
+3. browserd builds an ElementContextBundle
+4. ResourceBroker stores the immutable bundle
+5. Resolve the AgentEndpoint in the same tmux window
+6. AgentBridge delivers the attachment
+7. Show the delivery state in the browser pane and the agent pane
 ```
 
-Bundle manifest 예:
+An example bundle manifest:
 
 ```json
 {
@@ -1394,34 +1408,35 @@ Bundle manifest 예:
 }
 ```
 
-Source map이 있으면 workspace root에 대한 상대 경로와 commit/worktree identity를 함께 전달한다. Path가
-workspace 밖을 가리키거나 browser host와 agent host가 다르면 단순 local path로 가장하지 않는다.
+Where a source map exists, the path relative to the workspace root plus the commit/worktree identity travel
+with it. When the path points outside the workspace, or the browser host and the agent host differ, it is
+never presented as a plain local path.
 
-### 12.8 Download flow
+### 12.8 The download flow
 
-Download는 browser daemon의 임의 `~/Downloads`로 바로 떨어뜨리지 않는다.
+Downloads never drop straight into some arbitrary `~/Downloads` of the browser daemon.
 
 ```text
-Browser download
+a browser download
     ↓ quarantine staging
-ResourceBroker BrowserFile
+a ResourceBroker BrowserFile
     ↓ checksum, MIME, filename, source URL
-Window resource inbox
+the window resource inbox
     ↓ user/agent policy
-workspace로 atomic materialize
+an atomic materialization into the workspace
 ```
 
-정책:
+The policy:
 
-- `Content-Disposition` filename을 신뢰하지 않고 path traversal을 제거한다.
-- 기존 파일을 조용히 overwrite하지 않는다.
-- 실행 권한을 자동 부여하지 않는다.
-- Source URL, final URL, MIME, size, digest를 보존한다.
-- Download 완료 전에는 live progress resource로 표시한다.
-- Agent에게 전달할 때 파일 자체 대신 먼저 descriptor를 전달할 수 있다.
-- Remote browser에서 받은 파일은 필요할 때만 agent host로 전송한다.
+- Do not trust the `Content-Disposition` filename; strip path traversal.
+- Never silently overwrite an existing file.
+- Never grant the execute bit automatically.
+- Preserve the source URL, the final URL, the MIME type, the size and the digest.
+- Show it as a live progress resource until the download completes.
+- When handing it to an agent, the descriptor may go first rather than the file itself.
+- A file received from a remote browser is transferred to the agent host only when needed.
 
-예:
+Examples:
 
 ```sh
 tweb downloads --pane %3
@@ -1429,31 +1444,32 @@ tweb resource materialize r_01K... --to ./fixtures/report.pdf
 tweb resource send r_01K... --to-pane %1
 ```
 
-### 12.9 Upload flow
+### 12.9 The upload flow
 
-Upload는 agent host의 경로를 browser host의 경로로 오인하지 않는다.
+An upload never mistakes an agent host's path for a browser host's path.
 
 ```text
-Agent/workspace file
-    ↓ publish WorkspaceFile
+an agent/workspace file
+    ↓ publish a WorkspaceFile
 ResourceBroker
-    ↓ target host transfer/materialize
-Browser file chooser
+    ↓ transfer/materialize on the target host
+the browser file chooser
 ```
 
-예:
+Examples:
 
 ```sh
 tweb resource publish ./fixtures/avatar.png
 tweb upload --pane %3 --ref d4-n21 --resource r_01K...
 ```
 
-파일 upload는 외부 origin으로 local data를 공개하는 동작이므로 source file, target origin, field를 보여주고
-실행 직전 policy를 적용한다. Agent가 임의 absolute path를 지정해 browserd가 읽도록 하지 않는다.
+A file upload discloses local data to an external origin, so the source file, target origin and field are
+shown and policy is applied right before execution. An agent never gets to name an arbitrary absolute path
+for browserd to read.
 
-### 12.10 Console과 network resource
+### 12.10 Console and network resources
 
-기본 수집은 summary 중심이다.
+Collection is summary-centric by default.
 
 ```text
 ConsoleEntry
@@ -1463,49 +1479,49 @@ NetworkEntry
     method, URL, resource type, status, timing, size
 ```
 
-다음은 기본적으로 redaction한다.
+The following are redacted by default:
 
 - `Authorization`
 - `Cookie`, `Set-Cookie`
 - proxy credentials
-- password field value
-- file input local path
+- password field values
+- file input local paths
 - configured secret query/body fields
 
-Response/request body, WebSocket frame, full HAR는 명시적 capture session에서만 수집한다. Resource scope,
-TTL, size budget을 설정하고 managed Chrome에는 기본 적용하지 않는다.
+Response/request bodies, WebSocket frames and full HARs are collected only in an explicit capture session,
+with a resource scope, a TTL and a size budget configured, and never applied to managed Chrome by default.
 
-### 12.11 Clipboard와 선택 텍스트
+### 12.11 The clipboard and selected text
 
-Browser selection을 agent에 전달할 때 system clipboard를 중간 transport로 사용하지 않는다.
+The system clipboard is never used as an intermediate transport when handing a browser selection to an agent.
 
 ```text
-Browser selection
-    ↓ TextContext resource
-Agent attachment
+a browser selection
+    ↓ a TextContext resource
+an agent attachment
 ```
 
-사용자가 명시적으로 copy를 선택한 경우에만 OSC 52/system clipboard에도 반영한다. Agent → Browser paste도
-resource 또는 direct input으로 전달하고 clipboard history 전체를 읽지 않는다.
+It is reflected into OSC 52/the system clipboard only when the user explicitly chose copy. Agent → Browser
+paste also travels as a resource or as direct input, and the whole clipboard history is never read.
 
-### 12.12 Locality와 remote transfer
+### 12.12 Locality and remote transfer
 
-Resource identity와 저장 위치를 분리한다.
+Resource identity is separated from where it is stored.
 
-| Browser host | Agent host | 전달 방식 |
+| Browser host | Agent host | Delivery |
 |---|---|---|
-| 동일 host | 동일 host | file descriptor/path 또는 object-store reference |
-| remote | 같은 remote | remote-local reference |
-| remote | local | 요청 시 encrypted stream 후 local materialize |
-| local | remote | 승인 후 encrypted stream 후 remote materialize |
+| the same host | the same host | a file descriptor/path or an object-store reference |
+| remote | the same remote | a remote-local reference |
+| remote | local | an encrypted stream on request, then local materialization |
+| local | remote | an encrypted stream after approval, then remote materialization |
 
-`tweb://resource/<id>`는 어느 host에서도 같은 논리 resource를 가리킨다. Consumer가 bytes를 요구할 때
-ResourceBroker가 locality와 capability를 보고 전송한다. Remote connection이 끊기면 descriptor는 유지하되
-본문 상태를 `unavailable`로 표시하고 복구 후 resume/hash 검증한다.
+`tweb://resource/<id>` points at the same logical resource from any host. When a consumer asks for bytes, the
+ResourceBroker looks at locality and capability and transfers. If the remote connection drops, the descriptor
+survives but the body state is marked `unavailable`, then resumed and hash-verified on recovery.
 
-### 12.13 Resource inbox와 UI
+### 12.13 The resource inbox and its UI
 
-각 tmux window에는 resource inbox가 있다.
+Every tmux window has a resource inbox.
 
 ```text
 window @1 resources (4)
@@ -1515,16 +1531,16 @@ window @1 resources (4)
 └── console-trace    3 errors                → agent %1 delivered
 ```
 
-표시 surface:
+Where it surfaces:
 
-- tmux status/pane-border의 count badge
-- browser toolbar의 `Send to agent` 및 inbox
+- a count badge in tmux's status/pane-border
+- `Send to agent` and the inbox in the browser toolbar
 - `tweb resource list --window @1`
-- OSC notification
+- OSC notifications
 
-Terminal scrollback에 binary나 대형 JSON을 출력하지 않는다.
+Binary data and large JSON are never printed into the terminal scrollback.
 
-### 12.14 Resource CLI
+### 12.14 The resource CLI
 
 ```sh
 tweb resource list --window @1
@@ -1536,12 +1552,12 @@ tweb resource revoke r_01K...
 tweb resource gc --expired
 ```
 
-CLI 기본 출력은 사람이 읽는 summary이고 `--json`은 versioned schema를 반환한다. Binary body는 stdout으로
-암묵적으로 출력하지 않는다.
+CLI output defaults to a human-readable summary, and `--json` returns a versioned schema. A binary body is
+never printed to stdout implicitly.
 
 ### 12.15 Resource security
 
-Resource는 다음 sensitivity 중 하나를 가진다.
+Every resource has one of these sensitivities:
 
 ```text
 public
@@ -1551,189 +1567,189 @@ sensitive
 credential-bearing
 ```
 
-- DOM snapshot에서 password input과 configured sensitive field value를 제거한다.
-- Screenshot은 화면에 보이는 secret을 포함할 수 있으므로 최소 `workspace`로 취급한다.
-- Cookie/token은 ResourceBroker의 일반 resource 종류가 아니다.
-- Credential-bearing resource는 기본적으로 agent 전달과 cross-host 전송을 거부한다.
-- Digest 기반 dedup은 scope와 encryption boundary를 넘지 않는다.
-- Resource access는 opaque ID만으로 허용하지 않고 caller의 tmux/agent identity와 capability를 확인한다.
-- Resource revoke 후 새 handle 발급을 막고 materialized copy 위치를 audit에 남긴다.
-- Audit에는 metadata와 전달 결과만 남기고 본문은 남기지 않는다.
+- Strip password inputs and configured sensitive field values from DOM snapshots.
+- A screenshot may contain secrets visible on screen, so treat it as at least `workspace`.
+- Cookies/tokens are not an ordinary ResourceBroker resource kind.
+- Credential-bearing resources refuse agent delivery and cross-host transfer by default.
+- Digest-based dedup never crosses a scope or an encryption boundary.
+- Resource access is never granted on an opaque ID alone; the caller's tmux/agent identity and capability are checked.
+- After a resource is revoked, new handles are blocked and the locations of materialized copies are recorded in the audit.
+- The audit records metadata and delivery outcomes only, never the body.
 
-### 12.16 Orca 대비 차이
+### 12.16 Differences from Orca
 
-Orca의 active agent attachment 경험은 유지하되 target과 data boundary를 더 명시적으로 만든다.
+Orca's active-agent attachment experience is kept, but the target and data boundaries are made more explicit.
 
-| 항목 | Orca에서 확인된 모델 | tweb 설계 |
+| Item | The model observed in Orca | The tweb design |
 |---|---|---|
-| 기본 scope | worktree/active agent 중심 | tmux window + explicit pane |
-| Element context | HTML/CSS/cropped screenshot/source map | typed `ElementContextBundle` |
-| Agent 전달 | active agent attachment | capability-negotiated `AgentBridge` |
-| 다중 agent | 문서상 상세 불명 | ambiguity 시 selector/explicit target |
-| Remote locality | 구현 세부 불명 | resource ID와 host materialization 분리 |
-| Download/upload | 문서상 제한적 | first-class `BrowserFile`/`WorkspaceFile` |
-| Console/network | CLI 조회 | scoped resource로 전달 가능 |
-| Security | 문서상 상세 불명 | redaction/sensitivity/TTL/capability 명시 |
+| Default scope | worktree/active-agent centric | the tmux window plus an explicit pane |
+| Element context | HTML/CSS/cropped screenshot/source map | a typed `ElementContextBundle` |
+| Agent delivery | active agent attachment | a capability-negotiated `AgentBridge` |
+| Multiple agents | not detailed in the docs | a selector/explicit target on ambiguity |
+| Remote locality | implementation details unclear | resource ID separated from host materialization |
+| Download/upload | limited in the docs | first-class `BrowserFile`/`WorkspaceFile` |
+| Console/network | CLI inspection | deliverable as a scoped resource |
+| Security | not detailed in the docs | redaction/sensitivity/TTL/capability stated |
 
-## 13. 상태 복구
+## 13. State recovery
 
 ```text
-pane frontend 종료
-    page는 grace period 동안 유지
+the pane frontend exits
+    the page survives for a grace period
 
-pane 재attach
-    기존 BrowserPageID에 reconnect
+the pane re-attaches
+    reconnects to the existing BrowserPageID
 
-tmux client detach
-    browser process와 page 유지
+a tmux client detaches
+    the browser process and pages survive
 
-tmux pane kill
-    page 종료 또는 정책에 따라 history에 보관
+a tmux pane is killed
+    the page ends, or is kept in history per policy
 
-browserd crash
-    profile + URL/history 복원, DOM/JS heap은 복원 불가
+browserd crashes
+    the profile plus the URL/history are restored; the DOM/JS heap cannot be
 
-host reboot
-    persistent profile + layout metadata 복원
+the host reboots
+    the persistent profile plus the layout metadata are restored
 ```
 
-BrowserPageID를 tmux pane ID만으로 만들지 않는다. Pane ID 재사용에 대비해 tmux server identity와
-opaque generation을 함께 저장한다.
+A BrowserPageID is never built from the tmux pane ID alone. Against pane ID reuse, the tmux server identity and
+an opaque generation are stored alongside it.
 
-## 14. 성능 목표와 측정
+## 14. Performance goals and measurement
 
-정확한 수치는 hardware별 baseline 측정 후 고정하되 다음을 release gate로 둔다.
+Exact figures are fixed after a per-hardware baseline measurement, but the following are release gates.
 
-- 입력에서 browser event dispatch까지의 latency
-- event dispatch에서 visible frame까지의 latency
-- 1080p와 Retina viewport scroll frame pacing
+- the latency from input to browser event dispatch
+- the latency from event dispatch to a visible frame
+- scroll frame pacing at 1080p and Retina viewports
 - static page idle CPU
-- 1/2/4개 visible browser pane의 CPU·memory·GPU
-- resize 중 frame drop과 stale generation 표시 여부
-- terminal output backpressure 시 memory upper bound
-- Ghostty/Kitty/tmux 조합별 image leak와 stale placement
+- CPU, memory and GPU with 1/2/4 visible browser panes
+- frame drops during resize and whether a stale generation is ever displayed
+- the memory upper bound under terminal output backpressure
+- image leaks and stale placements per Ghostty/Kitty/tmux combination
 
-벤치마크 workload:
+The benchmark workloads:
 
 - static documentation
-- GitHub 같은 large DOM
+- a large DOM such as GitHub
 - Vite HMR
-- Monaco editor
+- the Monaco editor
 - canvas/WebGL
-- 60fps CSS animation
+- a 60fps CSS animation
 - video playback
-- 한글 입력과 긴 clipboard paste
+- Korean input and a long clipboard paste
 
-## 15. Conformance matrix
+## 15. The conformance matrix
 
-지원은 terminal 이름이 아니라 capability와 검증 조합으로 선언한다.
+Support is declared by capability and validated combination, not by terminal name.
 
-| 조합 | Graphics | Keyboard | Mouse | Mode | 상태 |
+| Combination | Graphics | Keyboard | Mouse | Mode | State |
 |---|---|---|---|---|---|
-| Ghostty direct | Kitty subset | extended keys | pixel/cell | app mode | 검증 필요 |
-| Ghostty + tmux | native image 목표 | tmux table | pane mouse | client mode | 핵심 target |
-| Kitty direct | full graphics | kitty keys | pixel | app mode | 핵심 target |
-| Kitty + tmux | native image 목표 | tmux table | pane mouse | client mode | 핵심 target |
-| SSH remote | inline/video backend | remote input | remote input | client mode | 별도 transport |
+| Ghostty direct | a Kitty subset | extended keys | pixel/cell | app mode | needs validation |
+| Ghostty + tmux | native image the goal | the tmux table | pane mouse | client mode | a core target |
+| Kitty direct | full graphics | kitty keys | pixel | app mode | a core target |
+| Kitty + tmux | native image the goal | the tmux table | pane mouse | client mode | a core target |
+| SSH remote | an inline/video backend | remote input | remote input | client mode | a separate transport |
 
-## 16. 보안
+## 16. Security
 
-- Chromium sandbox를 비활성화하지 않는다.
-- Browser/renderer/GPU/utility process 권한을 분리한다.
-- Browserd socket은 local user peer만 허용한다.
-- Profile directory 권한은 사용자 전용으로 제한한다.
-- Cookie/Profile Bridge는 별도 threat model과 security review를 통과해야 한다.
-- Profile sync audit에는 domain, cookie 개수, source/target, 시각만 기록하고 값은 기록하지 않는다.
-- Chrome extension과 native host의 update/signing chain을 검증한다.
-- Electron/Chromium security release를 추적하고 긴급 update 경로를 둔다.
-- Terminal escape sequence parser에 fuzzing을 적용한다.
-- tmux passthrough payload length와 parser boundary를 제한한다.
+- Never disable the Chromium sandbox.
+- Separate the browser/renderer/GPU/utility process privileges.
+- The browserd socket admits only local user peers.
+- Profile directory permissions are restricted to the user alone.
+- The Cookie/Profile Bridge has to pass its own threat model and security review.
+- The profile sync audit records the domain, the cookie count, the source/target and the time only, never values.
+- Verify the update/signing chain of the Chrome extension and the native host.
+- Track Electron/Chromium security releases and keep an emergency update path.
+- Apply fuzzing to the terminal escape sequence parser.
+- Bound the tmux passthrough payload length and the parser boundary.
 
-## 17. 구현 순서가 아닌 검증 순서
+## 17. A validation order, not an implementation order
 
-단기 MVP 범위를 정하는 것이 아니라 architecture 성립 여부를 먼저 검증한다.
+Rather than scoping a short-term MVP, whether the architecture holds up is validated first.
 
-1. **Renderer viability**: Ghostty GPU fast path와 damage-aware Kitty compatibility path가 각각 목표 frame pacing을 만족하는가?
-2. **tmux semantics**: image cache/visibility/resize/kill을 deterministic하게 관리할 수 있는가?
-3. **Input fidelity**: Browser mode, modifier, 한글 IME, mouse가 손실 없이 동작하는가?
-4. **Profile compatibility**: 주요 Chrome extension을 재설치하고 정상 동작시킬 수 있는가?
-5. **Profile security**: origin-scoped one-shot cookie transfer가 policy 경계를 지키는가?
-6. **Agent control**: human과 agent가 동일 page를 race 없이 공유할 수 있는가?
-7. **Remote extension**: 기존 identity와 API를 유지한 채 transport만 교체할 수 있는가?
+1. **Renderer viability**: do the Ghostty GPU fast path and the damage-aware Kitty compatibility path each meet the target frame pacing?
+2. **tmux semantics**: can the image cache/visibility/resize/kill be managed deterministically?
+3. **Input fidelity**: do Browser mode, modifiers, the Korean IME and the mouse work without loss?
+4. **Profile compatibility**: can the main Chrome extensions be reinstalled and made to work?
+5. **Profile security**: does origin-scoped one-shot cookie transfer respect the policy boundary?
+6. **Agent control**: can a human and an agent share one page without races?
+7. **Remote extension**: can the transport alone be swapped while keeping the existing identity and API?
 
-1~3에서 terminal protocol의 구조적 한계가 확인될 경우 runtime을 폐기하지 않고
-`NativeSurfaceTransport`를 추가한다. tmux pane/process/profile/automation 모델은 그대로 유지한다.
+If 1–3 reveal a structural limit in the terminal protocol, the runtime is not discarded;
+`NativeSurfaceTransport` is added instead. The tmux pane/process/profile/automation model stays as it is.
 
-## 18. 채택할 선례와 버릴 부분
+## 18. What to adopt from precedent and what to drop
 
-### `awrit`에서 채택
+### Adopted from `awrit`
 
-- 실제 Chromium browser를 terminal graphics로 표시
-- pane process가 keyboard/mouse/resize를 소유
+- displaying a real Chromium browser through terminal graphics
+- the pane process owning keyboard/mouse/resize
 - shared-memory Kitty transfer
-- browser toolbar와 content surface
+- the browser toolbar and content surface
 
-### `awrit`에서 교체
+### Replaced from `awrit`
 
-- pane마다 무거운 runtime
+- a heavy runtime per pane
 - full-frame `toBitmap()`
-- dirty rectangle 무시
-- terminal별 ad-hoc fallback
-- Chrome처럼 보이도록 User-Agent만 수정
+- ignoring the dirty rectangle
+- ad-hoc per-terminal fallbacks
+- editing only the User-Agent to look like Chrome
 
-### `cliweb`에서 채택
+### Adopted from `cliweb`
 
-- tmux pane discovery와 lifecycle
-- persistent profile
-- authenticated local control socket
-- semantic refs 기반 agent API
-- human/agent shared-control loop
-- visibility와 graceful cleanup의 문제 정의
+- tmux pane discovery and lifecycle
+- a persistent profile
+- an authenticated local control socket
+- a semantic-refs-based agent API
+- the human/agent shared-control loop
+- the problem statement of visibility and graceful cleanup
 
-### `cliweb`에서 교체
+### Replaced from `cliweb`
 
-- passthrough와 visibility hook을 최종 정상 경로로 간주하는 구조
-- POSIX shared memory 하나에 결합된 transport
-- Electron extension compatibility를 일반 Chrome compatibility로 간주하는 접근
+- a structure that treats passthrough and visibility hooks as the final normal path
+- a transport coupled to a single POSIX shared memory
+- the approach of treating Electron extension compatibility as general Chrome compatibility
 
-### `casty`에서 채택
+### Adopted from `casty`
 
-- Playwright/Puppeteer 없이 필요한 CDP domain만 구현한 작은 control client
-- terminal pixel query와 DPR을 반영한 viewport 계산
-- 저해상도 screencast를 변화 감지 signal로만 사용하는 방식
-- 정적 상태에서 lossless frame으로 refine하는 적응형 품질 개념
-- image ID 고정과 동일 frame deduplication
-- Chrome process와 CDP page/input lifecycle의 단순한 분리
-- SSH/headless 환경에서 동작해야 한다는 요구와 audio/media 문제 정의
+- a small control client implementing only the needed CDP domains, without Playwright/Puppeteer
+- viewport computation that accounts for the terminal pixel query and the DPR
+- using a low-resolution screencast purely as a change-detection signal
+- the adaptive-quality notion of refining to a lossless frame once the state is static
+- pinning image IDs and deduplicating identical frames
+- a simple separation of the Chrome process from the CDP page/input lifecycle
+- the requirement to work in SSH/headless environments and the audio/media problem statement
 
-### `casty`에서 교체
+### Replaced from `casty`
 
-- `Page.captureScreenshot` 기반 full-frame JPEG/PNG renderer
-- 약 20fps로 제한된 capture loop
-- base64 encode/decode와 PNG/JPEG encode/decode
-- inline 4096-byte chunk 전체 frame 전송
-- 임시 PNG file을 매 frame 동기적으로 쓰는 file transport
-- tmux passthrough만으로 image lifetime을 처리하는 구조
-- process마다 같은 `~/.casty/profile`을 열어 다중 pane ownership이 불명확한 구조
-- 시작할 때 cookie/local storage 외 profile data를 삭제하는 cleanup 정책
+- a `Page.captureScreenshot`-based full-frame JPEG/PNG renderer
+- a capture loop capped at roughly 20fps
+- base64 encode/decode plus PNG/JPEG encode/decode
+- inline whole-frame transfer in 4096-byte chunks
+- a file transport that writes a temporary PNG synchronously every frame
+- a structure that handles image lifetime through tmux passthrough alone
+- a structure where every process opens the same `~/.casty/profile`, leaving multi-pane ownership unclear
+- a cleanup policy that deletes profile data other than cookies/local storage at startup
 - `--disable-extensions`, `--disable-sync`, `--password-store=basic`, `--use-mock-keychain`
-- Linux에서 기본적으로 `--no-sandbox`를 적용하는 정책
-- User-Agent, `window.chrome`, plugin, WebGL 정보를 조작해 Chrome처럼 보이게 하는 stealth script
+- a policy of applying `--no-sandbox` by default on Linux
+- stealth scripts that manipulate the User-Agent, `window.chrome`, plugins and WebGL information to look like Chrome
 
-`casty`의 screenshot transport는 raw RGBA보다 terminal byte 수를 줄이고 SSH compatibility가 좋지만,
-interactive primary renderer로는 GPU fast path보다 명확한 상한이 낮다. `RemoteVideoTransport`가 준비되지
-않은 환경의 저프레임 fallback 또는 static snapshot backend로만 사용한다.
+`casty`'s screenshot transport uses fewer terminal bytes than raw RGBA and has good SSH compatibility, but as
+an interactive primary renderer its ceiling is clearly lower than the GPU fast path's. It is used only as a
+low-framerate fallback where `RemoteVideoTransport` is unavailable, or as a static snapshot backend.
 
-## 19. 최종 제품 정의
+## 19. The final product definition
 
-> TWeb Browser Runtime은 Ghostty/Kitty와 tmux 위에서 browser page를 실제 pane process로 실행하고,
-> 사람과 agent가 동일한 persistent Chromium profile을 공유하도록 하는 terminal-native browser다.
-> Browser에서 생성·관찰한 resource는 tmux window-scoped typed attachment로 agent에게 전달한다.
-> Shortcut ownership은 tmux client별 Browser mode로 분리하며, Chrome profile은 명시적이고
-> policy-aware한 bootstrap으로 가져온다. Managed Chrome이 필요한 identity 경계는 우회하지 않고
-> 실제 Chrome으로 handoff한다.
+> The TWeb Browser Runtime is a terminal-native browser that runs browser pages as real pane processes on
+> top of Ghostty/Kitty and tmux, and lets a human and an agent share the same persistent Chromium profile.
+> Resources created or observed in the browser are handed to agents as tmux window-scoped typed attachments.
+> Shortcut ownership is split by a per-tmux-client Browser mode, and Chrome profiles are imported through an
+> explicit, policy-aware bootstrap. Identity boundaries that require managed Chrome are not worked around but
+> handed off to real Chrome.
 
-## 참고
+## References
 
 - [awrit](https://github.com/chase/awrit)
 - [awrit frame path](https://github.com/chase/awrit/blob/electron/src/paint.ts)

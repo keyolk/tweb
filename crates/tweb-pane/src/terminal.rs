@@ -1,10 +1,10 @@
 //! Terminal capability negotiation.
 //!
-//! DESIGN.md 섹션 5.2, 7.3. Kitty graphics query(`a=q` + `ESC[c`)로 지원 판정.
-//! terminal 이름으로 추측하지 않고 graphics query로 판정.
+//! DESIGN.md sections 5.2 and 7.3. Support is decided by the Kitty graphics query
+//! (`a=q` + `ESC[c`) — by the query, never guessed from the terminal name.
 //!
-//! cliweb 방식: passthrough 없이 직접 stdout에 Kitty graphics.
-//! tmux 3.5a allow-passthrough all이 Kitty graphics를 자동으로 통과시킴.
+//! The cliweb approach: Kitty graphics straight to stdout, no passthrough.
+//! tmux 3.5a allow-passthrough all lets Kitty graphics through on its own.
 
 use anyhow::Result;
 use std::io::{self, Read, Write};
@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use tweb_core::frame::TerminalCapability;
 use tweb_core::geometry::PixelSize;
 
-/// PTY가 보고하는 현재 pane 크기.
+/// The current pane size as reported by the PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSize {
     pub cols: u16,
@@ -21,15 +21,15 @@ pub struct WindowSize {
     pub height: u16,
 }
 
-/// 현재 pane의 크기와 tmux client 기준 좌상단 cell 좌표.
+/// The current pane's size plus its top-left cell coordinate in tmux client space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub size: WindowSize,
     pub origin: Option<(u32, u32)>,
 }
 
-/// 현재 pane geometry를 조회한다. tmux 안에서는 크기와 origin을 한 번에 읽어
-/// resize 중 값의 race를 피하고, PTY 크기가 그대로인 pane 이동도 감지한다.
+/// Queries the current pane geometry. Inside tmux, size and origin are read in one shot to
+/// avoid racing values mid-resize, and to catch pane moves that leave the PTY size unchanged.
 pub fn window_geometry() -> Option<WindowGeometry> {
     let tmux = query_tmux_window_geometry();
     if let Some(geometry) = tmux {
@@ -203,24 +203,24 @@ fn pixel_size_from_cells(cols: u16, rows: u16, value: &str) -> Option<(u16, u16)
     Some((width as u16, height as u16))
 }
 
-/// tmux client 기준 pane 좌상단 cell 좌표를 반환한다.
+/// Returns the pane's top-left cell coordinate in tmux client space.
 pub fn tmux_pane_origin() -> Option<(u32, u32)> {
     window_geometry()?.origin
 }
 
-/// 원래 termios 상태. Drop에서 원복.
+/// The original termios state. Restored on Drop.
 struct OriginalTermios {
     fd: i32,
     termios: libc::termios,
 }
 
-/// raw terminal mode guard. 종료 시 원복.
+/// Raw terminal mode guard. Restores on exit.
 pub struct RawModeGuard {
     original: Option<OriginalTermios>,
 }
 
 impl RawModeGuard {
-    /// raw terminal mode 진입.
+    /// Enters raw terminal mode.
     pub fn enter() -> Result<Self> {
         let fd = io::stdin().as_raw_fd();
 
@@ -256,7 +256,7 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// browser pane 입력 mode. mouse와 modified-key reporting을 활성화하고 Drop에서 복원한다.
+/// Browser pane input mode. Enables mouse and modified-key reporting, restoring both on Drop.
 pub struct InputModeGuard {
     inside_tmux: bool,
 }
@@ -266,8 +266,8 @@ impl InputModeGuard {
         let inside_tmux = std::env::var_os("TMUX").is_some();
         let stdout = io::stdout();
         let mut lock = stdout.lock();
-        // Focus reporting(1004)은 tmux window 전환 시 ESC[I/ESC[O가 다른 pane의
-        // shell로 새어 나갈 수 있으므로 사용하지 않는다.
+        // Focus reporting (1004) is left off: on a tmux window switch its ESC[I/ESC[O can
+        // leak into another pane's shell.
         let _ =
             lock.write_all(b"\x1b[?1004l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1016h");
         // Bracketed paste(2004)는 Cmd-V가 페이지에 도달하는 유일한 경로다. Ghostty는
@@ -276,13 +276,13 @@ impl InputModeGuard {
         // 감싸 주고, engine이 그 경계를 보고 한 번의 paste로 처리할 수 있다.
         let _ = lock.write_all(b"\x1b[?2004h");
         if inside_tmux {
-            // tmux가 추적하는 modifyOtherKeys mode 2를 요청한다. tmux는 이를
-            // pane_key_mode=Ext 2로 기록하고 terminal protocol을 client별로
-            // 동기화한다. Kitty CSI > ... u를 tmux 너머 terminal에 직접 보내면
-            // tmux는 VT10x로 남은 채 Ghostty만 Kitty mode가 되어 입력이 막힌다.
+            // Ask for modifyOtherKeys mode 2, which tmux tracks: it records this as
+            // pane_key_mode=Ext 2 and keeps the terminal protocol in sync per client.
+            // Sending Kitty CSI > ... u straight through tmux to the terminal leaves tmux
+            // on VT10x while only Ghostty switches to Kitty mode, and input stops working.
             let _ = lock.write_all(b"\x1b[>4;2m");
         } else {
-            // tmux 밖에서는 Kitty flags 1|2|4|8을 직접 사용할 수 있다.
+            // Outside tmux, Kitty flags 1|2|4|8 can be used directly.
             let _ = lock.write_all(b"\x1b[>15u");
         }
         let _ = lock.flush();
@@ -290,17 +290,17 @@ impl InputModeGuard {
     }
 }
 
-/// tmux가 추적하는 modified-key mode를 PTY stdout에서 재선언한다.
-/// native DevTools 같은 보조 window가 terminal mode를 reset한 경우 사용한다.
+/// Re-declares the modified-key mode tmux tracks on the PTY stdout.
+/// Used when an auxiliary window such as the native DevTools reset the terminal modes.
 pub fn restore_tracked_keyboard_mode() {
     if std::env::var_os("TMUX").is_none() {
         return;
     }
     let stdout = io::stdout();
     let mut lock = stdout.lock();
-    // tmux가 pane mode로 추적하는 sequence만 단독으로 출력한다. Kitty
-    // reset을 같은 write에 섞으면 일부 tmux parser 경로에서 뒤 sequence까지
-    // VT10x input으로 취급할 수 있다.
+    // Emit only the sequence tmux tracks as a pane mode, on its own. Mixing a Kitty reset
+    // into the same write can make some tmux parser paths treat the trailing sequence as
+    // VT10x input too.
     let _ = lock.write_all(b"\x1b[>4;2m");
     let _ = lock.flush();
 }
@@ -321,14 +321,14 @@ impl Drop for InputModeGuard {
     }
 }
 
-/// terminal mode 설정 (cliweb output.ts 방식).
+/// Terminal mode setup (the cliweb output.ts approach).
 /// alternate screen, mouse SGR pixel, auto wrap, clear.
 /// alternate screen.
 ///
-/// `tweb open`은 사용자가 쓰던 pane 안에서 시작한다. 그 pane에 남아 있던 shell prompt와
-/// 출력은 page image가 text **위**에 있는 동안에는 가려졌지만, image가 아래로 내려간
-/// 뒤로는 page를 뚫고 보인다. alternate screen에 들어가면 빈 화면에서 시작하고, 나갈 때
-/// 사용자의 화면이 그대로 돌아온다.
+/// `tweb open` starts inside the pane the user was already working in. The shell prompt and
+/// output left in that pane were hidden while the page image sat **above** the text, but they
+/// show through the page once the image moved below it. Entering the alternate screen starts
+/// from a blank screen, and leaving it brings the user's screen back untouched.
 pub struct ScreenGuard;
 
 impl ScreenGuard {
@@ -365,16 +365,16 @@ pub fn terminal_setup() {
     let _ = lock.flush();
 }
 
-/// terminal 복원.
+/// Restores the terminal.
 pub fn terminal_cleanup() {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
-    // alternate screen 복원.
+    // Leave the alternate screen.
     let _ = lock.write_all(b"\x1b[?1049l");
     let _ = lock.flush();
 }
 
-/// terminal capability 탐지.
+/// Detects terminal capabilities.
 pub fn detect_capability() -> Result<TerminalCapability> {
     let has_kitty = query_kitty_graphics();
     let pixel_size = query_pixel_size();
@@ -391,8 +391,8 @@ pub fn detect_capability() -> Result<TerminalCapability> {
     })
 }
 
-/// Kitty graphics query 전송, 응답 확인.
-/// passthrough 없이 직접 전송 (cliweb 방식).
+/// Sends the Kitty graphics query and checks the response.
+/// Sent directly, without passthrough (the cliweb approach).
 fn query_kitty_graphics() -> bool {
     let query = b"\x1b_Ga=q\x1b\\";
 
@@ -427,7 +427,7 @@ pub fn query_pixel_size() -> Option<PixelSize> {
     if std::env::var("TMUX").is_ok() {
         return query_tmux_pixel_size();
     }
-    None // TODO: 직접 CSI 14t query.
+    None // TODO: query CSI 14t directly.
 }
 
 /// tmux pane pixel size query.
@@ -460,7 +460,7 @@ fn query_tmux_pixel_size() -> Option<PixelSize> {
     Some(PixelSize::new(cols * cell_w, rows * cell_h))
 }
 
-/// cell size query (CSI 16t). TODO: 실제 query.
+/// cell size query (CSI 16t). TODO: issue the real query.
 pub fn query_cell_size() -> Option<(u32, u32)> {
     None
 }

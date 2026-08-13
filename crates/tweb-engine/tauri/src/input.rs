@@ -425,6 +425,7 @@ mod tests {
                 },
             ]
         );
+        // A Korean syllable as a multi-byte UTF-8 fixture: the decoder has to keep it whole.
         assert_eq!(decoder.push("한".as_bytes()), vec![key("한", 1)]);
     }
 

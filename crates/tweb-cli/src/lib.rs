@@ -1,7 +1,7 @@
 //! tweb CLI — `tweb open/split/snapshot/click/profile/doctor`.
 //!
-//! DESIGN.md 섹션 4.1. subcommand가 항상 동작보다 먼저, target selector는 뒤.
-//! `tweb snapshot --pane %3`. 전역 selector와 subcommand별 selector를 섞지 않는다.
+//! DESIGN.md section 4.1. The subcommand always comes before the action, target selectors
+//! after: `tweb snapshot --pane %3`. Global selectors and per-subcommand selectors are never mixed.
 
 pub mod agent;
 pub mod doctor;
@@ -64,7 +64,7 @@ impl BrowserOptions {
 
 /// TWeb — terminal-native browser runtime.
 ///
-/// tmux pane 안에서 실제 Chromium browser를 실행. 사람과 agent가 동일 page 공유.
+/// Runs a real Chromium browser inside a tmux pane. Humans and agents share the same page.
 #[derive(Parser, Debug)]
 #[command(name = "tweb", version, about, long_about = None)]
 pub struct Cli {
@@ -74,13 +74,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// 현재 terminal/pane에서 browser frontend 실행.
+    /// Run the browser frontend in the current terminal/pane.
     Open {
         #[command(flatten)]
         browser: BrowserOptions,
         url: Option<String>,
     },
-    /// 현재 tmux window에 browser pane 생성.
+    /// Create a browser pane in the current tmux window.
     Split {
         #[command(flatten)]
         browser: BrowserOptions,
@@ -88,23 +88,23 @@ pub enum Command {
         #[arg(short = 'H')]
         horizontal: bool,
     },
-    /// automation 가능한 browser pane 목록.
+    /// List automatable browser panes.
     Panes {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// resolve된 browser page 이동.
+    /// Navigate the resolved browser page.
     Navigate {
         url: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// history 뒤로.
+    /// Go back in history.
     Back {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// history 앞으로.
+    /// Go forward in history.
     Forward {
         #[command(flatten)]
         agent: AgentOptions,
@@ -114,20 +114,20 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// browser page 상태.
+    /// Browser page state.
     Status {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// 상호작용 가능한 요소 snapshot. ref는 `f` hint label과 같다.
+    /// Snapshot of the interactive elements. The refs match the `f` hint labels.
     Snapshot {
-        /// link/heading/text까지 포함한 읽기용 snapshot.
+        /// Reading snapshot that also includes links, headings and text.
         #[arg(long)]
         text: bool,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// ref로 CSS selector 조회 (snapshot 없이 단건).
+    /// Look up a CSS selector by ref (single lookup, no snapshot needed).
     Query {
         selector: String,
         #[command(flatten)]
@@ -135,7 +135,7 @@ pub enum Command {
     },
     /// element click.
     Click {
-        /// snapshot이 부여한 ref (예: a, sd).
+        /// The ref a snapshot assigned (e.g. a, sd).
         r#ref: String,
         #[command(flatten)]
         agent: AgentOptions,
@@ -146,80 +146,80 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// input/textarea/contenteditable 값 설정.
+    /// Set the value of an input/textarea/contenteditable.
     Fill {
         r#ref: String,
         value: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// focus된 element에 text 입력.
+    /// Type text into the focused element.
     Type {
         text: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// key press (예: Enter, Tab, Escape).
+    /// key press (e.g. Enter, Tab, Escape).
     Press {
         key: String,
-        /// modifier (shift, control, alt, meta). 반복 가능.
+        /// modifier (shift, control, alt, meta). Repeatable.
         #[arg(long = "mod")]
         modifiers: Vec<String>,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// select option 선택.
+    /// Pick a select option.
     Select {
         r#ref: String,
         value: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// checkbox/radio 체크.
+    /// Check a checkbox/radio.
     Check {
         r#ref: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// checkbox 해제.
+    /// Uncheck a checkbox.
     Uncheck {
         r#ref: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// element text 읽기.
+    /// Read an element's text.
     Text {
         r#ref: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// element outer HTML 읽기.
+    /// Read an element's outer HTML.
     Html {
         r#ref: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// page에서 JavaScript 실행.
+    /// Run JavaScript in the page.
     Eval {
         script: String,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// 조건 충족까지 대기.
+    /// Wait until a condition holds.
     Wait {
-        /// CSS selector 등장 대기.
+        /// Wait for a CSS selector to appear.
         #[arg(long)]
         selector: Option<String>,
-        /// 본문 text 등장 대기.
+        /// Wait for text to appear in the body.
         #[arg(long)]
         text: Option<String>,
-        /// URL 부분 일치 대기.
+        /// Wait for a partial URL match.
         #[arg(long)]
         url: Option<String>,
-        /// 로딩 완료 대기.
+        /// Wait for loading to finish.
         #[arg(long)]
         load: bool,
-        /// 고정 시간 대기 (ms).
+        /// Wait a fixed amount of time (ms).
         #[arg(long)]
         ms: Option<u64>,
         #[arg(long, default_value_t = 10000)]
@@ -227,84 +227,84 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// console 기록.
+    /// console records.
     Console {
         #[arg(long, default_value_t = 100)]
         limit: usize,
-        /// 읽은 뒤 버퍼 비우기.
+        /// Clear the buffer after reading.
         #[arg(long)]
         clear: bool,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// console error만.
+    /// console errors only.
     Errors {
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// tab 목록.
+    /// List tabs.
     Tabs {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// tab 전환·생성·닫기.
+    /// Switch, create and close tabs.
     Tab {
         #[command(subcommand)]
         action: TabAction,
     },
     /// screenshot.
     Screenshot {
-        /// 저장 경로. 없으면 base64 PNG를 출력한다.
+        /// Where to save it. Without a path, a base64 PNG is printed.
         path: Option<String>,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// agent용 MCP server (stdio).
+    /// MCP server for agents (stdio).
     Mcp {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// resource 조회·전달·materialize.
+    /// Inspect, hand off and materialize resources.
     Resource {
         #[command(subcommand)]
         action: ResourceAction,
     },
-    /// profile bootstrap·관리.
+    /// Bootstrap and manage profiles.
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
     },
-    /// managed Chrome handoff·bridge 관리.
+    /// Manage the managed-Chrome handoff and bridge.
     Chrome {
         #[command(subcommand)]
         action: ChromeAction,
     },
-    /// 실행 중인 pane의 geometry·zoom·frame·input 상태.
+    /// A running pane's geometry, zoom, frame and input state.
     Diag {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// engine debug log (TWEB_DEBUG 줄) 조회.
+    /// Read the engine debug log (the TWEB_DEBUG lines).
     EngineLog {
         #[arg(long, default_value_t = 60)]
         limit: usize,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// terminal/tmux/GPU/extension capability 진단·설정.
+    /// Diagnose and configure terminal/tmux/GPU/extension capabilities.
     Doctor {
-        /// 안전하게 관리되는 설정 block을 설치하고 다시 진단.
+        /// Install the safely managed configuration block, then diagnose again.
         #[arg(long)]
         fix: bool,
     },
-    /// internal: pane frontend (tmux가 실행, 문서화된 automation API가 아님).
+    /// internal: the pane frontend (launched by tmux; not a documented automation API).
     #[command(name = "__pane", hide = true)]
     PaneInternal {
         #[command(flatten)]
         browser: BrowserOptions,
-        /// resolve된 page id. 지정하면 URL 대신 사용한다.
+        /// A resolved page id. When given, it is used instead of the URL.
         #[arg(long)]
         page: Option<String>,
         url: Option<String>,
@@ -314,30 +314,30 @@ pub enum Command {
 /// Shared options for every command that drives a running browser pane.
 #[derive(Args, Clone, Debug)]
 pub struct AgentOptions {
-    /// 대상 tmux pane (예: %3). 생략하면 실행 중인 유일한 pane.
+    /// Target tmux pane (e.g. %3). Omitted, it means the only running pane.
     #[arg(long, global = true)]
     pub pane: Option<String>,
 
-    /// 사람이 읽는 요약 대신 원본 JSON 출력.
+    /// Print raw JSON instead of the human-readable summary.
     #[arg(long, global = true)]
     pub json: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum TabAction {
-    /// index로 tab 전환.
+    /// Switch to a tab by index.
     Switch {
         index: usize,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// 새 tab.
+    /// New tab.
     New {
         url: Option<String>,
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// tab 닫기.
+    /// Close a tab.
     Close {
         index: Option<usize>,
         #[command(flatten)]
@@ -347,26 +347,26 @@ pub enum TabAction {
 
 #[derive(Subcommand, Debug)]
 pub enum ResourceAction {
-    /// resource 목록.
+    /// List resources.
     List {
         #[arg(long)]
         window: Option<String>,
     },
-    /// resource 상세.
+    /// Resource details.
     Inspect { id: String },
-    /// resource를 경로에 materialize.
+    /// Materialize a resource at a path.
     Materialize {
         id: String,
         #[arg(long)]
         to: String,
     },
-    /// resource를 다른 pane에 전달.
+    /// Hand a resource to another pane.
     Send {
         id: String,
         #[arg(long)]
         to_pane: i32,
     },
-    /// 만료된 resource 정리.
+    /// Clean up expired resources.
     Gc,
 }
 
@@ -374,15 +374,15 @@ pub enum ResourceAction {
 pub enum ProfileAction {
     /// Chrome profile bootstrap.
     Bootstrap { source: String },
-    /// profile 목록.
+    /// List profiles.
     List,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum ChromeAction {
-    /// managed Chrome으로 URL 열기.
+    /// Open a URL in managed Chrome.
     Open { url: String },
-    /// bridge 상태.
+    /// Bridge status.
     Status,
 }
 
@@ -434,7 +434,7 @@ fn resolve_url_argument(value: &str, working_directory: &Path) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-/// CLI 실행.
+/// Runs the CLI.
 pub async fn run() -> Result<()> {
     let cli = Cli::parse_from(default_open_args(std::env::args_os().collect()));
     tracing::debug!(?cli, "tweb command");
@@ -446,7 +446,7 @@ pub async fn run() -> Result<()> {
             // Resolve local paths before Electron changes into its app directory or a
             // split pane starts in a different shell directory.
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
-            // URL 미지정은 pane frontend까지 보존해 tmux window session을 복원한다.
+            // An omitted URL is carried through to the pane frontend so it restores the tmux window session.
             run_pane(url.as_deref(), &browser).await?;
         }
         Command::Split {
@@ -455,11 +455,11 @@ pub async fn run() -> Result<()> {
             horizontal,
         } => {
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
-            // tmux split-window에서도 URL 미지정을 보존한다.
+            // An omitted URL is preserved across tmux split-window too.
             split_and_run_pane(url.as_deref(), &browser, horizontal).await?;
         }
         Command::PaneInternal { browser, page, url } => {
-            // URL이 없으면 tmux window session을 복원한다.
+            // Without a URL, restore the tmux window session.
             run_pane(page.as_deref().or(url.as_deref()), &browser).await?;
         }
         Command::Doctor { fix } => {
@@ -567,16 +567,16 @@ fn agent_call(
     })
 }
 
-/// 현재 pane에서 browser frontend 실행.
+/// Runs the browser frontend in the current pane.
 ///
-/// `tweb`은 하나의 multi-call executable이므로 pane frontend를 별도 binary로
-/// spawn하지 않고 같은 process에서 직접 돌린다. 그래야 CLI와 frontend 사이에
-/// version skew가 생기지 않는다 (DESIGN.md 4.1).
+/// `tweb` is a single multi-call executable, so the pane frontend runs in this very process
+/// rather than being spawned as a separate binary. That is what keeps version skew from
+/// appearing between the CLI and the frontend (DESIGN.md 4.1).
 async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
-    // engine 경로는 frontend가 직접 찾는다. CLI가 추측해서 넘기면 binary와 app
-    // directory가 어긋날 수 있고 (node_modules/electron에도 package.json이 있다)
-    // 같은 process이므로 넘길 이유도 없다.
-    // URL 미지정은 tmux window session 복원 요청이다.
+    // The frontend locates the engine paths itself. If the CLI guessed and passed them in, the
+    // binary and the app directory could end up mismatched (node_modules/electron has a
+    // package.json too), and being the same process there is no reason to pass them anyway.
+    // An omitted URL is a request to restore the tmux window session.
     let options = tweb_pane::PaneOptions {
         engine: match browser.engine {
             BrowserEngineArg::Electron => tweb_pane::BrowserEngine::Electron,
@@ -589,8 +589,8 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
     tweb_pane::run_with_options(url.unwrap_or("about:blank"), options).await
 }
 
-/// tmux split-window 인자. 호출 pane을 알면 client의 active window가 아니라
-/// 그 pane이 속한 window를 분할한다.
+/// Arguments for tmux split-window. Knowing the calling pane, we split the window that pane
+/// belongs to rather than the client's active window.
 fn split_window_args(pane: Option<&str>, command: &str) -> Vec<String> {
     let mut args = ["split-window", "-h", "-p", "50"]
         .map(String::from)
@@ -602,18 +602,18 @@ fn split_window_args(pane: Option<&str>, command: &str) -> Vec<String> {
     args
 }
 
-/// tmux split-window로 pane 만들고 그 안에서 `tweb __pane` 실행.
+/// Creates a pane via tmux split-window and runs `tweb __pane` inside it.
 async fn split_and_run_pane(
     url: Option<&str>,
     browser: &BrowserOptions,
     _horizontal: bool,
 ) -> Result<()> {
-    // 같은 executable을 internal subcommand로 다시 부른다. 별도 binary를 찾지
-    // 않으므로 split pane이 이 CLI와 다른 build를 실행할 수 없다.
+    // Re-invoke the same executable through an internal subcommand. Nothing looks up a separate
+    // binary, so a split pane cannot end up running a different build than this CLI.
     let executable = std::env::current_exe().context("cannot resolve the running tweb binary")?;
     let pane_bin_str = executable.to_string_lossy().to_string();
 
-    // 선택한 engine binary를 split pane에 명시적으로 전달한다.
+    // Pass the chosen engine binary to the split pane explicitly.
     let mut env_str = String::new();
     match browser.engine {
         BrowserEngineArg::Electron => {
@@ -662,7 +662,7 @@ async fn split_and_run_pane(
     Ok(())
 }
 
-/// Tauri engine binary 경로 찾기 (환경 변수로 전달).
+/// Finds the Tauri engine binary path (passed through an environment variable).
 fn find_tauri_binary() -> Option<std::path::PathBuf> {
     if let Ok(path) = std::env::var("TWEB_TAURI") {
         return Some(std::path::PathBuf::from(path));
@@ -716,11 +716,11 @@ fn find_electron_binary() -> Option<std::path::PathBuf> {
     which::which("electron").ok()
 }
 
-/// Electron이 `.`으로 로드할 app directory.
+/// The app directory Electron loads as `.`.
 ///
-/// `node_modules/electron`에도 package.json이 있어서 단순히 가장 가까운
-/// package.json을 고르면 Electron package 자체를 app으로 실행하게 되고,
-/// 화면에 아무것도 뜨지 않는다. node_modules 안쪽은 건너뛴다.
+/// `node_modules/electron` carries a package.json of its own, so simply picking the nearest
+/// package.json would run the Electron package itself as the app and nothing would appear on
+/// screen. Anything under node_modules is skipped.
 fn electron_app_dir(binary: &std::path::Path) -> Option<std::path::PathBuf> {
     binary
         .ancestors()

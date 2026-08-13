@@ -1,7 +1,7 @@
-//! AutomationController — agent action 직렬화.
+//! AutomationController — serializes agent actions.
 //!
-//! DESIGN.md 섹션 12.1. snapshot → act → wait → verify loop.
-//! 사람이 browser input을 시작하면 agent lease 일시 중단.
+//! DESIGN.md section 12.1. snapshot → act → wait → verify loop.
+//! Once a human starts giving the browser input, the agent's lease is suspended.
 
 use std::sync::Arc;
 use tweb_core::engine::{Action, BrowserEngineAdapter};
@@ -17,12 +17,12 @@ impl AutomationController {
         Self { engine }
     }
 
-    /// page snapshot (agent automation용).
+    /// A page snapshot (for agent automation).
     pub async fn snapshot(&self, page: PageId) -> anyhow::Result<tweb_core::page::PageSnapshot> {
         self.engine.snapshot(page).await.map_err(Into::into)
     }
 
-    /// agent action 실행.
+    /// Executes an agent action.
     pub async fn execute(&self, page: PageId, action: &Action) -> anyhow::Result<()> {
         self.engine
             .execute_action(page, action)

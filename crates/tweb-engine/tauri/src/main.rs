@@ -276,8 +276,8 @@ pub(crate) fn activate_offscreen_window(window: &WebviewWindow) -> tauri::Result
 
     window.with_webview(|platform| unsafe {
         let native_window = &*(platform.ns_window() as *mut NSWindow);
-        // WKWebView는 ordered-out window에서 visibility를 hidden으로 바꾼다. 입력을
-        // 받지 않는 거의 투명한 capture surface로 ordered 상태만 유지한다.
+        // WKWebView flips visibility to hidden in an ordered-out window. Keep only the ordered
+        // state, as a nearly transparent capture surface that takes no input.
         native_window.orderFrontRegardless();
         native_window.setAlphaValue(0.001);
         native_window.setHasShadow(false);

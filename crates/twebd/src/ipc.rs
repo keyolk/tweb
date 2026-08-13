@@ -1,29 +1,29 @@
-//! IPC — twebd와 tweb CLI / tweb __pane 간 authenticated local IPC.
+//! IPC — authenticated local IPC between twebd and tweb CLI / tweb __pane.
 //!
-//! Unix socket + peer credential 확인. DESIGN.md 섹션 5.1.
-//! cookie/token 값을 반환하는 API는 만들지 않고 opaque ID만 사용.
+//! Unix socket + peer credential check. DESIGN.md section 5.1.
+//! No API ever returns a cookie/token value; only opaque IDs are used.
 
 use crate::Daemon;
 use std::path::Path;
 use std::sync::Arc;
 
-/// IPC 요청. opaque ID만 사용, cookie/token 값 포함 금지.
+/// An IPC request. Opaque IDs only — never a cookie/token value.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    /// page 생성. pane identity와 URL.
+    /// Create a page. Pane identity plus URL.
     CreatePage {
         pane: i32,
         tmux_server_id: String,
         url: String,
     },
-    /// page 종료.
+    /// Close a page.
     ClosePage { pane: i32 },
     /// page navigation.
     Navigate { pane: i32, url: String },
-    /// page snapshot (agent automation용).
+    /// A page snapshot (for agent automation).
     Snapshot { pane: i32 },
-    /// agent action 실행.
+    /// Execute an agent action.
     ExecuteAction {
         pane: i32,
         action: serde_json::Value,
@@ -32,13 +32,13 @@ pub enum Request {
     Resize { pane: i32, width: u32, height: u32 },
     /// page visibility.
     SetVisible { pane: i32, visible: bool },
-    /// resource 목록.
+    /// List resources.
     ResourceList { window: Option<String> },
-    /// daemon 상태.
+    /// daemon status.
     Status,
 }
 
-/// IPC 응답.
+/// An IPC response.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
@@ -50,18 +50,18 @@ pub enum Response {
     Error { message: String },
 }
 
-/// IPC server 시작.
+/// Starts the IPC server.
 pub async fn serve(_daemon: Arc<Daemon>, socket_path: &Path) -> anyhow::Result<()> {
-    // socket 이 이미 존재하면 제거.
+    // Remove the socket if it already exists.
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
 
-    // TODO: Unix socket bind, peer credential 확인 (SO_PEERCRED on Linux,
+    // TODO: Unix socket bind, peer credential check (SO_PEERCRED on Linux,
     // getpeereid on macOS), request dispatch.
     tracing::info!(?socket_path, "IPC server listening");
 
-    // placeholder: daemon 종료까지 대기.
+    // placeholder: wait until the daemon shuts down.
     tokio::signal::ctrl_c().await?;
 
     tracing::info!("twebd shutting down");

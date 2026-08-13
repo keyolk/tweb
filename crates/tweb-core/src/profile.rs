@@ -1,6 +1,6 @@
-//! ProfileStore — browser profile 추상.
+//! ProfileStore — the browser profile abstraction.
 //!
-//! DESIGN.md 섹션 6.2. engine이 각각 구현.
+//! DESIGN.md section 6.2. Implemented separately by each engine.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -17,11 +17,11 @@ pub enum ProfileError {
 
 pub type ProfileResult<T> = Result<T, ProfileError>;
 
-/// browser profile 식별자. hash(tmux server identity, session ID) 기반.
+/// A browser profile identifier. Derived from hash(tmux server identity, session ID).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ProfileId(pub String);
 
-/// profile metadata (DESIGN.md 섹션 6.2).
+/// Profile metadata (DESIGN.md section 6.2).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BrowserProfile {
     pub id: ProfileId,
@@ -30,18 +30,18 @@ pub struct BrowserProfile {
     pub source: ProfileSource,
 }
 
-/// profile 출처.
+/// Where a profile came from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProfileSource {
-    /// 새 profile.
+    /// A fresh profile.
     Fresh,
-    /// Chrome profile에서 bootstrap.
+    /// Bootstrapped from a Chrome profile.
     ChromeBootstrap,
-    /// import된 bundle.
+    /// An imported bundle.
     ImportedBundle,
 }
 
-/// cookie descriptor. 값은 포함하지 않음 (보안).
+/// A cookie descriptor. The value is not included (for security).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CookieDescriptor {
     pub domain: String,
@@ -52,7 +52,7 @@ pub struct CookieDescriptor {
     pub partitioned: bool,
 }
 
-/// cookie transfer 결과. 값이 아닌 개수와 속성만.
+/// The result of a cookie transfer. Counts and attributes only, never values.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CookieTransferResult {
     pub origin: String,
@@ -63,19 +63,19 @@ pub struct CookieTransferResult {
 /// ProfileStore trait.
 #[async_trait]
 pub trait ProfileStore: Send + Sync {
-    /// profile 생성 또는 가져오기.
+    /// Fetches or creates a profile.
     async fn get_or_create(&self, id: &ProfileId) -> ProfileResult<BrowserProfile>;
 
-    /// profile 목록.
+    /// Lists the profiles.
     async fn list(&self) -> ProfileResult<Vec<BrowserProfile>>;
 
-    /// cookie transfer (origin-scoped one-shot). 값은 내부적으로만 처리.
+    /// Cookie transfer (origin-scoped, one-shot). The values are only ever handled internally.
     async fn transfer_cookies(
         &self,
         profile: &ProfileId,
         origin: &str,
     ) -> ProfileResult<CookieTransferResult>;
 
-    /// profile 삭제.
+    /// Deletes a profile.
     async fn remove(&self, id: &ProfileId) -> ProfileResult<()>;
 }
