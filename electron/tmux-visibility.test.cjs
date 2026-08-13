@@ -30,3 +30,21 @@ test("visibility is tracked independently for each attached client", () => {
     "/dev/ttys004\tother\t@3\t0\t%7",
   ), ["/dev/ttys002"]);
 });
+
+// break-pane gives the pane a new window id and join-pane can change its session
+// too, while the pane id stays the same. Matching against where the pane started
+// then misses every client, the pane looks hidden, and painting stops — it froze
+// after being moved. The caller has to pass the pane's live placement.
+test("a moved pane is visible once matched against its current window", () => {
+  const moved = { session: "work", windowId: "@11", paneId: "%7" };
+  const clients = "/dev/ttys001\twork\t@11\t0\t%7";
+  assert.deepEqual([...visibleTmuxClientTtys(clients, identity)], [],
+    "the startup window no longer matches, which is the bug being guarded");
+  assert.deepEqual([...visibleTmuxClientTtys(clients, moved)], ["/dev/ttys001"]);
+});
+
+test("a pane joined into another session is visible under that session", () => {
+  const joined = { session: "other", windowId: "@2", paneId: "%7" };
+  const clients = "/dev/ttys001\tother\t@2\t0\t%7";
+  assert.deepEqual([...visibleTmuxClientTtys(clients, joined)], ["/dev/ttys001"]);
+});

@@ -186,7 +186,7 @@ test("another pane owning tmux zoom hides the browser image", () => {
   assert.match(main, /require\("\.\/tmux-visibility\.cjs"\)/);
   assert.match(main, /#\{window_zoomed_flag\}\\t#\{pane_id\}/);
   assert.match(main, /paneId: process\.env\.TMUX_PANE/);
-  assert.match(main, /const next = visibleTmuxClientTtys\(stdout, tmuxIdentity\);/);
+  assert.match(main, /const next = visibleTmuxClientTtys\(stdout, tmuxPlacement\);/);
   assert.match(main, /if \(!next\.has\(tty\)\) deleteImageFromClientTty\(tty\);/);
   assert.match(main, /if \(becameVisible\) repaintActiveTab\(\);/);
 });
@@ -672,4 +672,21 @@ test("agent socket refuses a path longer than sun_path", () => {
   const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
   assert.match(server, /Buffer\.byteLength\(target\) > 100/);
   assert.match(server, /agent-\$\{pane\.replace/);
+});
+
+// The startup identity is pinned because the window-session save path derives
+// from it, so visibility must not reuse it: a pane moved by break-pane/join-pane
+// keeps its id but changes window, every client match fails, and painting stops.
+test("visibility matches the pane's live placement, not its startup identity", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /let tmuxPlacement = null;/);
+  // The poll re-resolves placement before matching.
+  assert.match(main, /function syncTmuxVisibility\(\)[\s\S]*?"display-message", "-p", "-t", tmuxPlacement\.paneId/);
+  assert.match(main, /tmuxPlacement = \{ \.\.\.tmuxPlacement, session, windowId \}/);
+  assert.match(main, /visibleTmuxClientTtys\(stdout, tmuxPlacement\)/);
+  // The save path stays on the startup identity; a moved pane must not silently
+  // adopt another window's stored tabs.
+  assert.match(main, /const keys = windowSessionKeys\(tmuxIdentity\)/);
+  // The in-flight guard has to clear even if spawning throws, or polling stops.
+  assert.match(main, /catch \(spawnError\) \{\s*visibilityCheckRunning = false;/);
 });
