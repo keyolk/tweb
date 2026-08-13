@@ -159,11 +159,18 @@ tmux server restart. Renaming the session or changing the window index is treate
 
 `--frame-rate N` is the maximum frame rate during the active window right after user input or a resize,
 in the range 1–60. Adaptive mode, the default, uses the maximum for 700ms after terminal input or a
-resize and then drops to 1fps. Continuous painting from video or animation alone does not extend the
-active window, so long playback never saturates terminal output. PNG frames travel over a local file
-transport, leaving only a small Kitty graphics command on the tmux/Ghostty stream, and when the writer
-falls behind, intermediate frames are dropped and only the latest is kept. `--no-adaptive-frame-rate`
-pins the given value; `--adaptive-frame-rate` states the default policy explicitly.
+resize, then settles into one of two lower rates: **15fps while the page is still painting on its own**
+— video, an animation, a canvas — and 4fps once it stops. Playback is detected by counting paints over
+a window rather than by watching for a keystroke, so a video holds a watchable rate without anyone
+touching the keyboard, and a page that merely finished loading still falls all the way to idle.
+
+Playback is deliberately not the full rate. It is the one case that runs unbounded, and while the
+Kitty stream only carries a file path, every frame is still written to disk. PNG frames travel over
+that same local file transport, leaving only a small Kitty graphics command on the tmux/Ghostty
+stream, and when the writer falls behind, intermediate frames are dropped and only the latest is kept.
+`--no-adaptive-frame-rate` pins the given value — the right choice for watching something at 30fps or
+better; `--adaptive-frame-rate` states the default policy explicitly. `tweb diag` reports which tier is
+in force as `frames.rateKind`.
 
 On the same 80×24 tmux pane with a local fixture and debug builds, the median time to first Kitty frame
 (3 runs) was 6.084s for Electron and 1.834s for Tauri. Those are comparative numbers from the current
