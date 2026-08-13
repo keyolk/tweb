@@ -819,3 +819,30 @@ test("the input toggles are a badge, not a mode", () => {
   // The mode label keeps its own colours, minus the one the toggles used.
   assert.doesNotMatch(render, /indicatorMode === "passthrough"/);
 });
+
+// Every graphics write anchors the cursor at the pane origin and restores it afterwards,
+// but that restore uses the terminal's single DECSC slot, which the caret's own placement
+// does not own — so the cursor came back at the origin. Whole frames are continuous, so a
+// caret parked on a word halfway down the page was dragged to the pane's top-left corner
+// several times a second, which read as "the caret always starts in the corner".
+test("the caret is re-asserted after anything that moves the cursor", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /function reassertTerminalCaret\(\)/);
+  // Rewriting the same position is a few bytes and idempotent, so it simply repeats.
+  const reassert = main.slice(main.indexOf("function reassertTerminalCaret()"),
+    main.indexOf("function unparkTerminalCaret()") > main.indexOf("function reassertTerminalCaret()")
+      ? main.indexOf("function unparkTerminalCaret()")
+      : main.length);
+  assert.match(reassert, /if \(!caretCell\) return;/);
+  assert.match(reassert, /writeTerminalCaret\(caretCell\.row, caretCell\.col\)/);
+
+  // Both inline graphics paths, and the worker's — the worker writes whole frames on its
+  // own thread and is the one that fires continuously.
+  const gfx = main.slice(main.indexOf("function writeGfx(header, payload)"),
+    main.indexOf("// --- terminal setup ---"));
+  assert.equal((gfx.match(/reassertTerminalCaret\(\);/g) || []).length, 2,
+    "writeGfx and writeGfxChunked must both re-assert");
+  const ready = main.slice(main.indexOf("function handleGfxWorkerReady()"),
+    main.indexOf("function noteRawFrameFailure()"));
+  assert.match(ready, /reassertTerminalCaret\(\);/);
+});

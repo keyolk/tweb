@@ -645,6 +645,10 @@ function handleGfxWorkerReady() {
   const staleOutput = activeGfxGeneration !== null && activeGfxGeneration !== viewportGeneration;
   gfxWorkerBusy = false;
   activeGfxGeneration = null;
+  // The worker writes whole frames on its own thread, and its cursor anchoring leaves the
+  // cursor at the pane origin. Whole frames are continuous, so without this the caret is
+  // dragged back to the corner several times a second.
+  reassertTerminalCaret();
   if (staleOutput) writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
   const frame = pendingGfxFrame;
   pendingGfxFrame = null;
@@ -709,6 +713,7 @@ function writeGfx(header, payload) {
   try {
     writeSync(1, wrapped);
   } catch (e) {}
+  reassertTerminalCaret();
 }
 
 // The Kitty protocol caps one escape sequence's payload, so anything larger arrives as a
@@ -741,6 +746,7 @@ function writeGfxChunked(header, payload, prefix = "", suffix = "") {
   try {
     writeSync(1, graphicsPassthrough(`${prefix}${raw}${suffix}`));
   } catch (e) {}
+  reassertTerminalCaret();
 }
 
 // --- terminal setup ---
@@ -2267,11 +2273,28 @@ function moveTerminalCaret(point) {
   lastCaretPoint = { x: point.x, y: point.y, height: point.height || 0 };
   if (caretCell && caretCell.row === row && caretCell.col === col) return;
   caretCell = { row, col };
+  writeTerminalCaret(row, col);
+}
+
+function writeTerminalCaret(row, col) {
   try {
     writeSync(1, `${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
   } catch (error) {
     void error;
   }
+}
+
+// Every graphics write parks the cursor at the pane origin and restores it afterwards, but
+// the restore is the terminal's single DECSC slot — which the caret's own placement does
+// not own. In practice the cursor ends up back at the origin, so a caret parked on a word
+// halfway down the page slides to the pane's top-left corner as soon as the next frame
+// goes out. Frames are continuous, so it never stays where it was put.
+//
+// Rewriting the same position is a few bytes and idempotent, so the caret is simply
+// re-asserted after anything that moves the cursor.
+function reassertTerminalCaret() {
+  if (!caretCell) return;
+  writeTerminalCaret(caretCell.row, caretCell.col);
 }
 
 // The page reports CSS pixels but sendInputEvent takes unzoomed window
