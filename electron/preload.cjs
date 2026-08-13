@@ -34,11 +34,14 @@ const { ipcRenderer } = require("electron");
   let visualState = null;
   let inspectState = null;
   let tabListState = null;
+  let historyState = null;
   let helpHost = null;
   let contextMenuReturnFocus = null;
   let indicatorHost = null;
   let indicatorLabel = null;
   let inputBadge = null;
+  let audioBadge = null;
+  let audioState = { muted: false, owner: null };
   let tabBadge = null;
   let tabPopover = null;
   let tabPopoverPinned = false;
@@ -57,6 +60,7 @@ const { ipcRenderer } = require("electron");
     visual: "V",
     inspect: "I",
     tabs: "T",
+    history: "≡",
     omnibox: "O",
     help: "?",
   };
@@ -337,6 +341,15 @@ const { ipcRenderer } = require("electron");
       "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
       "white-space:nowrap", "backdrop-filter:blur(3px)",
     ].join(";");
+    // Only ever shown when another pane took the speakers. An indicator that is always
+    // lit says nothing, and "this pane has audio" is already answered by hearing it.
+    const audio = document.createElement("span");
+    audio.style.cssText = [
+      "box-sizing:border-box", "display:none", "height:18px", "padding:1px 6px",
+      "border:1px solid #fdd66366", "border-radius:4px", "background:#111d", "color:#fdd663",
+      "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "white-space:nowrap", "backdrop-filter:blur(3px)",
+    ].join(";");
     const popover = document.createElement("div");
     popover.setAttribute("role", "menu");
     popover.style.cssText = [
@@ -355,11 +368,12 @@ const { ipcRenderer } = require("electron");
     };
     popover.onmouseenter = () => clearTimeout(tabPopoverTimer);
     popover.onmouseleave = scheduleTabPopoverHide;
-    shadow.append(label, input, badge, popover);
+    shadow.append(label, input, audio, badge, popover);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
     inputBadge = input;
+    audioBadge = audio;
     tabBadge = badge;
     tabPopover = popover;
   }
@@ -400,6 +414,13 @@ const { ipcRenderer } = require("electron");
     inputBadge.textContent = input.text;
     inputBadge.title = input.title;
     inputBadge.style.display = input.text ? "" : "none";
+    // The owner's pane id is what makes the badge actionable: it says where the sound is
+    // coming from, so the user knows which pane to go to instead of guessing.
+    audioBadge.textContent = audioState.muted ? `🔇 ${audioState.owner || "other pane"}` : "";
+    audioBadge.title = audioState.muted
+      ? `Audio muted — ${audioState.owner || "another pane"} owns it · press m to take it back`
+      : "";
+    audioBadge.style.display = audioState.muted ? "" : "none";
     const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
     tabBadge.textContent = `${active}/${tabState.count}`;
     tabBadge.title = `Tab ${active}/${tabState.count} in this pane · hover/click for the list`;
@@ -1786,6 +1807,7 @@ const { ipcRenderer } = require("electron");
       ["f · F", "open via hint · open in new tab"],
       ["o · O / t", "omnibox in current tab · new tab"],
       ["b", "list open tabs"],
+      ["gh", "history page — search, open, delete"],
       ["J · K", "previous · next tab"],
       ["x · X", "close tab · restore recent tab"],
       ["r · gi", "reload · focus first input"],
@@ -1806,6 +1828,7 @@ const { ipcRenderer } = require("electron");
       ["Ctrl-Tab / PgUp / PgDn", "switch browser tab"],
       ["Ctrl-W", "close current browser tab"],
       ["i", "insert mode — page's own shortcuts, Esc returns"],
+      ["m", "take audio back — only one pane plays at a time"],
       ["Ctrl-;", "Shortcuts ↔ web passthrough"],
       ["Ctrl-C", "quit TWeb from Shortcuts mode"],
       ["Esc", "clear current mode · fullscreen · input focus"],
@@ -2168,6 +2191,176 @@ const { ipcRenderer } = require("electron");
       activateSelectedTab();
     }
     return true;
+  }
+
+  // --- history page ---
+  //
+  // The omnibox is an address bar that happens to read history: ten rows, no times, and
+  // you have to know what you are looking for. This is the other view of the same file —
+  // every visit, grouped by the day it happened on. Main owns the grouping (history-view.cjs)
+  // so day boundaries are decided once, on the side that also does the deleting.
+
+  function cancelHistory(restoreMode = true) {
+    historyState?.host.remove();
+    historyState = null;
+    if (restoreMode) normalMode();
+  }
+
+  function historyRows() {
+    return historyState?.rows || [];
+  }
+
+  function selectHistoryIndex(index) {
+    const rows = historyRows();
+    if (!historyState || rows.length === 0) {
+      setMode("history", historyState ? "0" : "");
+      return;
+    }
+    const count = rows.length;
+    historyState.selected = ((index % count) + count) % count;
+    for (const [rowIndex, entry] of rows.entries()) {
+      const selected = rowIndex === historyState.selected;
+      entry.row.style.background = selected ? "#3c4043" : "transparent";
+      entry.row.style.outline = selected ? "1px solid #8ab4f8" : "none";
+    }
+    rows[historyState.selected].row.scrollIntoView({ block: "nearest" });
+    setMode("history", `${historyState.selected + 1}/${count}`);
+  }
+
+  function openSelectedHistory(newTab) {
+    const entry = historyRows()[historyState?.selected];
+    if (!entry) return;
+    cancelHistory(false);
+    send(newTab ? "new-tab" : "navigate", entry.url);
+  }
+
+  // Deleting keeps the page open — main sends a fresh model back — so several entries can
+  // be cleared in a row without reopening the overlay each time.
+  function deleteSelectedHistory() {
+    const entry = historyRows()[historyState?.selected];
+    if (!entry || !historyState) return;
+    historyState.keepSelection = historyState.selected;
+    requestHistoryModel([{ url: entry.url, dayStart: entry.dayStart }]);
+  }
+
+  // The model is re-requested on every keystroke, so a reply that answers a query the user
+  // has already moved on from must not overwrite the current one.
+  function requestHistoryModel(rows = null) {
+    if (!historyState) return;
+    const query = historyState.input.value;
+    if (rows) send("history-delete", { rows, query });
+    else send("history-model", { query });
+  }
+
+  function renderHistoryModel(model) {
+    if (!historyState || !model) return;
+    if (String(model.query || "") !== historyState.input.value) return;
+    const { list } = historyState;
+    const rows = [];
+    list.replaceChildren();
+    for (const day of model.days || []) {
+      const heading = document.createElement("div");
+      heading.textContent = day.label;
+      heading.style.cssText = "position:sticky;top:0;padding:9px 7px 5px;background:#202124;color:#8ab4f8;font-size:12px;font-weight:600";
+      list.append(heading);
+      for (const entry of day.rows || []) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.style.cssText = "display:grid;grid-template-columns:5ch minmax(0,1fr);gap:8px;width:100%;padding:6px 7px;border:0;border-radius:5px;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer";
+        const time = document.createElement("span");
+        time.textContent = entry.time;
+        time.style.cssText = "color:#9aa0a6;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace";
+        const text = document.createElement("span");
+        const title = document.createElement("strong");
+        title.textContent = entry.title || entry.url;
+        title.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500";
+        const url = document.createElement("small");
+        url.textContent = entry.url;
+        url.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6";
+        text.append(title, url);
+        row.append(time, text);
+        const index = rows.length;
+        row.onmouseenter = () => selectHistoryIndex(index);
+        row.onclick = () => { selectHistoryIndex(index); openSelectedHistory(false); };
+        list.append(row);
+        rows.push({ url: entry.url, dayStart: entry.dayStart, row });
+      }
+    }
+    if (rows.length === 0) {
+      const empty = document.createElement("div");
+      empty.textContent = model.query ? `No history matches ${model.query}` : "No history yet";
+      empty.style.cssText = "padding:14px 7px;color:#9aa0a6";
+      list.append(empty);
+    }
+    historyState.rows = rows;
+    // A cap that looks like the whole history is what made the omnibox misleading, so say
+    // when there is more behind the one being shown.
+    historyState.count.textContent = model.truncated
+      ? `${model.shown} of ${model.total}`
+      : `${model.total} ${model.total === 1 ? "visit" : "visits"}`;
+    // After a delete the row under the cursor is gone; staying at the same offset lands on
+    // what took its place, which is what makes repeated deletes usable.
+    const resume = historyState.keepSelection;
+    historyState.keepSelection = null;
+    selectHistoryIndex(resume === null || resume === undefined ? 0 : Math.min(resume, rows.length - 1));
+  }
+
+  function showHistory() {
+    cancelTransient(false);
+    const host = document.createElement("div");
+    host.id = "__tweb_history__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483646;display:flex;align-items:flex-start;justify-content:center;padding-top:6vh;background:#0007;pointer-events:auto";
+    const shadow = host.attachShadow({ mode: "open" });
+    const panel = document.createElement("div");
+    panel.style.cssText = "box-sizing:border-box;display:flex;flex-direction:column;width:min(860px,calc(100vw - 32px));max-height:82vh;padding:8px;border:1px solid #5f6368;border-radius:8px;background:#202124;color:#e8eaed;box-shadow:0 12px 36px #000b;font:13px/1.4 system-ui,-apple-system,sans-serif";
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;gap:8px;padding:2px 4px 8px";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = "Search all history";
+    input.style.cssText = "flex:1;box-sizing:border-box;min-width:0;padding:7px 9px;border:1px solid #5f6368;border-radius:6px;outline:0;background:#303134;color:#f8f9fa;font:14px/1.3 system-ui,-apple-system,sans-serif";
+    const count = document.createElement("span");
+    count.style.cssText = "color:#bdc1c6;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap";
+    header.append(input, count);
+    const hint = document.createElement("div");
+    hint.textContent = "↑/↓ move · Enter open · Shift-Enter new tab · Ctrl-D delete · Esc close";
+    hint.style.cssText = "padding:0 5px 7px;color:#9aa0a6;font-size:11px";
+    const list = document.createElement("div");
+    list.setAttribute("role", "listbox");
+    list.style.cssText = "flex:1;min-height:0;overflow:auto;padding:0 2px 4px";
+    input.addEventListener("input", () => requestHistoryModel());
+    input.addEventListener("keydown", (event) => {
+      // The overlay owns its keys; letting them reach the page would scroll it behind the
+      // panel and typing would fire normal-mode shortcuts.
+      event.stopPropagation();
+      const rows = historyRows();
+      if (event.code === "Escape") {
+        event.preventDefault();
+        cancelHistory();
+      } else if (event.code === "ArrowDown" || event.ctrlKey && event.key.toLowerCase() === "j") {
+        event.preventDefault();
+        if (rows.length) selectHistoryIndex(historyState.selected + 1);
+      } else if (event.code === "ArrowUp" || event.ctrlKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (rows.length) selectHistoryIndex(historyState.selected - 1);
+      } else if (event.code === "Enter") {
+        event.preventDefault();
+        openSelectedHistory(event.shiftKey);
+      } else if (event.ctrlKey && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        deleteSelectedHistory();
+      }
+    });
+    panel.append(header, hint, list);
+    shadow.append(panel);
+    document.documentElement.append(host);
+    paintNow();
+    historyState = { host, input, list, count, rows: [], selected: 0, keepSelection: null };
+    setMode("history", "…");
+    requestHistoryModel();
+    requestAnimationFrame(() => input.focus());
   }
 
   function targetPoint(item) {
@@ -2786,6 +2979,7 @@ const { ipcRenderer } = require("electron");
     cancelVisual(false);
     cancelInspect(false);
     cancelTabList(false);
+    cancelHistory(false);
     cancelHelp(false);
     let restoredContextFocus = false;
     const contextMenu = document.getElementById("__tweb_context_menu__");
@@ -2827,7 +3021,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function hasTransientMode() {
-    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || helpHost || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
+    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || helpHost || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
 
   function handleNormalKey(event) {
@@ -2879,7 +3073,7 @@ const { ipcRenderer } = require("electron");
     if (handleVisualKey(event, key)) return;
     if (handleInspectKey(event, key)) return;
     if (handleTabListKey(event, key)) return;
-    if (searchState || promptHost) return;
+    if (searchState || promptHost || historyState) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
 
     if (eventIsEditable(event)) {
@@ -2898,6 +3092,7 @@ const { ipcRenderer } = require("electron");
     if (pendingG) {
       resetPendingG();
       if (key === "g") scrollSurfaceTo(0);
+      else if (key === "h") showHistory();
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
       else return;
       event.preventDefault();
@@ -2936,6 +3131,7 @@ const { ipcRenderer } = require("electron");
       case "d": scrollSurfaceBy(0, scrollSurfaceHeight() * 0.5); break;
       case "u": scrollSurfaceBy(0, -scrollSurfaceHeight() * 0.5); break;
       case "s": startScrollPicker(); break;
+      case "m": send("reclaim-audio"); flash("audio"); break;
       case "G": scrollSurfaceTo(scrollSurfaceEnd()); break;
       case "g": pendingG = true; pendingGTimer = setTimeout(resetPendingG, 800); setMode("normal", "g"); break;
       case "z": pendingZ = true; pendingZTimer = setTimeout(resetPendingZ, 800); setMode("normal", "z"); break;
@@ -3007,6 +3203,11 @@ const { ipcRenderer } = require("electron");
     setMode("search", searchState.result.textContent);
   });
 
+  ipcRenderer.on("tweb-audio-state", (_event, state) => {
+    audioState = { muted: Boolean(state?.muted), owner: state?.owner || null };
+    renderIndicator();
+  });
+
   ipcRenderer.on("tweb-select-all", () => {
     if (topFrame && isTag(document.activeElement, "iframe", "frame")) return;
     if (!topFrame && !document.hasFocus()) return;
@@ -3020,6 +3221,10 @@ const { ipcRenderer } = require("electron");
 
   ipcRenderer.on("tweb-tabs", (_event, model) => {
     renderTabList(model);
+  });
+
+  ipcRenderer.on("tweb-history", (_event, model) => {
+    renderHistoryModel(model);
   });
 
   ipcRenderer.on("tweb-tab-state", (_event, model) => {

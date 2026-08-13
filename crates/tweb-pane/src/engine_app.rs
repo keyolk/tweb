@@ -59,6 +59,14 @@ const FILES: &[(&str, &str)] = &[
         "agent-server.cjs",
         include_str!("../../../electron/agent-server.cjs"),
     ),
+    (
+        "history-view.cjs",
+        include_str!("../../../electron/history-view.cjs"),
+    ),
+    (
+        "audio-owner.cjs",
+        include_str!("../../../electron/audio-owner.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.
