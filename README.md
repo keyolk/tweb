@@ -78,7 +78,7 @@ tweb profile bootstrap chrome
 # Diagnose the environment
 tweb doctor
 
-# Ghostty Cmd passthrough와 tmux CSI-u/mouse 설정을 별도 include 파일로 설치
+# Install the Ghostty Cmd passthrough and tmux CSI-u/mouse settings as a separate include file
 tweb doctor --fix
 ```
 

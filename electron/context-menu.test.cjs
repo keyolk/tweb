@@ -46,7 +46,7 @@ test("selection context offers copy and a clipped web search", () => {
 
   assert.deepEqual(actions(items).slice(0, 2), ["copy", "search-selection"]);
   const search = items.find((item) => item.action === "search-selection");
-  assert.match(search.label, /^“a selection with enough wor…” 검색$/);
+  assert.match(search.label, /^Search for “a selection with enough wor…”$/);
   assertCleanSeparators(items);
 });
 
@@ -74,6 +74,6 @@ test("video context offers open, save and address copy", () => {
   });
 
   assert.deepEqual(actions(items).slice(0, 3), ["open-media", "save-media", "copy-media-url"]);
-  assert.match(items.find((item) => item.action === "save-media").label, /동영상/);
+  assert.match(items.find((item) => item.action === "save-media").label, /video/);
   assertCleanSeparators(items);
 });

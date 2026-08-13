@@ -11,11 +11,11 @@ const { ipcRenderer } = require("electron");
     }
   }
   const shortcutFrame = topFrame || sameOriginFrame;
-  // engine의 두 flag와 대응: vimium normal-mode 키와 Cmd bypass.
+  // Mirrors the engine's two flags: vimium normal-mode keys and Cmd bypass.
   let vimiumEnabled = true;
   let bypassEnabled = false;
-  // 기존 shortcutsEnabled는 vimiumEnabled로 통합 — bypass는 preload 게이트에
-  // 직접 관여하지 않으므로 (Cmd는 engine이 native로 전달), vimium만 본다.
+  // The old shortcutsEnabled folded into vimiumEnabled — bypass does not gate the
+  // preload directly (the engine delivers Cmd natively), so only vimium matters here.
   let insertMode = false;
   let mediaHoverTimer = null;
   let mediaHoverNudge = 0;
@@ -44,7 +44,7 @@ const { ipcRenderer } = require("electron");
   let tabPopoverTimer = null;
   let indicatorMode = "normal";
   let indicatorDetail = "";
-  let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "새 탭" }] };
+  let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "New tab" }] };
   let lastSearch = "";
 
   const hintAlphabet = "asdfghjklqwertyuiopzxcvbnm";
@@ -284,7 +284,7 @@ const { ipcRenderer } = require("electron");
       number.textContent = `${tab.index + 1}`;
       number.style.cssText = "flex:0 0 18px;color:#8ab4f8;text-align:right";
       const title = document.createElement("span");
-      title.textContent = tab.title || "새 탭";
+      title.textContent = tab.title || "New tab";
       title.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis";
       button.append(number, title);
       button.onmouseenter = () => { button.style.background = "#ffffff18"; };
@@ -366,21 +366,21 @@ const { ipcRenderer } = require("electron");
       : "#fdd663";
     const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
     tabBadge.textContent = `${active}/${tabState.count}`;
-    tabBadge.title = `이 pane의 탭 ${active}/${tabState.count} · hover/click으로 목록`;
+    tabBadge.title = `Tab ${active}/${tabState.count} in this pane · hover/click for the list`;
     if (tabPopover.style.display !== "none") showTabPopover(tabPopoverPinned);
   }
 
   function updateTabState(model) {
     const tabs = Array.isArray(model?.tabs) ? model.tabs.flatMap((tab, index) => {
       if (!tab || !Number.isInteger(tab.index)) return [];
-      return [{ index: tab.index, title: String(tab.title || `탭 ${index + 1}`) }];
+      return [{ index: tab.index, title: String(tab.title || `Tab ${index + 1}`) }];
     }) : [];
     const count = tabs.length || (Number.isInteger(model?.count) && model.count > 0 ? model.count : 1);
     const activeIndex = Number.isInteger(model?.activeIndex) ? model.activeIndex : 0;
     tabState = {
       activeIndex: Math.min(count - 1, Math.max(0, activeIndex)),
       count,
-      tabs: tabs.length ? tabs : Array.from({ length: count }, (_, index) => ({ index, title: `탭 ${index + 1}` })),
+      tabs: tabs.length ? tabs : Array.from({ length: count }, (_, index) => ({ index, title: `Tab ${index + 1}` })),
     };
     const root = document.documentElement;
     if (root) {
@@ -404,7 +404,7 @@ const { ipcRenderer } = require("electron");
     renderIndicator();
   }
 
-  // dataset.twebInputMode에 들어갈 값. 두 flag 조합으로 mode를 표시한다.
+  // The value written to dataset.twebInputMode. The two flags combine into a mode.
   function modeIndicator() {
     if (vimiumEnabled && !bypassEnabled) return "shortcuts";
     if (!vimiumEnabled && bypassEnabled) return "bypass";
@@ -413,8 +413,8 @@ const { ipcRenderer } = require("electron");
   }
 
   function normalMode() {
-    // bypass가 켜져 있으면 vimium 여부와 무관하게 bypass 상태로 표시.
-    // 사용자가 "지금 Cmd가 페이지로 가는 상태인지"를 indicator로 보게 하려는 것.
+    // With bypass on, show the bypass state regardless of vimium. The point of the
+    // indicator is to answer "are Cmd keys going to the page right now?".
     if (bypassEnabled) setMode("bypass");
     else if (!vimiumEnabled) setMode("passthrough");
     else if (insertMode) setMode("insert", "Esc");

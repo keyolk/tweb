@@ -52,14 +52,14 @@ const tabs = [];
 const closedTabs = [];
 let activeTabIndex = -1;
 let quitting = false;
-// 독립 토글: bypass(P)와 vimium은 각각 켜고 끈다.
-//   Ctrl-;  → bypass 토글 (Cmd-K/A/...를 페이지로 보낼지)
-//   Ctrl-:  → vimium 토글 (f/j/k/... normal-mode 키)
-// 조합이 mode indicator를 만든다:
+// Independent toggles: bypass (P) and vimium turn on and off separately.
+//   Ctrl-;  → bypass toggle (whether Cmd-K/A/... go to the page)
+//   Ctrl-:  → vimium toggle (f/j/k/... normal-mode keys)
+// Their combination makes the mode indicator:
 //   vimium on  + bypass off = N (normal)
 //   vimium off + bypass on  = P (passthrough)
-//   vimium on  + bypass on  = N-vim (둘 다)
-//   vimium off + bypass off = D (순수 웹)
+//   vimium on  + bypass on  = N-vim (both)
+//   vimium off + bypass off = D (web only)
 let vimiumShortcutsEnabled = true;
 let cmdBypassEnabled = false;
 let terminalVisible = true;
@@ -410,10 +410,10 @@ function switchTmuxClientTable(tty, table) {
   }
 }
 
-// passthrough table은 vimium이 꺼졌을 때만 켠다. bypass(Cmd)는 engine이
-// mode 무관으로 native 전달하므로 tmux table과 무관하고, vimium이 켜져 있으면
-// normal-mode 키가 먹어야 하므로 table을 끈다. 이래야 "bypass on + vimium on"
-// 조합에서 vimium도 Cmd도 둘 다 동작한다.
+// The passthrough table is armed only while vimium is off. Bypass (Cmd) does not
+// depend on the tmux table — the engine delivers it natively regardless of mode —
+// and with vimium on the normal-mode keys have to work, so the table stays off.
+// That is what makes "bypass on + vimium on" give both vimium and Cmd.
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
   if (!process.env.TMUX_PANE) return;
   const paneId = process.env.TMUX_PANE;
@@ -1176,21 +1176,22 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
   }
 }
 
-// preload는 두 flag를 따로 받아 mode indicator와 각 게이트를 독립적으로 처리한다.
+// The preload receives the two flags separately and drives the mode indicator and
+// each gate independently.
 function broadcastShortcutMode() {
   for (const tab of tabs) {
     sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   }
 }
 
-// 두 flag를 올바른 조합으로 설정하고 후속 처리를 한 번에 돌린다.
+// Applies the correct combination of the two flags and runs the follow-up work once.
 function applyShortcutMode() {
   pageInsertMode = false;
   broadcastShortcutMode();
-  // passthrough이 arm되면(vimium off) 페이지가 키 입력을 받을 수 있도록 focus.
+  // Once passthrough is armed (vimium off), focus so the page can receive keys.
   if (!vimiumShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
-  // Ghostty config reload나 pane restart가 한쪽 상태만 초기화할 수 있으므로
-  // 값이 이미 맞아도 reconcile은 항상 돌린다.
+  // A Ghostty config reload or a pane restart can reset one side only, so reconcile
+  // always runs even when the value already matches.
   reconcileTmuxPassthrough();
   updatePaneTitle();
   if (debugLogging) {
@@ -1219,7 +1220,7 @@ function setVimiumShortcutsEnabled(enabled) {
   applyShortcutMode();
 }
 
-// 5001(Ctrl-;)과 legacy 강제 시퀀스는 bypass만 토글/설정한다.
+// 5001 (Ctrl-;) and the legacy forcing sequences toggle or set bypass only.
 function setBrowserShortcutsEnabled(enabled) {
   setCmdBypassEnabled(enabled);
 }
@@ -1417,7 +1418,7 @@ function tabStateModel() {
     count: tabs.length,
     tabs: tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
       index,
-      title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "새 탭",
+      title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "New tab",
     }]),
   };
 }
@@ -2321,7 +2322,7 @@ function noWindowSessionPage() {
 <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
 background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;
 flex-direction:column;gap:8px">
-<div>복원할 이전 페이지가 없습니다</div><div style="color:#6f747c">t 키로 주소를 입력하세요</div></body>`)}`;
+<div>No previous page to restore</div><div style="color:#6f747c">Press t to enter an address</div></body>`)}`;
 }
 
 function applyViewport(vp, origin = tmuxOrigin) {
@@ -2552,9 +2553,10 @@ function keyName(codepoint) {
   return null;
 }
 
-// preload로 보내는 이름은 웹 표준 KeyboardEvent.key지만, sendInputEvent의 keyCode는
-// Electron Accelerator 이름만 받는다. 방향키는 두 체계의 이름이 달라서 그대로 넘기면
-// Chromium이 조용히 무시한다 — Slack 검색창에서 ArrowUp/Down이 먹지 않던 원인.
+// The name sent to the preload is the web-standard KeyboardEvent.key, but
+// sendInputEvent's keyCode only accepts Electron Accelerator names. The arrow keys
+// are named differently in the two schemes, so passing them straight through makes
+// Chromium ignore them silently — why ArrowUp/Down did nothing in Slack's search box.
 const ACCELERATOR_KEYS = new Map([
   ["ArrowUp", "Up"], ["ArrowDown", "Down"], ["ArrowLeft", "Left"], ["ArrowRight", "Right"],
 ]);
@@ -2580,10 +2582,10 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
     contents.sendInputEvent({ ...event, type: "keyUp" });
     return;
   }
-  // Cmd 조합은 keyDown으로 보내 Chromium의 shortcut path를 태운다. rawKeyDown은
-  // shortcut 처리를 건너뛰어 페이지가 key를 shortcut으로 안 본다.
-  // keyCode는 Accelerator 이름(KeyK)가 아니라 웹 표준 "k"를 쓴다 —
-  // Chromium의 keyDown이 "KeyK"를 모르는 경우가 있어 "k"가 안정적이다.
+  // Cmd combinations go out as keyDown so Chromium runs its shortcut path.
+  // rawKeyDown skips shortcut handling, leaving the page blind to the shortcut.
+  // keyCode uses the web-standard "k" rather than the Accelerator name (KeyK) —
+  // Chromium's keyDown does not always recognise "KeyK", while "k" is reliable.
   contents.sendInputEvent({ type: "keyDown", keyCode: key, modifiers });
   if (text && !modifiers.includes("control") && !modifiers.includes("meta")) {
     contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
@@ -2710,10 +2712,11 @@ function dispatchControlByte(byte, extraModifierBits = 0) {
   return false;
 }
 
-// Cmd-V. Ghostty의 paste_from_clipboard가 PTY에 쓴 bracketed paste body를 페이지에
-// 붙여넣는다. clipboard와 내용이 같으면 webContents.paste()를 쓴다 — Slack 같은
-// 페이지는 진짜 paste event를 보고 서식·첨부를 처리하므로 insertText보다 낫다.
-// terminal은 paste에서 \n을 \r로 바꾸는 일이 흔하므로 비교 전에 정규화한다.
+// Cmd-V. Pastes into the page the bracketed-paste body that Ghostty's
+// paste_from_clipboard wrote to the PTY. When the content matches the clipboard it
+// uses webContents.paste() — pages like Slack read the real paste event to handle
+// formatting and attachments, which insertText cannot deliver. Terminals commonly
+// turn \n into \r on paste, so both sides are normalized before comparing.
 function dispatchPaste(text) {
   if (!win || !text) return;
   const contents = win.webContents;
@@ -2727,7 +2730,7 @@ function dispatchPaste(text) {
     contents.paste();
     return;
   }
-  // Clipboard가 다르면 (tmux buffer paste 등) 텍스트 그대로 넣는다.
+  // A different clipboard (a tmux buffer paste, say) means inserting the text as is.
   contents.insertText(body);
 }
 
@@ -2755,11 +2758,11 @@ function dispatchText(buffer) {
   }
 }
 
-// Cmd 조합은 Ghostty가 PTY encoding을 만들지 않는다 (plain/modifyOtherKeys/Kitty
-// 모두 아무 byte도 보내지 않는 것을 key probe로 확인). 그래서 tweb key table이
-// 사설 sequence로 실어 보내고 여기서 원래 키로 되돌린다. 5020부터가 Cmd 영역이며
-// tmux user-keys[120+]에 등록돼 있어야 ESC가 재인코딩되지 않는다.
-// doctor의 CMD_PASSTHROUGH_KEYS와 code가 일치해야 한다.
+// Ghostty produces no PTY encoding for Cmd combinations (a key probe confirmed that
+// plain, modifyOtherKeys and Kitty modes all send zero bytes). They are carried as
+// private sequences instead and turned back into the original key here. 5020 and up
+// is the Cmd range, and each code must be registered in tmux user-keys[120+] or its
+// ESC gets re-encoded. The codes have to match doctor's CMD_PASSTHROUGH_KEYS.
 const CMD_PRIVATE_KEYS = new Map([
   [5020, "k"],
   [5021, "a"],
@@ -2769,25 +2772,25 @@ const CMD_PRIVATE_KEYS = new Map([
 
 function dispatchPrivateShortcut(code) {
   if (debugLogging) console.error(`tweb: private key ${code}`);
-  // Ctrl-; — bypass 토글. vimium은 건드리지 않는다.
+  // Ctrl-; — bypass toggle. Leaves vimium alone.
   if (code === 5001) {
     toggleBrowserShortcuts();
     return;
   }
-  // Ctrl-: — vimium 토글. bypass는 건드리지 않는다.
+  // Ctrl-: — vimium toggle. Leaves bypass alone.
   if (code === 5014) {
     setVimiumShortcutsEnabled(!vimiumShortcutsEnabled);
     return;
   }
-  // 기존 강제 ON/OFF 시퀀스 — 새 flag 구조에서는 bypass를 강제한다.
+  // The legacy forced ON/OFF sequences — under the new flags they force bypass.
   if (code === 5011 || code === 5012) {
     setCmdBypassEnabled(code === 5012);
     return;
   }
   const cmdKey = CMD_PRIVATE_KEYS.get(code);
   if (cmdKey) {
-    // 1 + meta(8). cmdBypassEnabled와 무관하게 페이지로 보낸다 — 사용자가
-    // 누른 것은 어느 mode에서나 그 웹앱의 Cmd 단축키다.
+    // 1 + meta(8). Sent to the page regardless of cmdBypassEnabled — in any mode,
+    // what the user pressed is that web app's Cmd shortcut.
     dispatchNamedKey(cmdKey, 9);
     return;
   }
@@ -2828,8 +2831,8 @@ function consumeRawInput() {
   for (;;) {
     if (rawInput.length === 0) return;
 
-    // Paste body는 escape sequence로 파싱하지 않는다. ESC를 포함한 임의 byte가
-    // 올 수 있고, 닫는 bracket까지는 전부 붙여넣을 텍스트다.
+    // A paste body is never parsed as escape sequences. It can hold arbitrary bytes
+    // including ESC, and everything up to the closing bracket is text to paste.
     if (paste.active) {
       const chunk = rawInput;
       rawInput = Buffer.alloc(0);
@@ -2858,12 +2861,12 @@ function consumeRawInput() {
 
     const input = rawInput.toString("utf8");
 
-    // Bracketed paste 시작. Cmd-V는 Ghostty가 key로 encoding하지 않고
-    // paste_from_clipboard로 clipboard 내용을 PTY에 쓰는 것이 전부다. 열린
-    // bracket을 만나면 뒤따르는 body를 모아 한 번의 paste로 처리한다.
+    // Start of a bracketed paste. Ghostty never encodes Cmd-V as a key; the whole
+    // event is paste_from_clipboard writing the clipboard into the PTY. On the
+    // opening bracket, collect the body that follows and handle it as one paste.
     if (paste.begins(rawInput)) {
-      // ESC 판별 timer가 paste 도중에 발화해 body 첫 byte를 Escape key로
-      // 확정해 버리는 것을 막는다.
+      // Stops the ESC-disambiguation timer from firing mid-paste and committing the
+      // body's first byte as an Escape key.
       if (rawInputFlushTimer) {
         clearTimeout(rawInputFlushTimer);
         rawInputFlushTimer = null;
@@ -2881,7 +2884,8 @@ function consumeRawInput() {
       continue;
     }
 
-    // 5001-5012는 기존 shortcut, 5013-5019는 mode 토글(5014=Ctrl-:), 5020부터는 Cmd 조합.
+    // 5001-5012 are the existing shortcuts, 5013-5019 the mode toggles
+    // (5014 = Ctrl-:), and 5020 and up the Cmd combinations.
     let match = /^\x1b\[(50(?:0[1-9]|1[0-9]|[2-9][0-9]))~/.exec(input);
     if (match) {
       dispatchPrivateShortcut(Number(match[1]));
@@ -2994,10 +2998,10 @@ process.stdin.on("data", (chunk) => {
         clearTimeout(rawInputFlushTimer);
         rawInputFlushTimer = null;
       }
-      // Escape sequence의 raw byte. decoding 전 값이라 "terminal이 아예 안 보냈다"와
-      // "받았지만 해석하지 못했다"를 가른다 — tmux가 모르는 sequence의 ESC를
-      // 재인코딩해 ESC[5020~을 ESC[91;3u5020~으로 만든 것도 이 로그로 찾았다.
-      // 평범한 타이핑까지 찍으면 로그가 밀리므로 sequence만 남긴다.
+      // The escape sequence's raw bytes. Being pre-decoding, it separates "the
+      // terminal never sent it" from "it arrived but was not understood" — this log
+      // is how tmux re-encoding ESC[5020~ into ESC[91;3u5020~ was found. Logging
+      // ordinary typing too would drown it, so only sequences are kept.
       if (debugLogging && input[1].startsWith("1b")) {
         console.error(`tweb: input ${input[1]}`);
       }

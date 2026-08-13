@@ -38,7 +38,7 @@
   let tabPopoverTimer = null;
   let indicatorMode = "normal";
   let indicatorDetail = "";
-  let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "새 탭" }] };
+  let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "New tab" }] };
   let caretIndicator = null;
   let caretCanvas = null;
   let terminalEditable = null;
@@ -283,7 +283,7 @@
       number.textContent = `${tab.index + 1}`;
       number.style.cssText = "flex:0 0 18px;color:#8ab4f8;text-align:right";
       const title = document.createElement("span");
-      title.textContent = tab.title || "새 탭";
+      title.textContent = tab.title || "New tab";
       title.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis";
       button.append(number, title);
       button.onmouseenter = () => { button.style.background = "#ffffff18"; };
@@ -365,21 +365,21 @@
       : "#fdd663";
     const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
     tabBadge.textContent = `${active}/${tabState.count}`;
-    tabBadge.title = `이 pane의 탭 ${active}/${tabState.count} · hover/click으로 목록`;
+    tabBadge.title = `Tab ${active}/${tabState.count} in this pane · hover/click for the list`;
     if (tabPopover.style.display !== "none") showTabPopover(tabPopoverPinned);
   }
 
   function updateTabState(model) {
     const tabs = Array.isArray(model?.tabs) ? model.tabs.flatMap((tab, index) => {
       if (!tab || !Number.isInteger(tab.index)) return [];
-      return [{ index: tab.index, title: String(tab.title || `탭 ${index + 1}`) }];
+      return [{ index: tab.index, title: String(tab.title || `Tab ${index + 1}`) }];
     }) : [];
     const count = tabs.length || (Number.isInteger(model?.count) && model.count > 0 ? model.count : 1);
     const activeIndex = Number.isInteger(model?.activeIndex) ? model.activeIndex : 0;
     tabState = {
       activeIndex: Math.min(count - 1, Math.max(0, activeIndex)),
       count,
-      tabs: tabs.length ? tabs : Array.from({ length: count }, (_, index) => ({ index, title: `탭 ${index + 1}` })),
+      tabs: tabs.length ? tabs : Array.from({ length: count }, (_, index) => ({ index, title: `Tab ${index + 1}` })),
     };
     const root = document.documentElement;
     if (root) {

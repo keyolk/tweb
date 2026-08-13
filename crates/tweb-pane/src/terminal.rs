@@ -270,10 +270,11 @@ impl InputModeGuard {
         // leak into another pane's shell.
         let _ =
             lock.write_all(b"\x1b[?1004l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1016h");
-        // Bracketed paste(2004)는 Cmd-V가 페이지에 도달하는 유일한 경로다. Ghostty는
-        // Cmd 조합의 PTY encoding을 만들지 않지만 paste_from_clipboard는 clipboard
-        // 내용을 그대로 써 준다. 2004를 켜야 tmux와 Ghostty가 ESC[200~ ... ESC[201~로
-        // 감싸 주고, engine이 그 경계를 보고 한 번의 paste로 처리할 수 있다.
+        // Bracketed paste (2004) is the only path by which Cmd-V reaches the page.
+        // Ghostty produces no PTY encoding for Cmd combinations, but
+        // paste_from_clipboard writes the clipboard content through as is. Only
+        // with 2004 on do tmux and Ghostty wrap it in ESC[200~ ... ESC[201~, which
+        // is what lets the engine see the boundaries and handle it as one paste.
         let _ = lock.write_all(b"\x1b[?2004h");
         if inside_tmux {
             // Ask for modifyOtherKeys mode 2, which tmux tracks: it records this as
