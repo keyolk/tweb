@@ -1307,7 +1307,65 @@ const { ipcRenderer } = require("electron");
     paintNow();
   }
 
+  // Where the visual caret sits, for a page that is not editable at all. `caretPoint`
+  // below only knows about form fields and contenteditable, because that is where a web
+  // caret normally lives — but visual caret mode puts one on ordinary text, and the
+  // terminal cursor has to follow it there too. Without this the cursor stays wherever it
+  // was last parked, which reads as the caret starting in the pane's top-left corner no
+  // matter where the selection is.
+  function visualCaretPoint() {
+    if (!visualState?.caret) return null;
+    const selection = visualSelection();
+    if (!selection?.rangeCount) return null;
+    const range = selection.getRangeAt(0).cloneRange();
+    range.collapse(true);
+    let box = range.getBoundingClientRect();
+    // A collapsed range measures as 0x0 whenever its container is an element rather than
+    // a text node — which is the normal case here, since selecting an element's contents
+    // and collapsing lands on the element at offset 0. Descend to the text the caret is
+    // actually in front of and measure its first character instead.
+    if (!box.width && !box.height) {
+      const measured = firstCharacterRect(range);
+      if (!measured) return null;
+      box = measured;
+    }
+    // Frame-local coordinates, like the editable path below: `reportCaret` runs the
+    // result through `topViewportPoint`, which is what shifts a subframe into the top
+    // document.
+    return {
+      x: Math.max(0, Math.min(innerWidth - 1, box.left)),
+      y: Math.max(0, Math.min(innerHeight - 1, box.top)),
+      height: box.height || 16,
+    };
+  }
+
+  // The box of the character a collapsed range sits in front of.
+  function firstCharacterRect(range) {
+    const owner = range.startContainer?.ownerDocument || document;
+    let node = range.startContainer;
+    let offset = range.startOffset;
+    // Walk down to a text node. An element container's offset indexes its children, so
+    // it points at the child the caret precedes.
+    while (node && node.nodeType !== Node.TEXT_NODE && node.childNodes?.length) {
+      node = node.childNodes[Math.min(offset, node.childNodes.length - 1)];
+      offset = 0;
+    }
+    if (!node || node.nodeType !== Node.TEXT_NODE || !node.nodeValue?.length) return null;
+    const start = Math.min(offset, node.nodeValue.length - 1);
+    try {
+      const probe = owner.createRange();
+      probe.setStart(node, start);
+      probe.setEnd(node, start + 1);
+      const box = probe.getBoundingClientRect();
+      return box.width || box.height ? box : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   function caretPoint() {
+    const visual = visualCaretPoint();
+    if (visual) return visual;
     const element = activeElement();
     if (!isEditable(element) || isTag(element, "select")) return null;
     const box = element.getBoundingClientRect();
@@ -1371,9 +1429,14 @@ const { ipcRenderer } = require("electron");
     const caret = caretPoint();
     let point = caret ? topViewportPoint(caret) : null;
     let height = caret?.height;
+    // The IME slot is a composition area: it reserves cells past the caret and paints
+    // them over the page. That is right where typing goes, but the visual caret only
+    // navigates — nothing is ever composed there — so reserving cells would blank text
+    // for no reason. Move the terminal cursor to it and leave the page alone.
+    const composing = !visualState?.caret;
     // A subframe cannot draw the surface in the top document, so it reports the raw
     // caret and the top frame's own report wins as soon as focus moves there.
-    const slot = point ? imeSlotRect({ ...point, height }) : null;
+    const slot = point && composing ? imeSlotRect({ ...point, height }) : null;
     if (slot) {
       point = { x: slot.left, y: slot.top };
       height = slot.height;
@@ -2334,10 +2397,14 @@ const { ipcRenderer } = require("electron");
 
   function cancelVisual(restoreMode = true) {
     if (!visualState) return;
+    const hadCaret = Boolean(visualState.caret);
     removeCaretBar();
     visualState.outline.remove();
     if (visualState.selectionMade) visualSelection()?.removeAllRanges();
     visualState = null;
+    // The terminal cursor was parked on the visual caret, and nothing else reports a
+    // caret on an ordinary page — so leaving would strand it on the last position.
+    if (hadCaret) reportCaret();
     if (restoreMode) normalMode();
   }
 
