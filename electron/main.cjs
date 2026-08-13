@@ -2719,7 +2719,11 @@ function dispatchPaste(text) {
   const contents = win.webContents;
   const normalize = (value) => value.replace(/\r\n?/g, "\n");
   const body = normalize(text);
-  if (normalize(clipboard.readText()) === body) {
+  const fromClipboard = normalize(clipboard.readText()) === body;
+  if (debugLogging) {
+    console.error(`tweb: paste ${body.length} chars clipboard=${fromClipboard}`);
+  }
+  if (fromClipboard) {
     contents.paste();
     return;
   }
