@@ -146,6 +146,14 @@ resource objects and caches each have their own subdirectory and quota.
 
 ## 5. Process structure
 
+> **This section is the target state, not what ships today.** `crates/twebd` is a placeholder
+> whose `main.rs` logs a TODO and waits; nothing in `electron/` refers to it. The shipping runtime
+> is the Electron engine in `electron/main.cjs`, one per pane, spawned by `tweb __pane` — so the
+> page registry is `tabs[]`, the frame producer is the paint path, and automation is the agent
+> socket, all inside that one process. Section 6.5's budgets describe what the daemon below is for:
+> a full Electron runtime per pane is exactly the duplication it exists to remove. Read 5.1 as the
+> S1 outcome; read `electron/main.cjs` for how a pane works now.
+
 ```text
 Host
 ├── tmux server
@@ -154,6 +162,7 @@ Host
 │           ├── terminal capability negotiation
 │           ├── keyboard/mouse decoding
 │           ├── SIGWINCH handling
+│           ├── pane visibility/focus, pushed to the engine
 │           └── the frame transport frontend
 │
 ├── twebd
@@ -209,6 +218,16 @@ Responsibilities:
 - forward keyboard/mouse to browserd
 - forward the pane visibility/focus lifecycle
 - show a text fallback when the terminal does not support graphics
+
+Where the shipping code stands against that list: pane identity, raw mode, `SIGWINCH`, input
+forwarding and the visibility/focus lifecycle are implemented — visibility is probed here and
+pushed to the engine over the stdin control channel, which is why the engine spawns no `tmux`
+children of its own. Two are not. `detect_capability` in `crates/tweb-pane/src/terminal.rs` exists
+but nothing calls it, so a terminal without Kitty graphics gets a running engine writing escape
+sequences it cannot render instead of the text fallback promised above. And frames do not pass
+through this process at all: the engine writes Kitty graphics straight to the inherited stdout, so
+"attach to a browserd page and display frames" describes the daemon architecture of 5.1 rather than
+the Electron one that ships.
 
 ### 5.3 The `tweb` CLI
 

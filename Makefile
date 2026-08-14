@@ -48,6 +48,8 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/mouse-click-state.cjs
 	node --check electron/tmux-visibility.cjs
 	node --check electron/window-session.cjs
+	node --check electron/agent-server.cjs
+	node --check electron/paste-state.cjs
 	node --check electron/url-normalization.cjs
 	node --check electron/patch-geometry.cjs
 	node --check electron/frame-rate-policy.cjs
