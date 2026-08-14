@@ -144,10 +144,25 @@ fn tmux_passthrough(sequence: &str) -> String {
     format!("\x1bPtmux;{escaped}\x1b\\")
 }
 
+/// The client TTYs that are actually showing this pane.
+///
+/// A delete written to a client TTY bypasses tmux, so the set has to be the panes a client
+/// can really see rather than every client on the window. A zoomed window keeps its window
+/// id while showing only its active pane, so matching on session and window alone treats
+/// every other pane in that window as visible and writes escape bytes into a terminal that
+/// is displaying something else. `electron/tmux-visibility.cjs` has always applied the zoom
+/// rule; this is the same rule on the Rust side, so the two agree about what "visible" means.
 fn matching_client_ttys(identity: &str, clients: &str) -> Vec<String> {
-    let Some((session, window)) = identity.trim().split_once('\t') else {
+    let mut identity_fields = identity.trim().split('\t');
+    let Some(session) = identity_fields.next() else {
         return Vec::new();
     };
+    let Some(window) = identity_fields.next() else {
+        return Vec::new();
+    };
+    // An identity without a pane id predates the zoom rule; falling back to window-only
+    // matching keeps such a caller working rather than silently deleting nothing.
+    let pane = identity_fields.next();
     clients
         .lines()
         .filter_map(|line| {
@@ -155,8 +170,19 @@ fn matching_client_ttys(identity: &str, clients: &str) -> Vec<String> {
             let tty = fields.next()?;
             let client_session = fields.next()?;
             let client_window = fields.next()?;
-            (client_session == session && client_window == window && !tty.is_empty())
-                .then(|| tty.to_string())
+            if client_session != session || client_window != window || tty.is_empty() {
+                return None;
+            }
+            let zoomed = fields.next().unwrap_or("");
+            let active_pane = fields.next().unwrap_or("");
+            if zoomed == "1" {
+                // Only the active pane is on screen for this client.
+                let pane = pane?;
+                if active_pane != pane {
+                    return None;
+                }
+            }
+            Some(tty.to_string())
         })
         .collect()
 }
@@ -168,7 +194,7 @@ fn visible_client_ttys(pane: &str) -> Vec<String> {
             "-p",
             "-t",
             pane,
-            "#{session_name}\t#{window_id}",
+            "#{session_name}\t#{window_id}\t#{pane_id}",
         ])
         .output()
     else {
@@ -178,7 +204,7 @@ fn visible_client_ttys(pane: &str) -> Vec<String> {
         .args([
             "list-clients",
             "-F",
-            "#{client_tty}\t#{client_session}\t#{window_id}",
+            "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}",
         ])
         .output()
     else {
@@ -773,15 +799,55 @@ mod tests {
     #[test]
     fn cleanup_only_targets_clients_showing_the_same_window() {
         let clients = concat!(
-            "/dev/ttys001\twork\t@3\n",
-            "/dev/ttys002\twork\t@4\n",
-            "/dev/ttys003\tother\t@3\n",
-            "/dev/ttys004\twork\t@3\n",
+            "/dev/ttys001\twork\t@3\t0\t%1\n",
+            "/dev/ttys002\twork\t@4\t0\t%9\n",
+            "/dev/ttys003\tother\t@3\t0\t%1\n",
+            "/dev/ttys004\twork\t@3\t0\t%1\n",
         );
         assert_eq!(
-            matching_client_ttys("work\t@3\n", clients),
+            matching_client_ttys("work\t@3\t%1\n", clients),
             vec!["/dev/ttys001", "/dev/ttys004"]
         );
         assert!(matching_client_ttys("invalid", clients).is_empty());
+    }
+
+    #[test]
+    fn a_zoomed_window_shows_only_its_active_pane() {
+        // The window id is unchanged by zoom, so matching on session and window alone
+        // would write a delete into a terminal that is displaying a different pane.
+        let clients = concat!(
+            "/dev/ttys001\twork\t@3\t1\t%7\n", // zoomed onto another pane
+            "/dev/ttys002\twork\t@3\t1\t%1\n", // zoomed onto us
+            "/dev/ttys003\twork\t@3\t0\t%7\n", // not zoomed: every pane is on screen
+        );
+        assert_eq!(
+            matching_client_ttys("work\t@3\t%1", clients),
+            vec!["/dev/ttys002", "/dev/ttys003"]
+        );
+    }
+
+    #[test]
+    fn a_client_line_without_zoom_fields_is_still_matched() {
+        // Field order is append-only, but a truncated line must not silently drop a client
+        // that is genuinely showing the pane.
+        let clients = "/dev/ttys001\twork\t@3\n";
+        assert_eq!(
+            matching_client_ttys("work\t@3\t%1", clients),
+            vec!["/dev/ttys001"]
+        );
+    }
+
+    #[test]
+    fn an_identity_without_a_pane_id_falls_back_to_window_matching() {
+        let clients = concat!(
+            "/dev/ttys001\twork\t@3\t0\t%1\n",
+            "/dev/ttys002\twork\t@3\t1\t%7\n",
+        );
+        // Unzoomed still matches; a zoomed client cannot be judged without a pane id, so it
+        // is left alone rather than written to.
+        assert_eq!(
+            matching_client_ttys("work\t@3", clients),
+            vec!["/dev/ttys001"]
+        );
     }
 }
