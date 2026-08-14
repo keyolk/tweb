@@ -399,14 +399,20 @@ extension
 
 ### 8.1 Addendum — measured frame costs (2026-08-14)
 
-Sections 1–3 were designed against research, not measurement. These numbers come from the shipping
+> **These measurements describe the path as it was before the work they prompted.** The whole-frame
+> PNG encode below is no longer what ships: damage now goes out as a cropped patch, and a whole frame
+> travels as raw pixels through the worker with PNG as the fallback. Section 8.3 records the path
+> that ships. The numbers here are why it changed, and they stay because a later reader needs to know
+> what the alternative cost.
+
+Sections 1–3 were designed against research, not measurement. These numbers come from the then-shipping
 Electron path on an M-series mac, Electron 43.2.0, a 1440×900 pane at `deviceScaleFactor: 2`
 (2880×1800 frame, 20.7MB raw), with **no** `disable-gpu-compositing` — the flag the shipping
 `main.cjs` does not set, so this is the production configuration. Three page profiles: `text` (a
 code-like document), `mixed` (cards plus noise canvases), `photo` (a full-viewport noise canvas).
 
 ```text
-whole-frame encode, on the Electron main thread (the current path)
+whole-frame encode, on the Electron main thread (the path as it then was)
 ├── image.toPNG()      text 23ms | mixed 28ms | photo 101ms
 ├── image.toBitmap()   1.4–5.9ms   (the copy, not the encode)
 └── image.getBitmap()  1.4–2.0ms   (a view; no copy)
@@ -441,7 +447,8 @@ Three conclusions, each of which changes what section 3's tile strategy should o
 3. **Damage is bimodal — tiny or whole-frame.** The 256×256 adaptive tile grid in section 3.1 is
    sized for a middle case the measurements do not show. A tiny-damage patch path plus a whole-frame
    path covers what actually happens; the tile grid is an optimization for a workload still to be
-   demonstrated.
+   demonstrated. Conclusions 1 and 2 have since been acted on; this one has not, and the tile
+   pipeline in `tweb-native` is still unused.
 
 Two API facts worth recording, both contradicting section 1:
 

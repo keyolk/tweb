@@ -292,6 +292,28 @@ pub fn install_runtime() -> Result<PathBuf> {
 mod tests {
     use super::{content_tag, extracted_app_dir, FILES};
 
+    // Every embedded .cjs ships inside the binary, but only the ones named in the
+    // Makefile's `electron-check` target are syntax-checked. A file in one list and not
+    // the other fails nowhere: `make check` passes, and the error surfaces when the app
+    // directory is unpacked at runtime. Two files sat in that gap before this test.
+    #[test]
+    fn every_embedded_module_is_syntax_checked_by_make() {
+        let makefile = include_str!("../../../Makefile");
+        let checked: Vec<&str> = makefile
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("node --check electron/"))
+            .collect();
+        let missing: Vec<&str> = FILES
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| name.ends_with(".cjs") && !checked.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "embedded but not in the Makefile electron-check target: {missing:?}"
+        );
+    }
+
     #[test]
     fn the_app_carries_every_file_it_requires() {
         let names: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
