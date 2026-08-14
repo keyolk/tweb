@@ -67,6 +67,10 @@ const FILES: &[(&str, &str)] = &[
         "audio-owner.cjs",
         include_str!("../../../electron/audio-owner.cjs"),
     ),
+    (
+        "orphan-watch.cjs",
+        include_str!("../../../electron/orphan-watch.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.

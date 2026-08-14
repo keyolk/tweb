@@ -53,6 +53,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/frame-rate-policy.cjs
 	node --check electron/history-view.cjs
 	node --check electron/audio-owner.cjs
+	node --check electron/orphan-watch.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

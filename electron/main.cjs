@@ -37,6 +37,7 @@ const {
   playbackWindowMs,
   settledFrameRate,
 } = require("./frame-rate-policy.cjs");
+const { isOrphaned } = require("./orphan-watch.cjs");
 const {
   parseClaim,
   claimExpired,
@@ -108,6 +109,7 @@ let windowSessionPath = null;
 let legacyWindowSessionPath = null;
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
+let orphanWatchdog = null;
 let agentServer = null;
 // Mirrors the preload's insert mode so key dispatch knows to go native.
 let pageInsertMode = false;
@@ -3761,6 +3763,19 @@ app.whenReady().then(() => {
   // show/focus/move listeners in `configureTab` are what actually keep a window hidden.
   // This caught anything they missed, twenty times a second, forever — a second is plenty
   // for a safety net whose job is to correct a window nobody can see anyway.
+  // Nothing in the OS ties this process to the frontend that spawned it: a frontend killed
+  // with SIGKILL, or one that crashes, cannot send the SIGTERM that normally stops us. The
+  // engine then keeps painting into a pane that has moved on — observed drawing a stale page
+  // over two other panes for four hours. Quitting through the normal path is what matters
+  // here, because that is what deletes the image from the terminal.
+  orphanWatchdog = setInterval(() => {
+    if (!isOrphaned(process.env.TWEB_FRONTEND_PID, process.ppid)) return;
+    clearInterval(orphanWatchdog);
+    orphanWatchdog = null;
+    console.error("tweb: frontend is gone, quitting");
+    app.quit();
+  }, 1000);
+  orphanWatchdog.unref();
   hiddenWindowWatchdog = setInterval(enforceHiddenWindows, 1000);
   hiddenWindowWatchdog.unref();
   enforceHiddenWindows();
