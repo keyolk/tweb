@@ -1,9 +1,31 @@
-# TWeb detailed design — the P1 damage-aware Kitty path + twebd/Electron integration
+# TWeb detailed design — the P1 damage-aware Kitty path (shipped) + the twebd/Electron integration (target)
 
 This document designs the first stage of `PREDEV.md`'s critical path (P1) and the twebd/Electron
 integration structure down to implementation depth. It assumes Engine = Electron is settled (S0).
 
 Research date: 2026-07-31.
+
+> **Read sections 1-7 as the target design, not as a description of the running system.** They were
+> written before implementation and are in the present indicative throughout; several of their
+> central claims are the opposite of what ships. Specifically:
+>
+> - **One whole Electron process runs per tmux pane.** `crates/tweb-pane/src/lib.rs` spawns one from
+>   every `tweb __pane`. The `BrowserWindow`s inside it are *tabs of that pane*, never other panes.
+>   So §4.1's topology and §4.2's "add a BrowserWindow per pane, not a new Electron process" describe
+>   the mitigation that has **not** been built — §4.2 is the single most misleading paragraph here.
+> - **`twebd` routes nothing.** It is a standalone supervisor binary that nothing in `electron/` or
+>   `crates/tweb-pane/` references. `RESIZE` / `VIS` / `INPUT` are newline-framed lines on the
+>   engine's **stdin**, written directly by the Rust frontend. Every arrow through `twebd` in §4.3,
+>   §4.4, §5.3, §6.1 and §6.3 is target state.
+> - **The Rust native module / SHM transport named in §4.3 was deleted** — see §8.4, which records
+>   the deletion but does not go back and correct §4.3. Frames go `paint` → `gfx-worker.cjs` → file →
+>   Kitty `t=f` on the inherited stdout.
+> - **No extension is loaded.** Nothing calls `session.loadExtension` (§7); the vimium-like behaviour
+>   ships as TWeb's own `electron/preload.cjs`.
+>
+> Sections **8.1-8.4 are dated, measured addenda** and do describe reality. Where a section below has
+> been superseded by a measurement, it now says so inline. DESIGN.md §5.1 carries the decision on
+> where the process boundary actually goes, argued from the marginal-cost measurement.
 
 ## 1. Securing the Electron offscreen rendering API
 
@@ -157,6 +179,10 @@ Capabilities are decided by a graphics query (`a=q` + `ESC[c`), never guessed fr
 
 ## 4. The twebd + Electron integration structure
 
+> **Target state.** What ships is one Electron process per pane, with no `twebd` in the path at all.
+> The topology below is the decided target — see DESIGN.md §5.1 for why the boundary sits where it
+> does and what the marginal-cost measurement says it is worth.
+
 ### 4.1 Process topology
 
 ```text
@@ -171,7 +197,7 @@ Host
 │
 ├── Electron main process (Node.js, single)
 │   ├── BrowserWindow #1 (offscreen, page = pane %3)
-│   │   └── webContents.on('paint') → Rust native module → SHM → Kitty graphics
+│   │   └── webContents.on('paint') → gfx-worker.cjs → frame file → Kitty t=f on the pane's tty
 │   ├── BrowserWindow #2 (offscreen, page = pane %5)
 │   │   └── ...
 │   ├── session.loadExtension() — vimium, 1Password and the like
@@ -180,7 +206,7 @@ Host
 │
 ├── twebd (a Rust daemon)
 │   ├── an authenticated Unix socket (peer credential check)
-│   ├── PageRegistry — tmux pane ID ↔ BrowserWindow/page mapping
+│   ├── PageRegistry — (tmux server, pane id) + generation ↔ page mapping
 │   ├── ProfileManager — a persistent profile per session
 │   ├── ResourceBroker — resource store, scope, TTL
 │   ├── AutomationController — serializes agent actions
@@ -190,7 +216,15 @@ Host
     └── The TWeb Profile Bridge extension (cookie transfer, engine-agnostic)
 ```
 
+Two lines above are target-only and worth naming because they read as shipped: nothing calls
+`session.loadExtension` (§7), and the Electron side has no IPC server — today the Rust frontend
+writes control lines to the engine's stdin.
+
 ### 4.2 The BrowserWindow reuse strategy (the heart of the memory mitigation)
+
+> **This is the mitigation that has not been built.** Today each pane is its own Electron process, so
+> the Node/V8 main process and the GPU process are duplicated per pane — exactly what this section
+> says they are not. The measurement of what the shared shape saves is in DESIGN.md §6.5.
 
 Orca creates a BrowserWindow per worktree. TWeb instead:
 
@@ -224,12 +258,18 @@ twebd (Unix socket, peer credential)
 Electron main process (IPC)
     ↓ create the BrowserWindow, loadURL
     ↓ webContents.on('paint') starts
-Rust native module
-    ↓ SHM write + Kitty graphics transfer
-tweb __pane (pane %3's foreground process)
-    ↓ receives the Kitty graphics
-    ↓ displays them in Ghostty
+gfx-worker.cjs
+    ↓ writes the frame file, then the Kitty t=f escape to the pane's tty
+the pane's terminal
+    ↓ renders the frame at the pane origin
 ```
+
+> **What ships instead.** There is no CLI → twebd → Electron hop: `tweb __pane` spawns its own
+> Electron and writes `RESIZE` / `VIS` / `INPUT` lines to that process's **stdin**. The "Rust native
+> module / SHM write" this section used to name was deleted (§8.4); the frame path above is the real
+> one, except that today the tty is the engine's *inherited* stdout rather than a tty the writer
+> opens. `task-2` measured that a process owning no pty can open a pane tty and write the same bytes
+> with the same result — see DESIGN.md §5.1.
 
 ### 4.4 The resize flow
 
@@ -237,7 +277,7 @@ tweb __pane (pane %3's foreground process)
 tmux pane resize
     ↓ SIGWINCH
 tweb __pane
-    ↓ terminal pixel query (CSI 14t)
+    ↓ tmux pane_width / pane_height / client_cell_width
     ↓ bump the viewport generation
     ↓ request a resize from twebd
 twebd
@@ -251,6 +291,11 @@ Electron
 
 No 100ms debounce. Coalescing per display frame only.
 
+> The pixel source above is corrected from "terminal pixel query (CSI 14t)": inside tmux, CSI 14t
+> describes the whole terminal rather than the pane, so the shipping frontend asks tmux
+> (`crates/tweb-pane/src/visibility.rs` `probe_args`). The twebd hop is target state — today the
+> resize line goes straight to the engine's stdin.
+
 ## 5. Frame lifetime and backpressure
 
 ### 5.1 The surface ring
@@ -262,6 +307,13 @@ No 100ms debounce. Coalescing per display frame only.
 - the producer never overwrites a surface before Ghostty releases it
 - when the queue falls behind, drop the intermediate frames not yet presented and keep only the latest complete frame
 ```
+
+> **No ring ships.** The shipping mechanism is a **one-deep** `pendingGfxFrame` slot
+> (`electron/main.cjs`) — a newer frame replaces the waiting one — plus a hidden pane collapsing its
+> surface to `width × 1` (`electron/surface-policy.cjs`). Same intent (never present a stale frame),
+> different mechanism. This matters beyond this section: DESIGN.md §7.7's gate "queue depth never
+> exceeding the configured surface ring size" is graded against a ring that does not exist, and is
+> restated there against the real queue.
 
 ### 5.2 Generation management
 
@@ -279,10 +331,22 @@ the generation is bumped on every resize
 hidden tmux window
     ↓ tweb __pane detects the visibility loss (a tmux hook or client visibility)
     ↓ reports hidden to twebd
-    ↓ Electron: stop webContents.beginFrameSubscription or setFrameRate(0)
-    ↓ release the GPU/SHM surfaces, optionally keeping only a compressed thumbnail
+    ↓ Electron: setFrameRate(1) + stopPainting()
+    ↓ collapse the offscreen surface to width x 1 (the GPU/SHM bytes go with it)
     ↓ reconcile with a full redraw on returning to visible
 ```
+
+> Two corrections against what ships. `setFrameRate(0)` is not available — Electron's floor is 1, so
+> the code pairs `setFrameRate(1)` with `stopPainting()`. And the visibility report does not go
+> through `twebd`: the frontend pushes a `VIS` line on the engine's stdin.
+>
+> **The hidden-pane gate is the runtime's job, not tmux's.** `task-2` measured that with
+> `allow-passthrough=all` — the setting on the reference machine — tmux forwards a passthrough
+> payload to the client no matter which window that client is viewing, and the payload's absolute
+> cursor move then lands the frame on whatever window the user is actually looking at. Under `on`,
+> tmux withholds it correctly; under `off` the route is silently dead. So a shared runtime writing
+> per-pane ttys must gate on its own `terminalVisible` and must read `allow-passthrough` rather than
+> assume tmux protects it.
 
 ## 6. Input handling (Browser mode)
 
@@ -327,6 +391,11 @@ receive no IME events. This is an S1/P3 validation item — does the native IME 
 window, or must `setMarkedText`/`insertText` be injected manually through the input injection path?
 
 ## 7. Extension loading
+
+> **Nothing here is implemented.** No code in `electron/` calls `loadExtension`, and no extension is
+> unpacked or loaded on any run. The vimium-like key handling that ships is TWeb's own preload
+> (`electron/preload.cjs`), which is a different mechanism with different limits — it cannot host a
+> third-party extension such as 1Password.
 
 ### 7.1 The Electron extension API
 
@@ -904,6 +973,10 @@ extending platforms (adding a new OS)
    transport can be swapped independently of the engine.
 
 ## 10. The implementation file structure (proposed)
+
+> **Proposed, and diverged from.** The shipping layout has no TypeScript anywhere — `electron/` is
+> plain `.cjs`, there is no `ipc.ts`, and the `native/` crate below was built and then deleted
+> (§8.4). Read this as an intent sketch; `crates/` and `electron/` are the real map.
 
 ```text
 tweb/

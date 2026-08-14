@@ -93,7 +93,8 @@ optional short alias   twb
 runtime daemon         twebd
 Chrome extension       TWeb Profile Bridge
 resource URI scheme    tweb://
-tmux key table         tweb-browser
+tmux key table         tweb-pass
+tmux pane flag         @tweb_browser
 ```
 
 `TWeb` is the human-readable product name and `tweb` the stable command used in scripts and shells.
@@ -123,11 +124,16 @@ tweb doctor [--fix]         diagnose terminal/tmux/Ghostty capabilities and mana
 The pane frontend's internal invocation is kept apart from the user-facing contract.
 
 ```text
-tweb __pane --page <opaque-id>
+tweb __pane [URL]
+tweb __pane --page <opaque-id>     (target state)
 ```
 
 `__pane` is an internal subcommand tmux launches and is not a documented automation API. Because it is
 the same binary, there is no separate `tweb-browser` install and no version skew.
+
+`--page` parses today but is not yet a page id: the value is forwarded as if it were a URL, because no
+page ids exist in the shipping path. It becomes real when a pane attaches to a daemon-held page
+(§5.1).
 
 `TWEB_CONFIG_HOME`, `TWEB_DATA_HOME` and `TWEB_RUNTIME_DIR` override the paths. The defaults follow
 platform convention.
@@ -146,13 +152,15 @@ resource objects and caches each have their own subdirectory and quota.
 
 ## 5. Process structure
 
-> **This section is the target state, not what ships today.** `crates/twebd` is a placeholder
-> whose `main.rs` logs a TODO and waits; nothing in `electron/` refers to it. The shipping runtime
-> is the Electron engine in `electron/main.cjs`, one per pane, spawned by `tweb __pane` — so the
-> page registry is `tabs[]`, the frame producer is the paint path, and automation is the agent
-> socket, all inside that one process. Section 6.5's budgets describe what the daemon below is for:
-> a full Electron runtime per pane is exactly the duplication it exists to remove. Read 5.1 as the
-> S1 outcome; read `electron/main.cjs` for how a pane works now.
+> **This section is the target state, not what ships today.** The shipping runtime is the Electron
+> engine in `electron/main.cjs`, **one whole process per pane**, spawned by `tweb __pane` — so the
+> page registry is `tabs[]`, the frame producer is the paint path, the frame sink is the engine's
+> inherited stdout, and automation is a per-pane agent socket, all inside that one process. A full
+> Electron runtime per pane is exactly the duplication §6.5's gate exists to remove, and §5.1 now
+> carries the measured decision on where the boundary goes. `crates/twebd` implements the supervisor
+> half of that decision (pane identity, generation, attach/detach, singleton, reaping) and nothing in
+> `electron/` refers to it yet. Read 5.1 as the S1 outcome; read `electron/main.cjs` for how a pane
+> works now.
 
 ```text
 Host
@@ -165,14 +173,18 @@ Host
 │           ├── pane visibility/focus, pushed to the engine
 │           └── the frame transport frontend
 │
-├── twebd
-│   ├── Chromium process manager
+├── twebd (Rust supervisor)
+│   ├── PaneRegistry — (tmux server, pane id) + generation
+│   ├── engine supervision — spawns and restarts the ONE Electron process
 │   ├── ProfileManager
-│   ├── PageRegistry
-│   ├── FrameProducer
 │   ├── ResourceBroker
 │   ├── AutomationController
 │   └── authenticated local IPC
+│       │
+│       └── Electron engine (one process, N panes)
+│           ├── BrowserWindow set for pane %3 (tabs)
+│           ├── BrowserWindow set for pane %5 (tabs)
+│           └── per-pane frame sink → the pane's tty
 │
 ├── tweb CLI (short-lived)
 │   ├── tmux/browser lifecycle
@@ -186,22 +198,131 @@ Host
 
 ### 5.1 `twebd`
 
-One daemon per host by default. A full Electron runtime is never started per pane.
+**The decided shape: `twebd` is a Rust supervisor that owns pane identity, routing and lifecycle,
+and it supervises ONE Electron process that hosts every pane as a `BrowserWindow`. It does not own
+Chromium directly.** That is one layer up from where this section originally put the boundary, and
+the measurement is why.
 
-Responsibilities:
+Measured 2026-08-14 on the reference machine, four real pages (Wikipedia / MDN / rust-lang.org /
+gnu.org) loaded in the same order on both paths, offscreen 1200×800@2x, summing `phys_footprint`
+over the whole process tree — never RSS, which double-counts shared Chromium pages and overstates by
+roughly 2×:
 
-- the Chromium browser process and crash recovery
+```text
+                 N windows in ONE Electron      N separate Electron instances
+  1 pane          154.4 MB /  4 procs            155.3 MB /  4 procs
+  2 panes         297.0 MB /  6 procs            361.5 MB /  9 procs
+  3 panes         357.0 MB /  7 procs            473.0 MB / 13 procs
+  4 panes         386.0 MB /  8 procs            563.8 MB / 17 procs
+
+  marginal pane    77.2 MB / 1.33 procs          136.2 MB / 4.33 procs   (mean over panes 2-4)
+
+  decomposed at 4 panes:
+    renderers     199.0 MB    |    200.0 MB    <- identical
+    main process   58.0 MB    |    161.8 MB    <- 2.8x, the duplicated Node/V8
+    GPU process   117.0 MB    |    174.4 MB    <- 1.5x
+    utility        12.0 MB    |     35.6 MB    <- 3.0x
+```
+
+The renderer line is the honest framing: **a renderer is the page, and sharing a runtime does not
+make pages cheaper.** What sharing removes is the duplicated Node/V8 main process, the duplicated GPU
+process and the duplicated utility processes — which is exactly, and only, what §6.5's release gate
+asks for. The claim to make is "≈31% at four panes and ≈55 MB saved per additional pane", not an
+order of magnitude.
+
+Isolating the runtime term from page weight — four ~600 B pages, so only the runtime moves — gives the
+cleanest statement of the same result, dead linear on both paths:
+
+```text
+                 shared               separate
+  2 panes    +34.0 MB / +1 proc    +98.5 MB / +4 procs
+  3 panes    +38.2 MB / +1 proc    +93.2 MB / +4 procs
+  4 panes    +38.1 MB / +1 proc    +97.3 MB / +4 procs
+```
+
+**A pane costs 38 MB and one process inside an existing Electron, and 96 MB and four processes as its
+own.**
+
+The third candidate — `twebd` driving Chromium over CDP with no Electron — was measured and **loses**.
+Stock headless Chrome with the same four pages: 830.0 MB over 13 processes, against shared Electron's
+386.0 MB over 8. The marginal per page is comparable and renderer-dominated; the floor is not.
+Chrome carries network/storage/alerts/speech services and an on-screen-configured GPU process for
+386 MB before a single page loads, where Electron's floor is 43 MB. Since dropping Electron could only
+ever buy back the main-process term — which sits flat at 58 MB across all four panes — spending
+343 MB of floor to win 58 MB back is not a trade worth taking. The caveat is stated with the number:
+this measured Google Chrome, not a trimmed Chromium build, so it rules out the *available* CDP path
+rather than a theoretical one.
+
+The second leg is the frame sink. A shared runtime cannot inherit N ptys, so the question was whether
+a process owning no pty can put Kitty graphics on a pane's tty. **Measured yes, with rendered
+pixels** — both on a bare tty and through tmux passthrough, using the same raw-pixel `f=32, t=f` file
+transport that ships, at 0.9–1.0 µs p50 for the 202-byte tty write. tmux's model of the pane cursor is
+unchanged across the write, because tmux never parses a passthrough payload.
+
+**And the daemon should nonetheless not write pane ttys directly.** Frames go daemon → frontend →
+the frontend's own pty, over the stdin control channel `crates/tweb-pane` already owns. The relay
+costs +9–18 µs p50 per frame (0.03–0.05% of a 30 Hz budget) and one extra 202-byte copy; the pixels
+cross neither route, since both send a path. What it buys is decisive:
+
+- **One writer per pty, by construction.** A pty write is **not atomic at any size** — this is a pipe
+  guarantee, not a line-discipline one. Two writers on one pty tore 2/1500 frames at 110 bytes,
+  25/1500 at 420, 496/1500 at 3072; one writer serialising both tore 0/1500 at every size. The direct
+  route structurally has two writers per pane, because the frontend already writes caret, cursor-shape
+  and teardown sequences to that same pty. A tear is worse than a dropped frame: the terminal falls
+  out of graphics-parsing state and prints the rest of the payload as literal text, which persists
+  until something repaints.
+- **The visibility gate stays in the process that knows.** In the daemon it would be a cache of
+  someone else's state.
+- **The tty, origin and passthrough wrapper stay with the frontend**, which already resolves them —
+  and `pane_tty` demonstrably goes stale.
+
+Three constraints hold under either route and are requirements, not footnotes:
+
+- **`allow-passthrough` must be read, not assumed.** `off` silently discards every frame — no error,
+  just a black pane, which deserves a diagnostic. `on` forwards only for visible panes. `all`
+  forwards always.
+- **Under `all`, tmux offers no hidden-pane protection at all.** A frame written to a hidden pane's
+  tty is drawn, at that pane's absolute coordinates, on whatever window the user is looking at. The
+  reference machine ships `all`. Today the only thing preventing this is the engine's own
+  `terminalVisible` gate.
+- **A pane's tty is not stable across the pane's life the way its id is.** A tty path can be reused
+  by an unrelated later pane, so it must be re-resolved or invalidated on `pane-died` — the
+  transport-layer twin of the pane-id reuse the page registry already models with a generation.
+
+Keep the file transport as the default. It is the only frame shape whose tty write is small enough
+that a tear is rare rather than routine, and its pixels stay off the tty entirely.
+
+One daemon per host by default. Under it, a full Electron runtime is started **once**, not per pane —
+which is not true today: today `tweb __pane` spawns one whole Electron per pane, and that is the
+duplication this section exists to remove.
+
+Responsibilities of `twebd`:
+
+- pane identity: a pane is keyed by (tmux server identity, pane id) with a monotonic generation,
+  because tmux reuses pane ids
+- registration lifetime: the frontend holds its control connection open for the pane's whole life, so
+  the kernel's close on that fd is the reap signal — no heartbeat, no pid polling
+- singleton ownership via `flock`, never a `connect()` probe (a wedged daemon accepts connections; a
+  daemon between `bind` and `listen` refuses them)
+- supervising the Electron engine process and restarting it on crash
+- routing per-pane requests to the engine and responses back
 - a persistent profile/context per session
-- page creation, closing, navigation and history
 - extension lifecycle
-- frame generation and backpressure
-- semantic accessibility/DOM snapshots
-- serializing agent actions
-- the human/agent control lease
+- serializing agent actions and the human/agent control lease
 - profile import/export policy
 
-The daemon socket lives in a user-private runtime directory and peer credentials are checked. Requests
-use opaque IDs only, and no API ever returns a cookie/token value.
+Responsibilities that stay in the Electron engine, because that is where the page lives: page
+creation/closing/navigation, frame generation and backpressure, accessibility/DOM snapshots.
+
+The daemon socket lives in a user-private runtime directory — the same one the per-pane agent sockets
+already use, so discovery stays one convention — and peer credentials are checked. Requests use
+opaque IDs only, and no API ever returns a cookie/token value.
+
+**Status.** The supervisor slice above (identity, generation, attach/detach/list/status, singleton,
+close-driven reaping) is implemented in `crates/twebd` with unit tests, and is deliberately
+architecture-neutral: it names panes and nothing else, carries no frame bytes and no page state.
+Nothing in `electron/` or `crates/tweb-pane/` references it yet, so the shipping path is unchanged.
+The engine-hosting half — one Electron, N panes, per-pane frame sinks — is scoped but not built.
 
 ### 5.2 The `tweb __pane` frontend
 
@@ -513,6 +634,17 @@ following, though, are architecture release gates.
 - A hidden page's GPU/SHM surface bytes converge to 0.
 - Queues and the resource cache have hard upper bounds.
 - After a page close, a renderer crash or a client detach, resource counts and private bytes return to baseline.
+
+**The first gate is failed today, by construction**, and knowing what passing it is worth is what
+§5.1's measurement settled. Each pane is its own Electron process, so the Node/V8 main process, the
+GPU process and the utility processes are duplicated exactly in proportion to the pane count. One
+Electron hosting N panes passes it: measured at four panes, the main-process term drops 161.8 MB →
+58.0 MB, the GPU term 174.4 → 117.0, utility 35.6 → 12.0, while the renderer term is unchanged
+(200.0 vs 199.0). Note what the gate asks and does not ask — it is about **duplication of the
+runtime**, not total bytes. A renderer is the page, so total footprint stays proportional to the
+number of pages under any architecture; the honest headline is ≈31% saved at four panes, ≈55 MB per
+additional pane. All figures are summed `phys_footprint` over the process tree; RSS is never the
+measure, as it overstates by roughly 2× on this workload.
 
 ### 6.6 Platform abstraction
 
@@ -918,12 +1050,19 @@ The main path is not marked `performance-ready` until it meets the following cri
 - 0 CPU full-frame copies of browser pixels on the GPU fast path
 - 0 frame transfers while a static page is idle
 - 0 frame production in a hidden tmux window
-- queue depth never exceeding the configured surface ring size
+- the pending-frame queue never holds more than the one frame it is specified to hold
 - only the new generation displayed within 2 display frames after a resize
 - sustainable frame pacing at a 60Hz display during a 1080p continuous scroll
 - no unbounded memory growth with two visible browser panes
 - 0 stale images, surfaces or shared-memory objects after 10 minutes of animation/video
 - surface handles reclaimed even when the producer, a tmux client or Ghostty crashes
+
+The queue gate is stated against the mechanism that exists. There is no surface ring: the shipping
+path keeps a **one-deep** pending-frame slot in which a newer frame replaces the waiting one, so the
+gate is "depth ≤ 1 and the frame presented is always the newest complete one". Under a shared runtime
+the same gate must hold **per pane**, and it acquires a second clause: no pane's frame may sit behind
+another pane's in a shared worker — a large raw frame for one pane must not delay a small patch for
+another.
 
 Latency and frame figures are quantified after fixing the reference hardware. The minimum measurement items:
 
@@ -959,7 +1098,7 @@ unchanged.
 ```text
 pane resize
     ↓ SIGWINCH
-terminal pixel query
+pane pixel size
     ↓
 bump the viewport generation
     ↓
@@ -976,8 +1115,14 @@ display the new-generation frame
 - Obtain the cell size, terminal padding and Retina scale from a capability query.
 - When the pixel size is unknown, use a cell-based estimate but surface that state.
 
+Inside tmux the pixel size does not come from a terminal query: CSI 14t describes the whole terminal,
+not the pane, so the frontend asks tmux for `pane_width`/`pane_height`/`client_cell_width` instead.
+The terminal query is the out-of-tmux path.
+
 Window/session changes are handled by client visibility notifications where possible rather than tmux hooks.
-Compatibility hooks must be idempotent, and browserd reconciles the full state after reconnecting.
+Compatibility hooks must be idempotent, and after any reconnect the full state is reconciled rather than
+assumed — today by the frontend re-pushing viewport and visibility to the engine, and under the shared
+runtime by the same reconciliation across the daemon connection.
 
 ## 9. The shortcut and input model
 
@@ -999,42 +1144,44 @@ attach, a session switch and error recovery all start in TMUX mode.
 
 ### 9.2 The tmux key table
 
-Pane options identify a browser surface.
+Pane options identify a browser surface. The shipped option is a flag on the pane, set by the
+frontend and removed when it exits:
 
 ```text
-@tweb_surface=browser
-@tweb_page_id=<opaque-id>
+@tweb_browser=1
 ```
 
-Entering Browser mode switches the client to a custom key table.
+Entering Browser mode switches the client to a custom key table. The shipped table is `tweb-pass`:
 
 ```tmux
-switch-client -T tweb-browser
+switch-client -T tweb-pass
 ```
 
-What the `tweb-browser` table does:
+What the passthrough table does:
 
 - the reserved toggle returns to the `root` table
-- `Any` sends the real key to the pane and re-arms the `tweb-browser` table
+- `Any` sends the real key to the pane and re-arms the table
 - mouse border events are used by tmux for resize
 - pane interior mouse events go to the browser process
 
 The conceptual configuration:
 
 ```tmux
-bind-key -n C-g if-shell -F '#{==:#{@tweb_surface},browser}' \
-  'switch-client -T tweb-browser' \
+bind-key -n C-g if-shell -F '#{==:#{@tweb_browser},1}' \
+  'switch-client -T tweb-pass' \
   'send-keys C-g'
 
-bind-key -T tweb-browser C-g switch-client -T root
-bind-key -T tweb-browser Any send-keys \; switch-client -T tweb-browser
+bind-key -T tweb-pass C-g switch-client -T root
+bind-key -T tweb-pass Any send-keys \; switch-client -T tweb-pass
 ```
 
 The exact behaviour of `Any` forwarding, key-up/repeat, extended keys and mouse is settled by conformance
 tests per supported tmux version. Versions where it does not work are never marked as supported.
 
-The default toggle is proposed as `C-g` but is configurable. In other panes the original `C-g` passes
-through as before. A separate binding is provided for sending a literal `C-g` to the browser.
+The toggle above is written as `C-g` for illustration and is configurable. What ships is `Ctrl-;`,
+carried as `User110` / private code 5001, because `C-g` is too valuable a key to take by default. In
+other panes the toggle key passes through as before, and a separate binding sends it literally to the
+browser.
 
 ### 9.3 Surfacing Browser mode
 
@@ -1473,7 +1620,11 @@ never presented as a plain local path.
 
 ### 12.8 The download flow
 
-Downloads never drop straight into some arbitrary `~/Downloads` of the browser daemon.
+Downloads are not to drop straight into some arbitrary `~/Downloads` of the browser daemon — but today
+they do. The engine writes to Electron's `app.getPath("downloads")`, overridable only by
+`TWEB_DOWNLOAD_DIR`, with no quarantine, no checksum and no ResourceBroker (the broker returns
+`NotFound` for every method). The flow below is target state, and the collision-avoidance guard is the
+only part of it that ships.
 
 ```text
 a browser download
@@ -1654,10 +1805,7 @@ Orca's active-agent attachment experience is kept, but the target and data bound
 
 ```text
 the pane frontend exits
-    the page survives for a grace period
-
-the pane re-attaches
-    reconnects to the existing BrowserPageID
+    the engine's page for that pane ends with it
 
 a tmux client detaches
     the browser process and pages survive
@@ -1665,15 +1813,25 @@ a tmux client detaches
 a tmux pane is killed
     the page ends, or is kept in history per policy
 
-browserd crashes
+the engine crashes
     the profile plus the URL/history are restored; the DOM/JS heap cannot be
 
 the host reboots
     the persistent profile plus the layout metadata are restored
 ```
 
-A BrowserPageID is never built from the tmux pane ID alone. Against pane ID reuse, the tmux server identity and
-an opaque generation are stored alongside it.
+The first line is deliberate and was decided against the alternative. A frontend that dies takes its
+page with it, because the failure it guards is worse: before that rule, an engine outlived its
+frontend and kept painting into a pane id tmux had since reused. There is therefore no grace period
+and no re-attach to a surviving page today. Under the shared runtime the mechanism changes but the
+rule does not — the frontend's control connection closing is what reaps its page, which the kernel
+delivers even on `kill -9`.
+
+A pane's identity is never the tmux pane id alone. Pane ids are reused, so a registration is keyed by
+(tmux server identity, pane id) and carries a monotonic generation; a re-attach on a reused id
+supersedes the old registration, and a detach or reap carrying a stale generation is a no-op. That
+rule is implemented in `crates/twebd/src/page_registry.rs` with tests. Page ids handed back to
+clients are opaque.
 
 ## 14. Performance goals and measurement
 
