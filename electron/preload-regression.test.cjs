@@ -186,7 +186,9 @@ test("another pane owning tmux zoom hides the browser image", () => {
   assert.match(main, /require\("\.\/tmux-visibility\.cjs"\)/);
   assert.match(main, /#\{window_zoomed_flag\}\\t#\{pane_id\}/);
   assert.match(main, /paneId: process\.env\.TMUX_PANE/);
-  assert.match(main, /const next = visibleTmuxClientTtys\(stdout, tmuxPlacement\);/);
+  // Both the frontend's push and the no-frontend fallback poll run this one function,
+  // so the zoom handling and the per-client delete cannot drift apart.
+  assert.match(main, /const next = visibleTmuxClientTtys\(clients, tmuxPlacement\);/);
   assert.match(main, /if \(!next\.has\(tty\)\) deleteImageFromClientTty\(tty\);/);
   assert.match(main, /if \(becameVisible\) repaintActiveTab\(\);/);
 });
@@ -739,15 +741,32 @@ test("agent socket refuses a path longer than sun_path", () => {
 test("visibility matches the pane's live placement, not its startup identity", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /let tmuxPlacement = null;/);
-  // The poll re-resolves placement before matching.
+  // The frontend re-resolves placement through `-t <pane id>` on every tick and the
+  // push carries the result, so the engine adopts the pane's current window rather
+  // than the one it started in.
+  assert.match(main, /applyClientListing\(push\.clients, push\.placement\)/);
+  assert.match(main, /function applyClientListing\(clients, placement\) \{\s*tmuxPlacement = placement;/);
+  assert.match(main, /visibleTmuxClientTtys\(clients, tmuxPlacement\)/);
+  // The no-frontend fallback keeps re-resolving it for itself.
   assert.match(main, /function syncTmuxVisibility\(\)[\s\S]*?"display-message", "-p", "-t", tmuxPlacement\.paneId/);
-  assert.match(main, /tmuxPlacement = \{ \.\.\.tmuxPlacement, session, windowId \}/);
-  assert.match(main, /visibleTmuxClientTtys\(stdout, tmuxPlacement\)/);
+  assert.match(main, /placement = \{ \.\.\.tmuxPlacement, session, windowId \}/);
   // The save path stays on the startup identity; a moved pane must not silently
   // adopt another window's stored tabs.
   assert.match(main, /const keys = windowSessionKeys\(tmuxIdentity\)/);
   // The in-flight guard has to clear even if spawning throws, or polling stops.
   assert.match(main, /catch \(spawnError\) \{\s*visibilityCheckRunning = false;/);
+});
+
+// The engine is launched directly by tests and by hand, where no frontend exists to push
+// visibility. It must not sit waiting for a line that will never arrive — a pane frozen at
+// its startup visibility looks exactly like a dead engine.
+test("visibility falls back to polling when no push arrives", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /const delay = process\.env\.TWEB_FRONTEND_PID \? VISIBILITY_PUSH_GRACE_MS : 0;/);
+  assert.match(main, /if \(visibilitySource === "push"\) return;\s*visibilitySource = "poll";/);
+  // The first push disarms both timers for good.
+  assert.match(main, /visibilitySource = "push";/);
+  assert.match(main, /if \(visibilityPollTimer\) \{\s*clearTimeout\(visibilityPollTimer\);/);
 });
 // Chromium's sendInputEvent takes Accelerator key codes, and it silently drops
 // names it does not know: measured in offscreen Chromium, keyDown with
