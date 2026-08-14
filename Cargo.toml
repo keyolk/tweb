@@ -4,10 +4,8 @@ members = [
     "crates/tweb-core",
     "crates/twebd",
     "crates/tweb-pane",
-    "crates/tweb-native",
     "crates/tweb-engine/electron",
     "crates/tweb-engine/tauri",
-    "crates/tweb-transport",
     "crates/tweb-platform",
     "crates/tweb-agent",
     "crates/tweb-cli",
@@ -41,8 +39,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # internal
 tweb-core = { path = "crates/tweb-core" }
-tweb-native = { path = "crates/tweb-native" }
-tweb-transport = { path = "crates/tweb-transport" }
 tweb-platform = { path = "crates/tweb-platform" }
 tweb-agent = { path = "crates/tweb-agent" }
 tweb-pane = { path = "crates/tweb-pane" }

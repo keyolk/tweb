@@ -37,8 +37,8 @@ const {
   playbackWindowMs,
   settledFrameRate,
 } = require("./frame-rate-policy.cjs");
-const { isOrphaned } = require("./orphan-watch.cjs");
-const { surfacePlan, surfaceResizeNeeded } = require("./surface-policy.cjs");
+const { isOrphaned, abandonedFrameFiles } = require("./orphan-watch.cjs");
+const { surfacePlan, surfaceResizeNeeded, agentNeedsGeometry } = require("./surface-policy.cjs");
 const {
   parseClaim,
   claimExpired,
@@ -1421,9 +1421,10 @@ function updatePaintingState() {
   // instead of re-placing. `repaintActiveTab` already falls back to `invalidate()` when
   // the cache is empty, which is the same path a resize generation bump takes.
   if (!terminalVisible) tabFrames.clear();
+  const held = surfaceHeldForAgent();
   for (const tab of tabs) {
     if (tab.isDestroyed()) continue;
-    const plan = surfacePlan(tab === win, terminalVisible, logicalContentSize(currentViewport()));
+    const plan = surfacePlan(tab === win, terminalVisible, logicalContentSize(currentViewport()), held);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? activeFrameRate : 1);
     applySurfacePlan(tab, plan);
@@ -1448,6 +1449,110 @@ function applySurfacePlan(tab, plan) {
   // back at 100% however the user had zoomed it.
   const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
   if (tab.webContents.getZoomFactor() !== zoomFactor) tab.webContents.setZoomFactor(zoomFactor);
+}
+
+// === The agent's surface hold =======================================================
+//
+// #22 collapses a hidden pane's surface to width x 1 to give the GPU bytes back. That is
+// right for the human — nobody is looking at the pane — and wrong for an agent, which
+// drives a pane precisely because it does not need a human watching. At innerHeight=1 the
+// page lays out with everything below the fold, so `snapshot` returned no refs and
+// `screenshot` returned a two-pixel strip. Both *succeeded*, which is why it was invisible.
+//
+// A hold restores the surface for the length of one agent call. It is a refcount rather
+// than a flag because calls overlap: `wait` polls for up to ten seconds while another
+// command runs against the same pane. And it has a deadline, because a hold leaked by an
+// exception would pin the surface open for the life of the process — undoing #22's gate
+// for anyone who ever ran one agent command.
+const AGENT_SURFACE_HOLD_TTL_MS = 30_000;
+let agentSurfaceHolds = 0;
+let agentSurfaceHoldDeadline = 0;
+
+function surfaceHeldForAgent() {
+  if (agentSurfaceHolds <= 0) return false;
+  if (Date.now() > agentSurfaceHoldDeadline) {
+    // The watchdog tick that notices is also the one that collapses the surface again, so
+    // a leak costs bytes for a bounded window rather than forever.
+    console.error(`tweb: agent surface hold expired with ${agentSurfaceHolds} outstanding`);
+    agentSurfaceHolds = 0;
+    return false;
+  }
+  return true;
+}
+
+// Restore was measured at about a millisecond in #22, but a page that is still loading can
+// take longer to produce its first frame at the new size. Bounded so a page that never
+// paints costs the call a beat rather than hanging it.
+const SURFACE_RESTORE_TIMEOUT_MS = 1500;
+
+// Waiting on layout is not enough: `capturePage` reads the compositor, and a window that
+// has just been resized and told to start painting has no frame in it yet — measured, the
+// first screenshots after a restore failed with UnknownVizError while `innerHeight`
+// already reported the full height. So the wait is for a paint at the restored size.
+//
+// The paint hands over the rendered page as a NativeImage, which is what `capturePage`
+// would have gone back to the compositor for. Keeping it is both cheaper and steadier:
+// asking the compositor again during the restore kept failing intermittently (2 of 6 runs)
+// even after the frame had arrived.
+function awaitRestoredFrame(contents) {
+  return new Promise((resolve) => {
+    const expected = renderedFrameSize(currentViewport());
+    let done = false;
+    const finish = (image) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { contents.off("paint", onPaint); } catch (error) { void error; }
+      resolve(image || null);
+    };
+    const onPaint = (_event, _dirty, image) => {
+      const size = image.getSize();
+      if (size.width === expected.width && size.height === expected.height) finish(image);
+    };
+    const timer = setTimeout(() => {
+      if (debugLogging) console.error("tweb: surface restore produced no frame in time");
+      finish(null);
+    }, SURFACE_RESTORE_TIMEOUT_MS);
+    contents.on("paint", onPaint);
+    // A hidden pane sits at 1fps and has just had `startPainting` called on it, so left
+    // alone the first frame could be a second away.
+    try { contents.invalidate(); } catch (error) { void error; }
+  });
+}
+
+// The frame the current hold restored, for a screenshot to use instead of re-asking the
+// compositor. Only ever set while a hold is open, and cleared with it.
+let agentSurfaceFrame = null;
+
+/// Runs `body` with the active tab laid out at its real size, whatever the pane shows.
+///
+/// A visible pane already has its full surface, so this is a straight pass-through there
+/// — the cost is paid only by the case that was broken.
+async function withAgentSurface(method, body) {
+  if (terminalVisible || !agentNeedsGeometry(method) || !win || win.isDestroyed()) {
+    return body();
+  }
+  agentSurfaceHolds += 1;
+  agentSurfaceHoldDeadline = Date.now() + AGENT_SURFACE_HOLD_TTL_MS;
+  const contents = win.webContents;
+  try {
+    updatePaintingState();
+    agentSurfaceFrame = await awaitRestoredFrame(contents);
+    return await body();
+  } finally {
+    agentSurfaceHolds = Math.max(0, agentSurfaceHolds - 1);
+    // Collapse again immediately rather than waiting for the watchdog's next tick: the
+    // gate #22 added is "a hidden page's surface bytes converge to 0", and converging a
+    // second late is fine while converging only on the next visit is not.
+    //
+    // The frame outlives an inner call so an overlapping one — `wait` polling for ten
+    // seconds while a screenshot runs — does not leave the other holding null and falling
+    // back to the capturePage that was unreliable here.
+    if (agentSurfaceHolds === 0) {
+      agentSurfaceFrame = null;
+      updatePaintingState();
+    }
+  }
 }
 
 
@@ -2554,14 +2659,23 @@ function agentTabList() {
 
 async function agentScreenshot(params) {
   const contents = agentContents();
-  const image = await contents.capturePage();
+  // On a hidden pane the hold has already collected a frame at the restored size, and
+  // going back to the compositor for a second copy of it is what failed intermittently.
+  const image = agentSurfaceFrame || await contents.capturePage();
   if (!params.path) return { png: image.toPNG().toString("base64") };
   const target = path.resolve(params.path);
   writeFileSync(target, image.toPNG());
   return { path: target, size: image.getSize() };
 }
 
-async function handleAgentCommand(method, params) {
+// Every agent command goes through the surface hold, so a pane nobody is watching still
+// answers with the page rather than with a one-pixel slice of it. The dispatch itself is
+// unchanged; `withAgentSurface` is a pass-through for a visible pane.
+function handleAgentCommand(method, params) {
+  return withAgentSurface(method, () => dispatchAgentCommand(method, params));
+}
+
+async function dispatchAgentCommand(method, params) {
   switch (method) {
     // Page-side methods run inside the preload, next to the hint machinery.
     case "snapshot":
@@ -3213,7 +3327,7 @@ function applyViewport(vp, origin = tmuxOrigin) {
     // resize is exactly when a hidden pane is most likely to be resized.
     for (const tab of tabs) {
       if (tab.isDestroyed()) continue;
-      applySurfacePlan(tab, surfacePlan(tab === win, terminalVisible, logical));
+      applySurfacePlan(tab, surfacePlan(tab === win, terminalVisible, logical, surfaceHeldForAgent()));
     }
   }
   win?.webContents.invalidate();
@@ -3904,6 +4018,7 @@ app.whenReady().then(() => {
   }
   markInteractionActivity();
   compactHistory();
+  sweepAbandonedFrameFiles();
   agentServer = startAgentServer({
     dispatch: handleAgentCommand,
     log: (message) => {
@@ -3935,6 +4050,37 @@ function cleanupFrameFiles() {
       }
     }
   }
+}
+
+// The above only removes this engine's own files, and only if it reaches its exit path. An
+// engine that is SIGKILLed — or orphaned, which is the case `orphan-watch.cjs` exists for —
+// leaves its last whole frame behind at up to 20MB, and nothing collects it. Observed: four
+// abandoned files in a real userData directory, the oldest five hours old.
+//
+// Sweeping at startup rather than on a timer: the files are named after the pid that wrote
+// them, so a dead one stays collectable indefinitely, and doing it once means never racing
+// a sibling that is mid-write.
+function sweepAbandonedFrameFiles() {
+  const directory = app.getPath("userData");
+  let names;
+  try {
+    names = readdirSync(directory);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: frame sweep failed: ${error.message}`);
+    return;
+  }
+  let removed = 0;
+  for (const name of abandonedFrameFiles(names, process.pid, processAlive)) {
+    try {
+      unlinkSync(path.join(directory, name));
+      removed += 1;
+    } catch (error) {
+      if (error.code !== "ENOENT" && debugLogging) {
+        console.error(`tweb: frame sweep failed ${name}: ${error.message}`);
+      }
+    }
+  }
+  if (removed > 0) console.error(`tweb: swept ${removed} frame files from dead engines`);
 }
 
 app.on("window-all-closed", () => {

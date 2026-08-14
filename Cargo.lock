@@ -3741,16 +3741,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tweb-native"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "parking_lot",
- "tracing",
- "tweb-core",
-]
-
-[[package]]
 name = "tweb-pane"
 version = "0.1.0"
 dependencies = [
@@ -3763,7 +3753,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tweb-core",
- "tweb-transport",
  "which",
 ]
 
@@ -3772,19 +3761,6 @@ name = "tweb-platform"
 version = "0.1.0"
 dependencies = [
  "tweb-core",
-]
-
-[[package]]
-name = "tweb-transport"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "parking_lot",
- "tokio",
- "tracing",
- "tweb-core",
- "tweb-native",
 ]
 
 [[package]]
@@ -3803,7 +3779,6 @@ dependencies = [
  "tweb-agent",
  "tweb-core",
  "tweb-platform",
- "tweb-transport",
  "uuid",
 ]
 

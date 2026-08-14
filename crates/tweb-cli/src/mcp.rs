@@ -259,6 +259,15 @@ fn call_tool(pane: Option<&str>, name: &str, arguments: &Value) -> Result<String
     for (key, value) in tool.fixed {
         params.insert((*key).to_string(), Value::String((*value).to_string()));
     }
+    // The engine writes the file, and its working directory is the Electron app
+    // directory rather than the agent's. A relative path would land there silently, so it
+    // is anchored to this server's directory — which is the agent's — before it is sent.
+    if tool.method == "screenshot" {
+        if let Some(Value::String(path)) = params.get("path") {
+            let resolved = crate::resolve_output_path(path, &std::env::current_dir()?);
+            params.insert("path".to_string(), Value::String(resolved));
+        }
+    }
     let result = agent::request(pane, tool.method, Value::Object(params))?;
     Ok(agent::render(tool.method, &result))
 }

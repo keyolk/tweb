@@ -12,6 +12,7 @@
 
 pub mod display;
 mod engine_app;
+pub mod graphics;
 pub mod input;
 pub mod resize;
 pub mod terminal;
@@ -255,6 +256,25 @@ pub async fn run(url: &str) -> Result<()> {
 /// Runs tweb __pane on the chosen browser engine and frame policy.
 pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     tracing::info!(url, ?options, "tweb __pane starting");
+
+    // Before anything is installed or entered: a terminal that cannot render Kitty graphics
+    // would otherwise get a running engine writing escape sequences at a pane that shows
+    // nothing (DESIGN.md 5.2's missing text fallback). The probe reads stdin, so it has to
+    // happen before the input loop takes it, and the message has to be written before the
+    // alternate screen is entered or leaving the screen would erase it.
+    //
+    // This refuses only on proof — see `graphics::gate`. Inside tmux, on a pipe, or against
+    // a terminal that never answers, it starts exactly as it did before this existed.
+    let support = terminal::probe_graphics_support();
+    let assume = std::env::var_os("TWEB_ASSUME_GRAPHICS").is_some();
+    tracing::info!(?support, assume, "terminal graphics capability");
+    if graphics::gate(support, assume) == graphics::Gate::Refuse {
+        eprint!("{}", graphics::unsupported_message());
+        // A clean exit rather than an error: the message above is the whole diagnosis, and
+        // returning `Err` would stack anyhow's error formatting on top of text written to be
+        // read as-is. Nothing here failed — tweb declined to start something unusable.
+        return Ok(());
+    }
 
     let pane = std::env::var("TMUX_PANE").unwrap_or_else(|_| "%0".to_string());
     tracing::info!(pane = %pane, "tmux pane identity");

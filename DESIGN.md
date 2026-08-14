@@ -222,12 +222,41 @@ Responsibilities:
 Where the shipping code stands against that list: pane identity, raw mode, `SIGWINCH`, input
 forwarding and the visibility/focus lifecycle are implemented — visibility is probed here and
 pushed to the engine over the stdin control channel, which is why the engine spawns no `tmux`
-children of its own. Two are not. `detect_capability` in `crates/tweb-pane/src/terminal.rs` exists
-but nothing calls it, so a terminal without Kitty graphics gets a running engine writing escape
-sequences it cannot render instead of the text fallback promised above. And frames do not pass
-through this process at all: the engine writes Kitty graphics straight to the inherited stdout, so
-"attach to a browserd page and display frames" describes the daemon architecture of 5.1 rather than
-the Electron one that ships.
+children of its own. Graphics detection is now implemented too, but not in the form this section
+originally assumed — see below. One responsibility is still missing: frames do not pass through
+this process at all. The engine writes Kitty graphics straight to the inherited stdout, so
+"attach to a browserd page and display frames" describes the daemon architecture of 5.1 rather
+than the Electron one that ships.
+
+#### Graphics detection is tri-state, because inside tmux the question cannot be answered
+
+`crates/tweb-pane/src/graphics.rs` gates engine startup on a Kitty graphics probe. The gate is
+deliberately weak, and the measurements are why (tmux 3.5a, Ghostty 1.3.1, Apple Terminal):
+
+```text
+context                         DA1 reply    Kitty a=q reply     verdict
+bare tty, Ghostty               0.1ms        Gi=31;OK  0.2ms     Supported
+bare tty, Apple Terminal        0.3ms        none                Unsupported
+inside tmux, Ghostty client     0.0ms        none                Unknown
+```
+
+tmux answers the device-attributes query itself and never forwards the outer terminal's graphics
+reply back — with or without DCS passthrough. So inside tmux a capable Ghostty is byte-for-byte
+indistinguishable from a terminal that cannot draw at all. "Detect the terminal's Kitty graphics
+capability" is therefore **not achievable inside tmux**, and tmux is the primary supported
+configuration (7.4). The frontend does not even send the query there; it would only put bytes on
+the wire for a reply that cannot come back.
+
+Only a *proven* negative stops the engine: the terminal answered DA1, proving it was listening,
+and still said nothing about graphics. Every ambiguity — inside tmux, not a tty, no answer within
+the deadline — starts the engine exactly as before the gate existed. Refusing to start on a
+terminal that would in fact have worked is worse than the blank pane this replaces, so ambiguity
+always resolves toward starting. `TWEB_ASSUME_GRAPHICS=1` overrides a refusal, since detection
+that is wrong in the refusing direction otherwise costs the user the browser entirely.
+
+The text fallback promised above is a startup message naming the missing protocol and how to fix
+it, not a text rendering of the page. It can only ever be reached outside tmux — the one context
+where the pane is the user's own terminal and the message stays on screen after the process exits.
 
 ### 5.3 The `tweb` CLI
 
@@ -772,8 +801,19 @@ basic transfer/display only
     → a coalesced full-frame fallback plus a lower frame cap
 ```
 
-Capabilities are decided by a graphics query, never guessed from the terminal name. The basic fallback is
-never marketed as a normal performance path, and the restricted state is surfaced in the UI.
+Capabilities are decided by a graphics query, never guessed from the terminal name — but only where
+that query can be answered. Inside tmux it cannot be (5.2 has the measurements), which is the single
+biggest constraint on this section.
+
+None of the three strategies above is implemented. `TerminalCapability` carries
+`kitty_animation`/`kitty_placement`/`kitty_shared_memory` fields, but nothing ever queries them —
+`detect_capability` hardcodes all three to false, and the only code that ever read a capability to
+pick a transfer strategy (`KittyGraphicsTransport` in the since-removed `tweb-transport`) consulted
+just `supports_kitty_basic()` and was never on the shipping Electron path. What ships is a single
+strategy: whole frames plus damage patches, chosen per frame by measured damage size rather than by
+terminal capability (DETAIL.md 8.1-8.3). There is no capability tier to market or to surface, so no
+restricted state is shown in the UI either. The only capability-driven fallback that exists is the
+startup gate in 5.2, which refuses to start on a terminal that proved it cannot draw.
 
 ### 7.4 tmux support tiers
 

@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 tweb-core.workspace = true
-tweb-transport.workspace = true
 tweb-platform.workspace = true
 tweb-agent.workspace = true
 tokio.workspace = true
