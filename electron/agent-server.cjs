@@ -29,6 +29,9 @@ function socketPath() {
   return process.env.TWEB_AGENT_SOCKET || path.join(runtimeDir(), socketName());
 }
 
+// At startup the pathname is either free or a dead engine's leftover, and rebinding is what
+// makes automation work again after a crash — so it is removed unconditionally here. What
+// must not happen is the *reverse* order: see `clearOwnedSocket` for the exit path.
 function clearStaleSocket(target) {
   try {
     fs.unlinkSync(target);
@@ -37,13 +40,48 @@ function clearStaleSocket(target) {
   }
 }
 
+function socketIdentity(target) {
+  try {
+    const stat = fs.lstatSync(target);
+    return { dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function sameSocketIdentity(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
+}
+
+// A pane id can be reused before its old engine notices that its frontend is gone. The new
+// engine unlinks the stale pathname and binds its own socket there, while the old server still
+// owns the now-unlinked inode. When that old engine exits later, it must not unlink the new
+// engine's socket. Device+inode is the socket instance's identity; the pathname is not.
+function clearOwnedSocket(target, ownedIdentity) {
+  try {
+    if (!sameSocketIdentity(socketIdentity(target), ownedIdentity)) return;
+    fs.unlinkSync(target);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+// The name actually handed to bind(2). The socket is bound here and renamed into place, so
+// this — not the final name — is what has to fit in sun_path.
+function stagingPath(target, pid = process.pid) {
+  return `${target}.${pid}.bind`;
+}
+
 // `dispatch(method, params)` returns a promise resolving to the JSON result.
 function startAgentServer({ dispatch, log = () => {} }) {
   const target = socketPath();
+  const staging = stagingPath(target);
   // sun_path is 104 bytes on macOS and 108 on Linux; a silently unbound socket
-  // would just look like "agent automation is broken" much later.
-  if (Buffer.byteLength(target) > 100) {
-    console.error(`tweb: agent socket path too long (${target.length} chars): ${target}`);
+  // would just look like "agent automation is broken" much later. The staging name is the
+  // longer of the two and the one bind sees, so it is what the budget is measured against.
+  if (Buffer.byteLength(staging) > 100) {
+    console.error(`tweb: agent socket path too long (${staging.length} chars): ${staging}`);
     return { path: target, close() {} };
   }
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
@@ -87,10 +125,30 @@ function startAgentServer({ dispatch, log = () => {} }) {
 
   // A dead automation socket is worth reporting even without TWEB_DEBUG.
   server.on("error", (error) => console.error(`tweb: agent socket error: ${error.message}`));
-  server.listen(target, () => {
+  // What we bound, not what the pathname points at later — see `clearOwnedSocket`.
+  let ownedIdentity = null;
+  // Bind to a private name and rename it into place, rather than binding the shared name
+  // directly. libuv unlinks *the path it bound* when the handle closes, and that path is a
+  // shared name a successor pane may already own — measured: a second server that rebound
+  // `agent-%42.sock` lost its socket the instant the first server closed, so the live pane
+  // went unreachable with no error anywhere. After the rename, close() can only ever unlink
+  // the staging name, which is nobody's.
+  clearStaleSocket(staging);
+  server.listen(staging, () => {
     try {
-      fs.chmodSync(target, 0o600);
+      fs.chmodSync(staging, 0o600);
     } catch (_) {}
+    try {
+      // Atomic: a client either sees the old socket or ours, never a missing path.
+      fs.renameSync(staging, target);
+    } catch (error) {
+      console.error(`tweb: agent socket rename failed: ${error.message}`);
+    }
+    try {
+      ownedIdentity = socketIdentity(target);
+    } catch (error) {
+      console.error(`tweb: agent socket identity unreadable: ${error.message}`);
+    }
     log(`agent socket ${target}`);
   });
 
@@ -100,9 +158,20 @@ function startAgentServer({ dispatch, log = () => {} }) {
       try {
         server.close();
       } catch (_) {}
-      clearStaleSocket(target);
+      // Only the socket instance we bound. A successor pane that reused this pane id has
+      // its own inode under the same name, and unlinking that would take automation away
+      // from a live pane.
+      clearOwnedSocket(target, ownedIdentity);
     },
   };
 }
 
-module.exports = { startAgentServer, socketPath, runtimeDir };
+module.exports = {
+  startAgentServer,
+  socketPath,
+  socketName,
+  stagingPath,
+  runtimeDir,
+  sameSocketIdentity,
+  clearOwnedSocket,
+};

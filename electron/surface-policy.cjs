@@ -87,7 +87,46 @@ function agentNeedsGeometry(method) {
   return typeof method === "string" && method.length > 0 && !GEOMETRY_FREE_METHODS.has(method);
 }
 
-module.exports = { surfacePlan, surfaceResizeNeeded, agentNeedsGeometry, COLLAPSED_HEIGHT };
+// The script a restoring hold runs in the page, to wait until the restored size has
+// actually been applied to the layout.
+//
+// Waiting for a paint at the restored size is not the same question. Measured on a hidden
+// pane, `eval innerHeight` 600ms apart against a page whose real height is 300: the
+// compositor delivered a correctly-sized 480px frame within 0-4ms every single time, while
+// the renderer answered `innerHeight === 1` on 13 of 30 calls. Polling from the main
+// process showed why — the layout takes ~380ms to catch up with `setContentSize`, and the
+// frame arrives first. So the agent read a page laid out at one pixel and got an empty
+// answer, which is the #22 symptom #24 was written to remove.
+//
+// The wait happens inside the renderer rather than as a poll from here: the `resize` event
+// fires exactly when the new size reaches layout, so there is no round trip per attempt.
+// Measured over 20 hidden `eval`s, p50 19ms against 396ms for the polling version, with
+// both at 0/20 wrong answers.
+//
+// `timeoutMs` is a backstop inside the page. The caller needs its own as well — a page
+// whose renderer is gone never runs this at all — see `withAgentSurface`.
+function restoredLayoutScript(timeoutMs) {
+  return `new Promise((resolve) => {
+    if (innerHeight > ${COLLAPSED_HEIGHT}) return resolve("already");
+    const settle = (how) => {
+      removeEventListener("resize", onResize);
+      clearTimeout(timer);
+      resolve(how);
+    };
+    const onResize = () => { if (innerHeight > ${COLLAPSED_HEIGHT}) settle("resize"); };
+    addEventListener("resize", onResize);
+    const timer = setTimeout(() => settle("timeout"), ${Math.max(0, Math.round(timeoutMs) || 0)});
+  })`;
+}
+
+module.exports = {
+  surfacePlan,
+  surfaceResizeNeeded,
+  paintingTransition,
+  agentNeedsGeometry,
+  restoredLayoutScript,
+  COLLAPSED_HEIGHT,
+};
 
 /// Whether a plan requires a `setContentSize` call. Reading before writing keeps a
 /// per-second reconciler from re-issuing a resize that would invalidate the page's
@@ -95,5 +134,30 @@ module.exports = { surfacePlan, surfaceResizeNeeded, agentNeedsGeometry, COLLAPS
 function surfaceResizeNeeded(plan, current) {
   if (!current) return true;
   return plan.width !== current.width || plan.height !== current.height;
+}
+
+/// Which of `startPainting`/`stopPainting` the reconciler still has to call, or
+/// `null` when the tab is already in the state the plan asks for.
+///
+/// Same read-before-write rule as `surfaceResizeNeeded`, and for a sharper reason:
+/// `startPainting()` on a webContents that is *already* painting provokes a fresh
+/// paint. Measured on Electron 43.2.0 over a settled static page, 8s windows:
+///
+///   touch nothing                      0 paints
+///   setFrameRate(the same value) 1/s   0 paints
+///   startPainting() 1/s                7 paints   (0.88/s)
+///
+/// The hidden-window watchdog reconciles once a second, so re-issuing it cost a
+/// static idle page ~1 whole frame every second forever — measured end to end at
+/// 126 frames over 120s of a page that was not changing, each one a 5.18MB raw
+/// file write. DESIGN.md 7.7 gates on "0 frame transfers while a static page is
+/// idle", and this is what stood between the pipeline and that number.
+function paintingTransition(wantPainting, isPainting) {
+  const want = Boolean(wantPainting);
+  // An engine that cannot report its state gets the call, since issuing a
+  // redundant one is recoverable and skipping a needed one leaves a pane blank.
+  if (typeof isPainting !== "boolean") return want ? "start" : "stop";
+  if (want === isPainting) return null;
+  return want ? "start" : "stop";
 }
 

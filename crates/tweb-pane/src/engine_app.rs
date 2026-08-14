@@ -75,6 +75,18 @@ const FILES: &[(&str, &str)] = &[
         "surface-policy.cjs",
         include_str!("../../../electron/surface-policy.cjs"),
     ),
+    (
+        "agent-key.cjs",
+        include_str!("../../../electron/agent-key.cjs"),
+    ),
+    (
+        "renderer-recovery.cjs",
+        include_str!("../../../electron/renderer-recovery.cjs"),
+    ),
+    (
+        "history-lock.cjs",
+        include_str!("../../../electron/history-lock.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.

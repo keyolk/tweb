@@ -731,7 +731,10 @@ test("history is shared through a file", () => {
 
 test("agent socket refuses a path longer than sun_path", () => {
   const server = fs.readFileSync(path.join(__dirname, "agent-server.cjs"), "utf8");
-  assert.match(server, /Buffer\.byteLength\(target\) > 100/);
+  // The socket is bound at a staging name and renamed into place, so the staging name — the
+  // longer of the two — is the one bind(2) sees and the one the budget has to be measured
+  // against. See agent-server.test.cjs for the behavioural test.
+  assert.match(server, /Buffer\.byteLength\(staging\) > 100/);
   assert.match(server, /agent-\$\{pane\.replace/);
 });
 

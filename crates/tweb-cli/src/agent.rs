@@ -140,20 +140,43 @@ pub fn resolve_socket(pane: Option<&str>) -> Result<PathBuf> {
     }
 }
 
+/// How long to wait for a pane to answer before giving up.
+///
+/// A page that wedges its main thread — an infinite loop in a script, a synchronous XHR —
+/// stops answering the page-side methods while the engine itself stays perfectly healthy.
+/// The wait has to outlast an ordinary slow page and still end.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One request/response round trip.
 pub fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("cannot reach browser pane at {}", socket.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
     let request = json!({ "id": 1, "method": method, "params": params });
     writeln!(writer, "{request}")?;
     writer.flush()?;
 
     let mut line = String::new();
-    BufReader::new(stream)
+    // A timeout and a closed socket are different diagnoses and were reported as the same
+    // one. Measured on a live pane whose renderer was wedged for 90s: the pane was up and
+    // `status` answered instantly, yet `eval` reported "browser pane closed the connection"
+    // — which sends someone looking for a dead engine that is not dead.
+    let read = BufReader::new(stream)
         .read_line(&mut line)
-        .context("browser pane closed the connection")?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => anyhow::anyhow!(
+                "browser pane did not answer {method} within {}s; the page is busy or its \
+                 renderer is gone (run `tweb diag --pane ...`: its `page` field probes the \
+                 page with its own short timeout, while `status` only reports the engine)",
+                READ_TIMEOUT.as_secs()
+            ),
+            _ => anyhow::Error::new(error).context("browser pane closed the connection"),
+        })?;
+    // Zero bytes is EOF: the engine went away mid-call rather than answering with nothing.
+    if read == 0 {
+        bail!("browser pane closed the connection before answering {method}");
+    }
     if line.trim().is_empty() {
         bail!("browser pane returned an empty response");
     }
