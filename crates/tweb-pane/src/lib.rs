@@ -15,6 +15,7 @@ mod engine_app;
 pub mod input;
 pub mod resize;
 pub mod terminal;
+pub mod visibility;
 
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -97,6 +98,42 @@ fn forward_changed_geometry(
     let current = terminal::window_geometry();
     tracing::debug!(?current, ?previous, "geometry poll");
     if let Some(message) = changed_geometry_message(previous, current) {
+        let _ = control_tx.send(message);
+    }
+}
+
+/// The tick that keeps the engine's view of this pane current: where it sits, how big it
+/// is, and which terminal clients can see it. All three come from one chained `tmux` call
+/// inside tmux, so a tick costs one child process instead of the three it would take to
+/// ask separately — and the engine spawns none at all.
+///
+/// Outside tmux there is nothing to be visible *to*, so only geometry is forwarded and the
+/// engine stays on its no-frontend default of always-visible.
+fn forward_pane_state(
+    control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    pane: &str,
+    previous_geometry: &mut Option<terminal::WindowGeometry>,
+    previous_visibility: &mut Option<String>,
+) {
+    if std::env::var_os("TMUX").is_none() {
+        forward_changed_geometry(control_tx, previous_geometry);
+        return;
+    }
+
+    let Some(probe) = visibility::run_probe(pane) else {
+        // A failed probe says nothing about the pane, so report nothing. Pushing a blank
+        // result would land as "no client can see this pane" and stop painting.
+        return;
+    };
+    tracing::debug!(?probe, "pane probe");
+
+    // `window_geometry()` is deliberately not called here: it would spawn its own tmux
+    // child for placement this probe already has. The PTY ioctl fallback it also owns
+    // only matters when tmux cannot answer, which is the branch that returned above.
+    if let Some(message) = changed_geometry_message(previous_geometry, probe.geometry) {
+        let _ = control_tx.send(message);
+    }
+    if let Some(message) = visibility::changed_visibility_message(previous_visibility, &probe) {
         let _ = control_tx.send(message);
     }
 }
@@ -354,11 +391,14 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     });
 
     // SIGWINCH and tmux geometry polling are used together: tmux may not send SIGWINCH
-    // for a layout change that moves the pane without changing its size.
+    // for a layout change that moves the pane without changing its size. The same tick
+    // carries visibility, which tmux cannot push at all — DESIGN.md 5.2 puts that
+    // lifecycle here, and the engine no longer polls tmux for it.
     // SIGUSR1 is how Electron asks the frontend — the owner of the PTY stdout — to
     // re-declare keyboard mode after its native DevTools reset the terminal modes.
     let sig_handle = tokio::spawn({
         let control_tx = control_tx.clone();
+        let pane = pane.clone();
         async move {
             let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
                 .expect("SIGHUP");
@@ -376,6 +416,9 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             let mut geometry_poll = tokio::time::interval(std::time::Duration::from_millis(250));
             geometry_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut previous_geometry = initial_geometry;
+            // Nothing has been pushed yet, so the first tick always sends — which is what
+            // gets the engine off its no-frontend default and onto the real answer.
+            let mut previous_visibility = None;
             loop {
                 tokio::select! {
                     _ = sighup.recv() => {
@@ -389,10 +432,20 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                         }
                     }
                     _ = sigwinch.recv() => {
-                        forward_changed_geometry(&control_tx, &mut previous_geometry);
+                        forward_pane_state(
+                            &control_tx,
+                            &pane,
+                            &mut previous_geometry,
+                            &mut previous_visibility,
+                        );
                     }
                     _ = geometry_poll.tick() => {
-                        forward_changed_geometry(&control_tx, &mut previous_geometry);
+                        forward_pane_state(
+                            &control_tx,
+                            &pane,
+                            &mut previous_geometry,
+                            &mut previous_visibility,
+                        );
                     }
                     _ = sigusr1.recv() => {
                         if std::env::var_os("TWEB_DEBUG").is_some() {
@@ -595,7 +648,10 @@ mod tests {
     #[test]
     fn deleting_covers_the_base_image_and_every_patch_slot() {
         let sequence = raw_kitty_delete(4242);
-        assert!(sequence.contains("i=4242,"), "base image id must be deleted");
+        assert!(
+            sequence.contains("i=4242,"),
+            "base image id must be deleted"
+        );
         for slot in 0..PATCH_ID_COUNT {
             let patch = 4243 + slot;
             assert!(
@@ -604,7 +660,10 @@ mod tests {
             );
         }
         // One command per id, and nothing beyond the reserved range.
-        assert_eq!(sequence.matches("a=d,d=I").count() as u32, PATCH_ID_COUNT + 1);
+        assert_eq!(
+            sequence.matches("a=d,d=I").count() as u32,
+            PATCH_ID_COUNT + 1
+        );
         let past_end = 4243 + PATCH_ID_COUNT;
         assert!(!sequence.contains(&format!("i={past_end},")));
     }

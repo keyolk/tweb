@@ -14,7 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, WebviewWindow};
 
 #[derive(Debug, Parser)]
@@ -292,6 +292,10 @@ pub(crate) fn activate_offscreen_window(_window: &WebviewWindow) -> tauri::Resul
     Ok(())
 }
 
+/// How long a half-decoded escape sequence waits for its remaining bytes before being
+/// flushed as-is.
+const ESCAPE_FLUSH: Duration = Duration::from_millis(35);
+
 fn spawn_control_thread(
     app: AppHandle,
     runtime: Arc<BrowserRuntime>,
@@ -318,17 +322,32 @@ fn spawn_control_thread(
 
     std::thread::spawn(move || {
         let mut decoder = InputDecoder::default();
+        // When an escape sequence is half-decoded, the rest of it has 35ms to arrive.
+        // That budget is an absolute deadline rather than a fresh timeout per receive:
+        // control lines the loop does not consume as input (RESIZE, and the frontend's
+        // visibility push) also wake the receive, and restarting the timer on each one
+        // would let a steady stream of them hold the escape unflushed indefinitely —
+        // swallowing the keypress.
+        let mut escape_deadline: Option<Instant> = None;
         loop {
             let line = if decoder.has_pending_escape() {
-                match lines_rx.recv_timeout(Duration::from_millis(35)) {
+                let deadline =
+                    *escape_deadline.get_or_insert_with(|| Instant::now() + ESCAPE_FLUSH);
+                match deadline
+                    .checked_duration_since(Instant::now())
+                    .map(|remaining| lines_rx.recv_timeout(remaining))
+                    .unwrap_or(Err(mpsc::RecvTimeoutError::Timeout))
+                {
                     Ok(line) => Some(line),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        escape_deadline = None;
                         dispatch_inputs(&runtime, decoder.flush_escape());
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => None,
                 }
             } else {
+                escape_deadline = None;
                 lines_rx.recv().ok()
             };
             let Some(line) = line else {

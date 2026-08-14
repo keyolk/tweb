@@ -29,7 +29,7 @@ const { MouseClickState } = require("./mouse-click-state.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
 const { startAgentServer, runtimeDir } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
-const { visibleTmuxClientTtys } = require("./tmux-visibility.cjs");
+const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
 const {
@@ -38,6 +38,7 @@ const {
   settledFrameRate,
 } = require("./frame-rate-policy.cjs");
 const { isOrphaned } = require("./orphan-watch.cjs");
+const { surfacePlan, surfaceResizeNeeded } = require("./surface-policy.cjs");
 const {
   parseClaim,
   claimExpired,
@@ -564,23 +565,45 @@ function initializeTmuxVisibility() {
   } catch (error) {
     if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
   }
-  syncTmuxVisibility();
-  scheduleVisibilityCheck();
+  armVisibilityFallback();
 }
 
-// Visibility is polled because tmux has no way to push it — but polling every 150ms means
-// two `tmux` child processes a second-and-a-bit, per pane, for the life of the process,
-// almost all of them reporting that nothing changed. (Measured: two tmux processes resident
-// at all times.) So the interval backs off while the answer keeps coming back the same and
-// snaps back the moment it does not, which is the only time latency matters.
+// === Pane visibility ================================================================
 //
-// DESIGN.md 5.2 puts this lifecycle in the Rust frontend, which already owns $TMUX_PANE and
-// SIGWINCH; pushing it over the existing stdin control channel would remove the poll
-// entirely. This is the cheap half of that fix.
-const VISIBILITY_POLL_MIN_MS = 150;
-const VISIBILITY_POLL_MAX_MS = 1200;
-let visibilityPollMs = VISIBILITY_POLL_MIN_MS;
+// DESIGN.md 5.2 gives the pane visibility lifecycle to the `tweb __pane` frontend, and
+// that is where it now lives: the frontend already owns $TMUX_PANE and already wakes on a
+// tick for geometry, so it probes tmux once per tick and pushes the raw result over the
+// control channel (see the VIS line in the control-channel parser). The engine spawns no
+// tmux child for visibility at all — it only reacts.
+//
+// FALLBACK, when no push ever arrives. The engine is launched directly by tests and by
+// hand, where there is no frontend to push. Two signals decide:
+//   - no TWEB_FRONTEND_PID  -> no frontend exists, poll from startup.
+//   - TWEB_FRONTEND_PID set -> wait one grace window for the first push, then poll anyway.
+// The grace window matters beyond belt-and-braces: an installed `tweb` older than this
+// main.cjs spawns an engine that would otherwise wait forever for a line that version
+// never sends, and the pane would freeze at its startup visibility. The first push
+// disarms the poll permanently; the frontend's death is already handled by the orphan
+// watchdog, so there is no need to re-arm afterwards.
+const VISIBILITY_PUSH_GRACE_MS = 2000;
+const VISIBILITY_POLL_MS = 250;
 let visibilityPollTimer = null;
+let visibilityFallbackTimer = null;
+let visibilitySource = "startup";
+let lastVisibilityPushAt = null;
+
+function armVisibilityFallback() {
+  if (!process.env.TMUX_PANE) return;
+  const delay = process.env.TWEB_FRONTEND_PID ? VISIBILITY_PUSH_GRACE_MS : 0;
+  visibilityFallbackTimer = setTimeout(() => {
+    visibilityFallbackTimer = null;
+    if (visibilitySource === "push") return;
+    visibilitySource = "poll";
+    if (debugLogging) console.error("tweb: visibility falling back to polling tmux");
+    scheduleVisibilityCheck();
+  }, delay);
+  visibilityFallbackTimer.unref();
+}
 
 function scheduleVisibilityCheck() {
   if (visibilityPollTimer) clearTimeout(visibilityPollTimer);
@@ -588,17 +611,58 @@ function scheduleVisibilityCheck() {
     visibilityPollTimer = null;
     syncTmuxVisibility();
     scheduleVisibilityCheck();
-  }, visibilityPollMs);
+  }, VISIBILITY_POLL_MS);
   visibilityPollTimer.unref();
 }
 
-// Called by the poll with whether this round saw anything move.
-function noteVisibilityPollResult(changed) {
-  if (changed) {
-    visibilityPollMs = VISIBILITY_POLL_MIN_MS;
-    return;
+// Applies a client listing to this pane. Shared by the push and the fallback poll so the
+// two cannot drift — the tty bookkeeping below is the part that has to stay identical.
+function applyClientListing(clients, placement) {
+  tmuxPlacement = placement;
+  const next = visibleTmuxClientTtys(clients, tmuxPlacement);
+  const wasVisible = terminalVisible;
+  // A client that stopped showing this pane keeps the image placed on it, so the delete
+  // goes to that tty directly.
+  for (const tty of visibleClientTtys) {
+    if (!next.has(tty)) deleteImageFromClientTty(tty);
   }
-  visibilityPollMs = Math.min(VISIBILITY_POLL_MAX_MS, Math.ceil(visibilityPollMs * 1.5));
+  const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
+  visibleClientTtys = next;
+  terminalVisible = next.size > 0;
+  if (wasVisible !== terminalVisible) {
+    updatePaintingState();
+    if (debugLogging) {
+      console.error(`tweb: visibility ${terminalVisible ? "visible" : "hidden"}`);
+    }
+  }
+  if (becameVisible) repaintActiveTab();
+}
+
+// The frontend's push. It carries the client key tables too, so the passthrough
+// reconcile runs off the same data instead of spawning its own `list-clients`.
+function applyVisibilityPush(hex) {
+  const push = parseVisibilityPush(hex);
+  if (!push) return;
+  if (visibilityFallbackTimer) {
+    clearTimeout(visibilityFallbackTimer);
+    visibilityFallbackTimer = null;
+  }
+  if (visibilityPollTimer) {
+    clearTimeout(visibilityPollTimer);
+    visibilityPollTimer = null;
+  }
+  visibilitySource = "push";
+  lastVisibilityPushAt = Date.now();
+  if (debugLogging
+    && (push.placement.session !== tmuxPlacement?.session
+      || push.placement.windowId !== tmuxPlacement?.windowId)) {
+    console.error(
+      `tweb: pane moved ${tmuxPlacement?.session}:${tmuxPlacement?.windowId}`
+      + ` -> ${push.placement.session}:${push.placement.windowId}`
+    );
+  }
+  applyClientListing(push.clients, push.placement);
+  reconcileTmuxPassthrough(push.states);
 }
 
 function syncTmuxVisibility() {
@@ -613,17 +677,10 @@ function syncTmuxVisibility() {
     ["display-message", "-p", "-t", tmuxPlacement.paneId, "#{session_name}\t#{window_id}"],
     { encoding: "utf8", timeout: 1000 },
     (placementError, placementOut) => {
+      let placement = tmuxPlacement;
       if (!placementError) {
         const [session, windowId] = String(placementOut).trim().split("\t");
-        if (session && windowId) {
-          if (debugLogging
-            && (session !== tmuxPlacement.session || windowId !== tmuxPlacement.windowId)) {
-            console.error(
-              `tweb: pane moved ${tmuxPlacement.session}:${tmuxPlacement.windowId} -> ${session}:${windowId}`
-            );
-          }
-          tmuxPlacement = { ...tmuxPlacement, session, windowId };
-        }
+        if (session && windowId) placement = { ...tmuxPlacement, session, windowId };
       }
       // The flag is cleared in the inner callback. If spawning it throws, clear
       // it here instead — otherwise visibility polling stops for good.
@@ -635,25 +692,13 @@ function syncTmuxVisibility() {
           (error, stdout) => {
             visibilityCheckRunning = false;
             if (error) return;
-            const next = visibleTmuxClientTtys(stdout, tmuxPlacement);
-
-            const wasVisible = terminalVisible;
-            for (const tty of visibleClientTtys) {
-              if (!next.has(tty)) deleteImageFromClientTty(tty);
-            }
-            const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
-            const lostClient = [...visibleClientTtys].some((tty) => !next.has(tty));
-            noteVisibilityPollResult(becameVisible || lostClient);
-            visibleClientTtys = next;
-            terminalVisible = next.size > 0;
+            // A push can land while this poll is still in flight: clearing the timer
+            // does not recall an execFile already running. Its answer predates the
+            // push, so applying it would put the engine back on stale state that
+            // nothing corrects until the next change.
+            if (visibilitySource === "push") return;
+            applyClientListing(stdout, placement);
             reconcileTmuxPassthrough();
-            if (wasVisible !== terminalVisible) {
-              updatePaintingState();
-              if (debugLogging) {
-                console.error(`tweb: visibility ${terminalVisible ? "visible" : "hidden"}`);
-              }
-            }
-            if (becameVisible) repaintActiveTab();
           }
         );
       } catch (spawnError) {
@@ -1360,16 +1405,51 @@ function restorePaneTitle() {
   } catch (e) {}
 }
 
+// The single place a tab's offscreen window is reconciled against what the pane shows.
+// Painting was already decided here; the surface size is decided here too, because the
+// two answer the same question and splitting them is how they drift.
+//
+// Measured (Electron 43.2.0, 1440x900 @dsf2, gpu-process phys_footprint): a background
+// window costs ~70MB of GPU surface and `stopPainting` gives back only ~7MB of it. The
+// surface itself is what holds the memory, so a tab that cannot put a pixel on screen
+// collapses its surface instead — see electron/surface-policy.cjs for why the collapsed
+// size keeps the full width.
 function updatePaintingState() {
+  // A hidden pane keeps nothing to redraw with. The cached frame is a 20.7MB decoded
+  // NativeImage (DETAIL.md 8.1) held in the main process, and DESIGN.md 6.5 gates on a
+  // hidden page's buffers converging to zero — so it goes, and the reveal below repaints
+  // instead of re-placing. `repaintActiveTab` already falls back to `invalidate()` when
+  // the cache is empty, which is the same path a resize generation bump takes.
+  if (!terminalVisible) tabFrames.clear();
   for (const tab of tabs) {
     if (tab.isDestroyed()) continue;
-    const active = tab === win && terminalVisible;
-    tab.webContents.setBackgroundThrottling(!active);
-    tab.webContents.setFrameRate(active ? activeFrameRate : 1);
-    if (active) tab.webContents.startPainting();
+    const plan = surfacePlan(tab === win, terminalVisible, logicalContentSize(currentViewport()));
+    tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
+    tab.webContents.setFrameRate(plan.painting ? activeFrameRate : 1);
+    applySurfacePlan(tab, plan);
+    if (plan.painting) tab.webContents.startPainting();
     else tab.webContents.stopPainting();
   }
 }
+
+function currentViewport() {
+  return lastViewport || queryViewportSize();
+}
+
+// Resizing re-lays out the page, so the size is read before it is written. A tab whose
+// surface grows back is repainted from scratch: the collapsed frames are a different size
+// and `queueFrame` drops them, so nothing stale can survive the restore.
+function applySurfacePlan(tab, plan) {
+  const size = tab.getContentSize();
+  const current = { width: size[0], height: size[1] };
+  if (!surfaceResizeNeeded(plan, current)) return;
+  tab.setContentSize(plan.width, plan.height);
+  // Chromium resets the zoom factor on a content resize, and a collapsed tab would come
+  // back at 100% however the user had zoomed it.
+  const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+  if (tab.webContents.getZoomFactor() !== zoomFactor) tab.webContents.setZoomFactor(zoomFactor);
+}
+
 
 // === Audio ownership across panes ===================================================
 //
@@ -2384,6 +2464,13 @@ function agentDiagnostics() {
       cmdBypass: cmdBypassEnabled,
       pageInsertMode,
       terminalVisible,
+      // Whether visibility is coming from the frontend's push or the no-frontend
+      // polling fallback, and how stale the last push is. A pane that reads hidden
+      // while showing "poll" is a frontend that never pushed, not a tmux problem.
+      visibilitySource,
+      visibilityPushAgeMs: lastVisibilityPushAt === null ? null : Date.now() - lastVisibilityPushAt,
+      visibleClientTtys: [...visibleClientTtys],
+      tmuxPlacement,
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
       // Where IME preedit will land. Comparing cell against point is the only way
       // to tell "caret parked on the wrong line" from "page never reported one".
@@ -2834,6 +2921,13 @@ function keepWindowHidden(tab) {
 
 function enforceHiddenWindows() {
   for (const window of BrowserWindow.getAllWindows()) keepWindowHidden(window);
+  // Surfaces are reconciled on the same tick. A transition calls `updatePaintingState`
+  // directly, but a pane that is *born* hidden has no transition to react to — measured:
+  // an engine started in an unviewed tmux window reported terminalVisible=false and sent
+  // zero frames, yet held a full-size surface indefinitely, which is the DESIGN.md 6.5
+  // gate failing at the one moment it most obviously should not. The reconciler reads
+  // each window's size before writing it, so a tick that has nothing to do costs nothing.
+  updatePaintingState();
 }
 
 function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
@@ -2997,6 +3091,12 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
 
   if (activate) activateTab(index);
   else {
+    // A tab opened in the background never becomes active, so nothing else would
+    // reconcile it and it would keep a full-size surface for the life of the window.
+    // Loading a page into an already-collapsed surface is safe: measured on a Wikipedia
+    // article, a page loaded at width x 1 and then restored reported the same
+    // scrollHeight and the same number of loaded images as one loaded at full size.
+    updatePaintingState();
     sendTabState();
     scheduleWindowSessionSave();
   }
@@ -3107,15 +3207,13 @@ function applyViewport(vp, origin = tmuxOrigin) {
     );
   }
   if (viewportChanged) {
+    // Through the same policy as everything else: resizing every tab to the new pane
+    // size unconditionally would re-inflate the collapsed surface of every background
+    // tab, and nothing would collapse them again until the next tab switch. A pane
+    // resize is exactly when a hidden pane is most likely to be resized.
     for (const tab of tabs) {
       if (tab.isDestroyed()) continue;
-      tab.setContentSize(logical.width, logical.height);
-      // Resizing the window resets the zoom factor, so a pane resize silently
-      // undid whatever the user had zoomed to. Put it back.
-      const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
-      if (tab.webContents.getZoomFactor() !== zoomFactor) {
-        tab.webContents.setZoomFactor(zoomFactor);
-      }
+      applySurfacePlan(tab, surfacePlan(tab === win, terminalVisible, logical));
     }
   }
   win?.webContents.invalidate();
@@ -3728,6 +3826,15 @@ process.stdin.on("data", (chunk) => {
         width: Number(resize[3]),
         height: Number(resize[4]),
       }, origin);
+      continue;
+    }
+
+    // The frontend's pane visibility push — see the pane visibility section. It is not
+    // interaction, so unlike RESIZE/INPUT it deliberately does not mark activity: a
+    // client attaching elsewhere must not count as someone using this pane.
+    const visibility = /^VIS\s+([0-9a-f]*)$/i.exec(line);
+    if (visibility) {
+      applyVisibilityPush(visibility[1]);
       continue;
     }
 
