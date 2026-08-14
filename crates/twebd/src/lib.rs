@@ -1,57 +1,39 @@
-//! twebd — TWeb browser daemon.
+//! twebd — the TWeb pane supervisor.
 //!
-//! One daemon per host. Rather than duplicating Electron/Node/V8 per pane, a single browser
-//! process manages many pages. DESIGN.md section 5.1.
+//! One supervisor per user. It owns the answer to a single question: **which panes exist right
+//! now, and which registration is each one currently on?** Every candidate architecture needs
+//! that answer identically — whether one Electron hosts N panes or twebd drives Chromium over CDP
+//! — so this crate is deliberately built to be correct before that choice is made, and to contain
+//! nothing that would have to change once it is.
 //!
-//! Responsibilities:
-//! - authenticated local IPC (user-private runtime directory, peer credential check)
-//! - PageRegistry (tmux pane ID ↔ page mapping)
-//! - ProfileManager (a persistent profile per session)
-//! - ResourceBroker (immutable resource store, scope, TTL)
-//! - AutomationController (serializing agent actions)
-//! - tmux integration (pane lifecycle, hooks)
+//! What that means concretely, and why it is a feature rather than an omission:
+//!
+//! - **No frame data in the protocol.** Where frame bytes flow is being measured separately.
+//!   A guess baked in here is how a tree ends up half-migrated.
+//! - **No page state** — no url, no title, no visibility, no navigation. Those belong to whichever
+//!   process ends up owning the engine.
+//! - **No engine, transport or platform handle on the daemon.** The previous `Daemon` struct held
+//!   `Box<dyn BrowserEngineAdapter>`, `Box<dyn FrameTransport>` and `Box<dyn PlatformService>`,
+//!   which is exactly why `main.rs` could only log a TODO: no implementation of any of them
+//!   exists, so the daemon could not be constructed at all. Dropping them is what makes the
+//!   supervisor a thing that runs.
+//!
+//! Nothing under `electron/` or `crates/tweb-pane/` references this crate. The shipping path
+//! (`tweb __pane` spawning its own Electron) is untouched and keeps working regardless.
+//!
+//! The three operational decisions, each argued where it is implemented:
+//! - socket location and discovery — [`paths`]
+//! - stale-socket detection and takeover — [`singleton`]
+//! - what happens when the last pane detaches — [`server`] (nothing: the daemon stays up)
 
 pub mod automation;
-pub mod ipc;
+pub mod cli;
+pub mod client;
 pub mod page_registry;
+pub mod paths;
 pub mod profile_manager;
+pub mod protocol;
 pub mod resource_broker;
+pub mod server;
+pub mod singleton;
 pub mod tmux;
-
-use tweb_core::engine::BrowserEngineAdapter;
-use tweb_core::frame::FrameTransport;
-use tweb_core::platform::PlatformService;
-use tweb_core::routing::BrowserRoutingPolicy;
-
-/// The twebd daemon's whole state.
-pub struct Daemon {
-    /// browser engine adapter (Electron/ExternalChrome/CustomShell).
-    pub engine: Box<dyn BrowserEngineAdapter>,
-    /// frame transport (KittyGraphics/NativeSurface/RemoteVideo).
-    pub transport: Box<dyn FrameTransport>,
-    /// platform service (macOS/Linux/Windows).
-    pub platform: Box<dyn PlatformService>,
-    /// The URL routing policy.
-    pub routing: BrowserRoutingPolicy,
-    /// page registry (pane ID ↔ page mapping).
-    pub pages: page_registry::PageRegistry,
-    /// profile manager.
-    pub profiles: profile_manager::ProfileManager,
-    /// resource broker.
-    pub resources: resource_broker::ResourceBrokerImpl,
-}
-
-impl Daemon {
-    /// Starts the daemon.
-    pub async fn run(self) -> anyhow::Result<()> {
-        tracing::info!("twebd starting");
-
-        // Start the IPC server.
-        let ipc_path = self.platform.paths().runtime_dir().join("twebd.sock");
-        let daemon = std::sync::Arc::new(self);
-
-        ipc::serve(daemon.clone(), &ipc_path).await?;
-
-        Ok(())
-    }
-}
