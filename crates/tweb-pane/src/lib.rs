@@ -48,8 +48,19 @@ impl Default for PaneOptions {
     }
 }
 
+/// How many damage-patch image ids the engine reserves after the base id. Must match
+/// `PATCH_ID_COUNT` in electron/main.cjs: the frontend deletes on paths the engine cannot
+/// reach (a pane torn down under it), and deleting only the base leaves the patches on
+/// screen — small strips of a page that is no longer there.
+const PATCH_ID_COUNT: u32 = 8;
+
 fn raw_kitty_delete(image_id: u32) -> String {
-    format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")
+    let mut sequence = format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\");
+    for slot in 0..PATCH_ID_COUNT {
+        let patch = image_id + 1 + slot;
+        sequence.push_str(&format!("\x1b_Ga=d,d=I,i={patch},q=2\x1b\\"));
+    }
+    sequence
 }
 
 fn resize_control_message(geometry: terminal::WindowGeometry) -> String {
@@ -573,9 +584,30 @@ fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
 mod tests {
     use super::{
         changed_geometry_message, matching_client_ttys, raw_kitty_delete, resolve_electron_paths,
-        tmux_passthrough,
+        tmux_passthrough, PATCH_ID_COUNT,
     };
     use crate::terminal::{WindowGeometry, WindowSize};
+
+    // The engine reserves `PATCH_ID_COUNT` ids after the base for damage patches. The
+    // frontend deletes on paths the engine cannot reach, so it has to know about them too —
+    // and the two constants live in different languages, where a drift is silent and shows
+    // up only as strips of a dead page left on screen.
+    #[test]
+    fn deleting_covers_the_base_image_and_every_patch_slot() {
+        let sequence = raw_kitty_delete(4242);
+        assert!(sequence.contains("i=4242,"), "base image id must be deleted");
+        for slot in 0..PATCH_ID_COUNT {
+            let patch = 4243 + slot;
+            assert!(
+                sequence.contains(&format!("i={patch},")),
+                "patch slot {patch} must be deleted"
+            );
+        }
+        // One command per id, and nothing beyond the reserved range.
+        assert_eq!(sequence.matches("a=d,d=I").count() as u32, PATCH_ID_COUNT + 1);
+        let past_end = 4243 + PATCH_ID_COUNT;
+        assert!(!sequence.contains(&format!("i={past_end},")));
+    }
 
     #[test]
     fn electron_paths_resolve_against_the_original_working_directory() {
@@ -607,9 +639,16 @@ mod tests {
         );
     }
 
+    // Every delete is q=2: the terminal must not answer. A reply would be read as terminal
+    // input by whatever is running in the pane once the browser is gone.
     #[test]
-    fn kitty_delete_targets_one_image_without_response() {
-        assert_eq!(raw_kitty_delete(42), "\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
+    fn kitty_delete_asks_for_no_response() {
+        let sequence = raw_kitty_delete(42);
+        assert_eq!(
+            sequence.matches("q=2").count(),
+            sequence.matches("a=d,d=I").count()
+        );
+        assert!(sequence.starts_with("\x1b_Ga=d,d=I,i=42,q=2\x1b\\"));
     }
 
     #[test]
