@@ -447,8 +447,9 @@ Three conclusions, each of which changes what section 3's tile strategy should o
 3. **Damage is bimodal — tiny or whole-frame.** The 256×256 adaptive tile grid in section 3.1 is
    sized for a middle case the measurements do not show. A tiny-damage patch path plus a whole-frame
    path covers what actually happens; the tile grid is an optimization for a workload still to be
-   demonstrated. Conclusions 1 and 2 have since been acted on; this one has not, and the tile
-   pipeline in `tweb-native` is still unused.
+   demonstrated. All three conclusions have since been acted on. This one took longest because
+   acting on it meant deleting rather than writing: section 8.4 records the measurements that
+   settled it and the removal of `tweb-native`/`tweb-transport` that followed.
 
 Two API facts worth recording, both contradicting section 1:
 
@@ -560,10 +561,9 @@ page. The worker pays more (a BGRA→RGBA pass plus a 20MB write against a 1.5MB
 sits behind the one-deep queue that already drops superseded frames, and the wire size never reaches
 the terminal as escape-sequence bytes: the file medium sends a path.
 
-The ~9ms channel swap is the one remaining CPU pass over the frame, and the natural place for the
-SIMD conversion `tweb-native` already implements — the first piece of that crate with a measured
-reason to exist. It is left in JS here because moving it needs a Node↔Rust bridge, which is a larger
-change than the one this measurement justifies.
+The ~9ms channel swap is the one remaining CPU pass over the frame, and it stays in JS. It was
+written here as the place `tweb-native`'s SIMD conversion would finally earn its keep; section 8.4
+measured that claim and found no SIMD to move and nothing for it to win. The crate is gone.
 
 Two constraints on when raw can be used:
 
@@ -589,6 +589,96 @@ Probed before implementing, since both were assumptions:
   when it is only a visibility one.
 - **`f=32` over `t=f` renders correctly**, verified by eye with a deliberately asymmetric test image
   — a white band over a magenta/yellow split, where a channel swap or a stride error is obvious.
+
+### 8.4 Addendum — the tile pipeline was deleted (2026-08-14)
+
+`crates/tweb-native` (damage tiling, BGRA→RGBA conversion, an SHM ring, a Kitty transport) and
+`crates/tweb-transport` (which wrapped it) are removed. 1113 lines and 10 tests. This section records
+what was measured, since a later reader will find the crates in git history and needs to know why
+they are not here.
+
+The obvious alternative was to keep the crate and finally use it: section 8.3 named the ~9ms channel
+swap as the one remaining per-frame CPU pass and the place `tweb-native`'s SIMD conversion would earn
+its keep. That is the claim that was measured, and it failed on every term.
+
+**There was no SIMD to move.** `simd` appeared twice in the whole repository, both times in a comment
+describing code nobody had written. `convert.rs`'s conversion was a scalar `chunks_exact(4)` byte
+swap — the same algorithm as the JS loop in `gfx-worker.cjs`, in a different language.
+
+**The swap is memory-bandwidth bound, so SIMD had no headroom to win.** Same 20.7MB frame as 8.1/8.3
+(2880×1800 BGRA), 30 iterations after 5 warmup, medians. `bench/convert-bench.rs`, `rustc -O`:
+
+```text
+copy only, no swap at all (the memcpy floor)   0.347ms
+scalar loop, as tweb-native had it             0.431ms
+u32 form, the one that autovectorizes          1.140ms
+```
+
+Swapping channels costs 1.24× a bare copy of the same bytes, so the work is already at the floor —
+there is nothing between 0.431ms and 0.347ms for a hand-written NEON kernel to take. The third line
+is a warning for anyone who tries anyway: the "optimized" u32 shuffle is 2.6× *slower* than the naive
+loop, because LLVM already vectorizes `chunks_exact(4)` and the manual form defeats it.
+
+**And the swap was not the expensive half of the worker.** `bench/convert-bench.cjs`, node v25.8.1,
+same frame:
+
+```text
+swap, bytewise (what ships)      p50  7.43ms    p90  7.93ms
+swap, u32 (JS, no bridge)        p50  2.94ms    p90  3.01ms
+write 20.7MB + rename            p50 17.69ms    p90 64.72ms
+whole worker pass, as it ships   p50 11.58ms
+```
+
+8.3 attributed the worker's 12.5–24.3ms to "a BGRA→RGBA pass plus a 20MB write" without splitting
+them. The write is the larger term, and its p90 alone is 9× the entire swap. A Rust bridge cannot
+touch it.
+
+So the arithmetic of wiring it up: 7.43ms → 0.43ms is 7.0ms saved at best, of which ten lines of JS
+(the u32 form, which is faster in JS even though it is slower in Rust) get 4.5ms for free. The
+bridge's marginal value over doing nothing but editing `gfx-worker.cjs` is 2.5ms — of *worker* time,
+which 8.3 already established does not decide input latency, on frames the one-deep queue is
+discarding anyway (`droppedByBackpressure` was 358 on the pane measured below). Buying that needs a
+napi/node-gyp toolchain this repository does not have, per-platform `.node` binaries, and an entry in
+both the `engine_app.rs` embed list and the `electron-check` target. It is a bad trade by about an
+order of magnitude.
+
+**The shipping binary had already thrown the crates away.** The measurement that should have been
+taken first:
+
+```text
+nm -a target/release/tweb | grep -c 'tweb_native\|tweb_transport'      0
+strings target/release/tweb | grep -c 'TileGrid\|ShmRing'              0
+```
+
+The linker dead-stripped both crates out entirely. They were compiled on every build and discarded.
+The two dependency edges that pulled them in — `tweb-transport.workspace = true` in
+`crates/tweb-pane/Cargo.toml` and `crates/twebd/Cargo.toml` — were declared and never used; neither
+crate's `src/` contained the string `tweb_transport`. Confirmed against a live pane: `tweb diag`
+reported `wholeFormat: "raw"`, 23076 whole frames and 252 patches, all through `gfx-worker.cjs`.
+
+The remaining argument was to keep it for the twebd path of DESIGN.md 5.1. It does not survive
+reading the code as something a twebd implementer would inherit:
+
+- **`shm.rs` was not shared memory.** `ShmBuffer::create` was `vec![0u8; size]` followed by
+  `mem::forget`, with a TODO for the real `shm_open`; `destroy()` was `let _ = self.ptr;` and freed
+  nothing, so a ring leaked its whole allocation on every resize and drop — 41MB at the measured
+  frame size. `ShmRing::resize` read `self.buffers.len()` *after* `mem::take` emptied it, so the
+  replacement count was always 2 and a 3-buffer ring silently became a 2-buffer one.
+- **The SHM transfer it existed for was a stub.** The `SharedMemory` arm of `kitty.rs::encode` sent
+  an empty payload under `// TODO: include the SHM name in the header`, and `tweb-transport` wrote
+  the frame into SHM and then transmitted the whole thing as `KittyMedium::Direct` regardless.
+- **Its Kitty writer could not work in tmux.** `write_to_stdout` wrote bare APC sequences with no
+  passthrough wrapping anywhere in the crate, and tmux is the primary supported configuration.
+- **The tile grid targeted the workload 8.1 measured as absent**, which is where this started.
+
+Inheriting that is not a head start on twebd; it is scaffolding that is wrong about the protocol,
+wrong about the workload, and leaking, plus the time to find that out. It is in git at `0f1c3b1`
+(last touched in `c6255a6`) for anyone who wants to read it.
+
+What the removal recovered: 41.3MiB of `target/` and 666 object files (`cargo clean -p tweb-native -p
+tweb-transport`), and 3.98s of the compile of every clean build. The benchmarks stay under `bench/`,
+because the next person to propose a native module for this should have to beat these numbers rather
+than re-derive them.
 
 ## 9. A component and interface structure built for extension
 

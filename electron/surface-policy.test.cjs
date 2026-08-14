@@ -2,7 +2,8 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { surfacePlan, surfaceResizeNeeded, COLLAPSED_HEIGHT } = require("./surface-policy.cjs");
+const { surfacePlan, surfaceResizeNeeded, agentNeedsGeometry, COLLAPSED_HEIGHT } =
+  require("./surface-policy.cjs");
 
 const LOGICAL = { width: 1440, height: 900 };
 
@@ -74,4 +75,65 @@ test("collapse then restore returns exactly the original size", () => {
   assert.strictEqual(surfaceResizeNeeded(collapsed, full), true);
   assert.strictEqual(surfaceResizeNeeded(full, collapsed), true);
   assert.strictEqual(surfaceResizeNeeded(full, surfacePlan(true, true, LOGICAL)), false);
+});
+
+// An agent driving a pane in a tmux window nobody is viewing used to get a 554x2
+// screenshot and a snapshot with zero refs, because the collapsed surface laid the page
+// out at innerHeight=1 and every element fell outside the viewport.
+test("a hold lays the active tab out at full size even while the pane is hidden", () => {
+  const held = surfacePlan(true, false, LOGICAL, true);
+  assert.strictEqual(held.height, 900);
+  assert.strictEqual(held.painting, true, "capturePage needs the window painting");
+  assert.strictEqual(held.backgroundThrottling, false);
+});
+
+test("a hold does not inflate a background tab", () => {
+  // Only the tab the agent actually drives is worth the bytes; the rest of the window's
+  // tabs stay collapsed exactly as they were.
+  assert.deepStrictEqual(
+    surfacePlan(false, false, LOGICAL, true),
+    surfacePlan(false, false, LOGICAL, false)
+  );
+});
+
+test("a hold changes nothing for a pane that is already visible", () => {
+  assert.deepStrictEqual(
+    surfacePlan(true, true, LOGICAL, true),
+    surfacePlan(true, true, LOGICAL, false)
+  );
+});
+
+test("the hold defaults off, so a caller that never heard of it collapses as before", () => {
+  assert.deepStrictEqual(surfacePlan(true, false, LOGICAL), surfacePlan(true, false, LOGICAL, false));
+  assert.strictEqual(surfacePlan(true, false, LOGICAL).height, COLLAPSED_HEIGHT);
+});
+
+test("every method that reaches the page holds the surface open", () => {
+  for (const method of [
+    "snapshot", "query", "info", "act", "eval", "wait", "screenshot",
+    "press", "type", "navigate", "back", "forward", "reload",
+  ]) {
+    assert.strictEqual(agentNeedsGeometry(method), true, method);
+  }
+});
+
+test("engine bookkeeping does not pay for a surface it cannot use", () => {
+  for (const method of [
+    "diag", "engine-log", "status", "tabs", "tab", "tab-new", "tab-close",
+    "console", "errors", "audio-sync",
+  ]) {
+    assert.strictEqual(agentNeedsGeometry(method), false, method);
+  }
+});
+
+// A method nobody anticipated is far more likely to read layout than not, and holding a
+// surface it did not need costs one collapse cycle rather than an empty result.
+test("an unknown method is assumed to need geometry", () => {
+  assert.strictEqual(agentNeedsGeometry("some-future-method"), true);
+});
+
+test("a non-method is not a method", () => {
+  for (const value of [null, undefined, "", 42, {}]) {
+    assert.strictEqual(agentNeedsGeometry(value), false, JSON.stringify(value));
+  }
 });

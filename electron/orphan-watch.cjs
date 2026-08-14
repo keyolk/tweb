@@ -32,4 +32,38 @@ function isOrphaned(frontendPid, parentPid) {
   return Number(parentPid) === INIT_PID;
 }
 
-module.exports = { isOrphaned, INIT_PID };
+// A whole frame is written to a file named after the pid that wrote it, and that file is
+// removed on exit. An engine that never gets to run its exit path — SIGKILL, a panic, the
+// same orphaning this module exists to catch — leaves its last frame behind, and nothing
+// else looks for it. Measured in a real userData directory: four abandoned files, 1-2.5MB
+// each, the oldest five hours old. The pid in the name is what makes them collectable.
+const FRAME_FILE_PATTERN = /^tweb-frame-(\d+)-\d+\.(?:png|rgba)(?:\.tmp)?$/;
+
+/**
+ * Picks the frame files left behind by engines that are no longer running.
+ *
+ * `isAlive` is injected rather than called here so the decision stays testable without
+ * spawning processes. Our own files are excluded by pid, not by name, so the in-flight
+ * `.tmp` of a live sibling is safe too.
+ *
+ * @param {string[]} names directory entries to consider
+ * @param {number} selfPid this engine's pid, never swept
+ * @param {(pid: number) => boolean} isAlive whether a pid still exists
+ * @returns {string[]} the names safe to delete
+ */
+function abandonedFrameFiles(names, selfPid, isAlive) {
+  const collectable = [];
+  for (const name of names || []) {
+    const match = FRAME_FILE_PATTERN.exec(String(name));
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pid === Number(selfPid)) continue;
+    // A pid we cannot judge is left alone: deleting a live engine's frame file mid-write
+    // costs it a frame, while leaving a dead one costs a few megabytes until next launch.
+    if (isAlive(pid)) continue;
+    collectable.push(name);
+  }
+  return collectable;
+}
+
+module.exports = { isOrphaned, abandonedFrameFiles, FRAME_FILE_PATTERN, INIT_PID };

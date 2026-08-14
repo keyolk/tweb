@@ -376,9 +376,13 @@ pub fn terminal_cleanup() {
 }
 
 /// Detects terminal capabilities.
+///
+/// Runs before the input loop takes stdin, so the interactive probe is allowed here.
+/// Inside tmux the pane's own geometry wins: CSI 14t describes the whole terminal
+/// window, and the pane is only a part of it.
 pub fn detect_capability() -> Result<TerminalCapability> {
     let has_kitty = query_kitty_graphics();
-    let pixel_size = query_pixel_size();
+    let probe = probe_terminal_pixels();
 
     Ok(TerminalCapability {
         kitty_graphics: has_kitty,
@@ -387,8 +391,8 @@ pub fn detect_capability() -> Result<TerminalCapability> {
         kitty_shared_memory: false,
         pixel_mouse: false,
         extended_keyboard: false,
-        pixel_size,
-        cell_size: query_cell_size(),
+        pixel_size: query_pixel_size().or(probe.pixel_size),
+        cell_size: query_cell_size().or(probe.cell_size),
     })
 }
 
@@ -423,52 +427,253 @@ fn query_kitty_graphics() -> bool {
     buf[..n].windows(3).any(|w| w == b"Gi=")
 }
 
-/// terminal pixel size query (CSI 14t).
+/// The pane's pixel size.
+///
+/// Never reads stdin, so it is safe to call while the input loop owns it — which is
+/// what the resize path does. Inside tmux the pane's cells are scaled by the client
+/// cell size; outside it the PTY's `ws_xpixel`/`ws_ypixel` answer. The interactive
+/// CSI 14t probe belongs to one-shot contexts only: see [`probe_terminal_pixels`].
 pub fn query_pixel_size() -> Option<PixelSize> {
-    if std::env::var("TMUX").is_ok() {
-        return query_tmux_pixel_size();
-    }
-    None // TODO: query CSI 14t directly.
-}
-
-/// tmux pane pixel size query.
-fn query_tmux_pixel_size() -> Option<PixelSize> {
-    let pane = std::env::var("TMUX_PANE").ok()?;
-    let output = std::process::Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            &pane,
-            "#{pane_width} #{pane_height}",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let size = window_geometry()?.size;
+    if size.width == 0 || size.height == 0 {
         return None;
     }
-    let line = String::from_utf8_lossy(&output.stdout);
-    let parts: Vec<u32> = line
-        .split_whitespace()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let cols = parts[0];
-    let rows = parts[1];
-    let (cell_w, cell_h) = query_cell_size().unwrap_or((8, 16));
-    Some(PixelSize::new(cols * cell_w, rows * cell_h))
+    Some(PixelSize::new(
+        u32::from(size.width),
+        u32::from(size.height),
+    ))
 }
 
-/// cell size query (CSI 16t). TODO: issue the real query.
+/// The cell size as tmux reports it for the attached client. No stdin, same reason.
 pub fn query_cell_size() -> Option<(u32, u32)> {
-    None
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    let value = tmux_query(&pane, "#{client_cell_width} #{client_cell_height}")?;
+    // Reuse the cell scaler on a 1x1 pane: it already rejects nan, zero and negatives.
+    let (width, height) = pixel_size_from_cells(1, 1, &value)?;
+    Some((u32::from(width), u32::from(height)))
+}
+
+/// What the terminal answered to the pixel-size probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PixelProbe {
+    /// The window's pixel size, from CSI 14t.
+    pub pixel_size: Option<PixelSize>,
+    /// One cell's pixel size, from CSI 16t.
+    pub cell_size: Option<(u32, u32)>,
+}
+
+/// Asks the terminal for its pixel size (CSI 14t) and cell size (CSI 16t).
+///
+/// This reads stdin, so it may only run in a one-shot context — `tweb doctor`, or
+/// capability detection before the input loop starts. Calling it once the input loop
+/// owns stdin would race it and swallow the user's keystrokes.
+///
+/// The queries are followed by DA1 (`ESC[c`). Terminals answer in order and every one
+/// of them answers DA1, so a DA reply with no `t` reply ahead of it means "not
+/// supported" rather than "too slow" — no fixed sleep needed, and nothing is left
+/// unread to leak onto the shell prompt after we exit.
+pub fn probe_terminal_pixels() -> PixelProbe {
+    let Some(response) = query_with_da1(b"\x1b[14t\x1b[16t\x1b[c") else {
+        return PixelProbe::default();
+    };
+    parse_pixel_probe(&response)
+}
+
+/// Writes `query` and reads the reply up to the terminating DA1 response.
+fn query_with_da1(query: &[u8]) -> Option<Vec<u8>> {
+    let fd = io::stdin().as_raw_fd();
+    if unsafe { libc::isatty(fd) } != 1 {
+        return None;
+    }
+
+    // Without raw mode the reply is line buffered and echoed back at the user.
+    let _raw = RawModeGuard::enter().ok()?;
+
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return None;
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+    {
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        let _ = lock.write_all(query);
+        let _ = lock.flush();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 256];
+    let mut stdin = io::stdin();
+    while std::time::Instant::now() < deadline {
+        match stdin.read(&mut chunk) {
+            Ok(0) => {}
+            Ok(n) => {
+                response.extend_from_slice(&chunk[..n]);
+                if has_da1_reply(&response) {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    Some(response)
+}
+
+/// Whether the buffer holds a complete DA1 reply (`ESC [ ? ... c`).
+fn has_da1_reply(response: &[u8]) -> bool {
+    let mut rest = response;
+    while let Some(start) = rest.windows(3).position(|w| w == b"\x1b[?") {
+        let tail = &rest[start + 3..];
+        if tail.contains(&b'c') {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+/// Reads the XTWINOPS replies out of a probe response.
+///
+/// `ESC [ 4 ; height ; width t` is the window size and `ESC [ 6 ; height ; width t`
+/// the cell size — height first in both, which is the opposite of every other size
+/// in this codebase.
+fn parse_pixel_probe(response: &[u8]) -> PixelProbe {
+    let mut probe = PixelProbe::default();
+    let text = String::from_utf8_lossy(response);
+    for report in text.split('\u{1b}') {
+        let Some(body) = report.strip_prefix('[') else {
+            continue;
+        };
+        let Some(body) = body.split('t').next() else {
+            continue;
+        };
+        let mut fields = body.split(';');
+        let kind = fields.next().unwrap_or_default();
+        let Some(height) = fields
+            .next()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(width) = fields
+            .next()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if fields.next().is_some() || width == 0 || height == 0 {
+            continue;
+        }
+        match kind {
+            "4" => probe.pixel_size = Some(PixelSize::new(width, height)),
+            "6" => probe.cell_size = Some((width, height)),
+            _ => {}
+        }
+    }
+    probe
+}
+
+/// Asks the terminal whether it speaks the Kitty graphics protocol.
+///
+/// Separate from [`detect_capability`]'s `query_kitty_graphics` because that one cannot be
+/// used as a gate: it sends a bare `a=q` with no payload and waits a fixed 50ms. Measured
+/// against a real Ghostty on a bare tty, that form draws no reply at all — the terminal
+/// answers a payload-carrying query in 0.2ms and ignores the bare one — so it reports "no
+/// graphics" on every terminal in every context. Sending an id and a one-pixel payload is
+/// what makes the reply mandatory and self-identifying (`Gi=31;...`).
+///
+/// Only ever queries on a bare tty. Inside tmux the answer cannot come back at all (see
+/// [`crate::graphics`]), so nothing is sent: an APC query whose reply tmux swallows leaves
+/// bytes on the wire for no possible benefit.
+pub fn probe_graphics_support() -> crate::graphics::GraphicsSupport {
+    use crate::graphics::GraphicsSupport;
+
+    if std::env::var_os("TMUX").is_some() {
+        return GraphicsSupport::Unknown;
+    }
+    // A one-pixel RGB payload: `a=q` validates and answers without storing an image, so
+    // there is nothing to clean up afterwards.
+    let Some(response) = query_with_da1(b"\x1b_Ga=q,i=31,s=1,v=1,f=24;AAAA\x1b\\\x1b[c") else {
+        return GraphicsSupport::Unknown;
+    };
+    classify_graphics_reply(&response)
+}
+
+/// Reads a graphics verdict out of a probe response.
+///
+/// The DA1 reply is what separates "no" from "too slow": every terminal answers it, and it
+/// is sent after the graphics reply. So a complete DA1 with no graphics reply ahead of it
+/// means the terminal was listening and had nothing to say, while no DA1 at all means the
+/// probe simply did not get an answer and nothing may be concluded.
+///
+/// Any `_G` reply counts as support, including an error such as `Gi=31;ENOENT`. A terminal
+/// that can report a protocol error is a terminal that parsed the protocol.
+pub fn classify_graphics_reply(response: &[u8]) -> crate::graphics::GraphicsSupport {
+    use crate::graphics::GraphicsSupport;
+
+    if response.windows(3).any(|window| window == b"\x1b_G") {
+        return GraphicsSupport::Supported;
+    }
+    if has_da1_reply(response) {
+        return GraphicsSupport::Unsupported;
+    }
+    GraphicsSupport::Unknown
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pane_geometry, parse_pane_placement, pixel_size_from_cells};
+    use super::{
+        classify_graphics_reply, has_da1_reply, parse_pane_geometry, parse_pane_placement,
+        parse_pixel_probe, pixel_size_from_cells,
+    };
+    use crate::graphics::GraphicsSupport;
+    use tweb_core::geometry::PixelSize;
+
+    /// The three byte strings below were captured from real terminals rather than written
+    /// from the specification, because the specification is what the shipping bare-`a=q`
+    /// probe was written against and it never worked.
+    #[test]
+    fn classifies_the_replies_real_terminals_actually_sent() {
+        // Ghostty 1.3.1 on a bare tty: the graphics reply, then DA1.
+        assert_eq!(
+            classify_graphics_reply(b"\x1b_Gi=31;OK\x1b\\\x1b[?62;22;52c"),
+            GraphicsSupport::Supported
+        );
+        // Apple Terminal on a bare tty: DA1 alone. It was listening, and it cannot draw.
+        assert_eq!(
+            classify_graphics_reply(b"\x1b[?1;2c"),
+            GraphicsSupport::Unsupported
+        );
+        // Inside tmux 3.5a with a Ghostty client: also DA1 alone, because tmux answers it
+        // itself and never forwards the terminal's graphics reply. Identical bytes to the
+        // case above, which is exactly why the probe never runs inside tmux.
+        assert_eq!(
+            classify_graphics_reply(b"\x1b[?1;2;4c"),
+            GraphicsSupport::Unsupported
+        );
+        // Nothing came back: unknowable, never a refusal.
+        assert_eq!(classify_graphics_reply(b""), GraphicsSupport::Unknown);
+    }
+
+    /// A terminal that answers the graphics query with an error still parsed the protocol,
+    /// and half a DA1 is not a verdict — it is a read that ended early.
+    #[test]
+    fn an_error_reply_still_proves_support_and_a_partial_da1_proves_nothing() {
+        assert_eq!(
+            classify_graphics_reply(b"\x1b_Gi=31;ENOENT:bad\x1b\\\x1b[?62;c"),
+            GraphicsSupport::Supported
+        );
+        assert_eq!(
+            classify_graphics_reply(b"\x1b[?62;22"),
+            GraphicsSupport::Unknown
+        );
+    }
 
     /// The pane's own row picks out its placement; a sibling's must not.
     #[test]
@@ -511,5 +716,53 @@ mod tests {
         for value in ["nan 12", "0 0", "-1 12", "12"] {
             assert_eq!(pixel_size_from_cells(80, 24, value), None, "{value}");
         }
+    }
+
+    /// XTWINOPS reports height before width — the opposite of every other size here.
+    #[test]
+    fn reads_the_xtwinops_replies() {
+        let probe = parse_pixel_probe(b"\x1b[4;1050;1680t\x1b[6;28;14t\x1b[?62;c");
+        assert_eq!(probe.pixel_size, Some(PixelSize::new(1680, 1050)));
+        assert_eq!(probe.cell_size, Some((14, 28)));
+    }
+
+    /// A terminal that answers DA but not XTWINOPS is how "unsupported" arrives.
+    #[test]
+    fn reports_nothing_when_only_da_answers() {
+        let probe = parse_pixel_probe(b"\x1b[?62;22c");
+        assert_eq!(probe.pixel_size, None);
+        assert_eq!(probe.cell_size, None);
+    }
+
+    /// A zero or malformed report is no report — a zero size would divide by zero
+    /// downstream, and a text report (`ESC[4;...;...;...t`) is not a size at all.
+    #[test]
+    fn refuses_malformed_reports() {
+        for response in [
+            &b"\x1b[4;0;1680t"[..],
+            &b"\x1b[4;1050;0t"[..],
+            &b"\x1b[4;abc;1680t"[..],
+            &b"\x1b[4;1050t"[..],
+            &b"\x1b[4;1;2;3t"[..],
+        ] {
+            let probe = parse_pixel_probe(response);
+            assert_eq!(
+                probe.pixel_size,
+                None,
+                "{}",
+                String::from_utf8_lossy(response)
+            );
+        }
+    }
+
+    /// The DA reply is the read loop's stop signal, so a partial one must not end it.
+    #[test]
+    fn waits_for_a_complete_da_reply() {
+        assert!(has_da1_reply(b"\x1b[?62;22c"));
+        assert!(has_da1_reply(b"\x1b[4;1050;1680t\x1b[?6c"));
+        assert!(!has_da1_reply(b"\x1b[?62;22"));
+        assert!(!has_da1_reply(b"\x1b[4;1050;1680t"));
+        // A 'c' before the DA introducer is not the DA terminator.
+        assert!(!has_da1_reply(b"c\x1b[?62;22"));
     }
 }

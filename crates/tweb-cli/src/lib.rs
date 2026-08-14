@@ -415,6 +415,23 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Resolves a file path an agent asked us to write, against the caller's directory.
+///
+/// The engine is the process that writes the file, and its cwd is the Electron app
+/// directory — not wherever the user ran `tweb`. So `tweb screenshot shot.png` used to
+/// land in the app directory (in a dev checkout, inside the source tree) while the caller
+/// looked for it beside them and found nothing. The path is made absolute here, where the
+/// caller's directory is still known.
+pub(crate) fn resolve_output_path(value: &str, working_directory: &Path) -> String {
+    let path = Path::new(value.trim());
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
+    };
+    normalize_path(&absolute).to_string_lossy().into_owned()
+}
+
 fn resolve_url_argument(value: &str, working_directory: &Path) -> String {
     let value = value.trim();
     let path = Path::new(value);
@@ -539,7 +556,12 @@ fn agent_call(
             agent,
         ),
         Command::Eval { script, agent } => ("eval", json!({ "script": script }), agent),
-        Command::Screenshot { path, agent } => ("screenshot", json!({ "path": path }), agent),
+        Command::Screenshot { path, agent } => {
+            // Without a path the PNG comes back as base64 and nothing is written, so
+            // there is nothing to resolve.
+            let path = path.map(|value| resolve_output_path(&value, working_directory));
+            ("screenshot", json!({ "path": path }), agent)
+        }
         Command::Console {
             limit,
             clear,
@@ -745,7 +767,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        default_open_args, electron_app_dir, resolve_url_argument, split_window_args, Cli, Command,
+        default_open_args, electron_app_dir, resolve_output_path, resolve_url_argument,
+        split_window_args, Cli, Command,
     };
 
     #[test]
@@ -799,6 +822,45 @@ mod tests {
 
     /// The bug this guards: picking `node_modules/electron` as the app directory
     /// makes Electron load itself instead of TWeb, and the pane stays blank.
+    /// The bug this guards: a relative screenshot path was sent to the engine verbatim,
+    /// and the engine resolved it against *its* cwd — the Electron app directory. In a dev
+    /// checkout that wrote the PNG into the source tree while the caller found nothing.
+    #[test]
+    fn screenshot_paths_resolve_against_the_calling_directory() {
+        let directory = Path::new("/Users/example/project");
+        assert_eq!(
+            resolve_output_path("shot.png", directory),
+            "/Users/example/project/shot.png"
+        );
+        assert_eq!(
+            resolve_output_path("./out/shot.png", directory),
+            "/Users/example/project/out/shot.png"
+        );
+        assert_eq!(
+            resolve_output_path("../shot.png", directory),
+            "/Users/example/shot.png"
+        );
+        // Whitespace around a shell-quoted path is the caller's, not part of the name.
+        assert_eq!(
+            resolve_output_path("  shot.png  ", directory),
+            "/Users/example/project/shot.png"
+        );
+    }
+
+    #[test]
+    fn an_absolute_screenshot_path_is_left_where_the_caller_put_it() {
+        let directory = Path::new("/Users/example/project");
+        assert_eq!(
+            resolve_output_path("/tmp/shot.png", directory),
+            "/tmp/shot.png"
+        );
+        // Still normalized, so the engine never has to interpret a `..` of its own.
+        assert_eq!(
+            resolve_output_path("/tmp/a/../shot.png", directory),
+            "/tmp/shot.png"
+        );
+    }
+
     #[test]
     fn app_dir_skips_the_electron_package() {
         let root = std::env::temp_dir().join(format!("tweb-appdir-{}", std::process::id()));

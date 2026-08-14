@@ -25,6 +25,8 @@ shipping configuration, which does not set that switch.
 | `stacking.py` | Whether a patch placed after a base actually draws *on top* of it (judged by eye — the protocol only reports lifetime) |
 | `shm-through-tmux.py` | Whether `t=s` survives tmux passthrough, with a temp-file transfer as the control |
 | `raw-render.py` | Whether `f=32` raw pixels render correctly over the file medium (judged by eye) |
+| `convert-bench.cjs` | How the gfx worker's per-frame time splits between the BGRA→RGBA swap and the 20MB write |
+| `convert-bench.rs` | What that swap costs in Rust, against a bare memcpy of the same bytes |
 
 `gfxprobe.py` is the odd one out: it talks to a terminal, not to Electron, and **must run on a bare
 tty**. Graphics responses do not come back through tmux DCS passthrough — which is why the shipping
@@ -44,6 +46,17 @@ read the control first.
 
 `stacking.py` and `raw-render.py` leave an image on screen to be looked at, and each has a
 `-cleanup.py` companion that removes it.
+
+The two `convert-bench` files are the odd pair: they need neither Electron nor a terminal, since a
+channel swap over a fixed buffer is the whole measurement. They are what settled section 8.4 —
+whether the swap was worth a native module — and they stay so the next person to propose one has to
+beat these numbers rather than re-derive them. The `.rs` reproduces the deleted `tweb-native` loop
+verbatim rather than calling it, which is why it outlived the crate.
+
+```sh
+node bench/convert-bench.cjs
+rustc -O -o /tmp/tweb-convert-bench bench/convert-bench.rs && /tmp/tweb-convert-bench
+```
 
 The fixture pages fill their canvases with deterministic pseudo-random noise, so a compressor cannot
 find structure that a real page would not have. `photo` is the adversarial case: a full viewport of
