@@ -2,8 +2,10 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { surfacePlan, surfaceResizeNeeded, agentNeedsGeometry, COLLAPSED_HEIGHT } =
-  require("./surface-policy.cjs");
+const {
+  surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry,
+  restoredLayoutScript, COLLAPSED_HEIGHT,
+} = require("./surface-policy.cjs");
 
 const LOGICAL = { width: 1440, height: 900 };
 
@@ -135,5 +137,133 @@ test("an unknown method is assumed to need geometry", () => {
 test("a non-method is not a method", () => {
   for (const value of [null, undefined, "", 42, {}]) {
     assert.strictEqual(agentNeedsGeometry(value), false, JSON.stringify(value));
+  }
+});
+
+// --- paintingTransition ---
+//
+// The reconciler behind these runs once a second for the life of the pane, so what
+// matters is what it does when nothing has changed. `startPainting()` on a tab that is
+// already painting provokes a paint (measured: 0.88/s on a settled static page), and a
+// paint is a whole 5.18MB frame — so a no-op tick has to actually be a no-op.
+
+test("a tab already in the state the plan asks for is left alone", () => {
+  assert.strictEqual(paintingTransition(true, true), null);
+  assert.strictEqual(paintingTransition(false, false), null);
+});
+
+test("only a real transition issues a call", () => {
+  assert.strictEqual(paintingTransition(true, false), "start");
+  assert.strictEqual(paintingTransition(false, true), "stop");
+});
+
+test("an engine that cannot report its state still gets told what to do", () => {
+  // Older Electron has no `isPainting`. A redundant call there costs what it always
+  // cost; skipping a needed one would leave the pane blank, which is worse.
+  for (const unknown of [null, undefined, "yes", 1]) {
+    assert.strictEqual(paintingTransition(true, unknown), "start", String(unknown));
+    assert.strictEqual(paintingTransition(false, unknown), "stop", String(unknown));
+  }
+});
+
+test("the plan's painting flag is read as a boolean, not by identity", () => {
+  assert.strictEqual(paintingTransition(1, true), null);
+  assert.strictEqual(paintingTransition(0, false), null);
+  assert.strictEqual(paintingTransition(undefined, true), "stop");
+});
+
+test("a surfacePlan feeds straight into it", () => {
+  const visible = surfacePlan(true, true, LOGICAL);
+  const hidden = surfacePlan(true, false, LOGICAL);
+  // The steady states a pane actually sits in: visible and painting, hidden and not.
+  assert.strictEqual(paintingTransition(visible.painting, true), null);
+  assert.strictEqual(paintingTransition(hidden.painting, false), null);
+  // And the two transitions between them.
+  assert.strictEqual(paintingTransition(visible.painting, false), "start");
+  assert.strictEqual(paintingTransition(hidden.painting, true), "stop");
+});
+
+// --- the restored-layout wait ---
+//
+// The script is a string because it runs in the page, so it is tested by running it in a
+// context that stands in for one. That keeps the assertions about behaviour — does it
+// settle, and on what — rather than about the text.
+
+const vm = require("node:vm");
+
+function runLayoutScript(innerHeight, timeoutMs = 1500) {
+  const listeners = new Set();
+  const timers = new Map();
+  let nextTimer = 1;
+  const context = {
+    innerHeight,
+    addEventListener: (type, fn) => { if (type === "resize") listeners.add(fn); },
+    removeEventListener: (_type, fn) => listeners.delete(fn),
+    setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    Promise,
+  };
+  vm.createContext(context);
+  const promise = vm.runInContext(restoredLayoutScript(timeoutMs), context);
+  return {
+    promise,
+    listeners,
+    timers,
+    // What the page does when the surface comes back: the size changes, then resize fires.
+    resizeTo: (height) => {
+      context.innerHeight = height;
+      for (const fn of [...listeners]) fn();
+    },
+    fireTimeout: () => {
+      for (const { fn } of [...timers.values()]) fn();
+    },
+  };
+}
+
+test("a page already laid out at its real size does not wait at all", async () => {
+  const run = runLayoutScript(900);
+  assert.strictEqual(await run.promise, "already");
+  assert.strictEqual(run.listeners.size, 0, "nothing to unsubscribe from");
+  assert.strictEqual(run.timers.size, 0, "and no timer to leak");
+});
+
+test("a collapsed page waits for the resize that restores it", async () => {
+  const run = runLayoutScript(COLLAPSED_HEIGHT);
+  run.resizeTo(900);
+  assert.strictEqual(await run.promise, "resize");
+});
+
+test("a resize that does not clear the collapsed height is not the one being waited for", async () => {
+  // The reconciler can resize a collapsed tab — a pane resize rewrites its width — and
+  // that resize still leaves the page one pixel tall. Settling on it would hand the agent
+  // exactly the empty page this wait exists to prevent.
+  const run = runLayoutScript(COLLAPSED_HEIGHT);
+  run.resizeTo(COLLAPSED_HEIGHT);
+  assert.strictEqual(run.listeners.size, 1, "still waiting");
+  run.resizeTo(640);
+  assert.strictEqual(await run.promise, "resize");
+});
+
+test("a page that never comes back settles on its own deadline", async () => {
+  const run = runLayoutScript(COLLAPSED_HEIGHT);
+  run.fireTimeout();
+  assert.strictEqual(await run.promise, "timeout");
+});
+
+test("settling unsubscribes and clears the timer either way", async () => {
+  for (const settle of ["resizeTo", "fireTimeout"]) {
+    const run = runLayoutScript(COLLAPSED_HEIGHT);
+    if (settle === "resizeTo") run.resizeTo(900); else run.fireTimeout();
+    await run.promise;
+    assert.strictEqual(run.listeners.size, 0, settle);
+    assert.strictEqual(run.timers.size, 0, settle);
+  }
+});
+
+test("the deadline reaches the page as a number, whatever it was given", () => {
+  assert.match(restoredLayoutScript(1500), /setTimeout\(\(\) => settle\("timeout"\), 1500\)/);
+  // A caller that passes nonsense must not produce a script that throws in the page.
+  for (const bad of [undefined, null, NaN, "soon", -5]) {
+    assert.match(restoredLayoutScript(bad), /settle\("timeout"\), \d+\)/, String(bad));
   }
 });

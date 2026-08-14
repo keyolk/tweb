@@ -38,7 +38,12 @@ const {
   settledFrameRate,
 } = require("./frame-rate-policy.cjs");
 const { isOrphaned, abandonedFrameFiles } = require("./orphan-watch.cjs");
-const { surfacePlan, surfaceResizeNeeded, agentNeedsGeometry } = require("./surface-policy.cjs");
+const {
+  surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry, restoredLayoutScript,
+} = require("./surface-policy.cjs");
+const { pressEvents } = require("./agent-key.cjs");
+const { recoveryDecision } = require("./renderer-recovery.cjs");
+const { withHistoryLock } = require("./history-lock.cjs");
 const {
   parseClaim,
   claimExpired,
@@ -103,6 +108,9 @@ let originalPaneTitle = null;
 const tabFrames = new Map();
 const tabZoomFactors = new Map();
 const tabSessionUrls = new Map();
+// Recovery attempts per tab, so a page that crashes its renderer on every load stops being
+// reloaded instead of looping forever. See renderer-recovery.cjs.
+const tabRendererRecoveries = new Map();
 const navigationHistory = [];
 let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
@@ -1428,8 +1436,25 @@ function updatePaintingState() {
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? activeFrameRate : 1);
     applySurfacePlan(tab, plan);
-    if (plan.painting) tab.webContents.startPainting();
-    else tab.webContents.stopPainting();
+    // Read before write, like the resize above: `startPainting()` on a tab that is
+    // already painting *provokes a paint*, and this reconciler runs every second, so
+    // re-issuing it billed a static idle page one whole frame per second — 5.18MB of
+    // raw pixels written to disk each time. See `paintingTransition` for the numbers.
+    const transition = paintingTransition(plan.painting, readIsPainting(tab.webContents));
+    if (transition === "start") tab.webContents.startPainting();
+    else if (transition === "stop") tab.webContents.stopPainting();
+  }
+}
+
+// `isPainting` is Electron 43 API, but the engine also runs against whatever the user
+// has cached, so an older runtime must degrade to the unconditional call rather than
+// throw inside the watchdog.
+function readIsPainting(contents) {
+  try {
+    return typeof contents.isPainting === "function" ? contents.isPainting() : null;
+  } catch (error) {
+    void error;
+    return null;
   }
 }
 
@@ -1485,6 +1510,25 @@ function surfaceHeldForAgent() {
 // paints costs the call a beat rather than hanging it.
 const SURFACE_RESTORE_TIMEOUT_MS = 1500;
 
+// A restored surface is not a restored layout. The compositor delivers a correctly sized
+// frame within a millisecond or two, and the renderer takes ~380ms longer to lay the page
+// out at that size — measured on a hidden pane, 13 of 30 `eval innerHeight` calls answered
+// 1 while `awaitRestoredFrame` had already accepted a full-height frame. Waiting for the
+// layout as well is what makes the hold mean what it says.
+//
+// The page's own backstop cannot cover a renderer that is gone: the script never runs, so
+// the promise never settles and the hold would sit open until its 30s TTL. Measured on a
+// SIGKILLed renderer, that turned a screenshot that used to fail in 1.5s into one that
+// failed in 62s. Hence the race here, in a process that is definitely alive.
+function awaitRestoredLayout(contents) {
+  return Promise.race([
+    contents.executeJavaScript(restoredLayoutScript(SURFACE_RESTORE_TIMEOUT_MS), true)
+      .catch(() => "unreachable"),
+    new Promise((resolve) =>
+      setTimeout(() => resolve("unreachable"), SURFACE_RESTORE_TIMEOUT_MS + 250)),
+  ]);
+}
+
 // Waiting on layout is not enough: `capturePage` reads the compositor, and a window that
 // has just been resized and told to start painting has no frame in it yet — measured, the
 // first screenshots after a restore failed with UnknownVizError while `innerHeight`
@@ -1537,6 +1581,9 @@ async function withAgentSurface(method, body) {
   const contents = win.webContents;
   try {
     updatePaintingState();
+    // Layout first, then the frame: the frame kept for `screenshot` has to come from the
+    // page as the rest of the call will read it, not from the moment before it reflowed.
+    await awaitRestoredLayout(contents);
     agentSurfaceFrame = await awaitRestoredFrame(contents);
     return await body();
   } finally {
@@ -2052,6 +2099,12 @@ function historyPath() {
   return path.join(app.getPath("userData"), "history.jsonl");
 }
 
+// Every pane shares this file, so appends and rewrites take the same lock. See
+// history-lock.cjs for why carrying arrivals across the rewrite is not enough on its own.
+function historyLockPath() {
+  return `${historyPath()}.lock`;
+}
+
 function recordNavigationHistory(url, title = "") {
   if (!isRestorableUrl(url) || url.startsWith("tweb-action:")) return;
   const existing = navigationHistory.findIndex((entry) => entry.url === url);
@@ -2072,7 +2125,11 @@ function recordNavigationHistory(url, title = "") {
   try {
     const line = `${JSON.stringify({ url, title: entryTitle, at: Date.now() })}\n`;
     mkdirSync(path.dirname(historyPath()), { recursive: true });
-    appendFileSync(historyPath(), line, { encoding: "utf8", mode: 0o600 });
+    // Under the lock, so an append cannot resolve the pre-rename inode of a concurrent
+    // compaction or delete and vanish with it.
+    withHistoryLock(historyLockPath(), () => {
+      appendFileSync(historyPath(), line, { encoding: "utf8", mode: 0o600 });
+    });
   } catch (error) {
     if (debugLogging) console.error(`tweb: history append failed: ${error.message}`);
   }
@@ -2145,13 +2202,14 @@ function deleteHistoryEntries(targets, query = "") {
   );
   if (rows.length === 0) return historyPageModel(query);
   try {
-    const before = readFileSync(historyPath(), "utf8");
-    const { lines: kept, removed } = removeEntries(before.split("\n"), rows);
-    if (removed > 0) {
+    withHistoryLock(historyLockPath(), () => {
+      const before = readFileSync(historyPath(), "utf8");
+      const { lines: kept, removed } = removeEntries(before.split("\n"), rows);
+      if (removed === 0) return;
       const { diverged, lines: arrived } = appendedSince(before, readFileSync(historyPath(), "utf8"));
       if (diverged) {
         if (debugLogging) console.error("tweb: history delete skipped; the file was rewritten underneath");
-        return historyPageModel(query);
+        return;
       }
       // A concurrent append can land on a row being deleted, so it is filtered too —
       // otherwise the row would reappear the moment the model was rebuilt.
@@ -2167,7 +2225,7 @@ function deleteHistoryEntries(targets, query = "") {
         if (stale >= 0) navigationHistory.splice(stale, 1);
       }
       if (rows.some((row) => row.url === lastHistoryAppend.url)) lastHistoryAppend = { url: "", title: "" };
-    }
+    });
   } catch (error) {
     if (error.code !== "ENOENT" && debugLogging) {
       console.error(`tweb: history delete failed: ${error.message}`);
@@ -2188,19 +2246,21 @@ function deleteHistoryEntries(targets, query = "") {
 // as `deleteHistoryEntries`, which faces the identical race on a much shorter fuse.
 function compactHistory() {
   try {
-    const before = readFileSync(historyPath(), "utf8");
-    const compacted = compactLines(before.split("\n"));
-    if (!compacted) return;
-    const arrived = appendedSince(before, readFileSync(historyPath(), "utf8"));
-    if (arrived.diverged) return;
-    const body = [...compacted, ...arrived.lines];
-    const temporary = `${historyPath()}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${body.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporary, historyPath());
-    if (debugLogging) {
-      const was = before.split("\n").filter((line) => line.trim()).length;
-      console.error(`tweb: history compacted ${was} -> ${body.length} lines`);
-    }
+    withHistoryLock(historyLockPath(), () => {
+      const before = readFileSync(historyPath(), "utf8");
+      const compacted = compactLines(before.split("\n"));
+      if (!compacted) return;
+      const arrived = appendedSince(before, readFileSync(historyPath(), "utf8"));
+      if (arrived.diverged) return;
+      const body = [...compacted, ...arrived.lines];
+      const temporary = `${historyPath()}.${process.pid}.tmp`;
+      writeFileSync(temporary, `${body.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+      renameSync(temporary, historyPath());
+      if (debugLogging) {
+        const was = before.split("\n").filter((line) => line.trim()).length;
+        console.error(`tweb: history compacted ${was} -> ${body.length} lines`);
+      }
+    });
   } catch (error) {
     if (error.code !== "ENOENT" && debugLogging) {
       console.error(`tweb: history compaction failed: ${error.message}`);
@@ -2608,13 +2668,13 @@ function agentNativeClick(point) {
   contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
 }
 
+// The rules live in electron/agent-key.cjs, next to the cases that were measured against
+// the real key path. This path had drifted from `dispatchNativeKey`: a shifted letter and
+// Space typed nothing, and an arrow key reached the page as key="" because Chromium wants
+// the Accelerator name.
 function agentPressKey(key, modifiers = []) {
   const contents = agentContents();
-  contents.sendInputEvent({ type: "keyDown", keyCode: key, modifiers });
-  if (key.length === 1 && modifiers.length === 0) {
-    contents.sendInputEvent({ type: "char", keyCode: key });
-  }
-  contents.sendInputEvent({ type: "keyUp", keyCode: key, modifiers });
+  for (const event of pressEvents(key, modifiers)) contents.sendInputEvent(event);
 }
 
 async function agentWaitFor(params) {
@@ -3168,6 +3228,28 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     console.error(`tweb: failed to load ${failedUrl}: ${description} (${code})`);
     void contents.loadURL(errorPage(failedUrl || contents.getURL(), code, description));
   });
+  // A lost render process leaves an offscreen tab dead but silent: the bytes are released, the
+  // engine keeps answering `tweb status` with a healthy pid, and the pane holds the last image
+  // it was sent. Chromium restarts a *visible* window's renderer on its next paint; an
+  // offscreen one has no such trigger, so nothing ever comes back without this.
+  contents.on("render-process-gone", (_event, details) => {
+    const reason = details?.reason;
+    const decision = recoveryDecision(reason, tabRendererRecoveries.get(tab), Date.now());
+    tabRendererRecoveries.set(tab, decision.recent);
+    if (decision.action === "ignore") return;
+    const url = tabSessionUrls.get(tab) || contents.getURL();
+    if (decision.action === "report") {
+      console.error(`tweb: renderer gone (${reason}), giving up on ${url}`);
+      showingLoadError = true;
+      void contents.loadURL(errorPage(url, reason, "This page keeps crashing"));
+      return;
+    }
+    console.error(`tweb: renderer gone (${reason}), reloading ${url}`);
+    // reload() on a webContents whose process died replays the current entry, which is the
+    // page the user was on — reloadIgnoringCache would additionally refetch, turning a
+    // recoverable crash into a network round trip the user did not ask for.
+    contents.reload();
+  });
 }
 
 function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
@@ -3184,6 +3266,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
     tabFrames.delete(tab);
     tabZoomFactors.delete(tab);
     tabSessionUrls.delete(tab);
+    tabRendererRecoveries.delete(tab);
     tabs.splice(closedIndex, 1);
     if (tabs.length === 0) {
       win = null;

@@ -57,6 +57,9 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/audio-owner.cjs
 	node --check electron/orphan-watch.cjs
 	node --check electron/surface-policy.cjs
+	node --check electron/agent-key.cjs
+	node --check electron/renderer-recovery.cjs
+	node --check electron/history-lock.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

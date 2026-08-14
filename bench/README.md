@@ -27,6 +27,9 @@ shipping configuration, which does not set that switch.
 | `raw-render.py` | Whether `f=32` raw pixels render correctly over the file medium (judged by eye) |
 | `convert-bench.cjs` | How the gfx worker's per-frame time splits between the BGRA→RGBA swap and the 20MB write |
 | `convert-bench.rs` | What that swap costs in Rust, against a bare memcpy of the same bytes |
+| `gate-harness.py` | Whether the DESIGN.md 6.5/7.7 release gates hold, per pane state — see [GATES.md](GATES.md) |
+| `idle-paint.cjs` | Whether `startPainting()`/`setFrameRate()` provoke a paint on a page that is not changing |
+| `scroll-pacing.cjs` | How many frames Chromium's own offscreen producer delivers under a continuous scroll |
 
 `gfxprobe.py` is the odd one out: it talks to a terminal, not to Electron, and **must run on a bare
 tty**. Graphics responses do not come back through tmux DCS passthrough — which is why the shipping
@@ -69,3 +72,30 @@ Two caveats when reading a run:
   frame it measured to `shot-<profile>.png` so you can confirm it is not blank.
 - **These are one machine's numbers.** The ratios between the paths are the durable result; the
   absolute milliseconds are not.
+
+## The gate harness
+
+`gate-harness.py` is the odd one out among the Electron scripts: it does not build its own
+`BrowserWindow`, it spawns the **shipping engine** the way `crates/tweb-pane/src/lib.rs`
+does — same argv, same env, stdin as the control channel — and then plays the frontend,
+pushing `VIS` lines to move the pane between visible and hidden.
+
+```sh
+python3 bench/gate-harness.py hidden --seconds 15
+python3 bench/gate-harness.py scroll --seconds 15 --frame-rate 60
+python3 bench/gate-harness.py multipane --seconds 30
+```
+
+Scenarios: `idle`, `hidden`, `multitab`, `scroll`, `animation`, `reopen`, `multipane`,
+`resize`, `crash`. Each prints one JSON object; [GATES.md](GATES.md) is what those objects
+were read as.
+
+Driving visibility over the control channel rather than through tmux is not a shortcut —
+it is the only way in. A pane's visibility is decided by which tmux **client** is showing
+its window, and an agent on this machine cannot attach or move one. So a measurement that
+waits for a real tmux client to reveal a pane waits forever, and reads the permanent hidden
+state as a result about the code.
+
+What it therefore cannot measure: anything past stdout. There is no terminal on the other
+end, so the patch-overlay path never fires and terminal-side texture bytes are out of
+reach. `gfxprobe.py` and friends above are where that half lives.
