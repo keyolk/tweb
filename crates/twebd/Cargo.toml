@@ -27,3 +27,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# `test-util` lets the READY-handshake test wait out the real ten-second timeout in virtual time,
+# so the regression it guards is covered without adding ten seconds to every `make check`.
+tokio = { version = "1", features = ["full", "test-util"] }

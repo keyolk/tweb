@@ -130,7 +130,7 @@ test("overlays ask for a paint instead of waiting for the frame clock", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "repaint":/);
   assert.match(main, /const wasIdle = activeFrameRate !== maxActiveFrameRate;/);
-  assert.match(main, /if \(wasIdle && win && !win\.isDestroyed\(\) && terminalVisible\) win\.webContents\.invalidate\(\);/);
+  assert.match(main, /if \(wasIdle && win && !win\.isDestroyed\(\) && solePane\.visible\) win\.webContents\.invalidate\(\);/);
   assert.match(electron, /function paintNow\(\)/);
   // Every transient overlay mount requests a paint. The persistent mode/tab
   // indicator additionally repaints when its hover popover opens or closes.
@@ -151,7 +151,7 @@ test("a resize re-places the existing image instead of baring the pane", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const applyViewport = main.slice(main.indexOf("function applyViewport(vp, origin"),
     main.indexOf("function createWindow(url)"));
-  assert.match(applyViewport, /if \(terminalVisible\) replacePlacement\(\);/);
+  assert.match(applyViewport, /if \(solePane\.visible\) replacePlacement\(\);/);
   assert.doesNotMatch(applyViewport, /writeGfx/);
   // A moved or shrunk pane leaves a placement the next frame cannot cover.
   assert.match(applyViewport, /if \(originChanged \|\| shrank\) pendingImageDelete = true;/);
@@ -547,7 +547,7 @@ test("the terminal caret follows the focused field for IME composition", () => {
   // No caret to follow means no cursor on top of the page, and the shape we
   // borrowed goes back — otherwise the shell inherits a bar cursor.
   assert.match(main, /function unparkTerminalCaret\(\)[\s\S]*?CSI\("\?25l"\)\}\$\{CARET_SHAPE_RESET\}/);
-  assert.match(main, /function terminalCleanup\(\)[\s\S]*?writeSync\(1, CSI\("0 q"\)\)/);
+  assert.match(main, /function terminalCleanup\(\)[\s\S]*?paneWrite\(CSI\("0 q"\)\)/);
   // A block cursor sits on the character and hides the page's own caret.
   assert.match(main, /const CARET_BAR = CSI\("6 q"\);/);
   assert.match(main, /\$\{CARET_BAR\}/);
@@ -561,7 +561,7 @@ test("the terminal caret follows the focused field for IME composition", () => {
   assert.match(main, /function reparkTerminalCaret\(\)/);
   const viewportTail = main.slice(main.indexOf("function applyViewport(vp, origin"),
     main.indexOf("function createWindow(url)"));
-  assert.match(viewportTail, /if \(terminalVisible\) replacePlacement\(\);[\s\S]{0,120}reparkTerminalCaret\(\);/);
+  assert.match(viewportTail, /if \(solePane\.visible\) replacePlacement\(\);[\s\S]{0,120}reparkTerminalCaret\(\);/);
   const zoomStep = main.slice(main.indexOf("function setBrowserZoom(action)"));
   assert.match(zoomStep.slice(0, zoomStep.indexOf("\n}")), /reparkTerminalCaret\(\);/);
   assert.match(electron, /function caretPoint\(\)/);

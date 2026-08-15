@@ -60,6 +60,10 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/agent-key.cjs
 	node --check electron/renderer-recovery.cjs
 	node --check electron/history-lock.cjs
+	node --check electron/frame-writer.cjs
+	node --check electron/pane-identity.cjs
+	node --check electron/pane-registry.cjs
+	node --check electron/pane-control.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

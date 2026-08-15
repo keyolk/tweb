@@ -7,9 +7,12 @@
 //! timeout to tune. The repo's audio arbitration had to invent a `{pane,pid,at}` claim file
 //! precisely because it had no such connection to lean on; this slice has one, so it does not.
 
+use crate::engine_host::{app_dir_looks_like_an_engine, EngineHost, Launcher};
+use crate::engine_wire::{self, EngineEvent};
 use crate::page_registry::PaneRegistry;
 use crate::protocol::{
-    decode_request, encode_response, pane_key, Generation, PaneKey, Request, Response,
+    decode_request, encode_response, pane_key, Generation, PaneEvent, PaneKey, PaneRef,
+    RefusalReason, Request, Response, PROTOCOL_VERSION,
 };
 use crate::{paths, singleton};
 use anyhow::{Context, Result};
@@ -19,11 +22,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-/// Everything the supervisor knows. Lifecycle only — deliberately nothing about pages, frames or
-/// engines, because which process owns those is exactly what is still being measured.
+/// Everything the supervisor knows: which panes are attached, and the one engine that hosts the
+/// pages of those that asked to be hosted.
 pub struct Supervisor {
     pub registry: PaneRegistry,
     pub socket_path: PathBuf,
+    /// Created on the first hosted attach and shared by every pane after it. `None` until then, so
+    /// a daemon nobody has asked to host anything owns no browser runtime.
+    engine: parking_lot::Mutex<Option<Arc<EngineHost>>>,
     started_at: Instant,
 }
 
@@ -32,6 +38,7 @@ impl Supervisor {
         Self {
             registry: PaneRegistry::new(),
             socket_path,
+            engine: parking_lot::Mutex::new(None),
             started_at: Instant::now(),
         }
     }
@@ -39,12 +46,61 @@ impl Supervisor {
     pub fn uptime_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
     }
+
+    /// The engine host, built from the engine the *frontend* resolved.
+    ///
+    /// The daemon deliberately does not resolve the engine itself: resolution walks up from the
+    /// current directory, so a daemon started from elsewhere answers differently than the pane's
+    /// shell does, and silently running a stale embedded copy is the most expensive mistake
+    /// available here. Once built, the first caller's engine is the engine — a second pane
+    /// pointing somewhere else is refused rather than silently served by the wrong build.
+    fn engine_for(&self, executable: &str, app_dir: &str) -> Arc<EngineHost> {
+        let mut slot = self.engine.lock();
+        if let Some(engine) = slot.as_ref() {
+            return engine.clone();
+        }
+        let app_dir = PathBuf::from(app_dir);
+        let engine = if !Path::new(executable).exists() {
+            Arc::new(EngineHost::unavailable(format!(
+                "engine {executable} does not exist"
+            )))
+        } else if !app_dir_looks_like_an_engine(&app_dir) {
+            Arc::new(EngineHost::unavailable(format!(
+                "{} is not an engine app",
+                app_dir.display()
+            )))
+        } else {
+            Arc::new(EngineHost::new(Launcher {
+                executable: PathBuf::from(executable),
+                app_dir,
+            }))
+        };
+        *slot = Some(engine.clone());
+        engine
+    }
+
+    fn engine_state(&self) -> String {
+        match self.engine.lock().as_ref() {
+            Some(engine) => engine.state().to_string(),
+            None => "idle".to_string(),
+        }
+    }
+
+    fn hosted_pane_count(&self) -> usize {
+        self.engine
+            .lock()
+            .as_ref()
+            .map_or(0, |engine| engine.hosted_pane_count())
+    }
 }
 
 /// What one connection has registered, so its close knows what to reap.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConnectionState {
     pub attached: Option<(PaneKey, Generation)>,
+    /// Whether this connection's pane is hosted by the daemon's engine, so the close path knows
+    /// to drop it there too.
+    pub hosted: bool,
 }
 
 /// The result of handling one request.
@@ -55,15 +111,26 @@ pub struct Dispatched {
     pub stop: bool,
 }
 
+/// Whether a client's protocol version can be served.
+///
+/// Exact equality rather than a range: the version only moves when the wire changes in a way that
+/// would otherwise be silent, and "close enough" is how a frontend ends up waiting forever for a
+/// frame the daemon encodes differently.
+pub fn protocol_refusal(client: u32) -> Option<RefusalReason> {
+    (client != PROTOCOL_VERSION).then_some(RefusalReason::ProtocolMismatch)
+}
+
 /// Handles one decoded request.
 ///
 /// Pure with respect to time and IO: the clock comes in as an argument and nothing here touches
-/// the socket, so every protocol behaviour below is tested without a daemon running.
-pub fn dispatch(
+/// the socket, so every protocol behaviour below is tested without a daemon running. `sink` is
+/// where this connection's pushed events go — a channel, not a socket, for the same reason.
+pub async fn dispatch(
     supervisor: &Supervisor,
     connection: &mut ConnectionState,
     request: Request,
     now_ms: u64,
+    sink: &crate::engine_host::PaneSink,
 ) -> Dispatched {
     match request {
         Request::Attach { pane, pid } => match pane_key(&pane) {
@@ -81,15 +148,109 @@ pub fn dispatch(
             }
             Err(err) => error(err.to_string()),
         },
+        Request::Host {
+            pane,
+            pid,
+            protocol,
+            image_id,
+            engine_executable,
+            engine_app_dir,
+            url,
+            frame_rate,
+            adaptive_frame_rate,
+            restore_session,
+        } => {
+            if let Some(reason) = protocol_refusal(protocol) {
+                return refused(
+                    reason,
+                    format!("daemon speaks protocol {PROTOCOL_VERSION}, client speaks {protocol}"),
+                );
+            }
+            let key = match pane_key(&pane) {
+                Ok(key) => key,
+                Err(err) => return error(err.to_string()),
+            };
+            let engine = supervisor.engine_for(&engine_executable, &engine_app_dir);
+            // Registering *before* the engine is asked, so that an engine that fails to start
+            // leaves nothing behind: the refusal path below drops the registration again.
+            let outcome = supervisor.registry.attach(key.clone(), pid, now_ms);
+            let generation = outcome.registration.generation;
+            let opened = engine
+                .open(
+                    key.clone(),
+                    sink.clone(),
+                    &engine_wire::OpenRequest {
+                        pane: &pane.pane,
+                        tmux_server: &pane.tmux_server,
+                        generation,
+                        image_id,
+                        frame_rate,
+                        adaptive_frame_rate,
+                        restore_session,
+                        url: &url,
+                    },
+                    now_ms,
+                )
+                .await;
+            match opened {
+                Ok(()) => {
+                    connection.attached = Some((key, generation));
+                    connection.hosted = true;
+                    Dispatched {
+                        response: Response::Hosted {
+                            page: outcome.registration.page_id.to_string(),
+                            generation,
+                            protocol: PROTOCOL_VERSION,
+                        },
+                        stop: false,
+                    }
+                }
+                Err(detail) => {
+                    // Nothing is left registered for a pane the daemon is not serving: the
+                    // frontend is about to spawn its own engine, and a phantom entry in `list`
+                    // would be a lie about who owns that pane.
+                    supervisor.registry.detach(&key, generation);
+                    refused(RefusalReason::EngineUnavailable, detail)
+                }
+            }
+        }
+        Request::Control {
+            pane,
+            generation,
+            body,
+        } => match pane_key(&pane) {
+            Ok(key) => {
+                // A control line from a superseded frontend is dropped rather than applied. tmux
+                // reuses pane ids, so "resize %3" from a dead predecessor would otherwise resize
+                // whatever page took its place.
+                if crate::page_registry::generation_is_current(
+                    supervisor.registry.get(&key).as_ref(),
+                    generation,
+                ) {
+                    if let Some(engine) = supervisor.engine.lock().as_ref() {
+                        engine.control(&key, &body);
+                    }
+                }
+                Dispatched {
+                    response: Response::Ok,
+                    stop: false,
+                }
+            }
+            Err(err) => error(err.to_string()),
+        },
         Request::Detach { pane, generation } => match pane_key(&pane) {
             Ok(key) => {
                 // A stale detach is answered `ok`, not `error`: the caller did nothing wrong, its
                 // registration was simply already superseded, and turning that into an error
                 // would make every reused pane id look like a failure in the frontend's logs.
-                if supervisor.registry.detach(&key, generation).is_some()
-                    && connection.attached.as_ref() == Some(&(key, generation))
-                {
-                    connection.attached = None;
+                if supervisor.registry.detach(&key, generation).is_some() {
+                    if let Some(engine) = supervisor.engine.lock().as_ref() {
+                        engine.close(&key);
+                    }
+                    if connection.attached.as_ref() == Some(&(key, generation)) {
+                        connection.attached = None;
+                        connection.hosted = false;
+                    }
                 }
                 Dispatched {
                     response: Response::Ok,
@@ -116,6 +277,9 @@ pub fn dispatch(
                 uptime_ms: supervisor.uptime_ms(),
                 pane_count: supervisor.registry.len(),
                 generation_counter: supervisor.registry.generation_counter(),
+                protocol: PROTOCOL_VERSION,
+                engine: supervisor.engine_state(),
+                hosted_pane_count: supervisor.hosted_pane_count(),
             },
             stop: false,
         },
@@ -133,6 +297,56 @@ fn error(message: String) -> Dispatched {
     }
 }
 
+fn refused(reason: RefusalReason, detail: String) -> Dispatched {
+    Dispatched {
+        response: Response::HostRefused { reason, detail },
+        stop: false,
+    }
+}
+
+/// Turns an engine event into the response the pane's frontend receives.
+///
+/// The generation is stamped here, at the daemon, because this is the only side that knows which
+/// registration is current. A frame that belongs to a dead predecessor is therefore recognisable
+/// as late by the frontend without the frontend having to track the engine's view of anything.
+pub fn engine_event_response(
+    event: EngineEvent,
+    pane: &PaneRef,
+    generation: Generation,
+) -> Option<Response> {
+    let pane_id = pane.pane.clone();
+    match event {
+        EngineEvent::Frame { payload, .. } => Some(Response::Frame {
+            pane: pane_id,
+            generation,
+            payload: engine_wire::encode_hex(&payload),
+        }),
+        EngineEvent::AgentSocket { path, .. } => Some(Response::Event {
+            pane: pane_id,
+            generation,
+            event: PaneEvent::AgentSocket { path },
+        }),
+        EngineEvent::Audio { audible, .. } => Some(Response::Event {
+            pane: pane_id,
+            generation,
+            event: PaneEvent::Audio { audible },
+        }),
+        // An empty pane name is how the engine host reports its own death to every pane at once:
+        // the process is gone, so it named no pane. That is `engine_lost`, not one pane closing.
+        EngineEvent::Closed { pane, reason } if pane.is_empty() => Some(Response::Event {
+            pane: pane_id,
+            generation,
+            event: PaneEvent::EngineLost { reason },
+        }),
+        EngineEvent::Closed { reason, .. } => Some(Response::Event {
+            pane: pane_id,
+            generation,
+            event: PaneEvent::Closed { reason },
+        }),
+        EngineEvent::Ready { .. } => None,
+    }
+}
+
 /// Reaps whatever a closing connection had registered.
 pub fn reap_connection(supervisor: &Supervisor, connection: &ConnectionState) {
     let Some((key, generation)) = connection.attached.as_ref() else {
@@ -140,6 +354,11 @@ pub fn reap_connection(supervisor: &Supervisor, connection: &ConnectionState) {
     };
     match supervisor.registry.detach(key, *generation) {
         Some(entry) => {
+            if connection.hosted {
+                if let Some(engine) = supervisor.engine.lock().as_ref() {
+                    engine.close(key);
+                }
+            }
             tracing::info!(pane = %key, generation = %generation, page = %entry.page_id, "reaped pane whose frontend disconnected")
         }
         None => {
@@ -213,6 +432,9 @@ pub fn bind(runtime_dir: &Path) -> Result<Option<BoundDaemon>> {
 
 /// Serves until `stop`, SIGINT or SIGTERM.
 pub async fn serve(daemon: BoundDaemon) -> Result<()> {
+    // Before any engine can be started: a hosted engine signals the process it believes owns its
+    // pane's pty, and that process is this one. See `engine_host::ignore_frontend_signals`.
+    crate::engine_host::ignore_frontend_signals();
     let BoundDaemon {
         listener,
         supervisor,
@@ -302,30 +524,61 @@ async fn handle_connection(
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     let mut connection = ConnectionState::default();
+    // Engine events for this connection's pane. Held even by a connection that never hosts, so
+    // `dispatch` needs no optionality and a plain `attach` costs one unused channel.
+    let (sink, mut events) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+    let mut pane_ref: Option<PaneRef> = None;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let dispatched = match decode_request(&line) {
-            Ok(request) => dispatch(&supervisor, &mut connection, request, now_ms()),
-            // An unrecognised request keeps the connection open. A client built against a later
-            // protocol should degrade, not fail in a way that looks like the daemon crashed.
-            Err(err) => Dispatched {
-                response: Response::Error {
-                    message: err.to_string(),
-                },
-                stop: false,
-            },
-        };
-        write_half
-            .write_all(encode_response(&dispatched.response).as_bytes())
-            .await?;
-        write_half.flush().await?;
-        if dispatched.stop {
-            // Flushed above, so the client sees its `ok` before the daemon goes away.
-            let _ = shutdown_tx.send(());
-            break;
+    loop {
+        tokio::select! {
+            // Biased towards the request stream: a frontend that has hung up must be noticed
+            // promptly, because its close is what reaps its registration.
+            biased;
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let dispatched = match decode_request(&line) {
+                    Ok(request) => {
+                        if let Request::Host { pane, .. } | Request::Attach { pane, .. } = &request {
+                            pane_ref = Some(pane.clone());
+                        }
+                        dispatch(&supervisor, &mut connection, request, now_ms(), &sink).await
+                    }
+                    // An unrecognised request keeps the connection open. A client built against a
+                    // later protocol should degrade, not fail in a way that looks like the daemon
+                    // crashed.
+                    Err(err) => Dispatched {
+                        response: Response::Error {
+                            message: err.to_string(),
+                        },
+                        stop: false,
+                    },
+                };
+                write_half
+                    .write_all(encode_response(&dispatched.response).as_bytes())
+                    .await?;
+                write_half.flush().await?;
+                if dispatched.stop {
+                    // Flushed above, so the client sees its `ok` before the daemon goes away.
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
+            }
+            event = events.recv() => {
+                let Some(event) = event else { continue };
+                let (Some(pane), Some((_, generation))) = (pane_ref.as_ref(), connection.attached.as_ref()) else {
+                    continue;
+                };
+                let Some(response) = engine_event_response(event, pane, *generation) else {
+                    continue;
+                };
+                write_half
+                    .write_all(encode_response(&response).as_bytes())
+                    .await?;
+                write_half.flush().await?;
+            }
         }
     }
 
@@ -349,32 +602,64 @@ mod tests {
         }
     }
 
-    fn attach(
+    /// A sink no test reads from. Every dispatch takes one; only the hosted tests care.
+    fn sink() -> crate::engine_host::PaneSink {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Leaked deliberately: dropping the receiver would make every send fail, which is a
+        // different scenario from the one under test.
+        std::mem::forget(rx);
+        tx
+    }
+
+    async fn go(
+        supervisor: &Supervisor,
+        connection: &mut ConnectionState,
+        request: Request,
+    ) -> Dispatched {
+        dispatch(supervisor, connection, request, 1_000, &sink()).await
+    }
+
+    async fn attach(
         supervisor: &Supervisor,
         connection: &mut ConnectionState,
         id: &str,
         pid: u32,
     ) -> Generation {
-        let dispatched = dispatch(
+        let dispatched = go(
             supervisor,
             connection,
             Request::Attach {
                 pane: pane(id, "srv"),
                 pid,
             },
-            1_000,
-        );
+        )
+        .await;
         match dispatched.response {
             Response::Attached { generation, .. } => generation,
             other => panic!("expected an attach response, got {other:?}"),
         }
     }
 
-    #[test]
-    fn attach_registers_the_pane_and_remembers_it_on_the_connection() {
+    fn host_request(id: &str, protocol: u32, app_dir: &str) -> Request {
+        Request::Host {
+            pane: pane(id, "srv"),
+            pid: 1,
+            protocol,
+            image_id: 4242,
+            engine_executable: "/nonexistent/Electron".into(),
+            engine_app_dir: app_dir.into(),
+            url: "https://example.com".into(),
+            frame_rate: 30,
+            adaptive_frame_rate: true,
+            restore_session: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_registers_the_pane_and_remembers_it_on_the_connection() {
         let supervisor = supervisor();
         let mut connection = ConnectionState::default();
-        let generation = attach(&supervisor, &mut connection, "%3", 42);
+        let generation = attach(&supervisor, &mut connection, "%3", 42).await;
         assert_eq!(supervisor.registry.len(), 1);
         assert_eq!(
             connection.attached,
@@ -388,39 +673,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attach_with_a_bad_pane_id_is_an_error_that_registers_nothing() {
+    #[tokio::test]
+    async fn attach_with_a_bad_pane_id_is_an_error_that_registers_nothing() {
         let supervisor = supervisor();
         let mut connection = ConnectionState::default();
-        let dispatched = dispatch(
+        let dispatched = go(
             &supervisor,
             &mut connection,
             Request::Attach {
                 pane: pane("3", "srv"),
                 pid: 1,
             },
-            0,
-        );
+        )
+        .await;
         assert!(matches!(dispatched.response, Response::Error { .. }));
         assert!(supervisor.registry.is_empty());
         assert!(connection.attached.is_none());
     }
 
-    #[test]
-    fn a_reattach_of_the_same_pane_reports_that_it_superseded() {
+    #[tokio::test]
+    async fn a_reattach_of_the_same_pane_reports_that_it_superseded() {
         let supervisor = supervisor();
         let mut first = ConnectionState::default();
-        attach(&supervisor, &mut first, "%3", 1);
+        attach(&supervisor, &mut first, "%3", 1).await;
         let mut second = ConnectionState::default();
-        let dispatched = dispatch(
+        let dispatched = go(
             &supervisor,
             &mut second,
             Request::Attach {
                 pane: pane("%3", "srv"),
                 pid: 2,
             },
-            0,
-        );
+        )
+        .await;
         assert!(matches!(
             dispatched.response,
             Response::Attached {
@@ -430,19 +715,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn list_reports_every_attached_pane() {
+    #[tokio::test]
+    async fn list_reports_every_attached_pane() {
         let supervisor = supervisor();
         let mut a = ConnectionState::default();
         let mut b = ConnectionState::default();
-        attach(&supervisor, &mut a, "%3", 1);
-        attach(&supervisor, &mut b, "%7", 2);
-        let dispatched = dispatch(
-            &supervisor,
-            &mut ConnectionState::default(),
-            Request::List,
-            0,
-        );
+        attach(&supervisor, &mut a, "%3", 1).await;
+        attach(&supervisor, &mut b, "%7", 2).await;
+        let dispatched = go(&supervisor, &mut ConnectionState::default(), Request::List).await;
         let Response::Panes { panes } = dispatched.response else {
             panic!("expected panes");
         };
@@ -450,17 +730,17 @@ mod tests {
         assert_eq!(ids, vec!["%3".to_string(), "%7".to_string()]);
     }
 
-    #[test]
-    fn status_counts_panes_and_the_generation_counter() {
+    #[tokio::test]
+    async fn status_counts_panes_and_the_generation_counter() {
         let supervisor = supervisor();
-        attach(&supervisor, &mut ConnectionState::default(), "%3", 1);
-        attach(&supervisor, &mut ConnectionState::default(), "%4", 2);
-        let dispatched = dispatch(
+        attach(&supervisor, &mut ConnectionState::default(), "%3", 1).await;
+        attach(&supervisor, &mut ConnectionState::default(), "%4", 2).await;
+        let dispatched = go(
             &supervisor,
             &mut ConnectionState::default(),
             Request::Status,
-            0,
-        );
+        )
+        .await;
         let Response::Status {
             pane_count,
             generation_counter,
@@ -475,102 +755,328 @@ mod tests {
         assert!(socket.ends_with("twebd.sock"));
     }
 
-    #[test]
-    fn detach_removes_the_pane_and_clears_the_connection() {
+    #[tokio::test]
+    async fn detach_removes_the_pane_and_clears_the_connection() {
         let supervisor = supervisor();
         let mut connection = ConnectionState::default();
-        let generation = attach(&supervisor, &mut connection, "%3", 1);
-        let dispatched = dispatch(
+        let generation = attach(&supervisor, &mut connection, "%3", 1).await;
+        let dispatched = go(
             &supervisor,
             &mut connection,
             Request::Detach {
                 pane: pane("%3", "srv"),
                 generation,
             },
-            0,
-        );
+        )
+        .await;
         assert_eq!(dispatched.response, Response::Ok);
         assert!(supervisor.registry.is_empty());
         assert!(connection.attached.is_none());
     }
 
-    #[test]
-    fn a_stale_detach_is_answered_ok_and_changes_nothing() {
+    #[tokio::test]
+    async fn a_stale_detach_is_answered_ok_and_changes_nothing() {
         let supervisor = supervisor();
         let mut first = ConnectionState::default();
-        let stale = attach(&supervisor, &mut first, "%3", 1);
-        attach(&supervisor, &mut ConnectionState::default(), "%3", 2);
-        let dispatched = dispatch(
+        let stale = attach(&supervisor, &mut first, "%3", 1).await;
+        attach(&supervisor, &mut ConnectionState::default(), "%3", 2).await;
+        let dispatched = go(
             &supervisor,
             &mut first,
             Request::Detach {
                 pane: pane("%3", "srv"),
                 generation: stale,
             },
-            0,
-        );
+        )
+        .await;
         assert_eq!(dispatched.response, Response::Ok);
         assert_eq!(supervisor.registry.len(), 1);
     }
 
-    #[test]
-    fn a_closing_connection_reaps_its_own_pane() {
+    #[tokio::test]
+    async fn a_closing_connection_reaps_its_own_pane() {
         let supervisor = supervisor();
         let mut connection = ConnectionState::default();
-        attach(&supervisor, &mut connection, "%3", 1);
+        attach(&supervisor, &mut connection, "%3", 1).await;
         reap_connection(&supervisor, &connection);
         assert!(supervisor.registry.is_empty());
     }
 
-    #[test]
-    fn a_closing_connection_never_reaps_the_pane_that_replaced_it() {
+    #[tokio::test]
+    async fn a_closing_connection_never_reaps_the_pane_that_replaced_it() {
         let supervisor = supervisor();
         let mut dead = ConnectionState::default();
-        attach(&supervisor, &mut dead, "%3", 1);
+        attach(&supervisor, &mut dead, "%3", 1).await;
         let mut live = ConnectionState::default();
-        attach(&supervisor, &mut live, "%3", 2);
+        attach(&supervisor, &mut live, "%3", 2).await;
         // The dead frontend's socket only closes now, after the pane id was reused.
         reap_connection(&supervisor, &dead);
         assert_eq!(supervisor.registry.len(), 1);
         assert_eq!(supervisor.registry.list()[0].pid, 2);
     }
 
-    #[test]
-    fn a_connection_that_never_attached_reaps_nothing() {
+    #[tokio::test]
+    async fn a_connection_that_never_attached_reaps_nothing() {
         let supervisor = supervisor();
-        attach(&supervisor, &mut ConnectionState::default(), "%3", 1);
+        attach(&supervisor, &mut ConnectionState::default(), "%3", 1).await;
         reap_connection(&supervisor, &ConnectionState::default());
         assert_eq!(supervisor.registry.len(), 1);
     }
 
-    #[test]
-    fn only_stop_asks_the_daemon_to_exit() {
+    #[tokio::test]
+    async fn only_stop_asks_the_daemon_to_exit() {
         let supervisor = supervisor();
         let mut connection = ConnectionState::default();
         for request in [Request::List, Request::Status] {
-            assert!(!dispatch(&supervisor, &mut connection, request, 0).stop);
+            assert!(!go(&supervisor, &mut connection, request).await.stop);
         }
-        assert!(dispatch(&supervisor, &mut connection, Request::Stop, 0).stop);
+        assert!(go(&supervisor, &mut connection, Request::Stop).await.stop);
     }
 
-    #[test]
-    fn the_last_detach_does_not_stop_the_daemon() {
+    #[tokio::test]
+    async fn the_last_detach_does_not_stop_the_daemon() {
         let supervisor = supervisor();
         let mut connection = ConnectionState::default();
-        let generation = attach(&supervisor, &mut connection, "%3", 1);
-        let dispatched = dispatch(
+        let generation = attach(&supervisor, &mut connection, "%3", 1).await;
+        let dispatched = go(
             &supervisor,
             &mut connection,
             Request::Detach {
                 pane: pane("%3", "srv"),
                 generation,
             },
-            0,
-        );
+        )
+        .await;
         assert!(supervisor.registry.is_empty());
         assert!(
             !dispatched.stop,
             "an idle daemon stays up; exiting here would race the next pane's attach"
         );
+    }
+
+    // The whole shippability argument rests on this: a daemon that cannot host says so, and the
+    // frontend answers by spawning its own engine. If this ever returned `Hosted` optimistically,
+    // the pane would sit blank waiting for frames nobody is producing.
+    #[tokio::test]
+    async fn a_daemon_with_no_hostable_engine_refuses_rather_than_pretending() {
+        let supervisor = supervisor();
+        let mut connection = ConnectionState::default();
+        let dispatched = go(
+            &supervisor,
+            &mut connection,
+            host_request("%3", PROTOCOL_VERSION, "/nonexistent/app"),
+        )
+        .await;
+        let Response::HostRefused { reason, detail } = dispatched.response else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(reason, RefusalReason::EngineUnavailable);
+        assert!(!detail.is_empty(), "a refusal has to say why");
+    }
+
+    // A refused host must leave nothing behind. A phantom entry in `list` would claim the daemon
+    // owns a pane that is in fact running its own engine.
+    #[tokio::test]
+    async fn a_refused_host_registers_nothing() {
+        let supervisor = supervisor();
+        let mut connection = ConnectionState::default();
+        go(
+            &supervisor,
+            &mut connection,
+            host_request("%3", PROTOCOL_VERSION, "/nonexistent/app"),
+        )
+        .await;
+        assert!(supervisor.registry.is_empty());
+        assert!(connection.attached.is_none());
+        assert!(!connection.hosted);
+    }
+
+    #[tokio::test]
+    async fn a_client_from_another_build_is_refused_on_the_version_not_the_engine() {
+        let supervisor = supervisor();
+        let mut connection = ConnectionState::default();
+        let dispatched = go(
+            &supervisor,
+            &mut connection,
+            host_request("%3", PROTOCOL_VERSION + 1, "/nonexistent/app"),
+        )
+        .await;
+        let Response::HostRefused { reason, .. } = dispatched.response else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(reason, RefusalReason::ProtocolMismatch);
+        assert!(supervisor.registry.is_empty());
+        assert_eq!(protocol_refusal(PROTOCOL_VERSION), None);
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_engine_and_the_protocol() {
+        let supervisor = supervisor();
+        let dispatched = go(
+            &supervisor,
+            &mut ConnectionState::default(),
+            Request::Status,
+        )
+        .await;
+        let Response::Status {
+            protocol,
+            engine,
+            hosted_pane_count,
+            ..
+        } = dispatched.response
+        else {
+            panic!("expected status");
+        };
+        assert_eq!(protocol, PROTOCOL_VERSION);
+        assert_eq!(engine, "idle", "no pane has asked for hosting yet");
+        assert_eq!(hosted_pane_count, 0);
+    }
+
+    // tmux reuses pane ids. A control line from a frontend that has already been replaced would
+    // otherwise resize, or type into, whatever page took its place.
+    #[tokio::test]
+    async fn a_control_line_from_a_superseded_frontend_is_dropped() {
+        let supervisor = supervisor();
+        let mut first = ConnectionState::default();
+        let stale = attach(&supervisor, &mut first, "%3", 1).await;
+        let live = attach(&supervisor, &mut ConnectionState::default(), "%3", 2).await;
+        assert_ne!(stale, live);
+        // Neither reaches an engine here (there is none), but the response must still be `ok`:
+        // the frontend did nothing wrong, and an error would look like a daemon fault in its log.
+        for generation in [stale, live] {
+            let dispatched = go(
+                &supervisor,
+                &mut first,
+                Request::Control {
+                    pane: pane("%3", "srv"),
+                    generation,
+                    body: "RESIZE 80 24 800 480".into(),
+                },
+            )
+            .await;
+            assert_eq!(dispatched.response, Response::Ok);
+        }
+        assert_eq!(supervisor.registry.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_control_line_for_a_bad_pane_id_is_an_error() {
+        let supervisor = supervisor();
+        let dispatched = go(
+            &supervisor,
+            &mut ConnectionState::default(),
+            Request::Control {
+                pane: pane("3", "srv"),
+                generation: Generation(1),
+                body: "VIS 1".into(),
+            },
+        )
+        .await;
+        assert!(matches!(dispatched.response, Response::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_frame_reaches_the_frontend_hex_encoded_and_stamped_with_the_generation() {
+        let response = engine_event_response(
+            EngineEvent::Frame {
+                pane: "%3".into(),
+                payload: vec![0x1b, 0x5f, 0x47],
+            },
+            &pane("%3", "srv"),
+            Generation(9),
+        )
+        .expect("a frame is delivered");
+        assert_eq!(
+            response,
+            Response::Frame {
+                pane: "%3".into(),
+                generation: Generation(9),
+                payload: "1b5f47".into(),
+            }
+        );
+    }
+
+    // The engine host reports its own death by naming no pane. Every hosted frontend has to read
+    // that as "the shared runtime is gone, spawn your own", not as "my one page closed".
+    #[tokio::test]
+    async fn an_unnamed_close_is_engine_lost_and_a_named_one_is_just_that_pane() {
+        let lost = engine_event_response(
+            EngineEvent::Closed {
+                pane: String::new(),
+                reason: "engine exited: signal 9".into(),
+            },
+            &pane("%3", "srv"),
+            Generation(2),
+        )
+        .expect("delivered");
+        assert!(matches!(
+            lost,
+            Response::Event {
+                event: PaneEvent::EngineLost { .. },
+                ..
+            }
+        ));
+        let closed = engine_event_response(
+            EngineEvent::Closed {
+                pane: "%3".into(),
+                reason: "renderer-gone".into(),
+            },
+            &pane("%3", "srv"),
+            Generation(2),
+        )
+        .expect("delivered");
+        assert!(matches!(
+            closed,
+            Response::Event {
+                event: PaneEvent::Closed { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_engine_ready_line_is_not_forwarded_to_a_frontend() {
+        assert_eq!(
+            engine_event_response(
+                EngineEvent::Ready { protocol: 1 },
+                &pane("%3", "srv"),
+                Generation(1)
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_and_audio_events_reach_the_frontend() {
+        let agent = engine_event_response(
+            EngineEvent::AgentSocket {
+                pane: "%3".into(),
+                path: "/tmp/a.sock".into(),
+            },
+            &pane("%3", "srv"),
+            Generation(1),
+        );
+        assert!(matches!(
+            agent,
+            Some(Response::Event {
+                event: PaneEvent::AgentSocket { .. },
+                ..
+            })
+        ));
+        let audio = engine_event_response(
+            EngineEvent::Audio {
+                pane: "%3".into(),
+                audible: true,
+            },
+            &pane("%3", "srv"),
+            Generation(1),
+        );
+        assert!(matches!(
+            audio,
+            Some(Response::Event {
+                event: PaneEvent::Audio { audible: true },
+                ..
+            })
+        ));
     }
 }

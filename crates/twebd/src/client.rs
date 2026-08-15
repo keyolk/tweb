@@ -69,6 +69,24 @@ pub fn render(response: &Response) -> String {
             };
             format!("attached {page} generation {generation}{note}")
         }
+        Response::Hosted {
+            page,
+            generation,
+            protocol,
+        } => format!("hosted {page} generation {generation} protocol {protocol}"),
+        Response::HostRefused { reason, detail } => {
+            format!("not hosted ({reason:?}): {detail}")
+        }
+        Response::Frame {
+            pane,
+            generation,
+            payload,
+        } => format!("frame {pane} gen {generation} {} bytes", payload.len() / 2),
+        Response::Event {
+            pane,
+            generation,
+            event,
+        } => format!("event {pane} gen {generation} {event:?}"),
         Response::Panes { panes } if panes.is_empty() => "no panes attached".to_string(),
         Response::Panes { panes } => panes
             .iter()
@@ -86,8 +104,11 @@ pub fn render(response: &Response) -> String {
             uptime_ms,
             pane_count,
             generation_counter,
+            protocol,
+            engine,
+            hosted_pane_count,
         } => format!(
-            "pid {pid}\nsocket {socket}\nuptime_ms {uptime_ms}\npanes {pane_count}\ngenerations {generation_counter}"
+            "pid {pid}\nsocket {socket}\nuptime_ms {uptime_ms}\npanes {pane_count}\ngenerations {generation_counter}\nprotocol {protocol}\nengine {engine}\nhosted {hosted_pane_count}"
         ),
         Response::Error { message } => format!("error: {message}"),
     }

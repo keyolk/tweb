@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tweb-core.workspace = true
+twebd.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
