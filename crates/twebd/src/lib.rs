@@ -29,6 +29,8 @@
 pub mod automation;
 pub mod cli;
 pub mod client;
+pub mod engine_host;
+pub mod engine_wire;
 pub mod page_registry;
 pub mod paths;
 pub mod profile_manager;

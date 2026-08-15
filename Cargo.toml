@@ -42,3 +42,4 @@ tweb-core = { path = "crates/tweb-core" }
 tweb-platform = { path = "crates/tweb-platform" }
 tweb-agent = { path = "crates/tweb-agent" }
 tweb-pane = { path = "crates/tweb-pane" }
+twebd = { path = "crates/twebd" }

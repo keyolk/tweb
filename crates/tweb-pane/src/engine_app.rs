@@ -87,6 +87,22 @@ const FILES: &[(&str, &str)] = &[
         "history-lock.cjs",
         include_str!("../../../electron/history-lock.cjs"),
     ),
+    (
+        "frame-writer.cjs",
+        include_str!("../../../electron/frame-writer.cjs"),
+    ),
+    (
+        "pane-identity.cjs",
+        include_str!("../../../electron/pane-identity.cjs"),
+    ),
+    (
+        "pane-registry.cjs",
+        include_str!("../../../electron/pane-registry.cjs"),
+    ),
+    (
+        "pane-control.cjs",
+        include_str!("../../../electron/pane-control.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.

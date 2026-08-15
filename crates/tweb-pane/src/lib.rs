@@ -10,10 +10,13 @@
 //! - pane resize → Electron viewport resize
 //! - pane kill → Electron shutdown, image delete
 
+pub mod attach;
 pub mod display;
 mod engine_app;
 pub mod graphics;
+pub mod hosted;
 pub mod input;
+pub mod pane_writer;
 pub mod resize;
 pub mod terminal;
 pub mod visibility;
@@ -319,6 +322,20 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     let initial_geometry = terminal::window_geometry();
     // Kitty image IDs live in a terminal-wide namespace, so each pane process needs its own.
     let image_id = std::process::id();
+
+    // The daemon path, off unless asked for. Every uncertainty inside this call falls through to
+    // the spawn below, which is the path that ships — so a pane that opted in and found no daemon,
+    // an incompatible daemon, or a daemon whose engine cannot host, behaves exactly as it does
+    // today rather than degrading.
+    match try_hosted(url, options, &pane, image_id).await {
+        HostedOutcome::Finished => return Ok(()),
+        HostedOutcome::Spawn(reason) => {
+            if !matches!(reason, attach::SpawnReason::FlagOff) {
+                tracing::info!(reason = %reason, "spawning this pane's own engine");
+            }
+        }
+    }
+
     let (mut command, engine_description) = match options.engine {
         BrowserEngine::Electron => {
             let (electron_path, electron_dir) = find_electron()?;
@@ -516,6 +533,179 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     control_handle.abort();
 
     Ok(())
+}
+
+/// What a hosted attempt produced.
+enum HostedOutcome {
+    /// The pane ran hosted and has ended. The caller returns.
+    Finished,
+    /// Spawn an engine for this pane — today's path, with the reason for the log.
+    Spawn(attach::SpawnReason),
+}
+
+/// Runs this pane against the daemon, or says why it cannot be.
+///
+/// The frontend keeps every job it has on the spawn path except starting a process: it still owns
+/// the terminal, raw input, geometry and visibility polling, and — decisively — it is still the
+/// only writer of this pane's pty. That is not incidental. A pty write is not atomic at any size,
+/// and the frontend already writes caret, cursor-shape and teardown sequences to this tty, so
+/// routing frames through it is what keeps one serialising writer per pane tty.
+async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
+    let socket = twebd::paths::socket_path_in(&twebd::paths::runtime_dir());
+    let flag = std::env::var(attach::DAEMON_FLAG).ok();
+    if let Err(reason) = attach::initial_route(flag.as_deref(), socket.exists()) {
+        return HostedOutcome::Spawn(reason);
+    }
+    // A pane the daemon cannot name is a pane it cannot key, and its whole identity model is
+    // (tmux server, pane id). Outside tmux there is no server identity, so there is nothing to
+    // host against.
+    let Some(tmux_server) =
+        twebd::tmux::server_identity_from(std::env::var("TMUX").ok().as_deref())
+    else {
+        return HostedOutcome::Spawn(attach::SpawnReason::NoSocket);
+    };
+    // Resolved here rather than in the daemon: resolution walks up from the current directory, and
+    // this process is the one standing in the pane's shell.
+    let (executable, app_dir) = match find_electron() {
+        Ok(paths) => paths,
+        Err(err) => {
+            return HostedOutcome::Spawn(attach::SpawnReason::ConnectFailed(err.to_string()))
+        }
+    };
+
+    let pane_ref = twebd::protocol::PaneRef {
+        pane: pane.to_string(),
+        tmux_server,
+    };
+    let request = hosted::HostRequest {
+        pane: pane_ref.clone(),
+        image_id,
+        url,
+        frame_rate: options.frame_rate,
+        adaptive_frame_rate: options.adaptive_frame_rate,
+        restore_session: options.restore_session,
+        engine_executable: executable.display().to_string(),
+        engine_app_dir: app_dir.display().to_string(),
+    };
+    let (stream, generation) = match hosted::connect_and_host(&socket, &request, std::process::id())
+    {
+        Ok(session) => session,
+        Err(reason) => return HostedOutcome::Spawn(reason),
+    };
+    tracing::info!(pane, %generation, "hosted by twebd");
+
+    let outcome = run_hosted_session(stream, pane, &pane_ref, generation, options).await;
+    // Whichever way the session ended, this pane's image has to come off the terminal before
+    // anything else draws there. Skipping it on the fallback path leaves the hosted page's pixels
+    // under the freshly spawned engine's.
+    write_kitty_delete(image_id, pane);
+    match outcome {
+        Some(reason) => HostedOutcome::Spawn(reason),
+        None => HostedOutcome::Finished,
+    }
+}
+
+/// Drives one hosted pane until it ends. `None` means the pane finished; `Some` means fall back.
+async fn run_hosted_session(
+    stream: std::os::unix::net::UnixStream,
+    pane: &str,
+    pane_ref: &twebd::protocol::PaneRef,
+    generation: twebd::protocol::Generation,
+    options: PaneOptions,
+) -> Option<attach::SpawnReason> {
+    use std::io::Write as _;
+
+    // stdout is this pane's tty. The frontend owns it on the spawn path too — what changes is only
+    // that the bytes arrive over a socket instead of being written by a child that inherited it.
+    let writer = std::sync::Arc::new(pane_writer::PaneWriter::new(Box::new(std::io::stdout())));
+
+    // Control lines go up to the daemon on the same connection the frames come down. One writer
+    // task owns the socket's write half so the input loop and the geometry tick cannot interleave
+    // two JSON lines.
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut socket_writer = match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(err) => return Some(attach::SpawnReason::HostedSessionLost(err.to_string())),
+    };
+    let pane_for_control = pane_ref.clone();
+    let control_handle = tokio::task::spawn_blocking(move || {
+        while let Some(body) = control_rx.blocking_recv() {
+            let request = hosted::control_request(&pane_for_control, generation, &body);
+            let line = twebd::protocol::encode_request(&request);
+            if socket_writer.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+            if socket_writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    let input_handle = tokio::spawn({
+        let control_tx = control_tx.clone();
+        async move {
+            let mut tty = tokio::io::stdin();
+            let mut buf = [0u8; 256];
+            loop {
+                match tty.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut hex = String::with_capacity(n * 2 + 7);
+                        hex.push_str("INPUT ");
+                        for byte in &buf[..n] {
+                            use std::fmt::Write as _;
+                            let _ = write!(hex, "{byte:02x}");
+                        }
+                        if control_tx.send(hex).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let state_handle = tokio::spawn({
+        let control_tx = control_tx.clone();
+        let pane = pane.to_string();
+        async move {
+            let mut sigwinch = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::from_raw(libc::SIGWINCH),
+            )
+            .expect("SIGWINCH");
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut previous_geometry = terminal::window_geometry();
+            let mut previous_visibility = None;
+            if let Some(geometry) = previous_geometry {
+                let _ = control_tx.send(resize_control_message(geometry));
+            }
+            loop {
+                tokio::select! {
+                    _ = sigwinch.recv() => {}
+                    _ = poll.tick() => {}
+                }
+                forward_pane_state(
+                    &control_tx,
+                    &pane,
+                    &mut previous_geometry,
+                    &mut previous_visibility,
+                );
+            }
+        }
+    });
+
+    let _ = options;
+    // The read side blocks, so it goes on its own thread: a frame must not wait behind the input
+    // loop or the geometry tick.
+    let reason = tokio::task::spawn_blocking(move || hosted::pump(stream, generation, writer))
+        .await
+        .unwrap_or_else(|err| attach::SpawnReason::HostedSessionLost(err.to_string()));
+
+    input_handle.abort();
+    state_handle.abort();
+    control_handle.abort();
+    Some(reason)
 }
 
 fn find_tauri() -> Result<std::path::PathBuf> {

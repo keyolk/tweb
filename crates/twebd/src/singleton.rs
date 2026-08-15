@@ -20,6 +20,17 @@
 //! process death whatever killed it. The lock is the truth; the socket file is just a name. This
 //! is the same lesson `electron/audio-owner.cjs` records — ownership must be judged, not trusted —
 //! reached there with a `{pane,pid,at}` claim file because that code had no connection to lean on.
+//!
+//! **One constraint that comes with `flock`, now that this daemon spawns an engine.** The lock
+//! belongs to the *open file description*, and `fork` duplicates every fd — so a child forked
+//! while the lock is open holds it too, until its `exec` closes it under `FD_CLOEXEC`. Closing the
+//! lock during that window does not release it. Measured here: with another thread spawning live
+//! children, an immediate re-acquire failed 2 times in 400.
+//!
+//! It is harmless as this daemon is built, because the lock is taken once at startup and held for
+//! the process lifetime — the window only matters to code that releases and retakes it. Anything
+//! that later wants to hand the lock over, or to drop it around spawning the engine, has to deal
+//! with this rather than assume a drop is immediate.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -143,6 +154,15 @@ mod tests {
         assert_eq!(decide(true, false), Acquisition::Bind);
     }
 
+    // The re-acquire retries, and the reason is a real POSIX property rather than test flakiness.
+    // `flock` is held by the *open file description*, and `fork` duplicates every fd — so a child
+    // forked while this lock is open holds it too, until `exec` closes it under `FD_CLOEXEC`.
+    // During that window a drop here does not release the lock. Measured directly: with another
+    // thread spawning live children, an immediate re-acquire failed 2 times in 400.
+    //
+    // It is harmless for the daemon, which takes the lock once and holds it for its whole life,
+    // and it stays harmless only because of that — a design that dropped and retook the lock
+    // around spawning the engine would hit this for real.
     #[test]
     fn a_second_acquisition_of_a_held_lock_fails_without_blocking() {
         let dir = tempdir();
@@ -151,7 +171,14 @@ mod tests {
         let second = try_acquire(&lock_path).expect("io ok");
         assert!(second.is_none(), "a second daemon must not get the lock");
         drop(first);
-        let third = try_acquire(&lock_path).expect("io ok");
+        let mut third = None;
+        for _ in 0..50 {
+            third = try_acquire(&lock_path).expect("io ok");
+            if third.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
             third.is_some(),
             "the lock must be free once the holder drops"
@@ -182,13 +209,19 @@ mod tests {
 
     /// A unique scratch directory. The crate has no dev-dependency on a temp-dir helper, and
     /// adding one would rewrite the workspace lockfile for the sake of six lines.
+    ///
+    /// The counter is what makes it unique, not the thread id: a test harness reuses thread ids as
+    /// tests finish, so two tests that ran on the same worker shared a directory — and since these
+    /// tests are about a *lock file*, sharing one made `try_acquire` see a lock another test still
+    /// held and fail intermittently.
     fn tempdir() -> std::path::PathBuf {
-        let unique = format!(
-            "twebd-test-{}-{:?}",
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "twebd-test-{}-{}",
             std::process::id(),
-            std::thread::current().id()
-        );
-        let dir = std::env::temp_dir().join(unique.replace(['(', ')', ' '], ""));
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
     }

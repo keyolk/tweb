@@ -218,17 +218,18 @@ roughly 2×:
   marginal pane    77.2 MB / 1.33 procs          136.2 MB / 4.33 procs   (mean over panes 2-4)
 
   decomposed at 4 panes:
-    renderers     199.0 MB    |    200.0 MB    <- identical
-    main process   58.0 MB    |    161.8 MB    <- 2.8x, the duplicated Node/V8
-    GPU process   117.0 MB    |    174.4 MB    <- 1.5x
-    utility        12.0 MB    |     35.6 MB    <- 3.0x
+    renderers     199.0 MB    |    200.0 MB    <- 1.00x, identical
+    main process   58.0 MB    |    158.0 MB    <- 2.72x, the duplicated Node/V8
+    GPU process   117.0 MB    |    171.0 MB    <- 1.46x
+    utility        12.0 MB    |     34.8 MB    <- 2.90x
+    total         386.0 MB    |    563.8 MB    <- 1.46x
 ```
 
 The renderer line is the honest framing: **a renderer is the page, and sharing a runtime does not
 make pages cheaper.** What sharing removes is the duplicated Node/V8 main process, the duplicated GPU
 process and the duplicated utility processes — which is exactly, and only, what §6.5's release gate
-asks for. The claim to make is "≈31% at four panes and ≈55 MB saved per additional pane", not an
-order of magnitude.
+asks for. The claim to make is "≈31% at four panes and ≈58 MB of runtime saved per additional pane,
+plus 3 processes", not an order of magnitude.
 
 Isolating the runtime term from page weight — four ~600 B pages, so only the runtime moves — gives the
 cleanest statement of the same result, dead linear on both paths:
@@ -449,8 +450,14 @@ Renaming a session or reordering windows must not change the profile identity.
 ### 6.3 Implementation languages
 
 TWeb's primary implementation language is **Rust**. Rust is chosen for memory efficiency, but the larger
-effect comes from removing Electron/Node/V8 from the daemon and the pane frontend and controlling buffer
+effect comes from keeping Electron/Node/V8 out of the daemon and the pane frontend and controlling buffer
 ownership explicitly.
+
+> **Scoped by the §5.1 measurement (2026-08-14).** "No Node/V8" applies to `twebd` and `tweb __pane`,
+> which are Rust. It does **not** extend to the engine: the engine is Electron, and the measured win
+> is that its Node/V8 main process is started **once** for N panes (58.0 MB flat across four panes)
+> instead of once per pane (158.0 MB at four). Removing Electron entirely was measured and rejected —
+> see §6.4.
 
 ```text
 Rust
@@ -532,7 +539,16 @@ building and debugging enough that the maintenance cost exceeds the memory saved
 
 ### 6.4 Choosing the Chromium adapter
 
-Putting memory efficiency first means not adopting Electron as the product core.
+> **Superseded by the §5.1 measurement (2026-08-14).** This section was written on the assumption
+> that putting memory efficiency first means *not* adopting Electron as the product core. Measurement
+> reversed it: Electron IS the product core, shared across panes. The only no-Electron path available
+> to measure — stock Chrome over CDP — lost badly (830.0 MB / 13 procs at four pages against shared
+> Electron's 386.0 MB / 8), because Chrome carries a 386 MB floor before the first page loads against
+> Electron's 43 MB. Dropping Electron could only ever buy back the main-process term, which sits flat
+> at 58.0 MB. The adapter goals below survive as the **long-term** shape of `BrowserEngineAdapter`,
+> not as the thing to validate first.
+
+The shipping and target adapter is Electron offscreen. The ranking as originally written was:
 
 ```text
 validate first
@@ -545,7 +561,12 @@ compatibility fallback
     an external Chrome/CDP screenshot adapter
 ```
 
-The goals of a CEF/custom Chromium adapter:
+The measured ranking is the reverse of the first two: the Electron offscreen adapter is what to build
+on, and a CEF/custom Chromium adapter is a future option that must beat 386 MB / 8 processes at four
+panes before it is worth its maintenance cost. The external Chrome/CDP adapter remains a
+compatibility fallback for driving the user's *own* Chrome (§11), not a candidate for the pane engine.
+
+The goals a CEF/custom Chromium adapter would have to serve, if it is ever revisited:
 
 - remove the Node/V8 main process
 - one browser process manages the session/profile context and many pages
@@ -554,9 +575,10 @@ The goals of a CEF/custom Chromium adapter:
 - keep the Chromium sandbox and process isolation
 - validate the extension API through a capability registry
 
-If CEF cannot provide the needed extension API or GPU handle export, it is replaced by a custom Chromium
-shell adapter maintained with a narrow patch. That change happens behind `BrowserEngineAdapter` and does
-not alter the profile/page/resource API.
+If such an adapter is ever built and CEF cannot provide the needed extension API or GPU handle export,
+it would be replaced by a custom Chromium shell adapter maintained with a narrow patch. Either change
+happens behind `BrowserEngineAdapter` and does not alter the profile/page/resource API — which is the
+reason the reversal above costs the rest of this document nothing.
 
 ### 6.5 Memory ownership and budgets
 
@@ -638,13 +660,14 @@ following, though, are architecture release gates.
 **The first gate is failed today, by construction**, and knowing what passing it is worth is what
 §5.1's measurement settled. Each pane is its own Electron process, so the Node/V8 main process, the
 GPU process and the utility processes are duplicated exactly in proportion to the pane count. One
-Electron hosting N panes passes it: measured at four panes, the main-process term drops 161.8 MB →
-58.0 MB, the GPU term 174.4 → 117.0, utility 35.6 → 12.0, while the renderer term is unchanged
+Electron hosting N panes passes it: measured at four panes, the main-process term drops 158.0 MB →
+58.0 MB, the GPU term 171.0 → 117.0, utility 34.8 → 12.0, while the renderer term is unchanged
 (200.0 vs 199.0). Note what the gate asks and does not ask — it is about **duplication of the
 runtime**, not total bytes. A renderer is the page, so total footprint stays proportional to the
-number of pages under any architecture; the honest headline is ≈31% saved at four panes, ≈55 MB per
-additional pane. All figures are summed `phys_footprint` over the process tree; RSS is never the
-measure, as it overstates by roughly 2× on this workload.
+number of pages under any architecture; the honest headline is ≈31% saved at four panes (386.0 vs
+563.8 MB), ≈58 MB of runtime plus 3 processes per additional pane. All figures are summed
+`phys_footprint` over the process tree; RSS is never the measure, as it overstates by roughly 2× on
+this workload.
 
 ### 6.6 Platform abstraction
 

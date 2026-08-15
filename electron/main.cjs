@@ -65,6 +65,14 @@ const {
   appendedSince,
   compactLines,
 } = require("./history-view.cjs");
+const { createPaneWriter, fdSink } = require("./frame-writer.cjs");
+const { serverIdentityFrom, paneKey } = require("./pane-identity.cjs");
+const {
+  PaneRegistry, createPaneRecord, applyVisibility: recordVisibility,
+  applyFrameTier: recordFrameTier, applySurface: recordSurface, applyAudio: recordAudio,
+  audioOwnerAmong,
+} = require("./pane-registry.cjs");
+const { parseControlLine, resolveTarget } = require("./pane-control.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
@@ -92,7 +100,11 @@ let quitting = false;
 //   vimium off + bypass off = D (web only)
 let vimiumShortcutsEnabled = true;
 let cmdBypassEnabled = false;
-let terminalVisible = true;
+// Pane visibility lives in the registry record, not in a variable beside it. It is the gate on
+// frame send, frame rate, and the surface plan — and on a terminal with tmux
+// `allow-passthrough=all`, which forwards a hidden pane's passthrough to whatever window the
+// client is actually viewing, it is the only thing between a hidden pane and drawing over the
+// user's visible one. A second copy of it is therefore the one piece of state that must not exist.
 let visibilityCheckRunning = false;
 let visibleClientTtys = new Set();
 const passthroughClientTables = new Map();
@@ -214,6 +226,64 @@ const imageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
 // patch, and the terminal took 64 of them in a row without complaint.
 const PATCH_ID_COUNT = 8;
 const patchIdBase = imageId + 1;
+
+// --- per-pane runtime registry ---
+//
+// One Electron per pane meant every piece of pane state was a module-level variable and "which
+// pane is this for" never had to be asked. The registry names that state and keys it by pane
+// identity, so one runtime can hold several.
+//
+// The default path registers exactly one pane and runs through the registry and the writer like
+// any other, rather than keeping a second code path beside them. That is deliberate: a seam only
+// used by a flag is a seam nothing proves, and this one carries every frame the shipping build
+// draws.
+const paneRegistry = new PaneRegistry();
+const tmuxServerIdentity = serverIdentityFrom(process.env.TMUX);
+// The generation is assigned by the supervisor once one exists. Until then a pane is generation
+// 0 — a real value, not a placeholder, because this process *is* the only registration of this
+// pane and nothing can supersede it from outside.
+const SOLE_PANE_GENERATION = 0;
+const solePaneId = process.env.TMUX_PANE || `pid-${process.pid}`;
+const solePane = createPaneRecord({
+  tmuxServer: tmuxServerIdentity,
+  paneId: solePaneId,
+  generation: SOLE_PANE_GENERATION,
+  imageId,
+});
+paneRegistry.attach(solePane);
+
+// Every byte bound for this pane's terminal goes through one writer: graphics, the caret
+// sequences that park on the web caret, and the image delete on exit. Two writers to one pane tore
+// roughly one frame in 750 under realistic contention — realistic meaning a caret sequence after
+// every frame, which is exactly what this file does — and moving into one process does not repair
+// that, it only changes which two writers are racing.
+//
+// The sink is synchronous because `process.on("exit")` writes the delete that removes this pane's
+// image, and an exit handler cannot await. Stdout is inherited from the frontend that owns the
+// pty; a host that opens a pane tty by name instead must pass O_NOCTTY, or the first pane's
+// hangup takes down the runtime serving all the others.
+const paneWriters = new Map();
+
+function writerFor(record) {
+  let writer = paneWriters.get(record.key);
+  if (!writer) {
+    writer = createPaneWriter({
+      sink: fdSink(record.tty ?? 1),
+      onError: (error) => {
+        if (debugLogging) console.error(`tweb: pane write failed ${record.paneId}: ${error.message}`);
+      },
+    });
+    paneWriters.set(record.key, writer);
+  }
+  return writer;
+}
+
+// The shipping path has exactly one pane, so this is the writer everything in this file uses.
+// A host resolves the record first and calls `writerFor` with it.
+function paneWrite(text) {
+  writerFor(solePane).write(text);
+}
+
 const frameTransport = process.env.TWEB_FRAME_TRANSPORT === "direct" ? "direct" : "file";
 const frameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.png`);
 // Raw frames go to their own path so a stale PNG can never be read as pixels, or the other
@@ -568,7 +638,7 @@ function initializeTmuxVisibility() {
         { encoding: "utf8", timeout: 1000 }
       );
       visibleClientTtys = visibleTmuxClientTtys(clients, tmuxPlacement);
-      terminalVisible = visibleClientTtys.size > 0;
+      recordVisibility(solePane, visibleClientTtys.size > 0);
     }
   } catch (error) {
     if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
@@ -628,7 +698,7 @@ function scheduleVisibilityCheck() {
 function applyClientListing(clients, placement) {
   tmuxPlacement = placement;
   const next = visibleTmuxClientTtys(clients, tmuxPlacement);
-  const wasVisible = terminalVisible;
+  const wasVisible = solePane.visible;
   // A client that stopped showing this pane keeps the image placed on it, so the delete
   // goes to that tty directly.
   for (const tty of visibleClientTtys) {
@@ -636,11 +706,11 @@ function applyClientListing(clients, placement) {
   }
   const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
   visibleClientTtys = next;
-  terminalVisible = next.size > 0;
-  if (wasVisible !== terminalVisible) {
+  const changed = recordVisibility(solePane, next.size > 0);
+  if (changed) {
     updatePaintingState();
     if (debugLogging) {
-      console.error(`tweb: visibility ${terminalVisible ? "visible" : "hidden"}`);
+      console.error(`tweb: visibility ${changed.visible ? "visible" : "hidden"}`);
     }
   }
   if (becameVisible) repaintActiveTab();
@@ -777,7 +847,7 @@ function noteRawFrameFailure() {
   if (rawFrameFailures < RAW_FRAME_FAILURE_LIMIT) return;
   rawFramesEnabled = false;
   console.error(`tweb: raw frames failed ${rawFrameFailures}x, falling back to PNG`);
-  if (win && !win.isDestroyed() && terminalVisible) win.webContents.invalidate();
+  if (win && !win.isDestroyed() && solePane.visible) win.webContents.invalidate();
 }
 
 gfxWorker.on("message", (message) => {
@@ -817,7 +887,7 @@ function writeGfx(header, payload) {
   // Wrap it in tmux passthrough.
   const wrapped = graphicsPassthrough(raw);
   try {
-    writeSync(1, wrapped);
+    paneWrite(wrapped);
   } catch (e) {}
   reassertTerminalCaret();
 }
@@ -850,7 +920,7 @@ function writeGfxChunked(header, payload, prefix = "", suffix = "") {
     raw += `${ESC}_G${chunkHeader};${chunk}${ESC}\\`;
   }
   try {
-    writeSync(1, graphicsPassthrough(`${prefix}${raw}${suffix}`));
+    paneWrite(graphicsPassthrough(`${prefix}${raw}${suffix}`));
   } catch (e) {}
   reassertTerminalCaret();
 }
@@ -867,7 +937,7 @@ function terminalSetup() {
   // reads as the caret having started there. Hide it until something parks it.
   caretHidden = true;
   try {
-    writeSync(1, `${CSI("?25l")}${CARET_SHAPE_RESET}`);
+    paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`);
   } catch (error) {
     void error;
   }
@@ -904,7 +974,7 @@ function terminalCleanup() {
   } catch (e) {}
   // Caret parking leaves the cursor shape as a bar, so restore the terminal default.
   try {
-    writeSync(1, CSI("0 q"));
+    paneWrite(CSI("0 q"));
   } catch (e) {}
 }
 
@@ -912,10 +982,13 @@ function terminalCleanup() {
 
 function applyActiveFrameRate(rate) {
   const next = Math.min(maxActiveFrameRate, Math.max(1, Math.round(rate)));
-  if (next === activeFrameRate) return;
+  // The mutator is what suppresses a redundant call. That matters beyond saving a syscall:
+  // `setFrameRate` provokes a paint of its own, and the playback tier is decided by counting
+  // paints over a window, so re-applying the current tier feeds the detector its own noise.
+  if (!recordFrameTier(solePane, next)) return;
   activeFrameRate = next;
   frameIntervalMs = Math.ceil(1000 / activeFrameRate);
-  if (win && !win.isDestroyed() && terminalVisible) win.webContents.setFrameRate(activeFrameRate);
+  if (win && !win.isDestroyed() && solePane.visible) win.webContents.setFrameRate(activeFrameRate);
   if (debugLogging) console.error(`tweb: frame rate ${activeFrameRate}fps`);
 }
 
@@ -926,7 +999,7 @@ function markInteractionActivity() {
   // a quarter second of "nothing happened" after a keypress.
   const wasIdle = activeFrameRate !== maxActiveFrameRate;
   applyActiveFrameRate(maxActiveFrameRate);
-  if (wasIdle && win && !win.isDestroyed() && terminalVisible) win.webContents.invalidate();
+  if (wasIdle && win && !win.isDestroyed() && solePane.visible) win.webContents.invalidate();
   if (frameIdleTimer) clearTimeout(frameIdleTimer);
   // The paints this interaction is about to cause say nothing about whether the page
   // paints on its own, which is the only thing the settle decides — so the count starts
@@ -1020,8 +1093,8 @@ let livePatchIds = [];
 // The damage every live patch covers between them. A patch repaints this whole region, so
 // a later, smaller one still erases what an earlier, larger one drew.
 let patchedDamage = null;
-let patchFramesSent = 0;
-let wholeFramesSent = 0;
+// Whole/patch counts live on the pane record: `tweb diag` reports them per pane, and one
+// runtime holding several must not attribute one pane's frames to another.
 
 function nextPatchId() {
   const id = patchIdBase + nextPatchSlot;
@@ -1086,7 +1159,8 @@ function sendPatch(image, dirty, generation) {
   writeGfxChunked(header, png.toString("base64"), prefix, suffix);
   if (!livePatchIds.includes(id)) livePatchIds.push(id);
   patchedDamage = damage;
-  patchFramesSent += 1;
+  solePane.frames.patches += 1;
+  const patchFramesSent = solePane.frames.patches;
   if (patchFramesSent <= 12) {
     console.error(`tweb: patch sent #${patchFramesSent} `
       + `cells=${geometry.place.cols}x${geometry.place.rows}`
@@ -1107,7 +1181,7 @@ function transferFrame(pixels, generation, format = "png", size = null) {
   const header = `a=T,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
-  wholeFramesSent += 1;
+  solePane.frames.whole += 1;
   // Only the first few: enough to see when a page actually reached the pane, which
   // is what separates "the engine is behind" from "the site is slow", and quiet
   // after that.
@@ -1118,7 +1192,7 @@ function transferFrame(pixels, generation, format = "png", size = null) {
 }
 
 function sendFrameNow(image, generation) {
-  if (!terminalVisible || generation !== viewportGeneration || !image || image.isEmpty()) return;
+  if (!solePane.visible || generation !== viewportGeneration || !image || image.isEmpty()) return;
   const viewport = lastViewport;
   const size = image.getSize();
   const expected = viewport && renderedFrameSize(viewport);
@@ -1147,7 +1221,7 @@ function flushPendingFrame() {
   pendingFrameTimer = null;
   const frame = pendingFrame;
   pendingFrame = null;
-  if (!frame || frame.tab !== win || frame.generation !== viewportGeneration || !terminalVisible) return;
+  if (!frame || frame.tab !== win || frame.generation !== viewportGeneration || !solePane.visible) return;
   sendFrameNow(frame.image, frame.generation);
 }
 
@@ -1174,7 +1248,7 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   // way. Dropping the entry is what makes it converge.
   if (tab === win) tabFrames.set(tab, { image, generation });
   else tabFrames.delete(tab);
-  if (tab !== win || !terminalVisible) return;
+  if (tab !== win || !solePane.visible) return;
   // Small damage goes out immediately as a patch instead of waiting for the frame
   // interval — the wait exists to pace whole-frame encodes, and a patch costs a
   // thousandth of one. A caret keeping up with the keyboard is the whole point.
@@ -1190,7 +1264,7 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
 }
 
 function repaintActiveTab() {
-  if (!terminalVisible || !win || win.isDestroyed()) return;
+  if (!solePane.visible || !win || win.isDestroyed()) return;
   const frame = tabFrames.get(win);
   if (frame && frame.generation === viewportGeneration && !frame.image.isEmpty()) {
     queueFrame(win, frame.image, true);
@@ -1428,11 +1502,11 @@ function updatePaintingState() {
   // hidden page's buffers converging to zero — so it goes, and the reveal below repaints
   // instead of re-placing. `repaintActiveTab` already falls back to `invalidate()` when
   // the cache is empty, which is the same path a resize generation bump takes.
-  if (!terminalVisible) tabFrames.clear();
+  if (!solePane.visible) tabFrames.clear();
   const held = surfaceHeldForAgent();
   for (const tab of tabs) {
     if (tab.isDestroyed()) continue;
-    const plan = surfacePlan(tab === win, terminalVisible, logicalContentSize(currentViewport()), held);
+    const plan = surfacePlan(tab === win, solePane.visible, logicalContentSize(currentViewport()), held);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? activeFrameRate : 1);
     applySurfacePlan(tab, plan);
@@ -1469,6 +1543,12 @@ function applySurfacePlan(tab, plan) {
   const size = tab.getContentSize();
   const current = { width: size[0], height: size[1] };
   if (!surfaceResizeNeeded(plan, current)) return;
+  // Recorded before the resize, and only for the tab that is this pane's active one: the
+  // record's `logical` is the size a restore goes back to, and reading it off a collapsed
+  // surface is how the agent API came back with innerHeight=1.
+  if (tab === win) {
+    recordSurface(solePane, { collapsed: plan.height <= 1, logical: { width: plan.width, height: plan.height } });
+  }
   tab.setContentSize(plan.width, plan.height);
   // Chromium resets the zoom factor on a content resize, and a collapsed tab would come
   // back at 100% however the user had zoomed it.
@@ -1573,7 +1653,7 @@ let agentSurfaceFrame = null;
 /// A visible pane already has its full surface, so this is a straight pass-through there
 /// — the cost is paid only by the case that was broken.
 async function withAgentSurface(method, body) {
-  if (terminalVisible || !agentNeedsGeometry(method) || !win || win.isDestroyed()) {
+  if (solePane.visible || !agentNeedsGeometry(method) || !win || win.isDestroyed()) {
     return body();
   }
   agentSurfaceHolds += 1;
@@ -1705,6 +1785,10 @@ function reconcileAudio({ claiming = false } = {}) {
   // A muted tab is not audible by definition, so this only ever reports the noise this
   // instance is actually allowed to make.
   const audible = anyTabAudible();
+  // Recorded on the pane so a runtime holding several arbitrates in memory rather than through
+  // the file. The file stays the boundary between *runtimes* — per-pane engines running beside a
+  // host share nothing else — but panes inside one runtime do not need to publish to it and poll.
+  recordAudio(solePane, { audible });
   if (audible) audioSilentSince = null;
   else if (audioSilentSince === null) audioSilentSince = now;
 
@@ -2617,8 +2701,8 @@ function agentDiagnostics() {
       // How the damage split between the two paths. A pane that feels slow while typing
       // but shows `patches` climbing is slow somewhere other than the frame pipeline;
       // one stuck at 0 during typing means the damage never qualified for a patch.
-      whole: wholeFramesSent,
-      patches: patchFramesSent,
+      whole: solePane.frames.whole,
+      patches: solePane.frames.patches,
       patchesPlaced: livePatchIds.length,
       // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
@@ -2628,7 +2712,7 @@ function agentDiagnostics() {
       vimiumShortcuts: vimiumShortcutsEnabled,
       cmdBypass: cmdBypassEnabled,
       pageInsertMode,
-      terminalVisible,
+      terminalVisible: solePane.visible,
       // Whether visibility is coming from the frontend's push or the no-frontend
       // polling fallback, and how stale the last push is. A pane that reads hidden
       // while showing "poll" is a frontend that never pushed, not a tmux problem.
@@ -2858,7 +2942,7 @@ function unparkTerminalCaret() {
   // Reported on every frame with no caret, so it writes only on the transition.
   if (caretHidden) return;
   caretHidden = true;
-  try { writeSync(1, `${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
+  try { paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
 }
 
 // The page draws the IME composition surface on the cell grid, which only main can measure: the
@@ -2922,7 +3006,7 @@ function moveTerminalCaret(point) {
 function writeTerminalCaret(row, col) {
   caretHidden = false;
   try {
-    writeSync(1, `${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
+    paneWrite(`${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
   } catch (error) {
     void error;
   }
@@ -3395,6 +3479,10 @@ function applyViewport(vp, origin = tmuxOrigin) {
   tmuxOrigin = origin;
   paneCells = { cols: vp.cols, rows: vp.rows };
   lastViewport = vp;
+  // The record is what a host reads back; `lastViewport`/`tmuxOrigin` stay because the rest of
+  // this file reads them on every frame and hop through the record would buy nothing here.
+  solePane.viewport = vp;
+  solePane.origin = origin;
   const logical = logicalContentSize(vp);
   if (debugLogging) {
     const anchor = tmuxOrigin ? `${tmuxOrigin.left},${tmuxOrigin.top}` : "none";
@@ -3410,11 +3498,11 @@ function applyViewport(vp, origin = tmuxOrigin) {
     // resize is exactly when a hidden pane is most likely to be resized.
     for (const tab of tabs) {
       if (tab.isDestroyed()) continue;
-      applySurfacePlan(tab, surfacePlan(tab === win, terminalVisible, logical, surfaceHeldForAgent()));
+      applySurfacePlan(tab, surfacePlan(tab === win, solePane.visible, logical, surfaceHeldForAgent()));
     }
   }
   win?.webContents.invalidate();
-  if (terminalVisible) replacePlacement();
+  if (solePane.visible) replacePlacement();
   broadcastCellMetrics();
   reparkTerminalCaret();
 }
@@ -4011,32 +4099,33 @@ process.stdin.on("data", (chunk) => {
     const line = controlBuffer.slice(0, newline).trim();
     controlBuffer = controlBuffer.slice(newline + 1);
 
-    const resize = /^RESIZE\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)(?:\s+(\d+)\s+(\d+))?$/.exec(line);
-    if (resize) {
+    // Parsed by `pane-control.cjs`, and addressed lines resolve through the registry. An
+    // unaddressed line means "the implicit sole pane", which is what the shipping frontend has
+    // always meant by it — so a frontend that never learns the `@%N` prefix keeps working.
+    const command = parseControlLine(line);
+    if (!command) continue;
+    // A line addressed to a pane this runtime does not hold is dropped rather than applied to
+    // whichever pane happened to be first. With one registration the sole pane always resolves.
+    const target = resolveTarget(command, paneRegistry, tmuxServerIdentity);
+    if (!target) continue;
+
+    if (command.kind === "resize") {
       markInteractionActivity();
-      const origin = resize[5] !== undefined && resize[6] !== undefined
-        ? { left: Number(resize[5]), top: Number(resize[6]) }
-        : tmuxOrigin;
-      applyViewport({
-        cols: Number(resize[1]),
-        rows: Number(resize[2]),
-        width: Number(resize[3]),
-        height: Number(resize[4]),
-      }, origin);
+      // An absent origin means "leave the anchor where it is". Normalising it to 0,0 would
+      // re-anchor the pane at the window's top-left, i.e. draw it over its neighbours.
+      applyViewport(command.viewport, command.origin === undefined ? tmuxOrigin : command.origin);
       continue;
     }
 
     // The frontend's pane visibility push — see the pane visibility section. It is not
     // interaction, so unlike RESIZE/INPUT it deliberately does not mark activity: a
     // client attaching elsewhere must not count as someone using this pane.
-    const visibility = /^VIS\s+([0-9a-f]*)$/i.exec(line);
-    if (visibility) {
-      applyVisibilityPush(visibility[1]);
+    if (command.kind === "visibility") {
+      applyVisibilityPush(command.hex);
       continue;
     }
 
-    const input = /^INPUT\s+([0-9a-f]*)$/i.exec(line);
-    if (input && input[1].length % 2 === 0) {
+    if (command.kind === "input") {
       markInteractionActivity();
       if (rawInputFlushTimer) {
         clearTimeout(rawInputFlushTimer);
@@ -4046,10 +4135,10 @@ process.stdin.on("data", (chunk) => {
       // terminal never sent it" from "it arrived but was not understood" — this log
       // is how tmux re-encoding ESC[5020~ into ESC[91;3u5020~ was found. Logging
       // ordinary typing too would drown it, so only sequences are kept.
-      if (debugLogging && input[1].startsWith("1b")) {
-        console.error(`tweb: input ${input[1]}`);
+      if (debugLogging && command.hex.startsWith("1b")) {
+        console.error(`tweb: input ${command.hex}`);
       }
-      rawInput = Buffer.concat([rawInput, Buffer.from(input[1], "hex")]);
+      rawInput = Buffer.concat([rawInput, Buffer.from(command.hex, "hex")]);
       consumeRawInput();
     }
   }
@@ -4216,7 +4305,12 @@ app.on("before-quit", () => {
 // Delete the image on process exit too (safety net).
 process.on("exit", () => {
   cleanupFrameFiles();
-  try {
-    writeGfx(`a=d,d=I,i=${imageId}`, "");
-  } catch (e) {}
+  // The delete that takes each pane's image off the terminal. An exit handler cannot await, so
+  // this only works because every pane writer has a synchronous sink — see `fdSink`. Give a
+  // writer an async sink and these deletes are dropped, stranding the images.
+  for (const record of paneRegistry.list()) {
+    try {
+      writeGfx(`a=d,d=I,i=${record.imageId}`, "");
+    } catch (e) {}
+  }
 });

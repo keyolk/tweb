@@ -11,6 +11,15 @@
 use serde::{Deserialize, Serialize};
 use tweb_core::page::PaneId;
 
+/// The protocol this build speaks.
+///
+/// Sent on every attach and echoed back, because the daemon and the frontend are separate binaries
+/// that a user can end up running from different builds — an installed `twebd` left running while
+/// a workspace `tweb` is rebuilt is the ordinary case, not an exotic one. A mismatch has to be a
+/// clean "use your own engine", never a frontend that hangs waiting for frames in a shape the
+/// daemon does not send.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// A pane as it appears on the wire: the tmux pane id (`%3`) plus the tmux server that issued it.
 ///
 /// Both halves are required. tmux reuses pane ids within a server and hands out the same small
@@ -98,6 +107,47 @@ pub enum Request {
         /// The frontend's pid. Diagnostics only — liveness is the connection, not this number.
         pid: u32,
     },
+    /// Register this connection's pane *and* ask the daemon's engine to host its page.
+    ///
+    /// Separate from [`Request::Attach`] rather than a flag on it, because the two have different
+    /// failure modes: a plain attach cannot fail for want of an engine, and a daemon built before
+    /// hosting existed answers this with an error and keeps the connection open — which is exactly
+    /// the signal the frontend needs to fall back to spawning its own engine.
+    Host {
+        #[serde(flatten)]
+        pane: PaneRef,
+        pid: u32,
+        /// The frontend's protocol version. A mismatch is answered, not guessed at.
+        protocol: u32,
+        /// The Kitty image id the frontend already reserved. It comes from the caller because
+        /// legacy per-pane engines derive theirs from their pid, and the id namespace is
+        /// terminal-wide: a host that invented its own range would collide with them.
+        image_id: u32,
+        /// The engine the *frontend* resolved, passed rather than re-resolved by the daemon.
+        ///
+        /// Engine resolution walks up from the current directory, so it answers differently in a
+        /// pane's shell than in a daemon started from somewhere else — running the wrong embedded
+        /// copy is the single most expensive mistake in this repo's history. The frontend is the
+        /// side standing in the right place, and it has to resolve the engine anyway for its own
+        /// fallback, so its answer is the one the daemon uses.
+        engine_executable: String,
+        engine_app_dir: String,
+        url: String,
+        frame_rate: u16,
+        adaptive_frame_rate: bool,
+        restore_session: bool,
+    },
+    /// One control line for an already-hosted pane — `RESIZE …`, `VIS …`, `INPUT …`, verbatim in
+    /// the grammar the single-pane engine already parses.
+    ///
+    /// Deliberately unanswered: control is a stream, and pairing every keystroke with a response
+    /// would put a round trip in the input path for no reader.
+    Control {
+        #[serde(flatten)]
+        pane: PaneRef,
+        generation: Generation,
+        body: String,
+    },
     /// Deregister a pane. Ignored if the generation is not the one currently registered.
     Detach {
         #[serde(flatten)]
@@ -123,6 +173,36 @@ pub struct PaneReport {
     pub attached_at_ms: u64,
 }
 
+/// Why the daemon would not host a pane.
+///
+/// A machine-readable reason rather than a message, because it decides control flow: the frontend
+/// falls back to spawning its own engine on any of these, and a fallback that turned on matching
+/// substrings of a human sentence would break the day someone improved the wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// The frontend and the daemon are different builds.
+    ProtocolMismatch,
+    /// This daemon has no engine that can host a pane — it could not be started, it crashed past
+    /// its restart budget, or the resolved engine app predates hosting.
+    EngineUnavailable,
+}
+
+/// Something the daemon pushes to an attached frontend without being asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum PaneEvent {
+    /// The hosted engine is gone and this pane is no longer being painted. The frontend's job on
+    /// seeing this is to stop trusting the daemon for this pane and spawn its own engine.
+    EngineLost { reason: String },
+    /// The engine dropped this one pane while continuing to serve others.
+    Closed { reason: String },
+    /// Where this pane's agent socket ended up.
+    AgentSocket { path: String },
+    /// Whether this pane currently holds the audio claim.
+    Audio { audible: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
@@ -133,6 +213,33 @@ pub enum Response {
         /// True when this attach displaced an earlier registration for the same pane key.
         superseded: bool,
     },
+    /// The pane is registered *and* its page is being hosted by the daemon's engine.
+    Hosted {
+        page: String,
+        generation: Generation,
+        protocol: u32,
+    },
+    /// The pane was not hosted, and nothing was registered. The frontend spawns its own engine.
+    HostRefused {
+        reason: RefusalReason,
+        detail: String,
+    },
+    /// Bytes this pane's frontend must write to its own tty, verbatim, hex-encoded.
+    ///
+    /// The daemon does not write pane ttys itself: the frontend is already the sole writer of
+    /// caret, cursor-shape and teardown sequences on that pty, and a pty write is not atomic at
+    /// any size, so routing frames through it is what keeps one serialising writer per pane tty.
+    Frame {
+        pane: String,
+        generation: Generation,
+        payload: String,
+    },
+    Event {
+        pane: String,
+        generation: Generation,
+        #[serde(flatten)]
+        event: PaneEvent,
+    },
     Panes {
         panes: Vec<PaneReport>,
     },
@@ -142,6 +249,11 @@ pub enum Response {
         uptime_ms: u64,
         pane_count: usize,
         generation_counter: Generation,
+        protocol: u32,
+        /// What the daemon's hosted engine is doing. Diagnostics, and the thing that tells an
+        /// operator whether a pane fell back because of the flag or because of the engine.
+        engine: String,
+        hosted_pane_count: usize,
     },
     Error {
         message: String,
@@ -219,6 +331,23 @@ mod tests {
                 pane: pane_ref("%3", "srv"),
                 pid: 4711,
             },
+            Request::Host {
+                pane: pane_ref("%3", "srv"),
+                pid: 4711,
+                protocol: PROTOCOL_VERSION,
+                image_id: 909,
+                engine_executable: "/opt/Electron".into(),
+                engine_app_dir: "/opt/tweb/electron".into(),
+                url: "https://example.com".into(),
+                frame_rate: 30,
+                adaptive_frame_rate: true,
+                restore_session: false,
+            },
+            Request::Control {
+                pane: pane_ref("%3", "srv"),
+                generation: Generation(2),
+                body: "INPUT 1b5b41".into(),
+            },
             Request::Detach {
                 pane: pane_ref("%3", "srv"),
                 generation: Generation(7),
@@ -234,6 +363,40 @@ mod tests {
         }
     }
 
+    // The whole point of the version field: a daemon from another build must be *detected*, not
+    // guessed at. A frontend that assumed compatibility would hang waiting for frames in a shape
+    // the daemon does not send.
+    #[test]
+    fn host_carries_the_protocol_version_on_the_wire() {
+        let line = encode_request(&Request::Host {
+            pane: pane_ref("%3", "srv"),
+            pid: 1,
+            protocol: PROTOCOL_VERSION,
+            image_id: 5,
+            engine_executable: "/opt/Electron".into(),
+            engine_app_dir: "/opt/tweb/electron".into(),
+            url: "https://example.com".into(),
+            frame_rate: 30,
+            adaptive_frame_rate: false,
+            restore_session: true,
+        });
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(value["kind"], "host");
+        assert_eq!(value["pane"], "%3");
+        assert_eq!(value["protocol"], PROTOCOL_VERSION);
+        assert_eq!(value["image_id"], 5);
+        assert_eq!(value["restore_session"], true);
+    }
+
+    // A daemon built before hosting existed answers `host` with an error and keeps the connection
+    // open — this is the decode side of that, and it is what makes an older daemon a fallback
+    // trigger rather than a hang.
+    #[test]
+    fn a_host_request_is_unknown_to_an_older_protocol_reader() {
+        let err = decode_request(r#"{"kind":"host","pane":"%3"}"#).unwrap_err();
+        assert!(matches!(err, ProtocolError::Malformed(_)));
+    }
+
     #[test]
     fn responses_round_trip() {
         let cases = vec![
@@ -242,6 +405,46 @@ mod tests {
                 page: "bpage_x".into(),
                 generation: Generation(1),
                 superseded: true,
+            },
+            Response::Hosted {
+                page: "bpage_x".into(),
+                generation: Generation(3),
+                protocol: PROTOCOL_VERSION,
+            },
+            Response::HostRefused {
+                reason: RefusalReason::EngineUnavailable,
+                detail: "no hosted-capable engine".into(),
+            },
+            Response::Frame {
+                pane: "%3".into(),
+                generation: Generation(4),
+                payload: "1b5f47".into(),
+            },
+            Response::Event {
+                pane: "%3".into(),
+                generation: Generation(4),
+                event: PaneEvent::EngineLost {
+                    reason: "exited".into(),
+                },
+            },
+            Response::Event {
+                pane: "%3".into(),
+                generation: Generation(4),
+                event: PaneEvent::AgentSocket {
+                    path: "/tmp/a.sock".into(),
+                },
+            },
+            Response::Event {
+                pane: "%3".into(),
+                generation: Generation(4),
+                event: PaneEvent::Audio { audible: true },
+            },
+            Response::Event {
+                pane: "%3".into(),
+                generation: Generation(4),
+                event: PaneEvent::Closed {
+                    reason: "renderer-gone".into(),
+                },
             },
             Response::Panes {
                 panes: vec![PaneReport {
@@ -259,6 +462,9 @@ mod tests {
                 uptime_ms: 5,
                 pane_count: 1,
                 generation_counter: Generation(2),
+                protocol: PROTOCOL_VERSION,
+                engine: "idle".into(),
+                hosted_pane_count: 0,
             },
             Response::Error {
                 message: "no".into(),
