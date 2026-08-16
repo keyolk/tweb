@@ -13,12 +13,13 @@ Ghostty / Kitty
 ## Core principles
 
 - **tmux-native**: tmux is the authority for sessions, windows, panes, resize, focus and lifecycle.
-- **Terminal graphics-native**: a Ghostty GPU surface fast path plus a standard Kitty graphics fallback.
+- **Terminal graphics-native**: Kitty graphics on stock Ghostty/Kitty, with no terminal fork required.
 - **Browser mode**: input ownership is split between tmux shortcuts and browser shortcuts, per client mode.
-- **Shared browser profile**: browser pages in the same tmux session share a persistent Chromium profile.
-- **Agent resource exchange**: screenshots, DOM/CSS context, downloads and console/network traces are handed to agents in the same tmux window as typed attachments.
-- **Chrome profile bootstrap**: extensions, bookmarks and general site state are imported policy-aware.
-- **Managed Chrome boundary**: URLs that need Okta Device Trust or enterprise-managed Chrome are handed off to real Google Chrome.
+- **Shared browser profile**: every browser pane shares one persistent Chromium profile — cookies, storage and history are the same across panes and across restarts.
+- **Agent control on the user's own screen**: an agent drives the very page the user is looking at, over a per-pane unix socket, with no separate headless session.
+
+Read the [Status](#status) section before switching to TWeb as a daily browser. It states what runs,
+what is broken today, and which Chrome behaviours are deliberately not attempted.
 
 ## Installation
 
@@ -68,19 +69,17 @@ tweb snapshot --pane %3
 tweb click a --pane %3
 tweb screenshot shot.png --pane %3
 
-# Manage browser resources
-tweb resource list --window @1
-tweb resource send r_01K... --to-pane %1
-
-# Chrome profile bootstrap
-tweb profile bootstrap chrome
-
 # Diagnose the environment
 tweb doctor
 
 # Install the Ghostty Cmd passthrough and tmux CSI-u/mouse settings as a separate include file
 tweb doctor --fix
 ```
+
+`tweb --help` also lists `resource`, `profile` and `chrome`. Those are **placeholders for unbuilt
+subsystems** — each one parses its arguments and then exits with
+`command not yet implemented`. They are listed here so nobody discovers it mid-migration; see
+[Status](#status).
 
 ## Agent control (CLI · MCP)
 
@@ -146,8 +145,13 @@ human-operated paths only.
 `open` and `split` both accept `--engine electron|tauri`. The default is `electron`, which provides
 every existing feature.
 
-- **Electron**: built on Chromium offscreen paint. Provides all current TWeb browser features — Vimium-style modes, tabs/omnibox, visual/inspect, smart copy, detached DevTools.
+- **Electron**: built on Chromium offscreen paint. Provides all current TWeb browser features — Vimium-style modes, tabs/omnibox, visual/inspect, smart copy, detached DevTools. This is the engine every measurement in [Status](#status) was taken on.
 - **Tauri (macOS experimental)**: sends native snapshots of the system `WKWebView` as Kitty PNG frames, so there is no separate Electron/Chromium startup cost. Supports resize, UTF-8/CSI-u/navigation keys, SGR mouse, adaptive frame transfer and terminal lifecycle. It shares the same preload as Electron, so Vimium-style modal shortcuts, hint/visual/inspect, the tab list, omnibox and multi-tab, find-in-page, zoom, smart copy/paste, and the browser shortcut ↔ web passthrough toggle all work too. DevTools opens as the Safari Web Inspector, and the Chromium-only `inspectElement` coordinate targeting has limited support.
+
+> The Tauri parity list above is **claimed by construction — a shared preload — and was not exercised
+> in the capability audit behind [Status](#status).** Every measured verdict in this README is
+> Electron. Treat Tauri as unvalidated until somebody drives it the same way.
+
 
 Electron and Tauri both persist the open tab URLs, the active tab and each tab's zoom per tmux window.
 Omitting the URL — plain `tweb open` — restores the last state, while naming a URL ignores the stored
@@ -156,6 +160,14 @@ state, starts fresh on that single URL and updates the stored state to match. El
 With no URL to restore it shows an address prompt rather than a black screen. The Electron persistence
 key uses the tmux socket, the session name and the window index, so the same slot is restored across a
 tmux server restart. Renaming the session or changing the window index is treated as separate state.
+
+> **The persistence key does not include the pane id, so two browser panes in one tmux window share
+> one session slot and the last to exit silently overwrites the other's tabs.** Measured this run:
+> four tabs in one pane were replaced by a second pane's single tab, and the key was independently
+> re-derived from `sha256('v2', socket, session, window index)` to confirm the collision is
+> structural rather than a race. Until it is fixed, keep one browser pane per tmux window if you
+> care about the restore.
+
 
 `--frame-rate N` is the maximum frame rate during the active window right after user input or a resize,
 in the range 1–60. Adaptive mode, the default, uses the maximum for 700ms after terminal input or a
@@ -181,7 +193,8 @@ development environment and will differ with release builds, real sites and WebK
 
 The modal shortcuts and mode indicator below behave identically on the Electron and Tauri engines,
 which share the same preload runtime. The only per-engine difference is DevTools: Electron opens
-detached Chromium DevTools, Tauri opens the Safari Web Inspector.
+detached Chromium DevTools, Tauri opens the Safari Web Inspector. Everything described here was
+measured on Electron; see the Tauri note above.
 
 `Ctrl-;` and `Ctrl-/` are two independent toggles.
 
@@ -335,7 +348,7 @@ composition area and the terminal cursor are removed with it.
 | --- | --- |
 | `?` | Open the supported-shortcut help (`?` or `Esc` closes it) |
 | `f` / `F` | Hint the clickable elements on screen / open the link in a new tab |
-| `/`, `n`, `N` | Find in page (`Enter` confirms) / next / previous match |
+| `/`, `n`, `N` | Find in page (`Enter` confirms) / next / previous match — **broken, see [Status](#status): the bar opens and accepts typing but matches nothing** |
 | `v` / `V` | Pick a target with the visual picker / open the whole page's text as a Visual selection (inside visual, `c` enters caret mode; from caret, `v` selects from that point) |
 | `b` | The open browser tab list (`j`/`k`, `1`–`9`, `Enter`, `x` closes, `Esc`) |
 | `I` | inspect picker: check element info and selectors |
@@ -419,40 +432,215 @@ was the cause of the earlier input lockups.
 ## Components
 
 ```text
-tweb                 The CLI and the tmux pane frontend
-twebd                The Chromium/profile/page/resource daemon
-TWeb Profile Bridge  The extension for Chrome profile bootstrap and managed Chrome handoff
+tweb          The CLI and the tmux pane frontend. One multi-call Rust binary.
+electron/     The engine: an Electron main process plus the preload that carries
+              the modal shortcuts, hints, omnibox, history and tab runtime.
+twebd         A Rust supervisor. Built, and it owns pane identity and lifecycle —
+              but it hosts no page today. See the note below.
 ```
+
+`twebd` is the seam for one Electron process hosting N panes instead of one Electron per pane. That
+saves a measured ≈58 MB of duplicated Node/V8 per additional pane (DESIGN.md §5.1). The seams exist —
+registry, protocol, frame writer, identity — but **the engine deliberately withdraws its host
+declaration rather than accepting an attach it cannot serve**, so the shipping path is still one
+Electron per `tweb __pane`. That withholding is intentional and load-bearing; it is what keeps a pane
+from attaching to a host that would render nothing.
 
 The published package uses `@keyolk/tweb` to avoid an unscoped name collision.
 
 ## Implementation languages
 
 ```text
-Rust              tweb, twebd, protocol, profile/resource/agent core
-C++               CEF/Chromium embedding and the GPU surface export adapter
-Objective-C++     The minimal boundary of the macOS IOSurface/Mach/Metal bridge
-Zig               Ghostty upstream renderer/protocol changes
-TypeScript        The TWeb Profile Bridge Chrome extension
+Rust              tweb, twebd, the tmux/terminal protocol, the frame and input path
+JavaScript (CJS)  the Electron main process and the page preload runtime
 ```
 
-Rust is the core choice, but the memory savings come less from the language itself than from not
-duplicating an Electron/Node/V8 runtime per pane: one Chromium process manages many pages and keeps
-GPU/frame/resource buffers under bounded ownership.
+Rust is the core choice. The memory argument for it is narrower than it looks: the saving comes from
+keeping Node/V8 out of the daemon and the pane frontend, not from the language. The engine is still
+Electron, and removing it was measured and rejected — stock headless Chrome over CDP cost 830 MB for
+four pages against shared Electron's 386 MB (DESIGN.md §5.1).
+
+> DESIGN.md §6.3 additionally names C++, Objective-C++, Zig and TypeScript. **None of those exist in
+> this repository** — there is not one `.cc`, `.cpp`, `.mm`, `.zig` or `.ts` file outside
+> `node_modules`. They belong to the design's long-term shape, not to what ships.
+
 
 ## Status
 
-Currently at the architecture/design stage. See [DESIGN.md](DESIGN.md) for the detailed design.
+TWeb is a working browser, not a design document. Sixteen merged PRs (#14–#29) of runtime ship the
+Electron → Kitty graphics pipeline, the modal input runtime, tabs/omnibox/history/session restore, and
+the agent socket.
 
-The main things to validate:
+It is **not yet a safe replacement for Chrome as a daily browser.** The capability verdicts below were
+measured on 2026-08-16 against HEAD `947891b` by driving real panes on the Electron engine. The
+sections above this one describe the implementation as built; they stand where the audit did not
+contradict them, but most of their mechanics were not re-exercised.
 
-1. The Ghostty GPU surface fast path
-2. The damage-aware Kitty graphics fallback
-3. tmux-native image lifecycle
-4. Browser mode and Korean IME/input fidelity
-5. Chrome extension/profile bootstrap compatibility
-6. tmux window-scoped agent resource exchange
-7. Remote Chromium/video transport scalability
+### What works
+
+| Capability | Note |
+|---|---|
+| Page rendering, resize, zoom | The default path is damage-aware Kitty graphics on stock Ghostty/Kitty. |
+| Modal shortcuts (`f`/`v`/`I`/`s`/`b`/`o`…) | TWeb's own preload, not a Vimium extension. |
+| Back / forward (`H`/`L`) | Measured, and fast. But `Alt-Left`, `Alt-Right` and `Backspace` — the keys a Chrome user's hands already know, and all three deliverable through tmux — are simply unbound and fail silently. The capability is there; only the muscle memory is missing. |
+| History (`gh`) | Measured: 343 real visits, live incremental search, `Enter` opens, `Ctrl-D` deletes. |
+| Tabs, close and reopen (`x`/`X`) | Measured: `X` restores the tab at its original strip position. |
+| Session restore across a pane kill | Measured: four tabs, order, active index and per-tab zoom all came back. One pane per window only — see the caveat above. |
+| Right-click context menu | Measured: built from Chromium's own params, varies by target, and the items execute. |
+| Downloads (the transfer) | Measured: lands in `~/Downloads`, the same directory Chrome uses. Collision handling is exact Chrome parity — the original is kept and the new file gets ` (1)`. A 156 KB PDF was byte-identical to its source. |
+| Login forms | Measured: fill and submit work; cookies persist, so existing sessions survive restarts. |
+| `mailto:` links | Measured twice: hands off to the OS default mail client, exactly as Chrome does, and leaves no orphan `about:blank` tab. |
+| Popups / `window.open` | Measured: becomes a TWeb tab rather than a floating OS window. See the `opener` caveat below. |
+| Video with sound | Measured: real decode, a live `AudioService` child process, `audible=true`. |
+| Korean IME | **Validated this run**, and this README previously listed it as unvalidated. `안녕하세요` and `한글 렌더 테스트 abc123` land byte-exact (`U+C548 U+B155 U+D558 U+C138 U+C694`, no mojibake, no doubling) and render correctly with the caret in the right place. Two honest limits: a live macOS 2-set IME with per-jamo backspace mid-composition was **not** driven, and typing hangul with no field focused flips the mode indicator to `insert` cosmetically — the keys still work and `Esc` clears it. |
+| Agent control (CLI · MCP) | Measured throughout the audit; it is how most of this table was driven. |
+
+### What is broken today
+
+These are ordered by what a Chrome user hits and how badly. Every one of them **fails silently** — no
+error, no beep, no toast — which is what makes them worse than an honest absence.
+
+1. **`window.print()` wedges the renderer.** There is no print handler anywhere, so `window.print()`
+   falls through to Chromium's native print dialog, which cannot draw from an offscreen `show:false`
+   window. The renderer never returns. Reproduced twice with a control before each: `eval` and
+   `page-diag` time out afterwards, the real key path is dead too, and **the pane keeps painting the
+   page perfectly**, so it looks healthy. Recovery by navigate or reload failed on the second
+   reproduction. Killing the tmux pane afterwards left an orphaned `tweb __pane` at PPID 1 still
+   holding its Electron. Sites call `window.print()` from their own Print button, so this is reachable
+   without ever pressing `Ctrl-P`.
+2. **File uploads do nothing.** The page draws a normal `Choose File` button, `tweb snapshot`
+   enumerates it, `tweb click` reports `ok`, a DOM click event fires — and no chooser opens, no native
+   window appears, no error is raised. `dialog` is not imported in `electron/main.cjs` and there is no
+   file-chooser handler at all. `tweb fill` cannot work around it; Chromium forbids setting a file
+   input's value from script. This costs every attachment: Gmail, Slack, GitHub, any upload form.
+3. **Find in page finds nothing.** `/` opens a Chrome-styled find bar, accepts typing, and
+   `contents.findInPage()` is genuinely called — but the `found-in-page` event never fires. Measured:
+   the result span stays empty for 8 seconds against a query that is on the page, nothing highlights,
+   and `Enter` closes the bar without scrolling to the match. Control: `window.find()` on the same
+   text in the same pane at the same moment returns true and selects it. The text is findable;
+   `findInPage` is what does not deliver.
+4. **PDFs are inert after page one.** Chromium's full PDF viewer is present and paints beautifully —
+   toolbar, thumbnail sidebar, `1 / 5` page indicator, download and print icons. None of it responds.
+   `j`, `Down` and `PageDown` all leave the rendered bytes identical, on both the real key path and
+   the agent socket, while the same keys scroll an HTML page in the same pane. The viewer lives in a
+   separate extension frame the preload does not reach: `snapshot` returns zero refs and an empty
+   title. You can read page one of a bank statement and nothing else.
+5. **Nothing tells you a download happened.** The transfer works, but the pane is unchanged,
+   `capture-pane` shows nothing, and the only record is a line in the engine's retained log that a
+   user would have to know to run `tweb engine-log` and read out of a raw JSON array. No progress for
+   a large file, no completion signal, no `chrome://downloads` equivalent. A user who thinks nothing
+   happened clicks again and gets `file (1)`.
+6. **Middle-click foregrounds the new tab.** It does open a tab, but it activates it, which defeats
+   the entire point of the gesture — middle-click six links off a results page and the second click
+   lands on the wrong document. `setWindowOpenHandler` calls `createTab(target, true)` for both
+   `window.open` and middle-click; Chrome differentiates the two.
+7. **Two browser panes in one tmux window destroy each other's session.** Described above under frame
+   policy. Silent tab loss.
+8. **`window.opener` is null in popups.** Forced by `action: 'deny'`. OAuth and SSO popup flows that
+   `postMessage` back to the opener — the classic "Sign in with Google" pattern — will authenticate
+   and then hang, because the parent never learns it succeeded. Ordinary `target=_blank` links are
+   unaffected.
+9. **Copying an image is a region capture, not an image copy.** `Cmd`-menu → Copy image calls
+   `capturePage(rect)` rather than copying the decoded resource, because `copyImageAt` does not update
+   the pasteboard offscreen. An image that is partly scrolled off copies clipped and contaminated with
+   surrounding page; a 4000px photo shown at 300px copies at 300px; a transparent PNG copies
+   composited. It works for the ordinary small, fully-visible image, and fails silently otherwise.
+
+**These are one bug, not nine.** Items 1–4 are the same class: a Chromium path that expects a native
+window or a focused `webContents`, with no offscreen workaround written. `electron/main.cjs` already
+carries that workaround for two paths somebody did hit — the context menu at `:3854` and copy-image at
+`:2688` — and both of those work.
+
+### What is missing
+
+Honestly absent, with no code pretending otherwise:
+
+- **Extensions.** Zero hits for `loadExtension`, `session.extensions` or `chrome.runtime` anywhere.
+  The `extension/` directory at the repo root is empty. This costs uBlock Origin — and in a terminal
+  browser ad blocking is not only comfort, since every animated ad is pixels re-encoded and pushed
+  through Kitty graphics — plus 1Password, devtools extensions and anything corporate-mandated.
+  Electron supports only a subset of Chrome's extension API, so **full extension support is not
+  achievable here** and should not be promised.
+- **Saved passwords and autofill.** No `Login Data`, no `Web Data` in the profile. Nothing offers to
+  save a password and nothing autofills on revisit. This is deliberate: **TWeb should not build its
+  own credential store.** A homegrown one is a security liability and would be strictly worse than the
+  1Password the owner already runs. The correct target is the extension path, which fixes both.
+- **Bookmarks, and any Chrome profile import.** `tweb profile bootstrap` and `tweb profile list` both
+  exit with `command not yet implemented` — run against a real Chrome profile to confirm. Nothing
+  reads Chrome's bookmarks, extensions or site state. The *import* is the migration blocker, more than
+  the bookmarks bar itself.
+- **The managed Chrome handoff.** `tweb chrome open` and `tweb chrome status` both exit with
+  `command not yet implemented`. `BrowserRoutingPolicy` exists in `crates/tweb-core/src/routing.rs`
+  with an `*.okta.com` denylist, but nothing calls it — it is a dead type. **A URL that needs Okta
+  Device Trust or enterprise-managed Chrome is not handed off; it simply loads in TWeb and fails
+  however that site fails.**
+- **Agent resource exchange as a broker.** `tweb resource list` exits with `command not yet
+  implemented` and `ResourceBrokerImpl` is 38 lines. What does work is the agent socket:
+  `snapshot`, `screenshot`, `console`, `errors` and `eval` genuinely hand page context to an agent.
+- **The Ghostty GPU surface fast path.** No TWeb-enhanced Ghostty build exists and nothing in the tree
+  exports an `IOSurface`. Everything runs on the standard Kitty path, which is the point — TWeb works
+  on official Ghostty and stock Kitty with no fork.
+
+### Deliberately not attempted
+
+A terminal cannot do these, and TWeb is not going to pretend otherwise. Nobody should build something
+that merely looks like them:
+
+- **Drag and drop from Finder onto a page.** There is no path from a GUI file manager into a tmux
+  pane. This is a permanent delta for uploads, not a to-do.
+- **Chrome's native file chooser** — previews, sidebar favourites, search. The honest terminal answer
+  is a path prompt with completion, which is *faster* than a Finder dialog for anyone who lives in a
+  shell. It does not exist yet, so uploads are broken today, but the GUI chooser is not the target.
+- **Chrome's print preview GUI** — paper size, margins, scaling, page range, a live preview, the macOS
+  print dialog. The honest split is save-as-PDF via `printToPDF()` for the common case and `lpr` for
+  actual paper.
+- **Chrome's autofill dropdown** anchored to a field, and its Touch ID / keychain confirmation. Those
+  are OS-level surfaces. A terminal port of autofill should be *more* explicit than Chrome's, not
+  less — silent autofill without a visible origin confirmation is a phishing risk.
+- **`Cmd` chords the way Chrome receives them.** Ghostty emits no PTY bytes at all for `Cmd`
+  combinations, so each one has to be carried as a private sequence through four cooperating layers
+  (see the input-modes section). The ones on that list work; an arbitrary `Cmd` chord does not, and
+  `Cmd+[` for back can never work.
+- **A live IME pre-edit underline inside the page.** Composition is drawn by the terminal emulator in
+  its own layer and pre-edit text never crosses the PTY. TWeb reserves a composition area next to the
+  web caret instead. Arguably an improvement: the page never sees half-formed state.
+
+### Where TWeb beats Chrome
+
+Not consolation prizes — these are things Chrome cannot do because it owns its own windows:
+
+- **tmux owns window management.** `split-window`, `resize-pane`, `swap-pane`, `join-pane`,
+  `break-pane` and zoom apply to a browser page like anything else. A browser pane sits beside the
+  server log and the agent, in a layout that survives detach and reattach, on the same keys as the
+  rest of the terminal. Chrome's window management is Chrome's; here it is yours.
+- **Exclusive audio across panes.** Exactly one TWeb pane holds the speakers. Takeover is automatic,
+  the loser is told *why* (`mutedByOther` distinguishes "I muted this" from "something took it"), and
+  `m` takes it back with one keystroke. And an autoplaying ad **cannot** steal your audio — a page
+  starting playback is not treated as consent. Chrome gives you N tabs shouting at once and a small
+  speaker icon to hunt for.
+- **History as a keyboard overlay.** `gh` opens a searchable overlay on the page you are already on,
+  filtered live as you type, over the whole store rather than a visible slice. Chrome makes you spend
+  a tab and navigate to it.
+- **Popups become tabs.** No chromeless window floating over your work.
+- **Session restore is on by default and per window.** Chrome only reopens tabs if you turned
+  "Continue where you left off" on, and it does so per profile.
+- **A download's absolute path beats "Show in folder".** A path in a terminal is directly actionable
+  by your own tools; a Finder window is not. This is the right shape, once TWeb actually prints it.
+- **Modal shortcuts are native.** The Vimium-style layer is TWeb's own preload rather than an
+  extension, so it survives the extension gap entirely.
+
+### What still needs validating
+
+1. The damage-aware Kitty path's frame pacing against the release gate in DESIGN.md §7.7
+2. Chrome extension/profile bootstrap compatibility — nothing is built, so nothing is validated
+3. tmux window-scoped agent resource exchange, beyond the agent socket that ships
+4. Remote Chromium/video transport scalability
+5. The Tauri engine, which no measurement in this README covers
+6. A live macOS 2-set hangul IME with per-jamo backspace mid-composition
+
+See [DESIGN.md](DESIGN.md) for the design and [DETAIL.md](DETAIL.md) for the implementation-depth
+design. Both are design documents that predate most of this runtime and mark their unbuilt sections
+inline; this Status section is the authority on what runs.
 
 ## Reference projects
 

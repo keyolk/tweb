@@ -1,5 +1,27 @@
 # TWeb Browser Runtime design
 
+> **This is a design document, and much of it is target state rather than a description of the
+> running system.** It was written before implementation and is in the present indicative
+> throughout. Sixteen merged PRs of runtime have landed since, and some of this document's central
+> claims are the opposite of what ships.
+>
+> **[README.md's Status section](README.md#status) is the authority on what actually runs**, what is
+> broken, what is missing and which Chrome behaviours are deliberately not attempted. It is built
+> from measurements against real panes; this document is built from intent.
+>
+> Sections whose claims are unbuilt carry their own marker at the section head, where a reader meets
+> the claim rather than in a footnote. The largest ones, so nobody has to hunt:
+>
+> - **§5** — one Electron per pane ships; the shared page host is built behind a closed gate. §5.1
+>   carries the measured decision and is accurate.
+> - **§6.3** — C++, Objective-C++, Zig and TypeScript are named as implementation languages. **None
+>   of those files exist in this repository.** Rust and CommonJS ship.
+> - **§7.2** — the Ghostty GPU surface fast path is unbuilt. No TWeb-enhanced Ghostty exists.
+> - **§10, §11** — Chrome profile bootstrap and the managed Chrome handoff are **entirely unbuilt**.
+>   The CLI subcommands parse and then exit with `command not yet implemented`.
+> - **§12.3, §12.14** — the ResourceBroker is a 38-line stub and the resource CLI is unimplemented.
+>   The agent socket, which is a different mechanism, does ship and does work.
+
 ## 1. Problem statement
 
 It has to be possible to use a real Chromium browser inside a tmux pane while continuing to use
@@ -532,6 +554,12 @@ Renaming a session or reordering windows must not change the profile identity.
 
 ### 6.3 Implementation languages
 
+> **Only two of these languages exist in this repository.** There is not one `.cc`, `.cpp`, `.mm`,
+> `.zig` or `.ts` file outside `node_modules`. What ships is **Rust** (`tweb`, `twebd`, the terminal
+> and frame path) and **CommonJS JavaScript** (`electron/*.cjs` — the engine main process and the
+> preload runtime). The C++/Objective-C++/Zig/TypeScript rows below describe the design's long-term
+> shape, not the build.
+
 TWeb's primary implementation language is **Rust**. Rust is chosen for memory efficiency, but the larger
 effect comes from keeping Electron/Node/V8 out of the daemon and the pane frontend and controlling buffer
 ownership explicitly.
@@ -909,6 +937,12 @@ Ghostty/Kitty first, and offer an optional TWeb-enhanced Ghostty GPU surface fas
 runtime.
 
 ### 7.2 The optional TWeb-enhanced Ghostty GPU surface fast path
+
+> **Unbuilt, and nothing depends on it.** No TWeb-enhanced Ghostty build exists, nothing in the tree
+> exports an `IOSurface` to another process, and no Zig lives here. Every frame TWeb has ever drawn
+> went through §7.3's standard Kitty path. That is the design working as intended — §7.3 is the
+> baseline for correctness and this section is an optimization — but the section below is written in
+> the present indicative and should not be read as a description of a path you can turn on.
 
 This path activates only when a separate TWeb-enhanced Ghostty build exists. Vanilla Ghostty support and
 TWeb's functional correctness never depend on it.
@@ -1324,6 +1358,17 @@ the constraint is stated. Global key event interception is never added to hide i
 
 ## 10. Chrome profile bootstrap and synchronization
 
+> **Nothing in this section is implemented.** `tweb profile bootstrap <source>` and `tweb profile
+> list` both parse their arguments and exit with `command not yet implemented` — verified against a
+> real Chrome profile directory. Nothing in `crates/` or `electron/` reads a Chrome profile, imports
+> a bookmark, or loads an extension; grep for `loadExtension`, `bookmark` and `session.extensions`
+> returns zero hits. The Chrome Profile Bridge extension described in §10.3 does not exist; the
+> `extension/` directory at the repo root is empty.
+>
+> The table below in particular reads as a description of shipped behaviour and is not one. **A user
+> migrating from Chrome loses every bookmark, extension and saved password on day one.** The import
+> is the migration blocker, and it is unbuilt.
+
 ### 10.1 Goal
 
 A user has to be able to reconstruct their existing Chrome environment quickly.
@@ -1439,6 +1484,16 @@ Extension compatibility results are managed in a per-version registry, never gue
 
 ## 11. The managed Chrome handoff
 
+> **Nothing in this section is implemented.** `tweb chrome open <url>` and `tweb chrome status` both
+> exit with `command not yet implemented`. `BrowserRoutingPolicy` exists as a type in
+> `crates/tweb-core/src/routing.rs`, complete with the `*.okta.com` denylist below — and **nothing
+> calls it.** Grep for `RouteDecision` or `BrowserRoutingPolicy` outside that one file returns zero
+> consumers. A dead type is not a handoff.
+>
+> What actually happens today: a URL that needs Okta Device Trust or enterprise-managed Chrome loads
+> in TWeb and fails however that site fails, with no handoff and no warning. Section 10.4's
+> "these domains open in real managed Google Chrome instead" is false as written.
+
 URLs that need real Google Chrome are handled by a separate trusted provider.
 
 ```text
@@ -1508,6 +1563,16 @@ Agent → Browser
 ```
 
 ### 12.3 ResourceBroker
+
+> **The broker is a 38-line stub.** `crates/twebd/src/resource_broker.rs` implements the trait and
+> stores nothing; §12.14's CLI exits with `command not yet implemented`. Everything from here to
+> §12.16 is target state.
+>
+> What ships instead, and it is a different mechanism rather than a partial one: a per-pane agent
+> socket over line-delimited JSON-RPC. `tweb snapshot`, `screenshot`, `console`, `errors` and `eval`
+> genuinely hand page context to an agent — on the very screen the user is looking at, which is the
+> part of §12.1 that survived. What does not exist is the typed, scoped, TTL'd resource store: no
+> resource ids, no window scope, no capability negotiation, no cross-pane handoff.
 
 Large payloads never go directly into tmux options, environment variables, terminal escape sequences or an
 agent prompt. A `ResourceBroker` with a lifecycle separate from `twebd` manages immutable resources and live
@@ -1990,6 +2055,15 @@ Support is declared by capability and validated combination, not by terminal nam
 
 ## 17. A validation order, not an implementation order
 
+> **Where this list now stands, measured 2026-08-16 — see [README Status](README.md#status) for the
+> evidence.** (1) partly: the Kitty path ships and works; the GPU fast path is unbuilt (§7.2).
+> (2) yes: image cache, visibility, resize and kill are deterministic across sixteen PRs of runtime.
+> (3) mostly: Browser mode, modifiers and the Korean IME are validated — hangul lands byte-exact and
+> renders — but find-in-page, uploads, print and PDF input all fail against Chromium paths that
+> expect a native window, and middle-click foregrounds where Chrome backgrounds. (4) and (5): not
+> started; there is no bootstrap and no bridge. (6) yes for the agent socket, no for the resource
+> broker. (7) not started.
+
 Rather than scoping a short-term MVP, whether the architecture holds up is validated first.
 
 1. **Renderer viability**: do the Ghostty GPU fast path and the damage-aware Kitty compatibility path each meet the target frame pacing?
@@ -2064,6 +2138,12 @@ an interactive primary renderer its ceiling is clearly lower than the GPU fast p
 low-framerate fallback where `RemoteVideoTransport` is unavailable, or as a static snapshot backend.
 
 ## 19. The final product definition
+
+> **This is the target definition, and two of its clauses are unbuilt.** Resource exchange as typed
+> window-scoped attachments is a 38-line stub (§12.3); the Chrome profile bootstrap and the managed
+> Chrome handoff do not exist at all (§10, §11). What is true today: browser pages do run as real
+> tmux pane processes on Ghostty/Kitty, a human and an agent do share one persistent Chromium
+> profile on the same screen, and shortcut ownership is split by a per-tmux-client Browser mode.
 
 > The TWeb Browser Runtime is a terminal-native browser that runs browser pages as real pane processes on
 > top of Ghostty/Kitty and tmux, and lets a human and an agent share the same persistent Chromium profile.

@@ -67,6 +67,8 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/hosted-runtime.cjs
 	node --check electron/frame-context.cjs
 	node --check electron/pane-windows.cjs
+	node --check electron/download-state.cjs
+	node --check electron/file-chooser.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

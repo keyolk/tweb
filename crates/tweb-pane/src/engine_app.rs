@@ -115,6 +115,14 @@ const FILES: &[(&str, &str)] = &[
         "pane-windows.cjs",
         include_str!("../../../electron/pane-windows.cjs"),
     ),
+    (
+        "download-state.cjs",
+        include_str!("../../../electron/download-state.cjs"),
+    ),
+    (
+        "file-chooser.cjs",
+        include_str!("../../../electron/file-chooser.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.

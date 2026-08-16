@@ -1,4 +1,81 @@
-const { ipcRenderer } = require("electron");
+const { ipcRenderer, webFrame } = require("electron");
+
+// window.print() must never reach Chromium's own handler.
+//
+// Chromium services a print by opening the platform's print sheet. This window is
+// offscreen and `show: false`, so the sheet has nowhere to appear — and the call never
+// returns. Measured: the renderer's main thread blocks permanently, `eval` and page-diag
+// both time out, the real key path dies, and the pane keeps painting its last frame so it
+// still LOOKS healthy. Killing the pane then leaves the frontend orphaned at PPID 1. Sites
+// call `window.print()` from their own Print buttons, so a user reaches this without ever
+// pressing Ctrl-P.
+//
+// The replacement has to live in the PAGE's world, not the preload's: with
+// contextIsolation the preload's `window` is a different object, so assigning to it leaves
+// the page's own `print` untouched. `webFrame.executeJavaScript` runs in the main world.
+//
+// The script is spelled out here rather than shared with main.cjs because THIS PRELOAD IS
+// SANDBOXED: `require` reaches Electron's builtins and nothing else, and requiring a local
+// module fails the whole preload with "module not found" — measured, and it takes every
+// shortcut and overlay down with it. main.cjs keeps its own copy for the frames it reaches.
+//
+// The accessor patch is what covers a child frame. Electron's `frame-created` is too late:
+// a page that does `f.contentWindow.document.write(...); f.contentWindow.print()` in ONE
+// TICK wedges the renderer before an async shim can land, and writing a receipt into a
+// hidden iframe and printing THAT is a common real-site pattern. Patching the accessors
+// the page must go through to reach a child shims it synchronously, on the very access
+// that precedes the call.
+//
+// `printToPDF` on the engine side does not go through the page and is unaffected.
+function installPrintShim() {
+  try {
+    webFrame.executeJavaScript(`(() => {
+      if (window.__twebPrintShim) return "already";
+      window.__twebPrintShim = true;
+      const notify = () => window.dispatchEvent(new CustomEvent("tweb-print-request"));
+      // Configurable so a page that assigns its own print() still can, and writable so the
+      // assignment does not throw in strict mode.
+      const define = (target) => Object.defineProperty(target, "print", {
+        configurable: true,
+        writable: true,
+        value: function print() { notify(); },
+      });
+      define(window);
+      const shimChild = (child) => {
+        try {
+          if (!child || child.__twebPrintShim) return;
+          child.__twebPrintShim = true;
+          Object.defineProperty(child, "print", {
+            configurable: true,
+            writable: true,
+            value: function print() { notify(); },
+          });
+        } catch (error) {
+          // Cross-origin: unreachable from here, and it gets its own preload instead.
+        }
+      };
+      for (const [proto, property] of [
+        [window.HTMLIFrameElement && window.HTMLIFrameElement.prototype, "contentWindow"],
+        [window.HTMLIFrameElement && window.HTMLIFrameElement.prototype, "contentDocument"],
+        [window.HTMLObjectElement && window.HTMLObjectElement.prototype, "contentWindow"],
+      ]) {
+        if (!proto) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, property);
+        if (!descriptor || !descriptor.get) continue;
+        Object.defineProperty(proto, property, { ...descriptor, get() {
+          const value = descriptor.get.call(this);
+          shimChild(property === "contentDocument" ? value && value.defaultView : value);
+          return value;
+        } });
+      }
+      return "installed";
+    })()`);
+  } catch (error) {
+    // A frame that is already gone cannot be shimmed, and there is nothing to protect.
+    void error;
+  }
+}
+installPrintShim();
 
 {
   const topFrame = window.top === window;
@@ -42,6 +119,10 @@ const { ipcRenderer } = require("electron");
   let inputBadge = null;
   let audioBadge = null;
   let audioState = { muted: false, owner: null };
+  let transferBadge = null;
+  let transferState = null;
+  let downloadsState = null;
+  let fileChooserState = null;
   let tabBadge = null;
   let tabPopover = null;
   let tabPopoverPinned = false;
@@ -61,6 +142,8 @@ const { ipcRenderer } = require("electron");
     inspect: "I",
     tabs: "T",
     history: "≡",
+    downloads: "⇣",
+    chooser: "⇡",
     omnibox: "O",
     help: "?",
   };
@@ -350,6 +433,17 @@ const { ipcRenderer } = require("electron");
       "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
       "white-space:nowrap", "backdrop-filter:blur(3px)",
     ].join(";");
+    // A transfer badge is the terminal's download shelf. It only appears while there is
+    // something to say — a running transfer, or one that just finished — because the
+    // point of the badge is that the user is TOLD, and a permanent one is furniture.
+    const transfer = document.createElement("span");
+    transfer.style.cssText = [
+      "box-sizing:border-box", "display:none", "max-width:min(46ch,60vw)", "height:18px",
+      "padding:1px 6px", "border:1px solid #81c99566", "border-radius:4px", "background:#111d",
+      "color:#81c995", "box-shadow:0 1px 4px #0007", "overflow:hidden", "text-overflow:ellipsis",
+      "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "white-space:nowrap", "backdrop-filter:blur(3px)",
+    ].join(";");
     const popover = document.createElement("div");
     popover.setAttribute("role", "menu");
     popover.style.cssText = [
@@ -368,12 +462,13 @@ const { ipcRenderer } = require("electron");
     };
     popover.onmouseenter = () => clearTimeout(tabPopoverTimer);
     popover.onmouseleave = scheduleTabPopoverHide;
-    shadow.append(label, input, audio, badge, popover);
+    shadow.append(label, input, audio, transfer, badge, popover);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
     inputBadge = input;
     audioBadge = audio;
+    transferBadge = transfer;
     tabBadge = badge;
     tabPopover = popover;
   }
@@ -421,6 +516,21 @@ const { ipcRenderer } = require("electron");
       ? `Audio muted — ${audioState.owner || "another pane"} owns it · press m to take it back`
       : "";
     audioBadge.style.display = audioState.muted ? "" : "none";
+    // The absolute path is what a terminal has instead of "Show in folder", and it is
+    // strictly more useful: a path can be fed to the user's own tools, a Finder window
+    // cannot. It goes in the tooltip rather than the badge because a full path would push
+    // the badge across the pane, and `gd` shows it in full.
+    transferBadge.textContent = transferState ? transferState.text : "";
+    transferBadge.title = transferState
+      ? `${transferState.path || transferState.text}${transferState.state === "progressing" ? " · Ctrl-D cancels · gd lists downloads" : " · gd lists downloads"}`
+      : "";
+    transferBadge.style.color = transferState?.tone === "failed" ? "#f28b82"
+      : transferState?.tone === "pending" ? "#8ab4f8"
+      : "#81c995";
+    transferBadge.style.borderColor = transferState?.tone === "failed" ? "#f28b8266"
+      : transferState?.tone === "pending" ? "#8ab4f866"
+      : "#81c99566";
+    transferBadge.style.display = transferState ? "" : "none";
     const active = Math.min(tabState.count, Math.max(1, tabState.activeIndex + 1));
     tabBadge.textContent = `${active}/${tabState.count}`;
     tabBadge.title = `Tab ${active}/${tabState.count} in this pane · hover/click for the list`;
@@ -1807,7 +1917,7 @@ const { ipcRenderer } = require("electron");
       ["f · F", "open via hint · open in new tab"],
       ["o · O / t", "omnibox in current tab · new tab"],
       ["b", "list open tabs"],
-      ["gh", "history page — search, open, delete"],
+      ["gh · gd", "history page · downloads — search, copy the path, open"],
       ["J · K", "previous · next tab"],
       ["x · X", "close tab · restore recent tab"],
       ["r · gi", "reload · focus first input"],
@@ -1827,6 +1937,8 @@ const { ipcRenderer } = require("electron");
       ["Ctrl + / - / 0", "browser zoom"],
       ["Ctrl-Tab / PgUp / PgDn", "switch browser tab"],
       ["Ctrl-W", "close current browser tab"],
+      ["Ctrl-P", "save the page as a PDF in ~/Downloads (a terminal cannot draw a print dialog)"],
+      ["Ctrl-D", "cancel the running download"],
       ["i", "insert mode — page's own shortcuts, Esc returns"],
       ["m", "take audio back — only one pane plays at a time"],
       ["Ctrl-;", "Shortcuts ↔ web passthrough"],
@@ -2361,6 +2473,304 @@ const { ipcRenderer } = require("electron");
     setMode("history", "…");
     requestHistoryModel();
     requestAnimationFrame(() => input.focus());
+  }
+
+  // --- downloads page ---
+  //
+  // Chrome's answer to "where did my file go" is a shelf plus chrome://downloads. The
+  // badge is the shelf; this is the list. It reads downloads.jsonl, which main appends to
+  // when a transfer settles, so a file downloaded an hour ago is still findable after the
+  // badge is long gone.
+  //
+  // The row's headline is the ABSOLUTE PATH, not the filename. In a GUI "Show in folder"
+  // is the useful action; in a terminal the path itself is the useful thing, because the
+  // user can act on it with the tools they already have.
+
+  function cancelDownloads(restoreMode = true) {
+    downloadsState?.host.remove();
+    downloadsState = null;
+    if (restoreMode) normalMode();
+  }
+
+  function downloadRowsList() {
+    return downloadsState?.rows || [];
+  }
+
+  function selectDownloadIndex(index) {
+    const rows = downloadRowsList();
+    if (!downloadsState || rows.length === 0) {
+      setMode("downloads", downloadsState ? "0" : "");
+      return;
+    }
+    const count = rows.length;
+    downloadsState.selected = ((index % count) + count) % count;
+    for (const [rowIndex, entry] of rows.entries()) {
+      const selected = rowIndex === downloadsState.selected;
+      entry.row.style.background = selected ? "#3c4043" : "transparent";
+      entry.row.style.outline = selected ? "1px solid #8ab4f8" : "none";
+    }
+    rows[downloadsState.selected].row.scrollIntoView({ block: "nearest" });
+    setMode("downloads", `${downloadsState.selected + 1}/${count}`);
+  }
+
+  // Copying the path is the terminal's "Show in folder": it puts the one thing the user
+  // needs onto the clipboard, ready to paste into the shell they are already in.
+  function copySelectedDownloadPath() {
+    const entry = downloadRowsList()[downloadsState?.selected];
+    if (!entry?.path) return;
+    send("copy-text", entry.path);
+    downloadsState.hint.textContent = `Copied ${entry.path}`;
+    paintNow();
+  }
+
+  function openSelectedDownload(newTab) {
+    const entry = downloadRowsList()[downloadsState?.selected];
+    if (!entry?.path) return;
+    cancelDownloads(false);
+    send(newTab ? "new-tab" : "navigate", `file://${entry.path}`);
+  }
+
+  function requestDownloadsModel() {
+    if (!downloadsState) return;
+    send("downloads-model", { query: downloadsState.input.value });
+  }
+
+  function renderDownloadsModel(model) {
+    if (!downloadsState || !model) return;
+    if (String(model.query || "") !== downloadsState.input.value) return;
+    const { list } = downloadsState;
+    const rows = [];
+    list.replaceChildren();
+    for (const entry of model.rows || []) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.style.cssText = "display:grid;grid-template-columns:8ch minmax(0,1fr);gap:8px;width:100%;padding:6px 7px;border:0;border-radius:5px;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer";
+      const state = document.createElement("span");
+      // A cancelled row is not a failure and must not read as one — the user did that on
+      // purpose, and the row exists to explain why there is no file.
+      state.textContent = entry.state === "completed" ? (entry.origin === "print" ? "print" : "done")
+        : entry.state === "cancelled" ? "cancel"
+        : "failed";
+      state.style.cssText = `color:${entry.state === "completed" ? "#81c995" : entry.state === "cancelled" ? "#9aa0a6" : "#f28b82"};font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace`;
+      const text = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = entry.path || entry.filename;
+      title.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500";
+      const meta = document.createElement("small");
+      meta.textContent = entry.url;
+      meta.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6";
+      text.append(title, meta);
+      row.append(state, text);
+      const index = rows.length;
+      row.onmouseenter = () => selectDownloadIndex(index);
+      row.onclick = () => { selectDownloadIndex(index); copySelectedDownloadPath(); };
+      list.append(row);
+      rows.push({ path: entry.path, filename: entry.filename, row });
+    }
+    if (rows.length === 0) {
+      const empty = document.createElement("div");
+      empty.textContent = model.query ? `No downloads match ${model.query}` : "No downloads yet";
+      empty.style.cssText = "padding:14px 7px;color:#9aa0a6";
+      list.append(empty);
+    }
+    downloadsState.rows = rows;
+    downloadsState.count.textContent = model.truncated
+      ? `${model.shown} of ${model.total}`
+      : `${model.total} ${model.total === 1 ? "file" : "files"}`;
+    selectDownloadIndex(0);
+  }
+
+  function showDownloads() {
+    cancelTransient(false);
+    const host = document.createElement("div");
+    host.id = "__tweb_downloads__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483646;display:flex;align-items:flex-start;justify-content:center;padding-top:6vh;background:#0007;pointer-events:auto";
+    const shadow = host.attachShadow({ mode: "open" });
+    const panel = document.createElement("div");
+    panel.style.cssText = "box-sizing:border-box;display:flex;flex-direction:column;width:min(860px,calc(100vw - 32px));max-height:82vh;padding:8px;border:1px solid #5f6368;border-radius:8px;background:#202124;color:#e8eaed;box-shadow:0 12px 36px #000b;font:13px/1.4 system-ui,-apple-system,sans-serif";
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;gap:8px;padding:2px 4px 8px";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = "Search downloads";
+    input.style.cssText = "flex:1;box-sizing:border-box;min-width:0;padding:7px 9px;border:1px solid #5f6368;border-radius:6px;outline:0;background:#303134;color:#f8f9fa;font:14px/1.3 system-ui,-apple-system,sans-serif";
+    const count = document.createElement("span");
+    count.style.cssText = "color:#bdc1c6;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap";
+    header.append(input, count);
+    const hint = document.createElement("div");
+    hint.textContent = "↑/↓ move · Enter copy path · Shift-Enter open the file · Esc close";
+    hint.style.cssText = "padding:0 5px 7px;color:#9aa0a6;font-size:11px";
+    const list = document.createElement("div");
+    list.setAttribute("role", "listbox");
+    list.style.cssText = "flex:1;min-height:0;overflow:auto;padding:0 2px 4px";
+    input.addEventListener("input", () => requestDownloadsModel());
+    input.addEventListener("keydown", (event) => {
+      // The overlay owns its keys, exactly as the history page does: letting them through
+      // would scroll the page behind the panel and fire normal-mode shortcuts.
+      event.stopPropagation();
+      const rows = downloadRowsList();
+      if (event.code === "Escape") {
+        event.preventDefault();
+        cancelDownloads();
+      } else if (event.code === "ArrowDown" || event.ctrlKey && event.key.toLowerCase() === "j") {
+        event.preventDefault();
+        if (rows.length) selectDownloadIndex(downloadsState.selected + 1);
+      } else if (event.code === "ArrowUp" || event.ctrlKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (rows.length) selectDownloadIndex(downloadsState.selected - 1);
+      } else if (event.code === "Enter") {
+        event.preventDefault();
+        if (event.shiftKey) openSelectedDownload(false);
+        else copySelectedDownloadPath();
+      }
+    });
+    panel.append(header, hint, list);
+    shadow.append(panel);
+    document.documentElement.append(host);
+    paintNow();
+    downloadsState = { host, input, list, count, hint, rows: [], selected: 0 };
+    setMode("downloads", "…");
+    requestDownloadsModel();
+    requestAnimationFrame(() => input.focus());
+  }
+
+  // --- file chooser ---
+  //
+  // Chrome opens a native picker. A tmux pane cannot draw one, and Chromium's own attempt
+  // from an offscreen window produces nothing at all — the button looks alive and does
+  // nothing. This is what replaces it: a path prompt with Tab completion.
+  //
+  // It is not a consolation prize. The terminal user already knows the path — they got
+  // there with ls, fd or fzf — so typing it with completion beats clicking through Finder.
+  // What genuinely has no terminal equivalent is dragging a file in from Finder, and
+  // nothing here pretends otherwise.
+
+  function cancelFileChooser(deliver = true) {
+    if (!fileChooserState) return;
+    const host = fileChooserState.host;
+    fileChooserState = null;
+    host.remove();
+    // Chromium is waiting for an answer either way. An unanswered chooser leaves the page
+    // believing a dialog is still open, which is the state this path exists to avoid.
+    if (deliver) send("file-chooser-resolve", { paths: [] });
+    normalMode();
+  }
+
+  function submitFileChooser() {
+    if (!fileChooserState) return;
+    // Several paths separated by whitespace is how a shell user says "these files"; a
+    // filename containing a space is spelled with a comma instead, which the split honours.
+    const raw = fileChooserState.input.value.trim();
+    const paths = raw.includes(",")
+      ? raw.split(",").map((entry) => entry.trim()).filter(Boolean)
+      : raw.split(/\s+/).filter(Boolean);
+    if (paths.length === 0) {
+      cancelFileChooser();
+      return;
+    }
+    const host = fileChooserState.host;
+    fileChooserState = null;
+    host.remove();
+    send("file-chooser-resolve", { paths });
+    normalMode();
+  }
+
+  function requestFileChooserCompletion() {
+    if (!fileChooserState) return;
+    send("file-chooser-completion", {
+      value: fileChooserState.input.value,
+      accept: fileChooserState.accept,
+    });
+  }
+
+  function renderFileChooserCompletion(model) {
+    if (!fileChooserState || !model) return;
+    if (String(model.value || "") !== fileChooserState.input.value) return;
+    fileChooserState.completed = String(model.completed || "");
+    const { list } = fileChooserState;
+    list.replaceChildren();
+    for (const item of model.entries || []) {
+      const row = document.createElement("div");
+      row.textContent = item.directory ? `${item.name}/` : item.name;
+      row.style.cssText = `padding:3px 9px;color:${item.directory ? "#8ab4f8" : "#e8eaed"};font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap`;
+      list.append(row);
+    }
+    if (model.truncated) {
+      const more = document.createElement("div");
+      more.textContent = `… ${model.truncated} more`;
+      more.style.cssText = "padding:3px 9px;color:#9aa0a6;font:11px ui-monospace,SFMono-Regular,Menlo,monospace";
+      list.append(more);
+    }
+    list.style.display = (model.entries || []).length ? "block" : "none";
+    setMode("chooser", (model.entries || []).length ? String(model.total) : "");
+    paintNow();
+  }
+
+  function showFileChooser(request) {
+    // A reopen after a bad path must replace the panel, not stack a second one over it.
+    fileChooserState?.host.remove();
+    fileChooserState = null;
+    cancelTransient(false);
+    const host = document.createElement("div");
+    host.id = "__tweb_file_chooser__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483646;display:flex;align-items:flex-start;justify-content:center;padding-top:6vh;background:#0007;pointer-events:auto";
+    const shadow = host.attachShadow({ mode: "open" });
+    const panel = document.createElement("div");
+    panel.style.cssText = "box-sizing:border-box;display:flex;flex-direction:column;width:min(760px,calc(100vw - 32px));max-height:72vh;padding:8px;border:2px solid #f6a723;border-radius:8px;background:#202124;color:#e8eaed;box-shadow:0 12px 36px #000b;font:13px/1.4 system-ui,-apple-system,sans-serif";
+    const heading = document.createElement("div");
+    // Naming the accept filter matters: a user offered fewer files than they expected
+    // should be able to see that the PAGE asked for that, rather than suspect the chooser.
+    heading.textContent = request.multiple
+      ? `Choose files to upload${request.accept ? ` (${request.accept})` : ""}`
+      : `Choose a file to upload${request.accept ? ` (${request.accept})` : ""}`;
+    heading.style.cssText = "padding:2px 5px 7px;color:#f6a723;font-size:12px;font-weight:600";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.value = String(request.start || "");
+    input.placeholder = "~/Downloads/photo.png";
+    input.style.cssText = "box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid #5f6368;border-radius:6px;outline:0;background:#303134;color:#f8f9fa;font:13px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
+    const hint = document.createElement("div");
+    // A mistyped path is the failure mode a path prompt has and a GUI picker cannot. It
+    // must say so rather than close silently, which would be the "looked like it worked"
+    // shape this whole prompt exists to avoid.
+    hint.textContent = request.error || (request.multiple
+      ? "Tab complete · space or comma separates several files · Enter upload · Esc cancel"
+      : "Tab complete · Enter upload · Esc cancel");
+    hint.style.cssText = `padding:6px 5px 5px;color:${request.error ? "#f28b82" : "#9aa0a6"};font-size:11px`;
+    const list = document.createElement("div");
+    list.style.cssText = "display:none;flex:1;min-height:0;overflow:auto;padding:2px 0 3px";
+    input.addEventListener("input", () => requestFileChooserCompletion());
+    input.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.code === "Escape") {
+        event.preventDefault();
+        cancelFileChooser();
+      } else if (event.code === "Tab") {
+        event.preventDefault();
+        if (fileChooserState?.completed && fileChooserState.completed !== input.value) {
+          input.value = fileChooserState.completed;
+        }
+        requestFileChooserCompletion();
+      } else if (event.code === "Enter") {
+        event.preventDefault();
+        submitFileChooser();
+      }
+    });
+    panel.append(heading, input, hint, list);
+    shadow.append(panel);
+    document.documentElement.append(host);
+    paintNow();
+    fileChooserState = { host, input, list, accept: String(request.accept || ""), completed: "" };
+    setMode("chooser", "…");
+    requestFileChooserCompletion();
+    requestAnimationFrame(() => {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
   }
 
   function targetPoint(item) {
@@ -2980,6 +3390,8 @@ const { ipcRenderer } = require("electron");
     cancelInspect(false);
     cancelTabList(false);
     cancelHistory(false);
+    cancelDownloads(false);
+    cancelFileChooser();
     cancelHelp(false);
     let restoredContextFocus = false;
     const contextMenu = document.getElementById("__tweb_context_menu__");
@@ -3021,7 +3433,7 @@ const { ipcRenderer } = require("electron");
   }
 
   function hasTransientMode() {
-    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || helpHost || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
+    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || downloadsState || fileChooserState || helpHost || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
 
   function handleNormalKey(event) {
@@ -3073,7 +3485,7 @@ const { ipcRenderer } = require("electron");
     if (handleVisualKey(event, key)) return;
     if (handleInspectKey(event, key)) return;
     if (handleTabListKey(event, key)) return;
-    if (searchState || promptHost || historyState) return;
+    if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
 
     if (eventIsEditable(event)) {
@@ -3093,6 +3505,7 @@ const { ipcRenderer } = require("electron");
       resetPendingG();
       if (key === "g") scrollSurfaceTo(0);
       else if (key === "h") showHistory();
+      else if (key === "d") showDownloads();
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
       else return;
       event.preventDefault();
@@ -3227,6 +3640,26 @@ const { ipcRenderer } = require("electron");
     renderHistoryModel(model);
   });
 
+  ipcRenderer.on("tweb-downloads", (_event, model) => {
+    renderDownloadsModel(model);
+  });
+
+  ipcRenderer.on("tweb-file-chooser", (_event, request) => {
+    showFileChooser(request || {});
+  });
+
+  ipcRenderer.on("tweb-file-chooser-completion", (_event, model) => {
+    renderFileChooserCompletion(model);
+  });
+
+  ipcRenderer.on("tweb-transfer", (_event, summary) => {
+    transferState = summary || null;
+    renderIndicator();
+    // A transfer badge that waits for the frame clock can miss the completion entirely on
+    // an idle page — the one moment the badge exists to cover.
+    paintNow();
+  });
+
   ipcRenderer.on("tweb-tab-state", (_event, model) => {
     updateTabState(model);
   });
@@ -3345,6 +3778,11 @@ const { ipcRenderer } = require("electron");
     resetPendingG();
     resetPendingZ();
   });
+
+  // The main-world shim cannot reach IPC, so it announces the request as a DOM event and
+  // this listener carries it across. Every frame listens: an iframe's print() is the
+  // parent page's print in Chrome too.
+  addEventListener("tweb-print-request", () => send("print"));
 
   const initializeDocument = () => {
     document.documentElement.dataset.twebInputMode = modeIndicator();
