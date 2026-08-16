@@ -5,6 +5,10 @@ integration structure down to implementation depth. It assumes Engine = Electron
 
 Research date: 2026-07-31.
 
+> **[README.md's Status section](README.md#status) is the authority on what actually runs.** It is
+> built from measurements against real panes; this document is built from intent, and the sections
+> below mark where the two diverge.
+>
 > **Read sections 1-7 as the target design, not as a description of the running system.** They were
 > written before implementation and are in the present indicative throughout; several of their
 > central claims are the opposite of what ships. Specifically:
@@ -754,6 +758,17 @@ because the next person to propose a native module for this should have to beat 
 than re-derive them.
 
 ## 9. A component and interface structure built for extension
+
+> **The traits below exist as Rust source; almost none of them have an implementation.**
+> `crates/tweb-core/` carries `ExtensionHost`, `BrowserRoutingPolicy` and friends as trait and type
+> definitions, and grep finds **zero implementors and zero callers** for most of them — the named
+> `ElectronExtensionHost` / `ChromeExtensionHost` / `ShellExtensionHost` in §9.3 do not exist in any
+> form. What ships routes through concrete code in `crates/tweb-pane/` and `electron/main.cjs`
+> without going through these seams.
+>
+> This section is worth keeping as the intended shape of the extension points. It is not a map of the
+> code, and §9.3's implementation matrix in particular reads as an inventory of things that are
+> there. They are not there.
 
 DESIGN.md proposed the `BrowserEngineAdapter`, `FrameTransport`, `BrowserRuntime` and `AgentBridge`
 traits, but they need making concrete at the level of implementable Rust traits/protocols. The core

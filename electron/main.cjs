@@ -84,6 +84,13 @@ const {
   createPaneWindows, surfaceHeld, holdSurface, releaseSurface,
   applyFrameRate: applyPaneFrameRate, isThrottled,
 } = require("./pane-windows.cjs");
+const {
+  transferSummary, downloadRecord, parseDownloadLines, downloadRows, printFilename,
+  printShimScript, SETTLED_HOLD_MS,
+} = require("./download-state.cjs");
+const {
+  completionScope, expandHome, completionEntries, completedInput, chosenPaths,
+} = require("./file-chooser.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
@@ -2639,6 +2646,27 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "history-delete":
       sendToFocusedTabFrame(tab, "tweb-history", deleteHistoryEntries(value?.rows, value?.query));
       break;
+    // Printing and the downloads list share one story: where a file landed. The page asks
+    // for the model on every keystroke, like history, so the filter runs over the whole
+    // file rather than over a slice the renderer happens to be holding.
+    case "print":
+      void printPageToPdf(tab);
+      break;
+    case "downloads-model":
+      sendToFocusedTabFrame(tab, "tweb-downloads", downloadsPageModel(value?.query));
+      break;
+    case "cancel-transfer":
+      cancelTransfer(value);
+      break;
+    case "file-chooser-completion":
+      sendToFocusedTabFrame(tab, "tweb-file-chooser-completion", {
+        value: String(value?.value || ""),
+        ...fileChooserCompletion(value?.value, value?.accept),
+      });
+      break;
+    case "file-chooser-resolve":
+      resolveFileChooser(tab, value);
+      break;
     case "activate-tab":
       if (Number.isInteger(value) && value >= 0 && value < soleWindows.tabs.length) activateTab(value);
       break;
@@ -2799,6 +2827,10 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
   if (tab === soleWindows.win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
+    // A download outlives the page that started it — clicking a link can navigate and
+    // download at once. Without this the badge for a transfer still running would vanish
+    // with the old document and never come back.
+    event.reply("tweb-transfer", transferSummary(transfers, Date.now()));
   }
 });
 
@@ -3277,16 +3309,353 @@ function availableDownloadPath(filename) {
   }
 }
 
+// Transfers this pane knows about, newest last. The bytes were always written; what was
+// missing is that nobody was told, so a click produced a file the user could not find.
+//
+// Bounded because a badge only ever shows one of these and the list on disk is the record
+// that lasts. A pane left open for a week must not accumulate every transfer in memory.
+const transfers = [];
+const MAX_LIVE_TRANSFERS = 40;
+let nextTransferId = 1;
+let transferBadgeTimer = null;
+
+function downloadsPath() {
+  return path.join(app.getPath("userData"), "downloads.jsonl");
+}
+
+/// Append one finished transfer to the on-disk record the downloads page reads.
+function recordTransfer(transfer) {
+  const record = downloadRecord(transfer);
+  if (!record) return;
+  try {
+    mkdirSync(path.dirname(downloadsPath()), { recursive: true });
+    appendFileSync(downloadsPath(), `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: download record failed: ${error.message}`);
+  }
+}
+
+function readDownloadEntries() {
+  try {
+    return parseDownloadLines(readFileSync(downloadsPath(), "utf8").split("\n"));
+  } catch (error) {
+    if (error.code !== "ENOENT" && debugLogging) {
+      console.error(`tweb: download list read failed: ${error.message}`);
+    }
+    return [];
+  }
+}
+
+function downloadsPageModel(query = "") {
+  const model = downloadRows(readDownloadEntries(), { query: String(query || "") });
+  return { ...model, query: String(query || "") };
+}
+
+/**
+ * Push the current transfer badge to the page, and schedule the push that retires it.
+ *
+ * The badge for a finished transfer expires on a timer rather than on the next event,
+ * because the next event may never come: a single download that completes is the common
+ * case, and without the timer its badge would sit over the page until something else
+ * happened to redraw it.
+ */
+function sendTransferState(tab = soleWindows.win) {
+  if (transferBadgeTimer) {
+    clearTimeout(transferBadgeTimer);
+    transferBadgeTimer = null;
+  }
+  const summary = transferSummary(transfers, Date.now());
+  sendToMainTabFrame(tab, "tweb-transfer", summary);
+  if (summary && summary.state !== "progressing") {
+    transferBadgeTimer = setTimeout(() => {
+      transferBadgeTimer = null;
+      sendToMainTabFrame(soleWindows.win, "tweb-transfer", transferSummary(transfers, Date.now()));
+    }, SETTLED_HOLD_MS + 100);
+  }
+}
+
+function trackTransfer(fields) {
+  const transfer = {
+    id: nextTransferId,
+    paused: false,
+    stalled: false,
+    received: 0,
+    total: 0,
+    startedAt: Date.now(),
+    endedAt: 0,
+    origin: "download",
+    ...fields,
+  };
+  nextTransferId += 1;
+  transfers.push(transfer);
+  if (transfers.length > MAX_LIVE_TRANSFERS) transfers.shift();
+  return transfer;
+}
+
+/// A transfer reached a terminal state: tell the page, write the record, log the path.
+function settleTransfer(transfer, state) {
+  transfer.state = state;
+  transfer.endedAt = Date.now();
+  transfer.cancel = null;
+  recordTransfer(transfer);
+  sendTransferState();
+  // Kept un-gated for the same reason the engine log is: a user who did not launch the
+  // pane with debug flags still needs the path recoverable after the badge is gone.
+  console.error(`tweb: download ${state} ${transfer.path}`);
+}
+
+/**
+ * Stop an in-flight transfer.
+ *
+ * Chrome leaves the partial file behind as a `.crdownload`; Electron's `cancel()` removes
+ * the partial itself, and TWeb does not fight it. Half a file under the name of a whole
+ * one is worse than no file, and the row in the list says the transfer was cancelled so
+ * the absence is explained rather than mysterious.
+ */
+function cancelTransfer(id) {
+  const target = Number.isInteger(id)
+    ? transfers.find((entry) => entry.id === id)
+    : transfers.findLast((entry) => entry.state === "progressing");
+  if (!target || target.state !== "progressing" || !target.cancel) return;
+  try {
+    target.cancel();
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: transfer cancel failed: ${error.message}`);
+  }
+}
+
 function configureDownloads() {
   session.defaultSession.on("will-download", (_event, item) => {
     const destination = availableDownloadPath(item.getFilename());
     pendingDownloadPaths.add(destination);
     item.setSavePath(destination);
+    const transfer = trackTransfer({
+      filename: path.basename(destination),
+      path: destination,
+      url: item.getURL(),
+      state: "progressing",
+      total: item.getTotalBytes(),
+      cancel: () => item.cancel(),
+    });
+    sendTransferState();
+    item.on("updated", (_updatedEvent, state) => {
+      transfer.received = item.getReceivedBytes();
+      transfer.total = item.getTotalBytes();
+      // `updated` reports "interrupted" for a transfer Chromium has not given up on, and
+      // isPaused() is separately true only when something asked it to pause. Reporting a
+      // broken connection as "paused" tells the user they did something they did not do.
+      transfer.paused = item.isPaused();
+      transfer.stalled = state === "interrupted" && !item.isPaused();
+      sendTransferState();
+    });
     item.once("done", (_doneEvent, state) => {
       pendingDownloadPaths.delete(destination);
-      if (debugLogging) console.error(`tweb: download ${state} ${destination}`);
+      transfer.received = item.getReceivedBytes();
+      settleTransfer(transfer, state);
     });
   });
+}
+
+// --- file chooser ---
+//
+// Chromium services `<input type=file>` by opening the platform's chooser. This window is
+// offscreen and `show: false`, so nothing opens: measured, the click lands on the element,
+// the DOM click event fires, and then absolutely nothing happens — no window, no error,
+// no file. The control looks present and does nothing, which is the worst shape a gap can
+// take, because the user only finds out mid-task with a composed message in front of them.
+//
+// So the request is intercepted before Chromium tries, and answered by a path prompt in
+// the pane. The interception is CDP's `Page.setInterceptFileChooserDialog`, and the answer
+// goes back through `DOM.setFileInputFiles` — there is no supported non-CDP way to put a
+// file on an input, and `value` cannot be assigned for security reasons that are
+// Chromium's and correct.
+//
+// WHAT THIS DOES NOT REPLACE: dragging a file from Finder onto the page. That does not
+// exist in a terminal and cannot be made to.
+const fileChooserByTab = new WeakMap();
+
+function attachChooserDebugger(tab) {
+  const contents = tab.webContents;
+  if (contents.debugger.isAttached()) return true;
+  try {
+    contents.debugger.attach("1.3");
+  } catch (error) {
+    // Something else owns the debugger (devtools, an extension host). The chooser cannot
+    // be intercepted then, and saying so beats a prompt that would never deliver.
+    if (debugLogging) console.error(`tweb: chooser debugger attach failed: ${error.message}`);
+    return false;
+  }
+  contents.debugger.on("message", (_event, method, params) => {
+    if (method !== "Page.fileChooserOpened") return;
+    openFileChooser(tab, params);
+  });
+  contents.debugger.on("detach", () => fileChooserByTab.delete(tab));
+  void contents.debugger.sendCommand("Page.enable")
+    .then(() => contents.debugger.sendCommand("Page.setInterceptFileChooserDialog", { enabled: true }))
+    .catch((error) => {
+      if (debugLogging) console.error(`tweb: chooser interception failed: ${error.message}`);
+    });
+  return true;
+}
+
+function openFileChooser(tab, params) {
+  const pending = {
+    backendNodeId: params?.backendNodeId,
+    frameId: params?.frameId,
+    multiple: params?.mode === "selectMultiple",
+    accept: "",
+  };
+  fileChooserByTab.set(tab, pending);
+  // The `accept` attribute is on the element, and CDP's event does not carry it. Reading
+  // it back from the page keeps the prompt able to offer the right files.
+  void tab.webContents.executeJavaScript(`(() => {
+    const active = document.activeElement;
+    const input = active && active.tagName === "INPUT" && active.type === "file" ? active : null;
+    return input ? input.accept || "" : "";
+  })()`, false).then((accept) => {
+    pending.accept = String(accept || "");
+    sendToMainTabFrame(tab, "tweb-file-chooser", {
+      multiple: pending.multiple,
+      accept: pending.accept,
+      // Starting where the user's shell is beats starting at / — they are far likelier to
+      // want something near their working directory than at the filesystem root.
+      start: `${process.cwd()}/`,
+    });
+  }).catch(() => {
+    sendToMainTabFrame(tab, "tweb-file-chooser", { multiple: pending.multiple, accept: "", start: `${process.cwd()}/` });
+  });
+}
+
+/// What the prompt shows as it is typed: the entries under the path, and the Tab completion.
+function fileChooserCompletion(value, accept) {
+  const home = app.getPath("home");
+  const { directory, prefix } = completionScope(value, home);
+  let listed = [];
+  try {
+    listed = readdirSync(expandHome(directory, home), { withFileTypes: true })
+      .map((item) => ({ name: item.name, directory: item.isDirectory() }));
+  } catch (error) {
+    // A path that does not exist yet is the normal state of a half-typed one, so an empty
+    // list is the answer rather than an error the user has to dismiss.
+    void error;
+  }
+  const model = completionEntries(listed, { prefix, accept });
+  return {
+    ...model,
+    directory,
+    completed: completedInput(value, model.entries, home),
+  };
+}
+
+/**
+ * Hand the chosen paths to the page, or cancel the request.
+ *
+ * A cancelled chooser must still be answered: `setFileInputFiles` with an empty list is
+ * what tells Chromium the dialog closed. Leaving it unanswered would leave the page
+ * believing a chooser is still open, which is the state this whole path exists to avoid.
+ *
+ * A path that does not exist is NOT a cancel, and this is the failure mode a path prompt
+ * has that Chrome's picker cannot: one mistyped character. Answering it as a cancel closes
+ * the prompt and does nothing, which is exactly the "looked like it worked" shape this
+ * whole change set exists to remove. So the request stays open and the prompt is reopened
+ * carrying the typed text and the reason.
+ */
+function resolveFileChooser(tab, value) {
+  const pending = fileChooserByTab.get(tab);
+  if (!pending) return;
+  const home = app.getPath("home");
+  const typed = (Array.isArray(value?.paths) ? value.paths : []).map(String).filter(Boolean);
+  const missing = typed.filter((entry) => !existsSync(expandHome(entry, home)));
+  if (typed.length > 0 && missing.length > 0) {
+    sendToMainTabFrame(tab, "tweb-file-chooser", {
+      multiple: pending.multiple,
+      accept: pending.accept,
+      start: typed[0],
+      error: missing.length === 1
+        ? `No such file: ${missing[0]}`
+        : `No such files: ${missing.join(", ")}`,
+    });
+    return;
+  }
+  fileChooserByTab.delete(tab);
+  const { paths } = chosenPaths(typed.map((entry) => expandHome(entry, home)), { multiple: pending.multiple });
+  void tab.webContents.debugger.sendCommand("DOM.setFileInputFiles", {
+    files: paths,
+    backendNodeId: pending.backendNodeId,
+  }).catch((error) => {
+    if (debugLogging) console.error(`tweb: file chooser delivery failed: ${error.message}`);
+  });
+  if (debugLogging) console.error(`tweb: file chooser ${paths.length ? paths.join(", ") : "cancelled"}`);
+}
+
+
+/**
+ * Shim `window.print` in a frame the preload never reached.
+ *
+ * This is the SECOND net, not the first. The primary cover for a preload-less child is the
+ * accessor patch inside `printShimScript`, which shims the child synchronously on the
+ * access that precedes the call — necessary because a page can create an iframe and print
+ * it in one tick, which this hook cannot win: measured, `frame-created` arrives after the
+ * renderer has already wedged. What this catches is the slower shapes, where a frame is
+ * created in one turn and printed in a later one, and any frame reached without going
+ * through a patched accessor.
+ *
+ * The frame has no IPC of its own, but an `about:blank`/`srcdoc` child is same-origin with
+ * its parent, so it can raise the event on an ancestor that DOES have a preload listening.
+ * A cross-origin frame cannot reach an ancestor, and it also gets its own preload
+ * (`nodeIntegrationInSubFrames`), so it is already covered there.
+ */
+function shimFramePrint(frame) {
+  if (!frame || frame.isDestroyed() || frame.detached) return;
+  const notify = `
+    try {
+      (window.top || window.parent).dispatchEvent(new CustomEvent("tweb-print-request"));
+    } catch (error) {
+      // A frame that can reach no listening ancestor cannot report the request. Swallowing
+      // it loses a print; letting it through would lose the renderer.
+    }`;
+  frame.executeJavaScript(printShimScript(notify), false).catch((error) => {
+    // A frame that navigated or died between creation and this call needs no shim.
+    void error;
+  });
+}
+
+/**
+ * What Ctrl-P and a page's own `window.print()` do instead of opening a print dialog.
+ *
+ * Chrome fuses two different jobs into one dialog: save-as-PDF, which is the common case,
+ * and putting ink on paper. A tmux pane can draw neither the preview nor the macOS print
+ * sheet, and Chromium's own attempt to open that sheet from an offscreen window never
+ * returns — it wedges the renderer's main thread permanently, measured. So printing does
+ * the half a terminal can do honestly: it writes the PDF next to the user's downloads and
+ * says where it went. The badge names it as a PDF rather than claiming the page printed,
+ * because silently swallowing a request for paper would be its own surprise.
+ */
+async function printPageToPdf(tab = soleWindows.win) {
+  if (!tab || tab.isDestroyed()) return;
+  const contents = tab.webContents;
+  const destination = availableDownloadPath(printFilename(contents.getTitle(), contents.getURL()));
+  pendingDownloadPaths.add(destination);
+  const transfer = trackTransfer({
+    filename: path.basename(destination),
+    path: destination,
+    url: contents.getURL(),
+    state: "progressing",
+    origin: "print",
+  });
+  sendTransferState();
+  try {
+    const pdf = await contents.printToPDF({});
+    writeFileSync(destination, pdf, { mode: 0o600 });
+    transfer.received = pdf.length;
+    transfer.total = pdf.length;
+    pendingDownloadPaths.delete(destination);
+    settleTransfer(transfer, "completed");
+  } catch (error) {
+    pendingDownloadPaths.delete(destination);
+    settleTransfer(transfer, "interrupted");
+    if (debugLogging) console.error(`tweb: print failed: ${error.message}`);
+  }
 }
 
 function runBrowserContextMenuCommand(tab, action) {
@@ -3402,6 +3771,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   const contents = tab.webContents;
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
+  attachChooserDebugger(tab);
+  // A frame with no preload gets its print shim from here; see shimFramePrint.
+  contents.on("frame-created", (_event, details) => shimFramePrint(details.frame));
   tab.on("show", keepHidden);
   tab.on("focus", keepHidden);
   tab.on("move", keepHidden);
@@ -3442,7 +3814,13 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   // separate TWeb tab, which keeps the native popup from ever being created.
   contents.setWindowOpenHandler((details) => {
     const target = details.url || "about:blank";
-    setImmediate(() => createTab(target, true));
+    // Middle-click and window.open share this path, and Chrome treats them differently:
+    // window.open takes you to the new tab, middle-click deliberately does not. The whole
+    // point of the gesture is to queue several links off a results page while staying
+    // where you are — force-activating the first one lands the rest on the wrong document,
+    // which makes the gesture worse than an ordinary click rather than better.
+    const activate = details.disposition !== "background-tab";
+    setImmediate(() => createTab(target, activate));
     return { action: "deny" };
   });
 
@@ -3966,13 +4344,20 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   if (vimiumShortcutsEnabled) {
     const tabCycle = control && (key === "Tab" || key === "PageDown" || key === "PageUp");
     const tabClose = control && key.toLowerCase() === "w";
+    const print = control && key.toLowerCase() === "p";
+    // Ctrl-D only belongs to a transfer while one is running. Claiming it unconditionally
+    // would take a key away from the page for a feature that has nothing to cancel.
+    const cancel = control && key.toLowerCase() === "d"
+      && transfers.some((entry) => entry.state === "progressing");
     const zoom = hasZoomModifier(modifiers) && ["+", "=", "-", "0"].includes(key);
-    if (tabCycle || tabClose || zoom) {
+    if (tabCycle || tabClose || print || cancel || zoom) {
       if (pressed) {
         if (key === "Tab") cycleTab(shift ? -1 : 1);
         else if (key === "PageDown") cycleTab(1);
         else if (key === "PageUp") cycleTab(-1);
         else if (tabClose) closeTab();
+        else if (print) void printPageToPdf();
+        else if (cancel) cancelTransfer();
         else if (key === "+" || key === "=") setBrowserZoom("in");
         else if (key === "-") setBrowserZoom("out");
         else if (key === "0") setBrowserZoom("reset");

@@ -529,6 +529,14 @@ test("every function the preload calls is defined in it", () => {
     for (const found of source.matchAll(/(?:const|let|var) ([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g)) {
       defined.add(found[1]);
     }
+    // A name destructured out of a require is as defined as one declared here — the point
+    // of the check is that nothing is called into thin air, not that nothing is imported.
+    for (const found of source.matchAll(/(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(/g)) {
+      for (const part of found[1].split(",")) {
+        const name = part.split(":").pop().trim();
+        if (name) defined.add(name);
+      }
+    }
     const called = new Set([...source.matchAll(/(?<![\w.$])([a-z][A-Za-z0-9_$]{3,})\(/g)]
       .map((found) => found[1]));
     const missing = [...called].filter((call) => !defined.has(call) && !builtins.has(call)

@@ -1,5 +1,10 @@
 # TWeb feasibility research and detailed-design reinforcement
 
+> **A dated research document. Its verdicts are pre-implementation feasibility assessments, not
+> statements about the running system** — several things assessed "feasible" here are still unbuilt,
+> notably extension reinstallation and the Profile Bridge. For what runs today see [README.md's
+> Status section](README.md#status). Research date 2026-07-31.
+
 For the seven validation targets in `DESIGN.md` section 17, this document assesses technical feasibility
 from external research and analysis of precedent projects, and reinforces the design where it is thin.
 Conclusions and recommendations are collected at the end of each section.

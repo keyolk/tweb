@@ -1,5 +1,10 @@
 # TWeb pre-development plan
 
+> **A dated planning document, superseded by what was actually built.** Research date 2026-07-31;
+> sixteen PRs of runtime have landed since and the plan diverged. For what runs today — and what is
+> broken, missing or deliberately not attempted — see [README.md's Status
+> section](README.md#status). Kept as a record of the reasoning that set the critical path.
+
 Building on `DESIGN.md` and `FEASIBILITY.md`, this document lays out the **Spikes** (research that
 removes uncertainty), **Prototypes** (minimal component validation) and **Architecture decisions**
 (settling the design) that have to happen before development actually starts. Items are ordered by
