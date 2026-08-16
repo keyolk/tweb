@@ -153,6 +153,8 @@ pub async fn dispatch(
             pid,
             protocol,
             image_id,
+            geometry,
+            tty,
             engine_executable,
             engine_app_dir,
             url,
@@ -187,6 +189,8 @@ pub async fn dispatch(
                         frame_rate,
                         adaptive_frame_rate,
                         restore_session,
+                        geometry,
+                        tty: tty.as_deref(),
                         url: &url,
                     },
                     now_ms,
@@ -330,6 +334,13 @@ pub fn engine_event_response(
             pane: pane_id,
             generation,
             event: PaneEvent::Audio { audible },
+        }),
+        // Forwarded rather than acted on: the daemon owns no pty, which is the entire reason this
+        // stopped being a signal at the supervisor and became an addressed event.
+        EngineEvent::KeyboardRestore { .. } => Some(Response::Event {
+            pane: pane_id,
+            generation,
+            event: PaneEvent::KeyboardRestore,
         }),
         // An empty pane name is how the engine host reports its own death to every pane at once:
         // the process is gone, so it named no pane. That is `engine_lost`, not one pane closing.
@@ -646,6 +657,14 @@ mod tests {
             pid: 1,
             protocol,
             image_id: 4242,
+            geometry: crate::protocol::PaneGeometry {
+                cols: 80,
+                rows: 24,
+                width: 800,
+                height: 480,
+                origin: Some((20, 0)),
+            },
+            tty: Some("/dev/ttys004".into()),
             engine_executable: "/nonexistent/Electron".into(),
             engine_app_dir: app_dir.into(),
             url: "https://example.com".into(),

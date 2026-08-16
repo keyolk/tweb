@@ -2,7 +2,9 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { parseControlLine, splitAddress, resolveTarget, formatOutbound } = require("./pane-control.cjs");
+const {
+  parseControlLine, splitAddress, resolveTarget, formatOutbound, keyboardRestoreEvent,
+} = require("./pane-control.cjs");
 const { PaneRegistry, createPaneRecord } = require("./pane-registry.cjs");
 
 test("an unaddressed RESIZE parses exactly as it always did", () => {
@@ -45,18 +47,44 @@ test("the address prefix targets a pane and leaves the rest of the line alone", 
 test("ATTACH carries the image id, because the host must not invent one", () => {
   // Kitty ids are terminal-wide and per-pane engines derive theirs from their pid; an invented
   // range would eventually overwrite one of their images.
-  assert.deepEqual(parseControlLine("@%3 ATTACH /tmp/sock,111 7 4242 30 1 0 https://example.com"), {
+  const line = "@%3 ATTACH /tmp/sock,111 7 4242 30 1 0 80 24 800 480 20 0"
+    + " /dev/ttys004 https://example.com";
+  assert.deepEqual(parseControlLine(line), {
     kind: "attach", paneId: "%3", tmuxServer: "/tmp/sock,111", generation: 7, imageId: 4242,
-    frameRate: 30, adaptive: true, restoreSession: false, url: "https://example.com",
+    frameRate: 30, adaptive: true, restoreSession: false,
+    viewport: { cols: 80, rows: 24, width: 800, height: 480 },
+    origin: { left: 20, top: 0 },
+    tty: "/dev/ttys004",
+    url: "https://example.com",
   });
 });
 
-test("a pane outside tmux attaches with an explicit dash, not an empty field", () => {
-  const attach = parseControlLine("@%0 ATTACH - 1 900 30 0 1");
+// Every field before the url is a fixed number of splits and the url is the verbatim rest, so an
+// empty field would shift the count and the tty would be read as the url.
+test("a pane outside tmux attaches with explicit sentinels, not empty fields", () => {
+  const attach = parseControlLine("@%0 ATTACH - 1 900 30 0 1 0 0 0 0 -1 -1 - https://example.com");
   assert.equal(attach.tmuxServer, null);
   assert.equal(attach.adaptive, false);
   assert.equal(attach.restoreSession, true);
-  assert.equal(attach.url, null);
+  assert.equal(attach.tty, null);
+  assert.equal(attach.url, "https://example.com");
+  // Not measured yet: the engine sizes the pane itself rather than opening a 0x0 window, which
+  // is not a smaller pane but one that can never paint.
+  assert.equal(attach.viewport, null);
+  // Unknown origin leaves the anchor alone. `0,0` would re-anchor the pane at the window's
+  // top-left, i.e. draw it over its neighbours — so the two must not collapse together.
+  assert.equal(attach.origin, undefined);
+});
+
+test("a known origin at the window's top-left is not confused with an unknown one", () => {
+  const attach = parseControlLine("@%1 ATTACH - 1 9 30 1 0 80 24 800 480 0 0 - https://a.example");
+  assert.deepEqual(attach.origin, { left: 0, top: 0 });
+});
+
+// A url can contain spaces; nothing before it can. Taking the rest verbatim is what carries one.
+test("a url with spaces survives, because it is the verbatim rest of the line", () => {
+  const attach = parseControlLine("@%1 ATTACH - 1 9 30 1 0 0 0 0 0 -1 -1 - https://e.com/a b");
+  assert.equal(attach.url, "https://e.com/a b");
 });
 
 test("DETACH parses addressed, and unaddressed for the sole pane", () => {
@@ -69,8 +97,24 @@ test("anything unrecognised is null, never a half-filled command", () => {
     "", "   ", null, undefined, "RESIZE", "RESIZE 80 24", "RESIZE 80 24 800 480 20",
     "VIS zz", "INPUT xyz", "@%3", "@ RESIZE 80 24 800 480", "ATTACH", "ATTACH /tmp 1",
     "@%3 ATTACH /tmp,1 7 4242 30 2 0", "RESIZE -80 24 800 480", "NONSENSE 1",
+    // The old seven-field form. Refused rather than filled in with defaults: a partial attach
+    // is the records-only accept that leaves a pane blank with no fallback.
+    "@%3 ATTACH /tmp,1 7 4242 30 1 0 https://example.com",
+    // Thirteen fields — the tty would silently become the url.
+    "@%3 ATTACH - 1 9 30 1 0 80 24 800 480 -1 -1",
   ];
   for (const line of lines) assert.equal(parseControlLine(line), null, `parsed: ${line}`);
+});
+
+// The engine cannot signal the pane's frontend on the hosted path: the pid it has is the
+// supervisor's, which owns no pty, and SIGUSR1's default action is terminate — measured killing
+// the daemon and every pane it served.
+test("a keyboard restore is addressed to the pane whose frontend must act", () => {
+  assert.equal(keyboardRestoreEvent("%3"), "@%3 KEYBOARD restore\n");
+  // Never bare: the case this exists for is one where several panes share a process, so "the
+  // implicit sole pane" has no meaning.
+  assert.throws(() => keyboardRestoreEvent(""), TypeError);
+  assert.throws(() => keyboardRestoreEvent(null), TypeError);
 });
 
 test("an unaddressed line resolves to the sole pane, which is the shipping path", () => {

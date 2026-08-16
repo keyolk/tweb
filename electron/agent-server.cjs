@@ -18,15 +18,31 @@ function runtimeDir() {
   return path.join(os.tmpdir(), `tweb-${process.getuid?.() ?? 0}`);
 }
 
-// tmux pane ids ("%3") are what a user names a pane by, so they make the
-// friendliest socket name. Fall back to the pid for a bare terminal.
-function socketName() {
-  const pane = process.env.TMUX_PANE;
-  return pane ? `agent-${pane.replace(/[^%\w.-]/g, "")}.sock` : `agent-pid-${process.pid}.sock`;
+// A pane's automation endpoint is named after THE PANE, never after the process serving it.
+// One engine hosting N panes has one pid and N panes, so a name derived from the engine would
+// give every pane the same socket — and worse, a daemon-started engine inherits the *daemon's*
+// `TMUX_PANE`, which was measured claiming `agent-%304.sock`: a name inside a completely
+// unrelated pane's namespace. That is the same collision class as the socket-unlink defect the
+// device+inode check below exists for, moved one level up.
+//
+// tmux pane ids ("%3") are what a user names a pane by, so they make the friendliest name. A
+// bare terminal has no tmux pane, and its caller passes the `pid-<pid>` identity it registered
+// that pane under — so the fallback lives in the identity, not here.
+function socketName(paneId) {
+  const pane = String(paneId ?? "").trim();
+  if (!pane) throw new TypeError("an agent socket is named after a pane, and none was given");
+  return `agent-${pane.replace(/[^%\w.-]/g, "")}.sock`;
 }
 
-function socketPath() {
-  return process.env.TWEB_AGENT_SOCKET || path.join(runtimeDir(), socketName());
+/**
+ * Where a pane's agent socket lives.
+ *
+ * `TWEB_AGENT_SOCKET` pins one path, which is a per-process answer: honouring it for every pane
+ * of a host would point N panes at one socket. So the override is a caller's decision — the
+ * single-pane path passes it, a host does not.
+ */
+function socketPath(paneId, { override = null } = {}) {
+  return override || path.join(runtimeDir(), socketName(paneId));
 }
 
 // At startup the pathname is either free or a dead engine's leftover, and rebinding is what
@@ -74,8 +90,11 @@ function stagingPath(target, pid = process.pid) {
 }
 
 // `dispatch(method, params)` returns a promise resolving to the JSON result.
-function startAgentServer({ dispatch, log = () => {} }) {
-  const target = socketPath();
+//
+// `paneId` names the socket. It is required rather than defaulted from the environment: a
+// default is what let the engine's own identity leak into a name that belongs to a pane.
+function startAgentServer({ paneId, socketOverride = null, dispatch, log = () => {} }) {
+  const target = socketPath(paneId, { override: socketOverride });
   const staging = stagingPath(target);
   // sun_path is 104 bytes on macOS and 108 on Linux; a silently unbound socket
   // would just look like "agent automation is broken" much later. The staging name is the

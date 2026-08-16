@@ -403,6 +403,7 @@ impl EngineHost {
             EngineEvent::Frame { pane, .. }
             | EngineEvent::AgentSocket { pane, .. }
             | EngineEvent::Audio { pane, .. }
+            | EngineEvent::KeyboardRestore { pane }
             | EngineEvent::Closed { pane, .. } => pane.clone(),
         };
         let inner = self.inner.lock();
@@ -456,7 +457,38 @@ async fn pump_stdin(mut stdin: tokio::process::ChildStdin, mut rx: UnboundedRece
     }
 }
 
+/// Which pid a hosted engine's orphan watchdog must watch, and under which name.
+///
+/// A pure statement of the contract `electron/orphan-watch.cjs` reads, so the rule is asserted in
+/// this repo's tests rather than only in the shape of a `Command`. Exactly one variable is set:
+/// two would leave the watchdog choosing, and neither leaves a hosted engine with no watchdog at
+/// all — which is the four-hour stale-page case that module exists for, now with N panes behind it.
+///
+/// Returns `(name, pid)`.
+pub fn orphan_watch_variable(supervisor_pid: u32) -> (&'static str, String) {
+    ("TWEB_SUPERVISOR_PID", supervisor_pid.to_string())
+}
+
+/// The variable a hosted engine must *not* inherit.
+///
+/// It means "a per-pane frontend owns my pty". A supervisor owns no pty, and an engine that
+/// believed otherwise sent it the SIGUSR1 that killed it.
+pub const FRONTEND_PID_VARIABLE: &str = "TWEB_FRONTEND_PID";
+
+/// Whether a hosted engine should still be running.
+///
+/// A parent that has gone means every pane this engine draws for is gone too. Mirrors
+/// `isOrphaned` in `electron/orphan-watch.cjs`, including its refusal to act without a pid: an
+/// engine started by hand or by a test has no parent to watch, and exiting on a guess would kill a
+/// legitimately parentless run.
+pub fn is_orphaned(watched_pid: Option<u32>, parent_pid: u32) -> bool {
+    // Chromium reparents the engine during startup, so `ppid` is not a stable identity — but
+    // landing on init specifically is unambiguous, because nothing else adopts a live child.
+    matches!(watched_pid, Some(pid) if pid > 1) && parent_pid == 1
+}
+
 fn start_process(launcher: &Launcher) -> Result<Child> {
+    let (watch_variable, watch_pid) = orphan_watch_variable(std::process::id());
     let mut command = Command::new(&launcher.executable);
     command
         .arg(".")
@@ -472,19 +504,21 @@ fn start_process(launcher: &Launcher) -> Result<Child> {
         // page over two other panes for four hours, and a hosted engine is that hazard with N
         // panes behind it.
         //
-        // `TWEB_FRONTEND_PID` carries the daemon's pid, not a pane frontend's, because that is the
-        // variable `isOrphaned` already watches and its rule — "my parent became init" — is exactly
-        // right here: the daemon *is* this process's parent. `TWEB_SUPERVISOR_PID` is set beside it
-        // so the engine can tell which kind of parent it has once it cares; measured as necessary,
-        // because with only the supervisor variable set a SIGKILLed daemon left the engine running
-        // indefinitely.
+        // **Exactly one of the two pid variables is ever set, and which one says what kind of
+        // parent this engine has.** `TWEB_FRONTEND_PID` means "a per-pane frontend owns my pty";
+        // `TWEB_SUPERVISOR_PID` means "a twebd supervisor owns me and I own no pty". The daemon
+        // therefore removes the frontend variable rather than impersonating a frontend with it,
+        // which is what it used to do — and that lie had teeth: the engine SIGUSR1s whatever it
+        // believes is its frontend to ask for a keyboard-mode re-declaration, the default action
+        // for SIGUSR1 is terminate, and the daemon died of it with every hosted pane attached
+        // (measured, rc=-30). A hosted engine now asks the pane's own frontend over the wire
+        // (`KEYBOARD restore`), which is the process that actually holds the pty.
         //
-        // Handing the engine this pid also makes the daemon the target of the engine's SIGUSR1
-        // keyboard-mode-restore signal, which is why [`ignore_frontend_signals`] exists. Measured:
-        // without it the daemon died of the default SIGUSR1 action the moment a real engine
-        // started, taking every other hosted pane with it.
-        .env("TWEB_FRONTEND_PID", std::process::id().to_string())
-        .env("TWEB_SUPERVISOR_PID", std::process::id().to_string())
+        // `orphan-watch.cjs` watches whichever variable is present, so the "my parent became init"
+        // rule applies unchanged — and the daemon genuinely *is* this process's parent, so it is
+        // the right pid to watch.
+        .env(watch_variable, watch_pid)
+        .env_remove(FRONTEND_PID_VARIABLE)
         .env("TWEB_MULTIPANE", "1")
         // No pane's url, viewport or image id here: a hosted engine gets those per pane, over the
         // control channel, because one process cannot have N values of an environment variable.
@@ -609,6 +643,14 @@ mod tests {
                     frame_rate: 30,
                     adaptive_frame_rate: true,
                     restore_session: false,
+                    geometry: crate::protocol::PaneGeometry {
+                        cols: 80,
+                        rows: 24,
+                        width: 800,
+                        height: 480,
+                        origin: None,
+                    },
+                    tty: None,
                     url: "https://example.com",
                 },
                 0,
@@ -617,6 +659,46 @@ mod tests {
             .expect_err("cannot host");
         assert_eq!(error, "no engine here");
         assert_eq!(host.hosted_pane_count(), 0);
+    }
+
+    // THE CONTRACT `electron/orphan-watch.cjs` READS. The daemon used to set `TWEB_FRONTEND_PID`
+    // to its own pid, impersonating a per-pane frontend. The engine then SIGUSR1'd it to ask for a
+    // keyboard-mode re-declaration, and SIGUSR1's default action is terminate: the daemon died
+    // with every hosted pane attached (measured, rc=-30).
+    #[test]
+    fn a_hosted_engine_is_handed_the_supervisor_pid_and_never_a_frontend_pid() {
+        let (name, pid) = orphan_watch_variable(4711);
+        assert_eq!(name, "TWEB_SUPERVISOR_PID");
+        assert_eq!(pid, "4711");
+        assert_ne!(
+            name, FRONTEND_PID_VARIABLE,
+            "a supervisor owns no pty and must not claim to"
+        );
+    }
+
+    // Exactly one of the two is set. Both would leave the watchdog choosing; neither would leave a
+    // hosted engine with no watchdog at all — it would keep painting after its supervisor died,
+    // which is precisely the four-hour stale-page case, now with N panes behind it.
+    #[test]
+    fn a_hosted_engine_always_has_exactly_one_watchable_pid() {
+        let (name, pid) = orphan_watch_variable(std::process::id());
+        assert!(!pid.is_empty());
+        // What the engine resolves: the frontend variable is absent, so it falls to the supervisor
+        // one, and the result is a pid it can actually watch.
+        let watched: Option<u32> = None
+            .or_else(|| Some(pid.parse::<u32>().expect("a pid")))
+            .filter(|value| *value > 1);
+        assert!(watched.is_some(), "{name} must yield a watchable pid");
+        assert!(is_orphaned(watched, 1), "a reparented engine is orphaned");
+        assert!(!is_orphaned(watched, 999), "a live parent is not init");
+    }
+
+    // An engine started by hand or by a test has no parent to watch, and exiting on a guess would
+    // kill a legitimately parentless run.
+    #[test]
+    fn an_engine_with_no_watchable_pid_is_never_reaped() {
+        assert!(!is_orphaned(None, 1));
+        assert!(!is_orphaned(Some(1), 1));
     }
 
     #[test]
@@ -676,6 +758,14 @@ mod tests {
             frame_rate: 30,
             adaptive_frame_rate: true,
             restore_session: false,
+            geometry: crate::protocol::PaneGeometry {
+                cols: 80,
+                rows: 24,
+                width: 800,
+                height: 480,
+                origin: Some((20, 0)),
+            },
+            tty: Some("/dev/ttys004"),
             url: "https://example.com",
         }
     }
@@ -726,7 +816,8 @@ mod tests {
         let launcher = fake_engine(
             "ready",
             &format!(
-                "#!/bin/sh\necho 'READY 1'\nwhile IFS= read -r line; do echo \"$line\" >> {}; done\n",
+                "#!/bin/sh\necho 'READY {}'\nwhile IFS= read -r line; do echo \"$line\" >> {}; done\n",
+                crate::protocol::PROTOCOL_VERSION,
                 record.display()
             ),
         );
@@ -746,7 +837,9 @@ mod tests {
             if let Ok(written) = std::fs::read_to_string(&record) {
                 if written.contains("DETACH") {
                     assert!(
-                        written.contains("@%3 ATTACH srv 1 4242 30 1 0 https://example.com"),
+                        written.contains(
+                            "@%3 ATTACH srv 1 4242 30 1 0 80 24 800 480 20 0 /dev/ttys004 https://example.com"
+                        ),
                         "the open line has to reach the engine: {written:?}"
                     );
                     return;
@@ -776,7 +869,13 @@ mod tests {
     // frames from a process that no longer exists.
     #[tokio::test]
     async fn an_engine_that_dies_tells_every_hosted_pane() {
-        let launcher = fake_engine("dies", "#!/bin/sh\necho 'READY 1'\nexit 0\n");
+        let launcher = fake_engine(
+            "dies",
+            &format!(
+                "#!/bin/sh\necho 'READY {}'\nexit 0\n",
+                crate::protocol::PROTOCOL_VERSION
+            ),
+        );
         let host = Arc::new(EngineHost::new(launcher));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         host.open(key(), tx, &open_request(), 0)

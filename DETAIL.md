@@ -9,14 +9,18 @@ Research date: 2026-07-31.
 > written before implementation and are in the present indicative throughout; several of their
 > central claims are the opposite of what ships. Specifically:
 >
-> - **One whole Electron process runs per tmux pane.** `crates/tweb-pane/src/lib.rs` spawns one from
->   every `tweb __pane`. The `BrowserWindow`s inside it are *tabs of that pane*, never other panes.
->   So §4.1's topology and §4.2's "add a BrowserWindow per pane, not a new Electron process" describe
->   the mitigation that has **not** been built — §4.2 is the single most misleading paragraph here.
-> - **`twebd` routes nothing.** It is a standalone supervisor binary that nothing in `electron/` or
->   `crates/tweb-pane/` references. `RESIZE` / `VIS` / `INPUT` are newline-framed lines on the
->   engine's **stdin**, written directly by the Rust frontend. Every arrow through `twebd` in §4.3,
->   §4.4, §5.3, §6.1 and §6.3 is target state.
+> - **One whole Electron process runs per tmux pane on the shipping path.**
+>   `crates/tweb-pane/src/lib.rs` spawns one from every `tweb __pane`, and the `BrowserWindow`s
+>   inside it are *tabs of that pane*, never other panes. §4.2's "add a BrowserWindow per pane, not
+>   a new Electron process" is now **built behind a closed gate**: the page host exists, renders a
+>   hosted pane under `TWEB_HOST_PREVIEW=1`, and refuses a second pane — so §4.1's topology is still
+>   what ships. See DESIGN.md §5.1 for the gate and what has to be true before it opens.
+> - **`twebd` routes nothing on the shipping path.** The supervisor exists and `crates/tweb-pane`
+>   now references it — `hosted.rs` attaches to a daemon-held page and writes the frames it gets
+>   back — but only under `TWEB_DAEMON=1`, and every attach is **refused** today because no engine
+>   declares host capability (DESIGN.md §5.1). So what actually carries `RESIZE` / `VIS` / `INPUT`
+>   is still newline-framed lines on the engine's **stdin**, written directly by the Rust frontend.
+>   Every arrow through `twebd` in §4.3, §4.4, §5.3, §6.1 and §6.3 remains target state.
 > - **The Rust native module / SHM transport named in §4.3 was deleted** — see §8.4, which records
 >   the deletion but does not go back and correct §4.3. Frames go `paint` → `gfx-worker.cjs` → file →
 >   Kitty `t=f` on the inherited stdout.

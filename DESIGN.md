@@ -320,10 +320,88 @@ already use, so discovery stays one convention — and peer credentials are chec
 opaque IDs only, and no API ever returns a cookie/token value.
 
 **Status.** The supervisor slice above (identity, generation, attach/detach/list/status, singleton,
-close-driven reaping) is implemented in `crates/twebd` with unit tests, and is deliberately
-architecture-neutral: it names panes and nothing else, carries no frame bytes and no page state.
-Nothing in `electron/` or `crates/tweb-pane/` references it yet, so the shipping path is unchanged.
-The engine-hosting half — one Electron, N panes, per-pane frame sinks — is scoped but not built.
+close-driven reaping) is implemented in `crates/twebd` with unit tests. The engine-hosting half is
+now built as well, and **is not reachable from any shipping path** — the paragraphs below say
+exactly where the line is, because "built" and "on" are different claims and conflating them is how
+a blank pane ships.
+
+`crates/tweb-pane` does reference `twebd` now (`hosted.rs`, `attach.rs`, and the `twebd` crate
+dependency): with `TWEB_DAEMON=1` the frontend asks the daemon to host its pane before spawning an
+engine of its own. What it gets today is a **refusal**, and the refusal is the design rather than a
+failure — see the gate below.
+
+**The gate.** A hosted engine declares what it can do by printing `READY <protocol>` on its stdout,
+and `electron/hosted-runtime.cjs` `hostProtocolVersion()` returns `null`, so no engine in the tree
+prints it. `twebd` kills an engine that has not declared itself within `READY_TIMEOUT` (10s) and
+answers `EngineUnavailable`; the frontend logs the reason and spawns its own engine. Two tests hold
+the gate shut: one asserts the null, one greps every non-test `.cjs` for a `READY` literal.
+
+The order is deliberate and is the lesson of the previous attempt. File presence is not evidence of
+behaviour — the modules a host needs shipped in a release *before* the host that used them, and a
+daemon that checked for files started a healthy single-pane engine which opened its own default
+page, painted it into the control pipe, and left the requesting pane blank forever with no failure
+anywhere to trigger a fallback. **A records-only accept is worse than a refusal**, because a refusal
+falls back to a browser that works.
+
+Measured on this tree, `TWEB_DAEMON=1` with a live daemon, a real pane in a `tmux split-window`:
+
+```text
+pane stderr   spawning this pane's own engine reason=twebd declined (EngineUnavailable):
+              engine did not declare itself a pane host within 10000ms
+twebd status  panes 0 · generations 1 · protocol 2 · engine unavailable
+parentage     pane_pid -> tweb -> Electron;  the daemon has no children at all
+```
+
+The first pane pays the 10s handshake; the daemon then remembers the engine is unavailable and
+every later pane falls back in **24 ms**. The daemon does not respawn the engine per attempt —
+sampled over 60s, `twebd` held 0 children and 0.0% CPU.
+
+Behind that gate the page host is real and renders. `bench/t1-host-harness.py` speaks the
+supervisor's side of the protocol to an engine started with `TWEB_MULTIPANE=1` and every pane
+identity variable removed, and reads back an agent socket named after the pane and whole frames
+addressed to it, carrying the image id **from the ATTACH** rather than from the process:
+
+```text
+READY:  NONE — the engine did not declare itself a host
+AGENT:  @%3 AGENT /tmp/t1harness/agent-%3.sock
+FRAME:  ESC_G a=T,i=4242,C=1,c=100,r=30,z=-1,f=32,s=1000,v=600,t=f,q=2;<base64 path>
+```
+
+The host runs only under `TWEB_HOST_PREVIEW=1`, which nothing but that harness sets. So the host is
+**measurable before it is declared**, which is the order this had to happen in.
+
+**What is still missing, and it is why the gate stays shut: one pane per host.** Everything a pane
+owns is per-pane — registry record, frame context, window context, writer, agent socket, image id
+pool, frame file. The tab plumbing on top is not: `createTab`/`activateTab` and the tab-keyed maps
+still reach for the sole window context, so a second attach would be recorded and would then draw
+into the first pane's window. `handleAttach` refuses the second pane rather than accepting it, and
+that frontend keeps its own engine.
+
+Declaring `READY 2` in that state would make `twebd` host one pane per engine — which **buys
+nothing**. The entire saving measured above is runtime duplication, and one pane in an Electron that
+hosts nothing else duplicates the runtime exactly as today, with a daemon added on top. The gate
+opens when N panes render in one engine, not before.
+
+#### What survives the collapse from N processes to one
+
+Four pieces of machinery exist *because* panes are separate processes, and each was a candidate to
+disappear when one process hosts N. Three were kept and one collapsed only halfway, for the same
+reason in every case: **a host does not replace per-pane engines, it runs beside them.** A
+mechanism that only protects the panes sharing memory, while dropping the guard against the ones
+that do not, is a strict regression rather than a simplification.
+
+| Machinery | Verdict | Why |
+|---|---|---|
+| Audio claim file + heartbeat | **File kept; arbitration between hosted panes collapses to memory** | `audioOwnerAmong` decides between panes that share a process without publishing to a file and polling it. The file stays because a per-pane engine running beside a host shares nothing else with it. The in-memory half is not yet wired — it needs the host. |
+| Orphan watchdog | **Kept and extended** — the opposite of a collapse | A hosted engine outliving its supervisor is the four-hour stale-page hazard with N panes behind it. It now watches `TWEB_FRONTEND_PID` if present, else `TWEB_SUPERVISOR_PID`. |
+| `history.jsonl` filesystem lock | **Kept** | Cross-process contention does not go away: legacy per-pane engines write the same file beside a host. Measured holding under real contention — 331 lines, **0 malformed**, after five concurrent engines wrote it. |
+| Agent socket bind-staging-then-rename | **Kept** | It guards pane-id reuse *across processes* (libuv unlinks the path it bound). An old per-pane engine and a new hosted pane still contend for one pathname. |
+
+One thing did collapse outright, and it was not on the candidate list: the graphics worker no longer
+writes a terminal. It writes the frame file and returns the escape sequences, which the pane's own
+writer emits. That removes the last place where output was "wherever `process.stdout` points" — a
+tear on the default path (two writers on one pty, ~1 frame in 750), and on a hosted engine a
+corrupted protocol stream rather than a frame.
 
 ### 5.2 The `tweb __pane` frontend
 
@@ -345,10 +423,15 @@ Where the shipping code stands against that list: pane identity, raw mode, `SIGW
 forwarding and the visibility/focus lifecycle are implemented — visibility is probed here and
 pushed to the engine over the stdin control channel, which is why the engine spawns no `tmux`
 children of its own. Graphics detection is now implemented too, but not in the form this section
-originally assumed — see below. One responsibility is still missing: frames do not pass through
-this process at all. The engine writes Kitty graphics straight to the inherited stdout, so
-"attach to a browserd page and display frames" describes the daemon architecture of 5.1 rather
-than the Electron one that ships.
+originally assumed — see below.
+
+"Attach to a browserd page and display frames" is now **built but not reachable**, and the
+distinction matters. `crates/tweb-pane/src/hosted.rs` attaches to a daemon-held page and writes the
+frames it gets back through this process's own `PaneWriter` — the frontend keeps every job it has
+today except spawning an engine, and stays **the only writer of this pane's pty**. But no engine
+declares host capability (5.1), so every attach is refused and the frontend spawns an engine whose
+Kitty graphics go straight to the inherited stdout, exactly as before. On the shipping path frames
+still do not pass through this process.
 
 #### Graphics detection is tri-state, because inside tmux the question cannot be answered
 

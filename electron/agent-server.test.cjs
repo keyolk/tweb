@@ -9,6 +9,8 @@ const path = require("node:path");
 const {
   clearOwnedSocket,
   sameSocketIdentity,
+  socketName,
+  socketPath,
   stagingPath,
   startAgentServer,
 } = require("./agent-server.cjs");
@@ -56,6 +58,38 @@ test("an identity matches only the same socket instance", () => {
   assert.equal(sameSocketIdentity({ dev: 1, ino: 2 }, null), false);
 });
 
+// A daemon-started engine inherits the DAEMON's TMUX_PANE. Deriving the name from it was
+// measured claiming `agent-%304.sock` — a name inside an unrelated pane's namespace, which
+// `tweb --pane %304` would then connect to and drive the wrong page. The name comes from the
+// pane the socket serves, and there is no environment fallback left to leak into it.
+test("a socket is named after the pane it serves, never after the engine", () => {
+  assert.equal(socketName("%3"), "agent-%3.sock");
+  // A bare terminal registers its pane under a pid-derived identity; that identity is the
+  // caller's, and arrives here as a pane id like any other.
+  assert.equal(socketName("pid-4242"), "agent-pid-4242.sock");
+  process.env.TMUX_PANE = "%304";
+  assert.equal(socketName("%7"), "agent-%7.sock", "the engine's own pane must not appear");
+  delete process.env.TMUX_PANE;
+});
+
+test("a nameless pane is refused rather than given the process's name", () => {
+  // Silently falling back to a pid would give N hosted panes N sockets nobody can address by
+  // pane id, which reads as "automation randomly picks the wrong pane".
+  assert.throws(() => socketName(""), TypeError);
+  assert.throws(() => socketName(null), TypeError);
+  assert.throws(() => socketName(undefined), TypeError);
+});
+
+test("the pinned-path override is the caller's decision, not the module's", () => {
+  const directory = temporaryDirectory();
+  process.env.TWEB_RUNTIME_DIR = directory;
+  // TWEB_AGENT_SOCKET names one path. Honouring it for every pane of a host would point N
+  // panes at one socket, so it only applies where a caller passes it.
+  assert.equal(socketPath("%3", { override: "/tmp/pinned.sock" }), "/tmp/pinned.sock");
+  assert.equal(socketPath("%3"), path.join(directory, "agent-%3.sock"));
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test("an engine removes the socket it actually bound", async () => {
   const directory = temporaryDirectory();
   const target = path.join(directory, "agent-%7.sock");
@@ -72,17 +106,19 @@ test("an engine removes the socket it actually bound", async () => {
 test("an engine never removes the socket a successor rebound at the same path", async () => {
   const directory = temporaryDirectory();
   process.env.TWEB_RUNTIME_DIR = directory;
-  process.env.TMUX_PANE = "%42";
-  delete process.env.TWEB_AGENT_SOCKET;
   const target = path.join(directory, "agent-%42.sock");
 
   // Engine A: its frontend was SIGKILLed, but the orphan watchdog has not fired yet.
-  const first = startAgentServer({ dispatch: async () => ({ from: "A" }), log: () => {} });
+  const first = startAgentServer({
+    paneId: "%42", dispatch: async () => ({ from: "A" }), log: () => {},
+  });
   await settle();
   const firstIno = fs.lstatSync(target).ino;
 
   // Engine B: tmux reused the pane id, so the same pathname, taken over legitimately.
-  const second = startAgentServer({ dispatch: async () => ({ from: "B" }), log: () => {} });
+  const second = startAgentServer({
+    paneId: "%42", dispatch: async () => ({ from: "B" }), log: () => {},
+  });
   await settle();
   const secondIno = fs.lstatSync(target).ino;
   assert.notEqual(secondIno, firstIno, "the successor must own a new socket");
@@ -144,7 +180,9 @@ test("a target that only fits before staging is refused rather than bound", asyn
   assert.ok(Buffer.byteLength(stagingPath(target)) > 100, "the staging name must not fit");
 
   process.env.TWEB_AGENT_SOCKET = target;
-  const server = startAgentServer({ dispatch: async () => ({}), log: () => {} });
+  const server = startAgentServer({
+    paneId: "%3", socketOverride: target, dispatch: async () => ({}), log: () => {},
+  });
   await settle();
   assert.equal(fs.existsSync(target), false, "nothing may be bound when the guard refuses");
   assert.equal(fs.existsSync(stagingPath(target)), false);

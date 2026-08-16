@@ -4,7 +4,8 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   PaneRegistry, createPaneRecord, applyViewport, applyVisibility, applyFrameTier,
-  applySurface, applyAudio, audioOwnerAmong,
+  applySurface, applyAudio, audioOwnerAmong, paneImageIds, paneFrameFileNames,
+  collidingImageRange, PATCH_ID_COUNT, IMAGE_ID_STRIDE,
 } = require("./pane-registry.cjs");
 
 const VP = (cols, rows, width, height) => ({ cols, rows, width, height });
@@ -174,4 +175,75 @@ test("silence has no owner at all, rather than a stale one", () => {
   assert.equal(audioOwnerAmong([pane]), null);
   assert.equal(audioOwnerAmong([], "some-key"), null);
   assert.equal(audioOwnerAmong([pane], pane.key), null);
+});
+
+// The Kitty image id namespace is terminal-wide: shared between the panes of one host AND with
+// every per-pane engine still running beside it. An id that came from the engine's own pid would
+// be identical for all N panes it serves, so ids are derived from the record and nothing else.
+test("a pane's image ids all come from its record", () => {
+  const pane = record({ imageId: 4242 });
+  const ids = paneImageIds(pane);
+  assert.equal(ids.base, 4242);
+  assert.equal(ids.patchBase, 4243);
+  assert.equal(ids.patchIds.length, PATCH_ID_COUNT);
+  assert.deepEqual(ids.patchIds, [4243, 4244, 4245, 4246, 4247, 4248, 4249, 4250]);
+  // Exclusive: the first id another pane may legally start at.
+  assert.equal(ids.end, 4242 + IMAGE_ID_STRIDE);
+  assert.equal(ids.end, 4251);
+});
+
+// The consequence of an overlap is invisible — no error, just one pane's whole frame appearing
+// in another pane's rectangle, or a patch id freeing an image a different pane is still placing.
+test("a base that treads on a live pane's range is found before it is used", () => {
+  const first = record({ paneId: "%1", generation: 1, imageId: 100 });
+  const panes = [first];
+  // Anywhere inside 100..108 collides, including the patch slots at the far end.
+  for (const candidate of [100, 101, 104, 108]) {
+    assert.equal(collidingImageRange(panes, candidate), first, `${candidate} must collide`);
+  }
+  // A base just below overlaps too: its own patch slots reach up into the first pane's base.
+  for (const candidate of [92, 99]) {
+    assert.equal(collidingImageRange(panes, candidate), first, `${candidate} must collide`);
+  }
+  // One stride away in either direction is the first base that does not.
+  assert.equal(collidingImageRange(panes, 109), null);
+  assert.equal(collidingImageRange(panes, 91), null);
+  assert.equal(collidingImageRange([], 100), null);
+});
+
+test("a pane's frame files cover both formats and their staging names", () => {
+  // The old cleanup named four paths from two module-level constants. That was right when a
+  // process was a pane; the four are now derived from the pane's own id.
+  assert.deepEqual(paneFrameFileNames(12345, 98466), [
+    "tweb-frame-12345-98466.rgba",
+    "tweb-frame-12345-98466.rgba.tmp",
+    "tweb-frame-12345-98466.png",
+    "tweb-frame-12345-98466.png.tmp",
+  ]);
+});
+
+test("two panes in one engine own disjoint frame files", () => {
+  // Otherwise one pane's detach deletes a frame the other is still writing.
+  const a = new Set(paneFrameFileNames(7, 100));
+  const b = paneFrameFileNames(7, 100 + IMAGE_ID_STRIDE);
+  assert.equal(b.some((name) => a.has(name)), false);
+});
+
+test("an unusable id yields nothing rather than a wildcard", () => {
+  // `Number(null)` is 0, so an integer check alone lets a null id name `tweb-frame-7-0.rgba` —
+  // a real file that no pane owns. `createPaneRecord` refuses 0 for the same reason.
+  for (const bad of [undefined, null, NaN, "x", Infinity, 0, -1, 1.5]) {
+    assert.deepEqual(paneFrameFileNames(7, bad), [], `imageId ${String(bad)}`);
+    assert.deepEqual(paneFrameFileNames(bad, 100), [], `pid ${String(bad)}`);
+  }
+});
+
+test("the names a live engine deletes are the ones a dead engine's sweep collects", () => {
+  // Two mechanisms, one naming rule: `cleanupFrameFiles` on the way out, and
+  // `abandonedFrameFiles` at the next startup for an engine that never got there. A change to
+  // either side that broke the match would stop the sweep silently.
+  const { FRAME_FILE_PATTERN } = require("./orphan-watch.cjs");
+  for (const name of paneFrameFileNames(12345, 98466)) {
+    assert.ok(FRAME_FILE_PATTERN.test(name), `${name} must stay collectable`);
+  }
 });
