@@ -39,6 +39,12 @@ pub struct HostRequest<'a> {
     pub frame_rate: u16,
     pub adaptive_frame_rate: bool,
     pub restore_session: bool,
+    /// Measured here because a hosted engine cannot measure it: measurement reads `$TMUX_PANE`,
+    /// and a hosted engine's own is the daemon's pane, not any of the N it serves.
+    pub geometry: twebd::protocol::PaneGeometry,
+    /// This pane's tty. Passed for diagnostics, not as a write target — frames come back over the
+    /// connection and are written here, because this process is already the sole writer of it.
+    pub tty: Option<String>,
     /// Resolved by the frontend, because resolution walks up from the current directory and the
     /// frontend is the process standing in the pane's shell. A daemon started elsewhere would
     /// silently resolve a different engine app.
@@ -64,6 +70,8 @@ pub fn connect_and_host(
         pid,
         protocol: PROTOCOL_VERSION,
         image_id: request.image_id,
+        geometry: request.geometry,
+        tty: request.tty.clone(),
         engine_executable: request.engine_executable.clone(),
         engine_app_dir: request.engine_app_dir.clone(),
         url: request.url.to_string(),
@@ -158,6 +166,17 @@ pub fn apply(
                 }
                 PaneEvent::Audio { audible } => {
                     tracing::debug!(audible, "hosted pane audio claim");
+                    Ok(())
+                }
+                // The SIGUSR1 replacement, and the reason it had to become an addressed event:
+                // this process holds the pane's pty, so it is the only one that can re-declare
+                // the mode. It goes through the pane writer rather than straight at stdout —
+                // writing the tty directly is exactly the second-writer hazard the writer exists
+                // to close, and a frame is in flight on this path several times a second.
+                PaneEvent::KeyboardRestore => {
+                    if crate::terminal::keyboard_mode_is_tracked() {
+                        let _ = writer.write_sequence(crate::terminal::TRACKED_KEYBOARD_MODE);
+                    }
                     Ok(())
                 }
             }
@@ -361,6 +380,48 @@ mod tests {
             .expect("not a fallback");
         }
         assert!(written(&recorder).is_empty(), "these are not tty bytes");
+    }
+
+    // The SIGUSR1 replacement. #28 removed the hazard (a daemon dying of the default action) but
+    // lost the *function* on the hosted path: nothing re-declared the mode after DevTools reset
+    // it. The bytes have to reach this pane's own pty, and through the writer — the tty already
+    // carries frames, and a second writer on it is the tear the writer exists to prevent.
+    #[test]
+    fn a_keyboard_restore_puts_the_tracked_sequence_on_this_panes_tty() {
+        // The mode only exists inside tmux, and the test process may be anywhere.
+        if !crate::terminal::keyboard_mode_is_tracked() {
+            return;
+        }
+        let (writer, recorder) = writer();
+        apply(
+            &Response::Event {
+                pane: "%3".into(),
+                generation: Generation(1),
+                event: PaneEvent::KeyboardRestore,
+            },
+            Generation(1),
+            &writer,
+        )
+        .expect("a restore is not a fallback");
+        assert_eq!(written(&recorder), crate::terminal::TRACKED_KEYBOARD_MODE);
+    }
+
+    // A restore stamped with a dead predecessor's generation would re-declare a mode on behalf of
+    // a frontend that no longer owns this pane.
+    #[test]
+    fn a_stale_keyboard_restore_writes_nothing() {
+        let (writer, recorder) = writer();
+        apply(
+            &Response::Event {
+                pane: "%3".into(),
+                generation: Generation(1),
+                event: PaneEvent::KeyboardRestore,
+            },
+            Generation(2),
+            &writer,
+        )
+        .expect("stale events are dropped");
+        assert!(written(&recorder).is_empty());
     }
 
     // The wire is one JSON value per line; a body carrying its own newline would be carried into

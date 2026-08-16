@@ -129,8 +129,8 @@ test("switching tabs replaces the image instead of deleting it", () => {
 test("overlays ask for a paint instead of waiting for the frame clock", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "repaint":/);
-  assert.match(main, /const wasIdle = activeFrameRate !== maxActiveFrameRate;/);
-  assert.match(main, /if \(wasIdle && win && !win\.isDestroyed\(\) && solePane\.visible\) win\.webContents\.invalidate\(\);/);
+  assert.match(main, /const wasIdle = isThrottled\(soleWindows\);/);
+  assert.match(main, /if \(wasIdle && soleWindows\.win && !soleWindows\.win\.isDestroyed\(\) && currentPane\(\)\.visible\)\s*\{?\s*soleWindows\.win\.webContents\.invalidate\(\);/);
   assert.match(electron, /function paintNow\(\)/);
   // Every transient overlay mount requests a paint. The persistent mode/tab
   // indicator additionally repaints when its hover popover opens or closes.
@@ -150,16 +150,17 @@ test("overlays ask for a paint instead of waiting for the frame clock", () => {
 test("a resize re-places the existing image instead of baring the pane", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const applyViewport = main.slice(main.indexOf("function applyViewport(vp, origin"),
-    main.indexOf("function createWindow(url)"));
-  assert.match(applyViewport, /if \(solePane\.visible\) replacePlacement\(\);/);
+    main.indexOf("function createWindow(url, frames"));
+  assert.match(applyViewport, /if \(record\.visible\) replacePlacement\(frames\);/);
   assert.doesNotMatch(applyViewport, /writeGfx/);
   // A moved or shrunk pane leaves a placement the next frame cannot cover.
-  assert.match(applyViewport, /if \(originChanged \|\| shrank\) pendingImageDelete = true;/);
-  // `d=I` frees the pixels, which would leave nothing to re-place.
-  const replace = main.slice(main.indexOf("function deletePlacement()"),
-    main.indexOf("function transferFrame("));
-  assert.match(replace, /a=d,d=i,i=\$\{imageId\}/);
-  assert.match(replace, /a=p,i=\$\{imageId\}/);
+  assert.match(applyViewport, /if \(change\.originChanged \|\| change\.shrank\) frames\.pendingImageDelete = true;/);
+  // `d=I` frees the pixels, which would leave nothing to re-place. The id comes from the pane's
+  // own range, never from anything process-wide.
+  const replace = main.slice(main.indexOf("function deletePlacement(frames"),
+    main.indexOf("// --- damage patches ---"));
+  assert.match(replace, /a=d,d=i,i=\$\{frames\.imageIds\.base\}/);
+  assert.match(replace, /a=p,i=\$\{frames\.imageIds\.base\}/);
 });
 
 test("bare open never restores or saves an internal blank page", () => {
@@ -167,7 +168,7 @@ test("bare open never restores or saves an internal blank page", () => {
   assert.match(main, /require\("\.\/window-session\.cjs"\)/);
   assert.match(main, /if \(showingLoadError \|\| !isRestorableUrl\(url\)\) return;/);
   assert.match(main, /const state = windowSessionForSave\(/);
-  assert.match(main, /if \(!windowSessionPath \|\| tabs\.length === 0\) return;/);
+  assert.match(main, /if \(!windowSessionPath \|\| soleWindows\.tabs\.length === 0\) return;/);
   assert.match(main, /function writeWindowSessionState\(state\)/);
   assert.match(main, /if \(!windowSessionPath \|\| !state\) return;/);
   assert.match(main, /windowSessionKeys\(tmuxIdentity\)/);
@@ -185,7 +186,7 @@ test("another pane owning tmux zoom hides the browser image", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /require\("\.\/tmux-visibility\.cjs"\)/);
   assert.match(main, /#\{window_zoomed_flag\}\\t#\{pane_id\}/);
-  assert.match(main, /paneId: process\.env\.TMUX_PANE/);
+  assert.match(main, /paneId: ownTmuxPane/);
   // Both the frontend's push and the no-frontend fallback poll run this one function,
   // so the zoom handling and the per-client delete cannot drift apart.
   assert.match(main, /const next = visibleTmuxClientTtys\(clients, tmuxPlacement\);/);
@@ -547,7 +548,7 @@ test("the terminal caret follows the focused field for IME composition", () => {
   // No caret to follow means no cursor on top of the page, and the shape we
   // borrowed goes back — otherwise the shell inherits a bar cursor.
   assert.match(main, /function unparkTerminalCaret\(\)[\s\S]*?CSI\("\?25l"\)\}\$\{CARET_SHAPE_RESET\}/);
-  assert.match(main, /function terminalCleanup\(\)[\s\S]*?paneWrite\(CSI\("0 q"\)\)/);
+  assert.match(main, /function terminalCleanup\(record = currentPane\(\)\)[\s\S]*?paneWrite\(CSI\("0 q"\)\)/);
   // A block cursor sits on the character and hides the page's own caret.
   assert.match(main, /const CARET_BAR = CSI\("6 q"\);/);
   assert.match(main, /\$\{CARET_BAR\}/);
@@ -560,8 +561,8 @@ test("the terminal caret follows the focused field for IME composition", () => {
   // cell themselves — measured 3 rows / 2 columns of drift without this.
   assert.match(main, /function reparkTerminalCaret\(\)/);
   const viewportTail = main.slice(main.indexOf("function applyViewport(vp, origin"),
-    main.indexOf("function createWindow(url)"));
-  assert.match(viewportTail, /if \(solePane\.visible\) replacePlacement\(\);[\s\S]{0,120}reparkTerminalCaret\(\);/);
+    main.indexOf("function createWindow(url, frames"));
+  assert.match(viewportTail, /if \(record\.visible\) replacePlacement\(frames\);[\s\S]{0,120}reparkTerminalCaret\(\);/);
   const zoomStep = main.slice(main.indexOf("function setBrowserZoom(action)"));
   assert.match(zoomStep.slice(0, zoomStep.indexOf("\n}")), /reparkTerminalCaret\(\);/);
   assert.match(electron, /function caretPoint\(\)/);
@@ -575,11 +576,11 @@ test("composition gets a cell-aligned surface past the caret", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   // Only main can measure a cell: it owns the pane geometry and the zoom factor.
   assert.match(main, /function cellMetrics\(\)/);
-  assert.match(main, /width: logical\.width \/ Math\.max\(1, paneCells\.cols\) \/ zoom/);
+  assert.match(main, /width: logical\.width \/ Math\.max\(1, currentFrames\(\)\.cells\.cols\) \/ zoom/);
   assert.match(main, /sendToTabFrames\(tab, "tweb-cell-metrics", cellMetrics\(\)\)/);
   // Cell size changes with both of those, and the page cannot see either change.
   const viewport = main.slice(main.indexOf("function applyViewport(vp, origin"),
-    main.indexOf("function createWindow(url)"));
+    main.indexOf("function createWindow(url, frames"));
   assert.match(viewport, /broadcastCellMetrics\(\);/);
   const zoomStep = main.slice(main.indexOf("function setBrowserZoom(action)"));
   assert.match(zoomStep.slice(0, zoomStep.indexOf("\n}")), /broadcastCellMetrics\(\);/);
@@ -688,7 +689,7 @@ test("insert mode delivers native keys to the page", () => {
   // The preload skips redundant IPC, so every engine-side reset has to tell the
   // page — otherwise native delivery never re-arms after a tab switch.
   assert.match(electron, /engineNativeKeys = false;/);
-  assert.match(main, /pageInsertMode = false;\s*\/\/ The preload mirrors this flag[\s\S]*?sendToTabFrames\(win, "tweb-shortcuts-mode"/);
+  assert.match(main, /pageInsertMode = false;\s*\/\/ The preload mirrors this flag[\s\S]*?sendToTabFrames\(soleWindows\.win, "tweb-shortcuts-mode"/);
 });
 
 // Cmd-V never arrives as a key — Ghostty emits no PTY encoding for Cmd combos,
@@ -858,15 +859,36 @@ test("the caret is re-asserted after anything that moves the cursor", () => {
   assert.match(reassert, /if \(!caretCell\) return;/);
   assert.match(reassert, /writeTerminalCaret\(caretCell\.row, caretCell\.col\)/);
 
-  // Both inline graphics paths, and the worker's — the worker writes whole frames on its
-  // own thread and is the one that fires continuously.
-  const gfx = main.slice(main.indexOf("function writeGfx(header, payload)"),
+  // Every path that emits graphics: the two inline ones and the one that puts the worker's
+  // whole frames on the pane. The last is the one that fires continuously.
+  const gfx = main.slice(main.indexOf("function writeGfxCommands(commands)"),
     main.indexOf("// --- terminal setup ---"));
-  assert.equal((gfx.match(/reassertTerminalCaret\(\);/g) || []).length, 2,
-    "writeGfx and writeGfxChunked must both re-assert");
-  const ready = main.slice(main.indexOf("function handleGfxWorkerReady()"),
-    main.indexOf("function noteRawFrameFailure()"));
-  assert.match(ready, /reassertTerminalCaret\(\);/);
+  assert.equal((gfx.match(/reassertTerminalCaret\(\);/g) || []).length, 3,
+    "writeGfxCommands, writeGfx and writeGfxChunked must all re-assert");
+  assert.match(gfx.slice(0, gfx.indexOf("function writeGfx(header, payload)")),
+    /reassertTerminalCaret\(\);/);
+});
+
+// The worker used to write whole frames to `process.stdout` from its own thread while the main
+// thread wrote caret, patch and placement sequences to the same tty — two writers on one pane,
+// which is the tear `frame-writer.cjs` was built to remove and measured at roughly one frame in
+// 750. It is also unsurvivable for a hosted engine, whose stdout is the supervisor's control
+// pipe: a frame written there is not a frame, it is a corrupted protocol stream.
+test("whole frames reach the terminal through the pane's writer, not the worker", () => {
+  const worker = fs.readFileSync(path.join(__dirname, "gfx-worker.cjs"), "utf8");
+  assert.doesNotMatch(worker, /process\.stdout/,
+    "the worker must not write to any terminal itself");
+  // What it does instead: hand back the escape sequences for someone else to write, with the
+  // pane they belong to. A reply that dropped the key would strand that pane believing the
+  // worker is busy — measured: every whole frame silently dropped, stdout down to 11 bytes,
+  // while frames.whole, the log lines and the frame file on disk all still said "working".
+  assert.match(worker, /postMessage\(\{ type: "ready", paneKey, commands \}\)/);
+  assert.match(worker, /postMessage\(\{ type: "error", paneKey,/);
+
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const commands = main.slice(main.indexOf("function writeGfxCommands(commands)"),
+    main.indexOf("// --- terminal setup ---"));
+  assert.match(commands, /paneWrite\(graphicsPassthrough\(raw\)\)/);
 });
 
 // The pane inherits the shell's cursor: a visible block in the top-left corner. Nothing

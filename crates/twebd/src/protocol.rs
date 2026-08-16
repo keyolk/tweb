@@ -18,7 +18,30 @@ use tweb_core::page::PaneId;
 /// a workspace `tweb` is rebuilt is the ordinary case, not an exotic one. A mismatch has to be a
 /// clean "use your own engine", never a frontend that hangs waiting for frames in a shape the
 /// daemon does not send.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Moved to 2 when `host` grew the pane's viewport, origin and tty and the engine grew
+/// `KEYBOARD`. Serde ignores unknown fields, so a version-1 daemon handed a version-2 `host` would
+/// otherwise accept it and open the pane with no geometry at all — the exact silent-success shape
+/// this number exists to prevent. The engine's `READY` line carries it too: a host that answers
+/// `READY 1` is refused, and refusal means the pane spawns its own engine and works.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// A pane's viewport and where it sits in the terminal window.
+///
+/// Carried in `host` rather than left to the engine because a hosted engine has no `$TMUX_PANE` of
+/// its own to measure from — it has N panes and one process identity, which is the defect class
+/// this whole protocol exists to fix. The frontend is the process standing in the pane, so it
+/// measures and sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneGeometry {
+    pub cols: u16,
+    pub rows: u16,
+    pub width: u32,
+    pub height: u32,
+    /// Where the pane starts in the window, in cells. `None` means "not measured yet", which is
+    /// not the same as `(0, 0)`: that would re-anchor the pane at the window's top-left.
+    pub origin: Option<(u32, u32)>,
+}
 
 /// A pane as it appears on the wire: the tmux pane id (`%3`) plus the tmux server that issued it.
 ///
@@ -119,10 +142,20 @@ pub enum Request {
         pid: u32,
         /// The frontend's protocol version. A mismatch is answered, not guessed at.
         protocol: u32,
-        /// The Kitty image id the frontend already reserved. It comes from the caller because
-        /// legacy per-pane engines derive theirs from their pid, and the id namespace is
-        /// terminal-wide: a host that invented its own range would collide with them.
+        /// The Kitty image id base the frontend allocated for this pane. It comes from the caller
+        /// because the id namespace is terminal-wide and a pane owns a whole *range* of it
+        /// (`image_id + 1 ..= image_id + 8` are its damage patches). The frontend allocates from
+        /// the pane's identity, so a hosted engine — which has N panes and one process identity —
+        /// never has to derive one, which is what it cannot do correctly.
         image_id: u32,
+        /// The pane's viewport and origin, measured by the frontend.
+        geometry: PaneGeometry,
+        /// The pane's own tty, absolute. **Diagnostics and escape hatch only**: frames come back
+        /// over this connection and the frontend writes them, because it is already the sole
+        /// writer of this pty and a pty write is not atomic at any size. An engine that opened
+        /// this path would be a second writing *process*, which no in-process writer can
+        /// serialise — the tear measured at roughly one frame in 750.
+        tty: Option<String>,
         /// The engine the *frontend* resolved, passed rather than re-resolved by the daemon.
         ///
         /// Engine resolution walks up from the current directory, so it answers differently in a
@@ -201,6 +234,14 @@ pub enum PaneEvent {
     AgentSocket { path: String },
     /// Whether this pane currently holds the audio claim.
     Audio { audible: bool },
+    /// Re-declare this pane's keyboard mode on its own pty.
+    ///
+    /// Replaces the SIGUSR1 the engine used to send its frontend after native DevTools reset the
+    /// terminal modes. A signal names a *process*, and a hosted engine's idea of "my frontend" is
+    /// the supervisor — which owns no pty, has nothing to re-declare, and (SIGUSR1's default action
+    /// being terminate) died of it. The mode belongs to one pane's pty, so the message has to be
+    /// addressed to that pane and delivered to the process holding it.
+    KeyboardRestore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +365,16 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    fn geometry() -> PaneGeometry {
+        PaneGeometry {
+            cols: 80,
+            rows: 24,
+            width: 800,
+            height: 480,
+            origin: Some((20, 0)),
+        }
+    }
+
     #[test]
     fn requests_round_trip() {
         let cases = vec![
@@ -336,6 +387,8 @@ mod tests {
                 pid: 4711,
                 protocol: PROTOCOL_VERSION,
                 image_id: 909,
+                geometry: geometry(),
+                tty: Some("/dev/ttys004".into()),
                 engine_executable: "/opt/Electron".into(),
                 engine_app_dir: "/opt/tweb/electron".into(),
                 url: "https://example.com".into(),
@@ -363,6 +416,28 @@ mod tests {
         }
     }
 
+    // A pane that has not measured its placement yet is not a pane at the window's top-left.
+    // Collapsing the two would re-anchor it there, which is a visible jump on every cold start.
+    #[test]
+    fn an_unmeasured_origin_is_not_an_origin_of_zero() {
+        let unmeasured = PaneGeometry {
+            origin: None,
+            ..geometry()
+        };
+        let line = serde_json::to_string(&unmeasured).expect("serializable");
+        assert_eq!(
+            serde_json::from_str::<PaneGeometry>(&line).expect("valid"),
+            unmeasured
+        );
+        assert_ne!(
+            unmeasured,
+            PaneGeometry {
+                origin: Some((0, 0)),
+                ..geometry()
+            }
+        );
+    }
+
     // The whole point of the version field: a daemon from another build must be *detected*, not
     // guessed at. A frontend that assumed compatibility would hang waiting for frames in a shape
     // the daemon does not send.
@@ -373,6 +448,8 @@ mod tests {
             pid: 1,
             protocol: PROTOCOL_VERSION,
             image_id: 5,
+            geometry: geometry(),
+            tty: Some("/dev/ttys004".into()),
             engine_executable: "/opt/Electron".into(),
             engine_app_dir: "/opt/tweb/electron".into(),
             url: "https://example.com".into(),
@@ -386,6 +463,20 @@ mod tests {
         assert_eq!(value["protocol"], PROTOCOL_VERSION);
         assert_eq!(value["image_id"], 5);
         assert_eq!(value["restore_session"], true);
+        assert_eq!(value["geometry"]["cols"], 80);
+        assert_eq!(value["tty"], "/dev/ttys004");
+    }
+
+    // Serde ignores unknown fields, so a version-1 daemon handed a version-2 `host` would decode it
+    // happily and open the pane with no geometry at all — a silent success that paints nothing.
+    // The version number is what turns that into a refusal, so it must actually have moved.
+    #[test]
+    fn the_version_moved_when_host_grew_fields() {
+        let previous_version_that_lacked_geometry = 1;
+        assert!(
+            PROTOCOL_VERSION > previous_version_that_lacked_geometry,
+            "geometry, tty and keyboard_restore are protocol 2"
+        );
     }
 
     // A daemon built before hosting existed answers `host` with an error and keeps the connection
@@ -438,6 +529,11 @@ mod tests {
                 pane: "%3".into(),
                 generation: Generation(4),
                 event: PaneEvent::Audio { audible: true },
+            },
+            Response::Event {
+                pane: "%3".into(),
+                generation: Generation(4),
+                event: PaneEvent::KeyboardRestore,
             },
             Response::Event {
                 pane: "%3".into(),

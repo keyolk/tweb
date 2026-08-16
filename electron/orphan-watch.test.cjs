@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { isOrphaned, abandonedFrameFiles, INIT_PID } = require("./orphan-watch.cjs");
+const { isOrphaned, watchedPid, abandonedFrameFiles, INIT_PID } = require("./orphan-watch.cjs");
 
 test("reparenting to init means the frontend is gone", () => {
   assert.equal(isOrphaned(4242, INIT_PID), true);
@@ -22,6 +22,34 @@ test("no frontend pid means nothing to watch", () => {
   assert.equal(isOrphaned(0, INIT_PID), false);
   assert.equal(isOrphaned(INIT_PID, INIT_PID), false);
   assert.equal(isOrphaned("not-a-pid", INIT_PID), false);
+});
+
+// A hosted engine's owner is the supervisor, not a frontend. Reading only TWEB_FRONTEND_PID
+// would leave it with no watchdog at all — still painting N panes with nothing left to stop it.
+test("a hosted engine watches its supervisor", () => {
+  assert.equal(watchedPid({ TWEB_SUPERVISOR_PID: "4242" }), 4242);
+  assert.equal(isOrphaned(watchedPid({ TWEB_SUPERVISOR_PID: "4242" }), INIT_PID), true);
+});
+
+test("a per-pane engine watches its frontend", () => {
+  assert.equal(watchedPid({ TWEB_FRONTEND_PID: "77" }), 77);
+});
+
+// twebd sets both to its own pid today, so either answer is the same process. The order is
+// what happens if a supervisor ever hands over a frontend's pid: the frontend is the more
+// specific owner of that pane's pty and is the right thing to watch.
+test("the frontend wins when both are present", () => {
+  assert.equal(watchedPid({ TWEB_FRONTEND_PID: "77", TWEB_SUPERVISOR_PID: "4242" }), 77);
+});
+
+test("an unusable pid falls through to the next candidate, then to no owner", () => {
+  assert.equal(watchedPid({ TWEB_FRONTEND_PID: "", TWEB_SUPERVISOR_PID: "4242" }), 4242);
+  assert.equal(watchedPid({ TWEB_FRONTEND_PID: "0", TWEB_SUPERVISOR_PID: "4242" }), 4242);
+  assert.equal(watchedPid({ TWEB_FRONTEND_PID: "not-a-pid", TWEB_SUPERVISOR_PID: "4242" }), 4242);
+  // init is nobody's supervisor: watching it would make every engine an orphan forever.
+  assert.equal(watchedPid({ TWEB_SUPERVISOR_PID: String(INIT_PID) }), null);
+  assert.equal(watchedPid({}), null);
+  assert.equal(watchedPid(), null);
 });
 
 // The files a SIGKILLed engine leaves behind. Observed in a real userData directory:

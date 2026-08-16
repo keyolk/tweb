@@ -16,13 +16,26 @@
 //   VIS <hex>
 //   INPUT <hex>
 //   @%3 RESIZE 80 24 800 480 20 0
-//   @%3 ATTACH <server> <generation> <imageId> <frameRate> <adaptive> <restore> <url>
+//   @%3 ATTACH <server> <gen> <imageId> <rate> <adaptive> <restore> <cols> <rows> <w> <h> <left> <top> <tty> <url>
 //   @%3 DETACH
 //
 // ATTACH carries the image id rather than letting the host allocate one. Kitty image ids are a
 // terminal-wide namespace shared with every per-pane engine still running beside a host, and those
 // derive theirs from their pid. A host inventing its own range would eventually overwrite one of
 // their images. The caller already holds a collision-free scheme, so it supplies the id.
+//
+// Every field before the url is a fixed number of whitespace splits, and the url is taken verbatim
+// after them — a url cannot contain a raw newline, and this is what lets one carry spaces. So no
+// field may ever be empty: an empty one shifts the count and the tty would be read as the url.
+// Absent values are spelled with sentinels instead:
+//
+//   server       `-` outside tmux
+//   cols/rows/width/height   `0 0 0 0` when the frontend has not measured the pane yet
+//   left/top     `-1 -1` when the origin is unknown, which means LEAVE THE ANCHOR WHERE IT IS.
+//                Not the same as `0 0`, which would re-anchor the pane at the window's top-left.
+//   tty          `-` when unknown. Diagnostics only: frames leave as addressed events, because
+//                an engine writing a pane's pty directly would be a second writer PROCESS on it
+//                and `createPaneWriter` serialises within one process only.
 
 // Kept byte-identical to what main.cjs matched before this module existed, so an unaddressed line
 // parses exactly as it always did.
@@ -31,7 +44,13 @@ const VIS = /^VIS\s+([0-9a-f]*)$/i;
 const INPUT = /^INPUT\s+([0-9a-f]*)$/i;
 const ADDRESS = /^@(%[\w-]+)\s+(.*)$/;
 const DETACH = /^DETACH$/;
-const ATTACH = /^ATTACH\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([01])\s+([01])(?:\s+(.*))?$/;
+// Fourteen fields, the last taken verbatim. `-?\d+` on the origin because `-1 -1` is its
+// "unknown" sentinel, and the tty is any non-space run so a path is not split on.
+const ATTACH = new RegExp(
+  "^ATTACH\\s+(\\S+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+([01])\\s+([01])"
+  + "\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(-?\\d+)\\s+(-?\\d+)\\s+(\\S+)"
+  + "(?:\\s+(.*))?$"
+);
 
 /**
  * Splits an optional `@%N ` address off the front of a line.
@@ -85,6 +104,12 @@ function parseControlLine(rawLine) {
 
   const attach = ATTACH.exec(rest);
   if (attach) {
+    const cols = Number(attach[7]);
+    const rows = Number(attach[8]);
+    const width = Number(attach[9]);
+    const height = Number(attach[10]);
+    const left = Number(attach[11]);
+    const top = Number(attach[12]);
     return {
       kind: "attach",
       // An unaddressed ATTACH is meaningless: the whole point is to name a pane that does not
@@ -96,7 +121,18 @@ function parseControlLine(rawLine) {
       frameRate: Number(attach[4]),
       adaptive: attach[5] === "1",
       restoreSession: attach[6] === "1",
-      url: attach[7] ? attach[7].trim() : null,
+      // Null rather than a zeroed viewport: a pane the frontend has not measured yet must fall
+      // through to the engine's own sizing, and a 0x0 window is not a smaller pane, it is one
+      // that can never paint.
+      viewport: cols > 0 && rows > 0 && width > 0 && height > 0
+        ? { cols, rows, width, height }
+        : null,
+      // Undefined means "leave the anchor where it is", matching RESIZE's absent origin. It is
+      // deliberately not 0,0, which would anchor the pane at the window's top-left — i.e. draw
+      // it over its neighbours.
+      origin: left >= 0 && top >= 0 ? { left, top } : undefined,
+      tty: attach[13] === "-" ? null : attach[13],
+      url: attach[14] ? attach[14].trim() : null,
     };
   }
 
@@ -133,4 +169,22 @@ function formatOutbound(kind, paneId, payload = "") {
   return paneId ? `@${paneId} ${body}\n` : `${body}\n`;
 }
 
-module.exports = { parseControlLine, splitAddress, resolveTarget, formatOutbound };
+/**
+ * The event that asks a pane's own frontend to re-declare tracked keyboard mode.
+ *
+ * Chromium's native DevTools resets the terminal's modified-key mode, and the process that can
+ * re-declare it is the one holding that pane's pty. A per-pane engine signals it directly. A host
+ * cannot: the pid it has is the supervisor's, which owns no pty — and SIGUSR1's default action is
+ * *terminate*, measured killing the daemon and every pane it served. So the request is addressed
+ * and travels over that pane's connection.
+ *
+ * Always addressed, never bare: the case this exists for is precisely one where several panes
+ * share a process, so "the implicit sole pane" has no meaning here.
+ */
+function keyboardRestoreEvent(paneId) {
+  const pane = String(paneId || "").trim();
+  if (!pane) throw new TypeError("a keyboard restore names the pane whose frontend must act");
+  return formatOutbound("KEYBOARD", pane, "restore");
+}
+
+module.exports = { parseControlLine, splitAddress, resolveTarget, formatOutbound, keyboardRestoreEvent };

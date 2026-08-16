@@ -37,7 +37,7 @@ const {
   playbackWindowMs,
   settledFrameRate,
 } = require("./frame-rate-policy.cjs");
-const { isOrphaned, abandonedFrameFiles } = require("./orphan-watch.cjs");
+const { isOrphaned, watchedPid, abandonedFrameFiles } = require("./orphan-watch.cjs");
 const {
   surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry, restoredLayoutScript,
 } = require("./surface-policy.cjs");
@@ -65,14 +65,25 @@ const {
   appendedSince,
   compactLines,
 } = require("./history-view.cjs");
-const { createPaneWriter, fdSink } = require("./frame-writer.cjs");
+const { createPaneWriter, fdSink, channelSink } = require("./frame-writer.cjs");
 const { serverIdentityFrom, paneKey } = require("./pane-identity.cjs");
 const {
   PaneRegistry, createPaneRecord, applyVisibility: recordVisibility,
   applyFrameTier: recordFrameTier, applySurface: recordSurface, applyAudio: recordAudio,
-  audioOwnerAmong,
+  audioOwnerAmong, paneImageIds, paneFrameFileNames, collidingImageRange, PATCH_ID_COUNT,
 } = require("./pane-registry.cjs");
-const { parseControlLine, resolveTarget } = require("./pane-control.cjs");
+const {
+  parseControlLine, resolveTarget, formatOutbound, keyboardRestoreEvent,
+} = require("./pane-control.cjs");
+const { isHostedRuntime, hostProtocolVersion } = require("./hosted-runtime.cjs");
+const {
+  createFrameContext, nextPatchId: takeNextPatchId, notePatch, takeLivePatchIds,
+  applyFrameViewport, queueGfxFrame: enqueueGfxFrame, completeGfxFrame,
+} = require("./frame-context.cjs");
+const {
+  createPaneWindows, surfaceHeld, holdSurface, releaseSurface,
+  applyFrameRate: applyPaneFrameRate, isThrottled,
+} = require("./pane-windows.cjs");
 
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
@@ -84,11 +95,22 @@ if (process.env.TWEB_DOWNLOAD_DIR) {
 if (process.platform === "darwin") {
   app.setActivationPolicy("prohibited");
 }
+// Whether a supervisor started this process to host panes. Read once: it cannot change over a
+// process's life, and re-reading it invites two call sites to disagree about which runtime they
+// are in — which is exactly how a hosted pane ends up drawing into a control pipe.
+const hostedRuntime = isHostedRuntime(process.env);
 
-let win = null;
-const tabs = [];
-const closedTabs = [];
-let activeTabIndex = -1;
+// The tmux pane this PROCESS was started in, or null when it has none it may act on.
+//
+// A per-pane engine's own pane is the pane it serves, so everything tmux-related — the origin
+// query, the visibility poll, the passthrough key tables, the pane title — is addressed to it.
+// A hosted engine's `TMUX_PANE` is the DAEMON's. Acting on it would query the daemon pane's
+// origin, poll the daemon pane's visibility and rewrite the daemon pane's title, all on behalf of
+// panes that are somewhere else entirely — measured in the same class of defect as the agent
+// socket claimed as `agent-%304.sock`. So a host has no pane of its own, and every one of those
+// call sites falls through to its "not in tmux" branch, which already exists and is already
+// correct. A hosted pane's geometry and visibility arrive over its own connection instead.
+const ownTmuxPane = hostedRuntime ? null : (process.env.TMUX_PANE || null);
 let quitting = false;
 // Independent toggles: bypass (P) and vimium turn on and off separately.
 //   Ctrl-;  → bypass toggle (whether Cmd-K/A/... go to the page)
@@ -135,7 +157,7 @@ let agentServer = null;
 // Mirrors the preload's insert mode so key dispatch knows to go native.
 let pageInsertMode = false;
 // Set while a close came from the tab list, so the list can be redrawn once the
-// tab has actually left `tabs`.
+// tab has actually left `soleWindows.tabs`.
 let refreshTabListAfterClose = false;
 // Electron logs an ipcNative error when frame.send races preload setup or navigation.
 // A frame opts in only after its preload has installed all IPC listeners.
@@ -179,18 +201,19 @@ const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxA
 const frameRates = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
 const playbackFrameRate = frameRates.playback;
 const playbackWindow = playbackWindowMs(idleFrameRate);
-let paintsSinceSettle = 0;
-let activeFrameRate = maxActiveFrameRate;
-let frameIntervalMs = Math.ceil(1000 / activeFrameRate);
-let frameIdleTimer = null;
+// The window/tab and frame-rate state for this pane. Like the frame context, the shipping path
+// has exactly one and runs through it — the ceiling is per-pane because a host serves panes
+// launched with different `--tweb-frame-rate` settings, and because the adaptive tiers are decided
+// by counting THAT pane's paints.
+const soleWindows = createPaneWindows({
+  maxFrameRate: maxActiveFrameRate,
+  adaptive: adaptiveFrameRate,
+});
 const configuredDefaultZoom = Number.parseFloat(process.env.TWEB_DEFAULT_ZOOM || "");
 const defaultZoomFactor = Number.isFinite(configuredDefaultZoom)
   ? Math.min(2, Math.max(0.5, configuredDefaultZoom))
   : 0.8;
 const configuredDeviceScaleFactor = Number.parseFloat(process.env.TWEB_DEVICE_SCALE_FACTOR || "");
-let pendingFrame = null;
-let pendingFrameTimer = null;
-let lastFrameSentAt = 0;
 // A Kitty placement with z >= 0 covers the terminal's own text — including the
 // cell the terminal paints IME preedit into, and the cursor we park on the web
 // caret for it. So a composing Korean syllable was drawn behind the page and never
@@ -218,14 +241,9 @@ console.error = (...args) => {
 };
 
 const configuredImageId = Number.parseInt(process.env.TWEB_IMAGE_ID || "", 10);
-const imageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
+const configuredPaneImageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
   ? configuredImageId
   : 1;
-// Damage patches are placed as their own images over the base frame, so they need image ids
-// of their own. A small fixed pool, cycled: the ids only have to outlive the frame they
-// patch, and the terminal took 64 of them in a row without complaint.
-const PATCH_ID_COUNT = 8;
-const patchIdBase = imageId + 1;
 
 // --- per-pane runtime registry ---
 //
@@ -238,19 +256,55 @@ const patchIdBase = imageId + 1;
 // used by a flag is a seam nothing proves, and this one carries every frame the shipping build
 // draws.
 const paneRegistry = new PaneRegistry();
+// The tmux server this process sits on. It is the SERVER, not a pane — an engine and the daemon
+// that started it are on the same server, so this is one of the few things a hosted engine can
+// still read from its own environment. Which pane, and whether that pane is in tmux at all, comes
+// from each ATTACH; see `paneIsInTmux`.
 const tmuxServerIdentity = serverIdentityFrom(process.env.TMUX);
 // The generation is assigned by the supervisor once one exists. Until then a pane is generation
 // 0 — a real value, not a placeholder, because this process *is* the only registration of this
 // pane and nothing can supersede it from outside.
 const SOLE_PANE_GENERATION = 0;
-const solePaneId = process.env.TMUX_PANE || `pid-${process.pid}`;
+// A hosted engine has no pane of its own, and the identity it *would* derive one from is the
+// supervisor's — measured as an agent socket claimed inside an unrelated pane's namespace. So
+// this identity is only ever the per-pane runtime's. A host registers each pane from its ATTACH.
+const solePaneId = ownTmuxPane || `pid-${process.pid}`;
 const solePane = createPaneRecord({
   tmuxServer: tmuxServerIdentity,
   paneId: solePaneId,
   generation: SOLE_PANE_GENERATION,
-  imageId,
+  imageId: configuredPaneImageId,
 });
-paneRegistry.attach(solePane);
+// A host registers nothing of its own: its panes arrive by ATTACH, each with the identity and
+// image id its frontend allocated. Registering this process's derived identity first would make
+// the first real attach look like a supersession of a pane that never existed — and would put a
+// record in the registry that nothing is drawing for.
+if (!hostedRuntime) paneRegistry.attach(solePane);
+
+// There is deliberately no module-level image id. One process serving N panes has one pid and N
+// image ids, so a constant here would put every pane's frame under the same id — and the Kitty id
+// namespace is terminal-wide, so that is a collision not only between our own panes but with every
+// per-pane engine drawing beside us. Every id comes from a frame context's `imageIds`, which comes
+// from that pane's record. See `paneImageIds`.
+
+// The frame pipeline's state for this pane. The shipping path has exactly one, and runs through
+// it like any other — a seam only a flag exercises is a seam nothing proves, and this one carries
+// every frame the default build draws.
+const frameContexts = new Map();
+const soleFrames = createFrameContext(solePane);
+frameContexts.set(solePane.key, soleFrames);
+
+/**
+ * The frame context a worker completion belongs to.
+ *
+ * Keyed rather than assumed. A completion applied to the wrong pane frees that pane's base image
+ * and dispatches its queue against another pane's generation, which shows up as one pane's frame
+ * appearing in another pane's rectangle rather than as an error.
+ */
+function frameContextFor(paneKey) {
+  if (!paneKey) return null;
+  return frameContexts.get(paneKey) || null;
+}
 
 // Every byte bound for this pane's terminal goes through one writer: graphics, the caret
 // sequences that park on the web caret, and the image delete on exit. Two writers to one pane tore
@@ -262,13 +316,82 @@ paneRegistry.attach(solePane);
 // image, and an exit handler cannot await. Stdout is inherited from the frontend that owns the
 // pty; a host that opens a pane tty by name instead must pass O_NOCTTY, or the first pane's
 // hangup takes down the runtime serving all the others.
+// The ONE place anything is written to the supervisor's control channel.
+//
+// A hosted engine's stdout is a protocol stream, not a terminal, and it is shared by every pane
+// the engine serves. So it is funnelled through a single synchronous write: two writers on it
+// would interleave two panes' lines, and an interleaved line is not a corrupt frame for one pane,
+// it is an unparseable line for both.
+//
+// Synchronous for the same reason `fdSink` is: the exit path writes each pane's image delete and
+// an exit handler cannot await.
+function writeProtocolLine(line) {
+  if (!hostedRuntime) return;
+  try {
+    writeSync(1, line);
+  } catch (error) {
+    // stdout closing means the supervisor is gone. The orphan watchdog is what reaps this
+    // process; complaining once per frame here would fill the log while it does.
+    if (debugLogging && !protocolChannelBroken) {
+      protocolChannelBroken = true;
+      console.error(`tweb: control channel write failed: ${error.message}`);
+    }
+  }
+}
+let protocolChannelBroken = false;
+
 const paneWriters = new Map();
+// A hosted pane's automation endpoint, one per pane rather than one per process.
+const paneAgentServers = new Map();
+// Whether Electron is far enough along to make a window. An ATTACH that arrived before
+// `app.whenReady()` would fail inside BrowserWindow rather than anywhere legible.
+let hostReady = false;
+
+/**
+ * The descriptor a pane's bytes go to, or null when it has no terminal yet.
+ *
+ * Falling back to stdout is right for a per-pane engine, whose stdout IS its pane's terminal.
+ * It is never right for a hosted one, whose stdout is the supervisor's control pipe: bytes
+ * written there are not a frame but a corrupted protocol stream, and the pane they were meant
+ * for stays blank. So a hosted pane with no tty of its own writes nowhere rather than somewhere
+ * wrong — measured, this is what stops even the exit-path image delete from reaching the pipe.
+ */
+function paneOutputFd(record) {
+  if (record.tty !== null && record.tty !== undefined) return record.tty;
+  return hostedRuntime ? null : 1;
+}
+
+// One addressed line on the supervisor's stdout, carrying a pane's bytes to the frontend that
+// owns its pty.
+//
+// The frontend does the writing, and that is the load-bearing part rather than an implementation
+// detail: an engine that opened the pane's tty itself would be a second writer PROCESS on it,
+// racing the frontend's own caret, alternate-screen and keyboard writes — and `createPaneWriter`
+// serialises within one process only, so there would be nothing to serialise them.
+//
+// Hex rather than raw bytes because this channel is line-delimited and a frame is arbitrary
+// binary. It costs a doubling of a payload that is measured at ~110 bytes a frame on the file
+// transport, where the pixels travel as a pathname.
+function hostedFrameSink(record) {
+  return channelSink((bytes) => {
+    writeProtocolLine(formatOutbound("FRAME", record.paneId, bytes.toString("hex")));
+  });
+}
 
 function writerFor(record) {
   let writer = paneWriters.get(record.key);
   if (!writer) {
+    const fd = paneOutputFd(record);
+    // A hosted pane with no tty of its own goes out over the control channel. A hosted pane with
+    // nowhere at all to write — neither tty nor host channel — writes nowhere rather than to fd 1,
+    // which under hosting is the control pipe: bytes there are a corrupted protocol stream, not a
+    // frame, and the pane they were meant for stays blank.
+    let sink;
+    if (fd !== null) sink = fdSink(fd);
+    else if (hostedRuntime) sink = hostedFrameSink(record);
+    else sink = () => {};
     writer = createPaneWriter({
-      sink: fdSink(record.tty ?? 1),
+      sink,
       onError: (error) => {
         if (debugLogging) console.error(`tweb: pane write failed ${record.paneId}: ${error.message}`);
       },
@@ -280,19 +403,52 @@ function writerFor(record) {
 
 // The shipping path has exactly one pane, so this is the writer everything in this file uses.
 // A host resolves the record first and calls `writerFor` with it.
+// The pane every un-parameterised write goes to.
+//
+// A per-pane engine has exactly one and it is `currentPane()`. A host has exactly one *attached*, and
+// it is that pane's writer these bytes belong on — writing them to `currentPane()` instead would
+// address them `@pid-<pid>`, a pane name the supervisor has never heard of, and the frontend
+// would drop every one. Measured: the harness saw `@pid-53793 FRAME ...` instead of `@%3 FRAME`.
+//
+// A second attached pane is refused (see `handleAttach`), which is what keeps this answer
+// unambiguous. It is the piece that has to become a parameter before a host serves two.
+function currentPane() {
+  return hostedRuntime ? (paneRegistry.list()[0] || solePane) : solePane;
+}
+
+// The frame context those bytes belong to, by the same rule and for the same reason. The two are
+// resolved together so a write and the generation it was rendered for can never disagree about
+// which pane they are for.
+function currentFrames() {
+  return frameContexts.get(currentPane().key) || soleFrames;
+}
+
 function paneWrite(text) {
-  writerFor(solePane).write(text);
+  writerFor(currentPane()).write(text);
 }
 
 const frameTransport = process.env.TWEB_FRAME_TRANSPORT === "direct" ? "direct" : "file";
-const frameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.png`);
+
+// Where a pane's whole frames are staged for the terminal to read.
+//
+// Keyed on the pane's image id, not only on the pid. The pid alone is one path for every pane a
+// host serves, so N panes would overwrite each other's pixels in one file while each told the
+// terminal to read it — the same defect class as a shared image id, arrived at through the
+// filesystem. The image id is unique per pane by construction, and the pid stays in the name
+// because that is what `abandonedFrameFiles` collects a dead engine's leftovers by.
+//
 // Raw frames go to their own path so a stale PNG can never be read as pixels, or the other
 // way round — the terminal is told the format out of band, not by extension. Unlike a PNG,
 // a raw file carries no dimensions of its own: the `s=`/`v=` in the escape sequence supply
 // them. A resize can therefore shear one frame, if the terminal reads the file after the
 // next frame has already overwritten it at a new size. The window is a single frame and the
 // one after it corrects the pane, so this is left alone.
-const rawFrameFilePath = path.join(app.getPath("userData"), `tweb-frame-${process.pid}-${imageId}.rgba`);
+function frameFilePathFor(frames, format) {
+  const extension = format === "raw" ? "rgba" : "png";
+  return path.join(app.getPath("userData"),
+    `tweb-frame-${process.pid}-${frames.imageIds.base}.${extension}`);
+}
+
 // Whole frames can travel as raw pixels rather than PNG. The encode is what the main thread
 // was paying for — 28ms on an ordinary page, 101ms on a photo, against ~2ms to hand the
 // bitmap to the worker — and `f=32` costs the terminal nothing to decode.
@@ -303,13 +459,7 @@ const rawFrameFilePath = path.join(app.getPath("userData"), `tweb-frame-${proces
 // failing — see `noteRawFrameFailure`.
 let rawFramesEnabled = frameTransport === "file"
   && process.env.TWEB_RAW_FRAMES !== "0";
-let lastViewport = null;
-let viewportGeneration = 0;
 let loggedFrameGeneration = -1;
-let gfxWorkerBusy = false;
-let activeGfxGeneration = null;
-let pendingGfxFrame = null;
-let droppedGfxFrames = 0;
 const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"));
 gfxWorker.unref();
 
@@ -318,24 +468,29 @@ const CSI = (s) => `${ESC}[${s}`;
 
 // --- tmux passthrough (the cliweb escapeCodes.ts approach) ---
 
-let tmuxOrigin = null;
 
+// Where this pane sits on screen, resolved from the engine's OWN tmux pane.
+//
+// Right for a per-pane engine and wrong for every pane a host serves: a hosted engine's
+// `TMUX_PANE` is the DAEMON's, so this would anchor every pane at the daemon pane's origin —
+// each one drawing over whatever is actually there. A hosted pane's origin arrives in its ATTACH
+// and in the RESIZE lines after it, which is the only place that knows it.
 function getTmuxPaneOrigin() {
-  if (!process.env.TMUX_PANE) return;
+  if (!ownTmuxPane) return;
   const configured = String(process.env.TWEB_PANE_ORIGIN || "").split(/[ ,]+/).map(Number);
   if (configured.length === 2 && configured.every(Number.isFinite)) {
-    tmuxOrigin = { left: configured[0], top: configured[1] };
+    currentFrames().origin = { left: configured[0], top: configured[1] };
     return;
   }
   try {
     const out = execFileSync(
       "tmux",
-      ["display-message", "-p", "-t", process.env.TMUX_PANE, "#{pane_left}\t#{pane_top}"],
+      ["display-message", "-p", "-t", ownTmuxPane, "#{pane_left}\t#{pane_top}"],
       { encoding: "utf8", timeout: 1000 }
     ).trim();
     const parts = out.split("\t").map(Number);
     if (parts.length >= 2) {
-      tmuxOrigin = { left: parts[0], top: parts[1] };
+      currentFrames().origin = { left: parts[0], top: parts[1] };
     }
   } catch (e) {}
 }
@@ -348,23 +503,36 @@ function wrapTmuxPassthrough(sequence) {
 
 // cliweb anchorTmuxGraphics: move the cursor to the pane origin, emit the graphics, restore it.
 function anchorTmuxGraphics(sequence) {
-  if (!tmuxOrigin) return wrapTmuxPassthrough(sequence);
-  const row = tmuxOrigin.top + 1;
-  const col = tmuxOrigin.left + 1;
+  if (!currentFrames().origin) return wrapTmuxPassthrough(sequence);
+  const row = currentFrames().origin.top + 1;
+  const col = currentFrames().origin.left + 1;
   return wrapTmuxPassthrough(`${ESC}7${ESC}[${row};${col}H${sequence}${ESC}8`);
 }
 
-function graphicsPassthrough(sequence) {
-  if (!process.env.TMUX) return sequence;
+// Whether a pane's bytes have to travel through tmux's passthrough wrapper.
+//
+// Asked of the PANE, not of the process. A per-pane engine's `$TMUX` describes the only pane it
+// serves, so reading the environment was right — but a hosted engine's describes the daemon, and
+// one answer for N panes is wrong in both directions: a bare-terminal pane's frames would be
+// wrapped in a passthrough its terminal prints literally, and a tmux pane's would go out unwrapped
+// and unanchored, landing wherever the cursor happens to be. The record's `tmuxServer` comes from
+// the pane's own ATTACH.
+function paneIsInTmux(record = currentPane()) {
+  return record.tmuxServer !== null && record.tmuxServer !== undefined;
+}
+
+function graphicsPassthrough(sequence, record = currentPane()) {
+  if (!paneIsInTmux(record)) return sequence;
   return anchorTmuxGraphics(sequence);
 }
 
-function rawKittyDelete() {
+function rawKittyDelete(record = currentPane()) {
   // The base image plus every damage patch slot. A client that stopped showing this pane
   // keeps whatever was placed on it, so leaving the patches would strand them there.
-  let raw = `${ESC}_Ga=d,d=I,i=${imageId},q=2${ESC}\\`;
-  for (let slot = 0; slot < PATCH_ID_COUNT; slot++) {
-    raw += `${ESC}_Ga=d,d=I,i=${patchIdBase + slot},q=2${ESC}\\`;
+  const ids = paneImageIds(record);
+  let raw = `${ESC}_Ga=d,d=I,i=${ids.base},q=2${ESC}\\`;
+  for (const id of ids.patchIds) {
+    raw += `${ESC}_Ga=d,d=I,i=${id},q=2${ESC}\\`;
   }
   return raw;
 }
@@ -454,7 +622,7 @@ function configureTmuxRootBindings() {
 }
 
 function ensureTmuxPassthroughTable() {
-  if (!process.env.TMUX_PANE) return;
+  if (!ownTmuxPane) return;
   configureTmuxRootBindings();
   const zoomUserKeys = [
     [113, "User113", 5002],
@@ -522,7 +690,7 @@ function ensureTmuxPassthroughTable() {
 }
 
 function listTmuxClientStates() {
-  if (!process.env.TMUX_PANE) return new Map();
+  if (!ownTmuxPane) return new Map();
   try {
     const output = execFileSync(
       "tmux",
@@ -559,8 +727,8 @@ function switchTmuxClientTable(tty, table) {
 // and with vimium on the normal-mode keys have to work, so the table stays off.
 // That is what makes "bypass on + vimium on" give both vimium and Cmd.
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
-  if (!process.env.TMUX_PANE) return;
-  const paneId = process.env.TMUX_PANE;
+  if (!ownTmuxPane) return;
+  const paneId = ownTmuxPane;
   const passthroughArmed = !vimiumShortcutsEnabled;
 
   for (const [tty, originalTable] of [...passthroughClientTables]) {
@@ -595,7 +763,7 @@ function restoreTmuxPassthroughClients() {
 }
 
 function initializeTmuxVisibility() {
-  if (!process.env.TMUX_PANE) return;
+  if (!ownTmuxPane) return;
   ensureTmuxPassthroughTable();
   try {
     const output = execFileSync(
@@ -604,7 +772,7 @@ function initializeTmuxVisibility() {
         "display-message",
         "-p",
         "-t",
-        process.env.TMUX_PANE,
+        ownTmuxPane,
         "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_title}",
       ],
       { encoding: "utf8", timeout: 1000 }
@@ -617,7 +785,7 @@ function initializeTmuxVisibility() {
         session,
         windowId,
         windowIndex,
-        paneId: process.env.TMUX_PANE,
+        paneId: ownTmuxPane,
       };
       const keys = windowSessionKeys(tmuxIdentity);
       if (keys) {
@@ -627,7 +795,7 @@ function initializeTmuxVisibility() {
           ? path.join(directory, `${keys.legacy}.json`)
           : null;
       }
-      tmuxPlacement = { session, windowId, paneId: process.env.TMUX_PANE };
+      tmuxPlacement = { session, windowId, paneId: ownTmuxPane };
     }
     originalPaneTitle = titleParts.join("\t");
 
@@ -638,7 +806,7 @@ function initializeTmuxVisibility() {
         { encoding: "utf8", timeout: 1000 }
       );
       visibleClientTtys = visibleTmuxClientTtys(clients, tmuxPlacement);
-      recordVisibility(solePane, visibleClientTtys.size > 0);
+      recordVisibility(currentPane(), visibleClientTtys.size > 0);
     }
   } catch (error) {
     if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
@@ -671,7 +839,7 @@ let visibilitySource = "startup";
 let lastVisibilityPushAt = null;
 
 function armVisibilityFallback() {
-  if (!process.env.TMUX_PANE) return;
+  if (!ownTmuxPane) return;
   const delay = process.env.TWEB_FRONTEND_PID ? VISIBILITY_PUSH_GRACE_MS : 0;
   visibilityFallbackTimer = setTimeout(() => {
     visibilityFallbackTimer = null;
@@ -698,7 +866,7 @@ function scheduleVisibilityCheck() {
 function applyClientListing(clients, placement) {
   tmuxPlacement = placement;
   const next = visibleTmuxClientTtys(clients, tmuxPlacement);
-  const wasVisible = solePane.visible;
+  const wasVisible = currentPane().visible;
   // A client that stopped showing this pane keeps the image placed on it, so the delete
   // goes to that tty directly.
   for (const tty of visibleClientTtys) {
@@ -706,7 +874,7 @@ function applyClientListing(clients, placement) {
   }
   const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
   visibleClientTtys = next;
-  const changed = recordVisibility(solePane, next.size > 0);
+  const changed = recordVisibility(currentPane(), next.size > 0);
   if (changed) {
     updatePaintingState();
     if (debugLogging) {
@@ -789,15 +957,20 @@ function syncTmuxVisibility() {
 
 // --- Kitty graphics ---
 
-function dispatchGfxFrame(frame) {
+// Hands one frame to the shared graphics worker.
+//
+// The worker is one thread doing one CPU-bound job, so it is shared between panes — but each
+// pane's view of what it has in flight there is its own, which is what `frame-context.cjs`
+// keeps. The pane a completion belongs to travels with the message rather than being inferred,
+// because inferring it is how one pane's frame ends up placed in another pane's rectangle.
+function sendGfxFrameToWorker(frame, frames = currentFrames()) {
   const pixels = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
     ? frame.png
     : Buffer.from(frame.png);
-  gfxWorkerBusy = true;
-  activeGfxGeneration = frame.generation;
   try {
     gfxWorker.postMessage({
       type: "frame",
+      paneKey: frames.record.key,
       buffer: pixels.buffer,
       byteOffset: pixels.byteOffset,
       byteLength: pixels.byteLength,
@@ -806,29 +979,59 @@ function dispatchGfxFrame(frame) {
       width: frame.width,
       height: frame.height,
       transport: frameTransport,
-      filePath: frame.format === "raw" ? rawFrameFilePath : frameFilePath,
-      tmux: Boolean(process.env.TMUX),
-      origin: tmuxOrigin,
+      filePath: frameFilePathFor(frames, frame.format),
     }, [pixels.buffer]);
   } catch (error) {
-    gfxWorkerBusy = false;
-    activeGfxGeneration = null;
+    // The hand-off never happened, so the pane must not be left believing the worker is busy —
+    // it would never dispatch again and the pane would freeze on its last frame.
+    frames.gfxBusy = false;
+    frames.activeGfxGeneration = null;
     console.error(`tweb: graphics dispatch failed: ${error.message}`);
   }
 }
 
-function handleGfxWorkerReady() {
-  const staleOutput = activeGfxGeneration !== null && activeGfxGeneration !== viewportGeneration;
-  gfxWorkerBusy = false;
-  activeGfxGeneration = null;
-  // The worker writes whole frames on its own thread, and its cursor anchoring leaves the
-  // cursor at the pane origin. Whole frames are continuous, so without this the caret is
-  // dragged back to the corner several times a second.
+// The escape sequences the worker produced, put on the pane's own tty by the pane's own
+// writer. The worker no longer writes them itself: a second writer on one tty is the tear
+// `frame-writer.cjs` exists to remove, and on a hosted engine stdout is the supervisor's
+// control pipe rather than anybody's terminal.
+//
+// One write for the whole run, not one per command. The direct transport splits a payload
+// into `m=1` continuation chunks that the terminal must read consecutively, and writing them
+// separately would let a caret sequence land in the middle of one.
+function writeGfxCommands(commands) {
+  if (!commands || commands.length === 0) return;
+  let raw = "";
+  for (const command of commands) {
+    raw += `${ESC}_G${command.header}`;
+    if (command.payload && command.payload.length > 0) raw += `;${command.payload}`;
+    raw += `${ESC}\\`;
+  }
+  try {
+    paneWrite(graphicsPassthrough(raw));
+  } catch (error) {
+    void error;
+  }
+  // The graphics command leaves the cursor at the pane origin, and whole frames are
+  // continuous — so without this the caret is dragged back to the corner several times a
+  // second. `writeGfx` does the same for everything that does not come from the worker.
   reassertTerminalCaret();
-  if (staleOutput) writeGfx(`a=d,d=I,i=${imageId},q=2`, "");
-  const frame = pendingGfxFrame;
-  pendingGfxFrame = null;
-  if (frame && frame.generation === viewportGeneration) dispatchGfxFrame(frame);
+}
+
+function handleGfxWorkerReady(commands, frames = currentFrames()) {
+  // The bookkeeping — was that frame stale, what runs next, and the `imageTransferred` reset
+  // that goes with freeing a stale frame's data — is decided in `frame-context.cjs` and tested
+  // there. What is left here is the writing, which is the part that needs a terminal.
+  const settled = completeGfxFrame(frames);
+  // A frame the viewport has already moved past is never placed: the terminal would scale a
+  // stale-sized image into the new pane box. Its data is freed instead of drawn.
+  if (settled.stale) {
+    writeGfx(`a=d,d=I,i=${frames.imageIds.base},q=2`, "");
+  } else {
+    writeGfxCommands(commands);
+  }
+  // `writeGfxCommands` reasserts the caret itself; the stale branch above wrote a delete
+  // through `writeGfx`, which does the same. So there is nothing left to do here.
+  if (settled.next) sendGfxFrameToWorker(settled.next, frames);
 }
 
 // The PNG path degrades to `t=d` when a frame file cannot be written, but a raw frame has
@@ -847,7 +1050,7 @@ function noteRawFrameFailure() {
   if (rawFrameFailures < RAW_FRAME_FAILURE_LIMIT) return;
   rawFramesEnabled = false;
   console.error(`tweb: raw frames failed ${rawFrameFailures}x, falling back to PNG`);
-  if (win && !win.isDestroyed() && solePane.visible) win.webContents.invalidate();
+  if (soleWindows.win && !soleWindows.win.isDestroyed() && currentPane().visible) soleWindows.win.webContents.invalidate();
 }
 
 gfxWorker.on("message", (message) => {
@@ -857,24 +1060,36 @@ gfxWorker.on("message", (message) => {
   } else {
     rawFrameFailures = 0;
   }
-  handleGfxWorkerReady();
+  // The completion is routed to the pane whose frame it was, by the key that travelled with the
+  // request. A completion applied to the wrong pane would free that pane's image and dispatch
+  // its queue against another's generation.
+  const frames = frameContextFor(message?.paneKey);
+  if (!frames) {
+    // Never silent. An unroutable completion means that pane is stuck believing the worker is
+    // busy, so it will never dispatch again — a pane frozen on its last frame with no error is
+    // exactly the failure this run exists to avoid.
+    console.error(`tweb: graphics completion for an unknown pane: ${message?.paneKey}`);
+    return;
+  }
+  handleGfxWorkerReady(message?.commands, frames);
 });
 gfxWorker.on("error", (error) => {
-  gfxWorkerBusy = false;
-  activeGfxGeneration = null;
-  pendingGfxFrame = null;
+  // The worker is gone, so every pane's in-flight hand-off is gone with it. Leaving any of them
+  // marked busy would freeze that pane on its last frame.
+  for (const frames of frameContexts.values()) {
+    frames.gfxBusy = false;
+    frames.activeGfxGeneration = null;
+    frames.pendingGfxFrame = null;
+  }
   console.error(`tweb: graphics writer crashed: ${error.stack || error.message}`);
 });
 
-function queueGfxFrame(png, header, generation, format = "png", size = null) {
-  if (generation !== viewportGeneration) return;
+function queueGfxFrame(png, header, generation, format = "png", size = null, frames = currentFrames()) {
   const frame = { png, header, generation, format, width: size?.width, height: size?.height };
-  if (!gfxWorkerBusy) {
-    dispatchGfxFrame(frame);
-    return;
-  }
-  if (pendingGfxFrame) droppedGfxFrames += 1;
-  pendingGfxFrame = frame;
+  // Whether it goes now or waits — and whether it is already too old to be worth either — is
+  // decided in `frame-context.cjs`, which is where the one-deep queue's reasons are written down.
+  const ready = enqueueGfxFrame(frames, frame);
+  if (ready) sendGfxFrameToWorker(ready, frames);
 }
 
 function writeGfx(header, payload) {
@@ -943,8 +1158,25 @@ function terminalSetup() {
   }
 }
 
+// Chromium's native DevTools resets the terminal's modified-key mode, and the process that has
+// to re-declare it is the one holding this pane's pty — its own frontend. A per-pane engine can
+// ask directly, because `TWEB_FRONTEND_PID` is that frontend.
+//
+// A hosted engine MUST NOT. The pid it has is the supervisor's, which owns no pty and has
+// nothing to re-declare, and SIGUSR1's default action is *terminate*: measured, the daemon died
+// the moment a real engine started, taking every other hosted pane with it. The supervisor now
+// ignores the signal (`engine_host::ignore_frontend_signals`), but ignoring is a guard against
+// the hazard rather than a way to do the work — so the hosted path does not signal at all, and
+// the request travels as an addressed event over that pane's connection instead.
 function requestTrackedKeyboardModeRestore() {
-  if (!process.env.TMUX) return;
+  if (!paneIsInTmux()) return;
+  if (hostedRuntime) {
+    // The verb is the supervisor's to define, so this stays a no-op until it lands rather than
+    // inventing one the daemon would drop. Signalling in the meantime is the one thing that is
+    // definitely wrong.
+    if (debugLogging) console.error("tweb: keyboard mode restore skipped (hosted)");
+    return;
+  }
   const frontendPid = Number.parseInt(process.env.TWEB_FRONTEND_PID || "", 10);
   if (!Number.isSafeInteger(frontendPid) || frontendPid <= 1) return;
   try {
@@ -963,13 +1195,14 @@ function scheduleTrackedKeyboardModeRestore() {
   }
 }
 
-function terminalCleanup() {
+function terminalCleanup(record = currentPane()) {
   try {
     // Delete the base image and any damage patches still placed over it. A patch left
     // behind would outlive the pane as a stale image in the terminal's cache.
-    writeGfx(`a=d,d=I,i=${imageId}`, "");
-    for (let slot = 0; slot < PATCH_ID_COUNT; slot++) {
-      writeGfx(`a=d,d=I,i=${patchIdBase + slot}`, "");
+    const ids = paneImageIds(record);
+    writeGfx(`a=d,d=I,i=${ids.base}`, "");
+    for (const id of ids.patchIds) {
+      writeGfx(`a=d,d=I,i=${id}`, "");
     }
   } catch (e) {}
   // Caret parking leaves the cursor shape as a bar, so restore the terminal default.
@@ -980,16 +1213,17 @@ function terminalCleanup() {
 
 // --- frame transfer ---
 
-function applyActiveFrameRate(rate) {
-  const next = Math.min(maxActiveFrameRate, Math.max(1, Math.round(rate)));
-  // The mutator is what suppresses a redundant call. That matters beyond saving a syscall:
+function applyActiveFrameRate(rate, windows = soleWindows, record = currentPane()) {
+  // Both mutators suppress a redundant call, and that matters beyond saving a syscall:
   // `setFrameRate` provokes a paint of its own, and the playback tier is decided by counting
   // paints over a window, so re-applying the current tier feeds the detector its own noise.
-  if (!recordFrameTier(solePane, next)) return;
-  activeFrameRate = next;
-  frameIntervalMs = Math.ceil(1000 / activeFrameRate);
-  if (win && !win.isDestroyed() && solePane.visible) win.webContents.setFrameRate(activeFrameRate);
-  if (debugLogging) console.error(`tweb: frame rate ${activeFrameRate}fps`);
+  const change = applyPaneFrameRate(windows, rate);
+  if (!change) return;
+  recordFrameTier(record, change.rate);
+  if (windows.win && !windows.win.isDestroyed() && record.visible) {
+    windows.win.webContents.setFrameRate(change.rate);
+  }
+  if (debugLogging) console.error(`tweb: frame rate ${change.rate}fps`);
 }
 
 function markInteractionActivity() {
@@ -997,17 +1231,17 @@ function markInteractionActivity() {
   // Raising the rate only affects future paints, so coming out of the idle rate
   // would otherwise leave the last idle frame on screen for a whole interval —
   // a quarter second of "nothing happened" after a keypress.
-  const wasIdle = activeFrameRate !== maxActiveFrameRate;
+  const wasIdle = isThrottled(soleWindows);
   applyActiveFrameRate(maxActiveFrameRate);
-  if (wasIdle && win && !win.isDestroyed() && solePane.visible) win.webContents.invalidate();
-  if (frameIdleTimer) clearTimeout(frameIdleTimer);
+  if (wasIdle && soleWindows.win && !soleWindows.win.isDestroyed() && currentPane().visible) soleWindows.win.webContents.invalidate();
+  if (soleWindows.frameIdleTimer) clearTimeout(soleWindows.frameIdleTimer);
   // The paints this interaction is about to cause say nothing about whether the page
   // paints on its own, which is the only thing the settle decides — so the count starts
   // fresh. It does not need a handicap beyond that: over a 700ms window, echoing a
   // keystroke is one or two paints while an animating page is dozens, and the threshold
   // sits between them.
-  paintsSinceSettle = 0;
-  frameIdleTimer = setTimeout(settleFrameRate, 700);
+  soleWindows.paintsSinceSettle = 0;
+  soleWindows.frameIdleTimer = setTimeout(settleFrameRate, 700);
 }
 
 // Where the rate lands once the active window expires: the playback rate while the page is
@@ -1015,23 +1249,23 @@ function markInteractionActivity() {
 // so a video that ends drops the rest of the way and a static page that starts an animation
 // picks up without needing a keystroke.
 function settleFrameRate() {
-  frameIdleTimer = null;
+  soleWindows.frameIdleTimer = null;
   // Dropping the rate while a page is still loading stops offscreen painting
   // almost entirely: measured on google.com, the page committed at 1.4s and the
   // next frame did not go out until 5.4s. Stay at the active rate until the load
   // settles — that is precisely when the screen is changing anyway.
-  if (win && !win.isDestroyed() && win.webContents.isLoading()) {
+  if (soleWindows.win && !soleWindows.win.isDestroyed() && soleWindows.win.webContents.isLoading()) {
     markInteractionActivity();
     return;
   }
   // Judge against the paints that arrived over the window just ended, then reset the
   // count. Reading a timestamp instead would count the paint that changing the rate
   // itself provokes, and a static page would hold the playback rate forever.
-  const settled = settledFrameRate(paintsSinceSettle, frameRates);
-  paintsSinceSettle = 0;
+  const settled = settledFrameRate(soleWindows.paintsSinceSettle, frameRates);
+  soleWindows.paintsSinceSettle = 0;
   applyActiveFrameRate(settled.rate);
   if (settled.painting) {
-    frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
+    soleWindows.frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
   }
 }
 
@@ -1039,25 +1273,22 @@ function settleFrameRate() {
 // runs — and at the idle rate nothing would raise it again. Arm the timer so the next
 // settle sees the paints and moves up to the playback rate.
 function notePaintActivity() {
-  paintsSinceSettle += 1;
-  if (!adaptiveFrameRate || frameIdleTimer) return;
-  if (activeFrameRate >= playbackFrameRate) return;
-  frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
+  soleWindows.paintsSinceSettle += 1;
+  if (!adaptiveFrameRate || soleWindows.frameIdleTimer) return;
+  if (soleWindows.activeFrameRate >= playbackFrameRate) return;
+  soleWindows.frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
 }
 
 // A placement the next frame will not fully cover has to be deleted, but the
 // delete is paired with the replacement so the pane is never left bare: on its
 // own it would bare the terminal for as long as the frame takes to arrive.
-let framesSentCount = 0;
-let pendingImageDelete = false;
 // The terminal holds the last image we transferred under `imageId`, which lets a
 // resize re-place it without sending the pixels again.
-let imageTransferred = false;
 
 // `d=i` drops the placements but keeps the image data, so it can be re-placed.
-function deletePlacement() {
-  pendingImageDelete = false;
-  writeGfx(`a=d,d=i,i=${imageId},q=2`, "");
+function deletePlacement(frames = currentFrames()) {
+  frames.pendingImageDelete = false;
+  writeGfx(`a=d,d=i,i=${frames.imageIds.base},q=2`, "");
 }
 
 // Chromium needs a moment to repaint at a new size, and tmux has already redrawn
@@ -1065,10 +1296,10 @@ function deletePlacement() {
 // lands. Re-placing the image the terminal already has covers the pane at once:
 // it is a few dozen bytes, so unlike a frame it never waits behind the encoder.
 // The accurate frame replaces it as soon as it arrives.
-function replacePlacement() {
-  if (!imageTransferred) return;
-  if (pendingImageDelete) deletePlacement();
-  writeGfx(`a=p,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
+function replacePlacement(frames = currentFrames()) {
+  if (!frames.imageTransferred) return;
+  if (frames.pendingImageDelete) deletePlacement(frames);
+  writeGfx(`a=p,i=${frames.imageIds.base},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2", "");
 }
 
@@ -1088,59 +1319,47 @@ function replacePlacement() {
 // Patches deliberately bypass the gfx worker. That queue is one frame deep, which is right
 // for whole frames but would leave a 0.4KB patch waiting behind a 1.5MB one; a patch is
 // small enough to write inline for the same reason `replacePlacement` does.
-let nextPatchSlot = 0;
-let livePatchIds = [];
-// The damage every live patch covers between them. A patch repaints this whole region, so
-// a later, smaller one still erases what an earlier, larger one drew.
-let patchedDamage = null;
-// Whole/patch counts live on the pane record: `tweb diag` reports them per pane, and one
-// runtime holding several must not attribute one pane's frames to another.
-
-function nextPatchId() {
-  const id = patchIdBase + nextPatchSlot;
-  nextPatchSlot = (nextPatchSlot + 1) % PATCH_ID_COUNT;
-  return id;
-}
+//
+// The pool and the damage union it covers live on the pane's frame context — see
+// `frame-context.cjs`. Whole/patch counts live on the pane record: `tweb diag` reports them per
+// pane, and one runtime holding several must not attribute one pane's frames to another.
 
 // `d=I` frees the image data as well as the placement. Unlike the base image a patch is
 // never re-placed, so keeping its pixels around would only consume the terminal's image
 // budget — and leaving them behind at exit is exactly the stale-image case DESIGN.md
 // section 7.7 gates on.
-function deletePatches() {
-  patchedDamage = null;
-  if (livePatchIds.length === 0) return;
-  for (const id of livePatchIds) writeGfx(`a=d,d=I,i=${id},q=2`, "");
-  livePatchIds = [];
+function deletePatches(frames = currentFrames()) {
+  for (const id of takeLivePatchIds(frames)) writeGfx(`a=d,d=I,i=${id},q=2`, "");
 }
 
 // Kitty places an image at the cursor. Patches address their cell against the pane's own
 // origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
-function patchPlacementSequence(id, place) {
+function patchPlacementSequence(id, place, frames = currentFrames()) {
   const header = `a=T,f=100,i=${id},C=1,c=${place.cols},r=${place.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
-  return { header, ...patchCursorMove(place, tmuxOrigin, paneCells, ESC) };
+  return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
 
 // Returns true when the damage was sent as a patch, false when the caller should fall back
 // to transferring the whole frame.
-function sendPatch(image, dirty, generation) {
-  if (!lastViewport || generation !== viewportGeneration) return false;
+function sendPatch(image, dirty, generation, frames = currentFrames(), record = currentPane()) {
+  if (!frames.viewport || generation !== frames.generation) return false;
   // Addressing a patch's cell needs to know where the pane sits on screen. Without tmux
   // there is no pane offset to resolve — the whole terminal is the pane — but the cursor is
   // then wherever the page last parked it, so the origin has to be known either way.
-  if (process.env.TMUX && !tmuxOrigin) return false;
+  if (paneIsInTmux(record) && !frames.origin) return false;
   // A patch only makes sense over an already-correct base frame. With nothing on screen
   // yet, or a base from an older generation, the whole frame is what is needed.
-  if (!imageTransferred || pendingImageDelete) return false;
+  if (!frames.imageTransferred || frames.pendingImageDelete) return false;
   // Cover everything patched since the last whole frame, not just this frame's damage.
   // Without this a narrower patch leaves the previous, wider one showing around it — a
   // deleted character stays on screen until something forces a whole frame.
-  const damage = unionDamage(dirty, patchedDamage);
+  const damage = unionDamage(dirty, frames.patchedDamage);
   // The dirty rect and the crop are in the frame's own pixels, so the cell grid has to be
   // measured against the frame rather than the pane: the two can differ by a rounding step,
   // and the terminal is already scaling the frame into the pane's cell box.
   const size = image.getSize();
-  const geometry = patchGeometry(damage, paneCells, size);
+  const geometry = patchGeometry(damage, frames.cells, size);
   if (!geometry) return false;
 
   let png;
@@ -1152,15 +1371,14 @@ function sendPatch(image, dirty, generation) {
   }
   if (!png || png.length === 0) return false;
 
-  const id = nextPatchId();
-  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place);
+  const id = takeNextPatchId(frames);
+  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames);
   // The id may still hold an older patch from a previous cycle through the pool.
   writeGfx(`a=d,d=I,i=${id},q=2`, "");
   writeGfxChunked(header, png.toString("base64"), prefix, suffix);
-  if (!livePatchIds.includes(id)) livePatchIds.push(id);
-  patchedDamage = damage;
-  solePane.frames.patches += 1;
-  const patchFramesSent = solePane.frames.patches;
+  notePatch(frames, id, damage);
+  record.frames.patches += 1;
+  const patchFramesSent = record.frames.patches;
   if (patchFramesSent <= 12) {
     console.error(`tweb: patch sent #${patchFramesSent} `
       + `cells=${geometry.place.cols}x${geometry.place.rows}`
@@ -1170,7 +1388,7 @@ function sendPatch(image, dirty, generation) {
 }
 
 function transferFrame(pixels, generation, format = "png", size = null) {
-  if (pendingImageDelete) deletePlacement();
+  if (currentFrames().pendingImageDelete) deletePlacement();
   // Any patch on screen describes damage this frame already contains, so it goes out with
   // the frame that supersedes it. Dropping them earlier would bare the stale pixels
   // underneath for as long as the encode takes.
@@ -1178,22 +1396,23 @@ function transferFrame(pixels, generation, format = "png", size = null) {
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
   // whose pixel size no longer matches still covers exactly the pane. `f=` is left to the
   // worker, which knows whether it is writing a PNG or raw pixels.
-  const header = `a=T,i=${imageId},C=1,c=${paneCells.cols},r=${paneCells.rows}`
+  const header = `a=T,i=${currentFrames().imageIds.base},C=1,`
+    + `c=${currentFrames().cells.cols},r=${currentFrames().cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
-  solePane.frames.whole += 1;
+  currentPane().frames.whole += 1;
   // Only the first few: enough to see when a page actually reached the pane, which
   // is what separates "the engine is behind" from "the site is slow", and quiet
   // after that.
-  if (framesSentCount < 12) {
-    console.error(`tweb: frame sent #${++framesSentCount} ${format}`);
+  if (currentFrames().framesSentCount < 12) {
+    console.error(`tweb: frame sent #${++currentFrames().framesSentCount} ${format}`);
   }
-  lastFrameSentAt = Date.now();
+  currentFrames().lastFrameSentAt = Date.now();
 }
 
 function sendFrameNow(image, generation) {
-  if (!solePane.visible || generation !== viewportGeneration || !image || image.isEmpty()) return;
-  const viewport = lastViewport;
+  if (!currentPane().visible || generation !== currentFrames().generation || !image || image.isEmpty()) return;
+  const viewport = currentFrames().viewport;
   const size = image.getSize();
   const expected = viewport && renderedFrameSize(viewport);
   if (!expected || size.width !== expected.width || size.height !== expected.height) return;
@@ -1203,14 +1422,14 @@ function sendFrameNow(image, generation) {
     // the view `getBitmap` returns belongs to the frame and cannot be transferred.
     if (rawFramesEnabled) {
       const bitmap = image.toBitmap();
-      imageTransferred = true;
+      currentFrames().imageTransferred = true;
       transferFrame(bitmap, generation, "raw", size);
       return;
     }
     // Hand the base64 conversion and the terminal write off to a worker once the PNG exists.
     // Even under stdout backpressure, the Electron main thread and keyboard input keep going.
     const png = image.toPNG();
-    imageTransferred = true;
+    currentFrames().imageTransferred = true;
     transferFrame(png, generation, "png", size);
   } catch (error) {
     console.error(`tweb: frame encode failed: ${error.message}`);
@@ -1218,16 +1437,16 @@ function sendFrameNow(image, generation) {
 }
 
 function flushPendingFrame() {
-  pendingFrameTimer = null;
-  const frame = pendingFrame;
-  pendingFrame = null;
-  if (!frame || frame.tab !== win || frame.generation !== viewportGeneration || !solePane.visible) return;
+  currentFrames().pendingFrameTimer = null;
+  const frame = currentFrames().pendingFrame;
+  currentFrames().pendingFrame = null;
+  if (!frame || frame.tab !== soleWindows.win || frame.generation !== currentFrames().generation || !currentPane().visible) return;
   sendFrameNow(frame.image, frame.generation);
 }
 
 function queueFrame(tab, image, immediate = false, dirty = null) {
-  const generation = viewportGeneration;
-  const viewport = lastViewport;
+  const generation = currentFrames().generation;
+  const viewport = currentFrames().viewport;
   const size = image?.getSize();
   const expected = viewport && renderedFrameSize(viewport);
   if (!expected || !size || size.width !== expected.width || size.height !== expected.height) {
@@ -1244,34 +1463,34 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   // (DETAIL.md 8.1), so caching every tab put N x that in the main process for the life of
   // the window — against DESIGN.md 6.5, which gates on a hidden page's buffers converging
   // to zero. Nothing reads a background tab's frame: `repaintActiveTab` only ever asks for
-  // `win`, and `activateTab` calls `invalidate()`, so a switched-to tab paints fresh either
+  // `soleWindows.win`, and `activateTab` calls `invalidate()`, so a switched-to tab paints fresh either
   // way. Dropping the entry is what makes it converge.
-  if (tab === win) tabFrames.set(tab, { image, generation });
+  if (tab === soleWindows.win) tabFrames.set(tab, { image, generation });
   else tabFrames.delete(tab);
-  if (tab !== win || !solePane.visible) return;
+  if (tab !== soleWindows.win || !currentPane().visible) return;
   // Small damage goes out immediately as a patch instead of waiting for the frame
   // interval — the wait exists to pace whole-frame encodes, and a patch costs a
   // thousandth of one. A caret keeping up with the keyboard is the whole point.
-  if (dirty && !pendingFrameTimer && sendPatch(image, dirty, generation)) {
-    lastFrameSentAt = Date.now();
+  if (dirty && !currentFrames().pendingFrameTimer && sendPatch(image, dirty, generation)) {
+    currentFrames().lastFrameSentAt = Date.now();
     return;
   }
-  pendingFrame = { tab, image, generation };
-  if (pendingFrameTimer) return;
-  const elapsed = Date.now() - lastFrameSentAt;
-  const delay = immediate ? 0 : Math.max(0, frameIntervalMs - elapsed);
-  pendingFrameTimer = setTimeout(flushPendingFrame, delay);
+  currentFrames().pendingFrame = { tab, image, generation };
+  if (currentFrames().pendingFrameTimer) return;
+  const elapsed = Date.now() - currentFrames().lastFrameSentAt;
+  const delay = immediate ? 0 : Math.max(0, soleWindows.frameIntervalMs - elapsed);
+  currentFrames().pendingFrameTimer = setTimeout(flushPendingFrame, delay);
 }
 
 function repaintActiveTab() {
-  if (!solePane.visible || !win || win.isDestroyed()) return;
-  const frame = tabFrames.get(win);
-  if (frame && frame.generation === viewportGeneration && !frame.image.isEmpty()) {
-    queueFrame(win, frame.image, true);
+  if (!currentPane().visible || !soleWindows.win || soleWindows.win.isDestroyed()) return;
+  const frame = tabFrames.get(soleWindows.win);
+  if (frame && frame.generation === currentFrames().generation && !frame.image.isEmpty()) {
+    queueFrame(soleWindows.win, frame.image, true);
     if (debugLogging) console.error("tweb: visibility repaint");
     return;
   }
-  win.webContents.invalidate();
+  soleWindows.win.webContents.invalidate();
 }
 
 // --- viewport size query ---
@@ -1287,7 +1506,7 @@ function parseViewport(value) {
 }
 
 function queryTmuxViewport() {
-  if (!process.env.TMUX_PANE) return null;
+  if (!ownTmuxPane) return null;
   try {
     const { execFileSync } = require("node:child_process");
     const out = execFileSync(
@@ -1296,7 +1515,7 @@ function queryTmuxViewport() {
         "display-message",
         "-p",
         "-t",
-        process.env.TMUX_PANE,
+        ownTmuxPane,
         "#{pane_width} #{pane_height} #{client_cell_width} #{client_cell_height}",
       ],
       { encoding: "utf8", timeout: 1000 }
@@ -1318,11 +1537,10 @@ function queryTmuxViewport() {
 function queryViewportSize() {
   return parseViewport(process.env.TWEB_VIEWPORT)
     || queryTmuxViewport()
-    || lastViewport
+    || currentFrames().viewport
     || { cols: 80, rows: 24, width: 640, height: 384 };
 }
 
-let paneCells = { cols: 80, rows: 24 };
 
 // --- browser window ---
 
@@ -1371,7 +1589,7 @@ function renderedFrameSize(vp) {
   };
 }
 
-function browserWindowOptions(vp = lastViewport || queryViewportSize()) {
+function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize()) {
   const logical = logicalContentSize(vp);
   return {
     width: logical.width,
@@ -1405,7 +1623,7 @@ function browserWindowOptions(vp = lastViewport || queryViewportSize()) {
 
 function tabLabel(tab, index) {
   const title = tab.webContents.getTitle() || tab.webContents.getURL() || "New tab";
-  return `${index + 1}/${tabs.length} ${title}`;
+  return `${index + 1}/${soleWindows.tabs.length} ${title}`;
 }
 
 function writeWindowSessionState(state) {
@@ -1446,14 +1664,14 @@ function readWindowSession() {
 }
 
 function writeWindowSession() {
-  if (!windowSessionPath || tabs.length === 0) return;
-  const state = windowSessionForSave(tabs.flatMap((tab) => {
+  if (!windowSessionPath || soleWindows.tabs.length === 0) return;
+  const state = windowSessionForSave(soleWindows.tabs.flatMap((tab) => {
     if (tab.isDestroyed()) return [];
     return [{
       url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
       zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor,
     }];
-  }), activeTabIndex, defaultZoomFactor);
+  }), soleWindows.activeTabIndex, defaultZoomFactor);
   // A bare startup used to replace the last useful session with about:blank
   // after 100 ms. Preserve the existing file until a real page commits.
   writeWindowSessionState(state);
@@ -1470,18 +1688,18 @@ function scheduleWindowSessionSave() {
 }
 
 function updatePaneTitle() {
-  if (!process.env.TMUX_PANE) return;
+  if (!ownTmuxPane) return;
   // Tab state belongs to this pane's in-page badge. Putting it in tmux's pane
   // title makes one active pane look like the state of the whole window.
-  execFile("tmux", ["select-pane", "-t", process.env.TMUX_PANE, "-T", "tweb"], () => {});
+  execFile("tmux", ["select-pane", "-t", ownTmuxPane, "-T", "tweb"], () => {});
 }
 
 function restorePaneTitle() {
-  if (!process.env.TMUX_PANE || originalPaneTitle === null) return;
+  if (!ownTmuxPane || originalPaneTitle === null) return;
   try {
     execFileSync(
       "tmux",
-      ["select-pane", "-t", process.env.TMUX_PANE, "-T", originalPaneTitle],
+      ["select-pane", "-t", ownTmuxPane, "-T", originalPaneTitle],
       { timeout: 1000, stdio: "ignore" }
     );
   } catch (e) {}
@@ -1502,13 +1720,13 @@ function updatePaintingState() {
   // hidden page's buffers converging to zero — so it goes, and the reveal below repaints
   // instead of re-placing. `repaintActiveTab` already falls back to `invalidate()` when
   // the cache is empty, which is the same path a resize generation bump takes.
-  if (!solePane.visible) tabFrames.clear();
+  if (!currentPane().visible) tabFrames.clear();
   const held = surfaceHeldForAgent();
-  for (const tab of tabs) {
+  for (const tab of soleWindows.tabs) {
     if (tab.isDestroyed()) continue;
-    const plan = surfacePlan(tab === win, solePane.visible, logicalContentSize(currentViewport()), held);
+    const plan = surfacePlan(tab === soleWindows.win, currentPane().visible, logicalContentSize(currentViewport()), held);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
-    tab.webContents.setFrameRate(plan.painting ? activeFrameRate : 1);
+    tab.webContents.setFrameRate(plan.painting ? soleWindows.activeFrameRate : 1);
     applySurfacePlan(tab, plan);
     // Read before write, like the resize above: `startPainting()` on a tab that is
     // already painting *provokes a paint*, and this reconciler runs every second, so
@@ -1533,7 +1751,7 @@ function readIsPainting(contents) {
 }
 
 function currentViewport() {
-  return lastViewport || queryViewportSize();
+  return currentFrames().viewport || queryViewportSize();
 }
 
 // Resizing re-lays out the page, so the size is read before it is written. A tab whose
@@ -1546,8 +1764,8 @@ function applySurfacePlan(tab, plan) {
   // Recorded before the resize, and only for the tab that is this pane's active one: the
   // record's `logical` is the size a restore goes back to, and reading it off a collapsed
   // surface is how the agent API came back with innerHeight=1.
-  if (tab === win) {
-    recordSurface(solePane, { collapsed: plan.height <= 1, logical: { width: plan.width, height: plan.height } });
+  if (tab === soleWindows.win) {
+    recordSurface(currentPane(), { collapsed: plan.height <= 1, logical: { width: plan.width, height: plan.height } });
   }
   tab.setContentSize(plan.width, plan.height);
   // Chromium resets the zoom factor on a content resize, and a collapsed tab would come
@@ -1570,19 +1788,16 @@ function applySurfacePlan(tab, plan) {
 // exception would pin the surface open for the life of the process — undoing #22's gate
 // for anyone who ever ran one agent command.
 const AGENT_SURFACE_HOLD_TTL_MS = 30_000;
-let agentSurfaceHolds = 0;
-let agentSurfaceHoldDeadline = 0;
 
-function surfaceHeldForAgent() {
-  if (agentSurfaceHolds <= 0) return false;
-  if (Date.now() > agentSurfaceHoldDeadline) {
-    // The watchdog tick that notices is also the one that collapses the surface again, so
-    // a leak costs bytes for a bounded window rather than forever.
-    console.error(`tweb: agent surface hold expired with ${agentSurfaceHolds} outstanding`);
-    agentSurfaceHolds = 0;
-    return false;
+function surfaceHeldForAgent(windows = soleWindows) {
+  const state = surfaceHeld(windows, Date.now());
+  // The watchdog tick that notices the expiry is also the one that collapses the surface again,
+  // so a leak costs bytes for a bounded window rather than forever. Reported once: the count is
+  // dropped with the report, so the next tick does not repeat the complaint.
+  if (state.expired) {
+    console.error(`tweb: agent surface hold expired with ${state.outstanding} outstanding`);
   }
-  return true;
+  return state.held;
 }
 
 // Restore was measured at about a millisecond in #22, but a page that is still loading can
@@ -1644,41 +1859,36 @@ function awaitRestoredFrame(contents) {
   });
 }
 
-// The frame the current hold restored, for a screenshot to use instead of re-asking the
-// compositor. Only ever set while a hold is open, and cleared with it.
-let agentSurfaceFrame = null;
-
 /// Runs `body` with the active tab laid out at its real size, whatever the pane shows.
 ///
 /// A visible pane already has its full surface, so this is a straight pass-through there
-/// — the cost is paid only by the case that was broken.
-async function withAgentSurface(method, body) {
-  if (solePane.visible || !agentNeedsGeometry(method) || !win || win.isDestroyed()) {
+/// — the cost is paid only by the case that was broken. The hold is on THIS pane: one pane's
+/// agent call must not restore another's surface, which would undo the collapse for every pane
+/// at once rather than for the one being driven.
+async function withAgentSurface(method, body, windows = soleWindows, record = currentPane()) {
+  const tab = windows.win;
+  if (record.visible || !agentNeedsGeometry(method) || !tab || tab.isDestroyed()) {
     return body();
   }
-  agentSurfaceHolds += 1;
-  agentSurfaceHoldDeadline = Date.now() + AGENT_SURFACE_HOLD_TTL_MS;
-  const contents = win.webContents;
+  holdSurface(windows, Date.now(), AGENT_SURFACE_HOLD_TTL_MS);
+  const contents = tab.webContents;
   try {
     updatePaintingState();
     // Layout first, then the frame: the frame kept for `screenshot` has to come from the
     // page as the rest of the call will read it, not from the moment before it reflowed.
     await awaitRestoredLayout(contents);
-    agentSurfaceFrame = await awaitRestoredFrame(contents);
+    // The frame the hold restored, for a screenshot to use instead of re-asking the compositor.
+    windows.agentSurfaceFrame = await awaitRestoredFrame(contents);
     return await body();
   } finally {
-    agentSurfaceHolds = Math.max(0, agentSurfaceHolds - 1);
     // Collapse again immediately rather than waiting for the watchdog's next tick: the
     // gate #22 added is "a hidden page's surface bytes converge to 0", and converging a
     // second late is fine while converging only on the next visit is not.
     //
-    // The frame outlives an inner call so an overlapping one — `wait` polling for ten
-    // seconds while a screenshot runs — does not leave the other holding null and falling
-    // back to the capturePage that was unreliable here.
-    if (agentSurfaceHolds === 0) {
-      agentSurfaceFrame = null;
-      updatePaintingState();
-    }
+    // `releaseSurface` keeps the frame until the LAST hold closes, so an overlapping call —
+    // `wait` polling for ten seconds while a screenshot runs — is not left holding null and
+    // falling back to the capturePage that was unreliable here.
+    if (releaseSurface(windows)) updatePaintingState();
   }
 }
 
@@ -1720,7 +1930,7 @@ function processAlive(pid) {
 }
 
 function writeAudioClaim() {
-  const claim = { pane: process.env.TMUX_PANE || null, pid: process.pid, at: Date.now() };
+  const claim = { pane: ownTmuxPane, pid: process.pid, at: Date.now() };
   const temporary = `${audioClaimPath}.${process.pid}.tmp`;
   try {
     mkdirSync(path.dirname(audioClaimPath), { recursive: true, mode: 0o700 });
@@ -1749,7 +1959,7 @@ function clearAudioClaim() {
 }
 
 function anyTabAudible() {
-  for (const tab of tabs) {
+  for (const tab of soleWindows.tabs) {
     if (tab.isDestroyed()) continue;
     // A muted tab reports itself as not audible, so the instance that gave audio up
     // would never notice it is still playing. Its own claim state answers instead.
@@ -1762,13 +1972,13 @@ function anyTabAudible() {
 // Mute, never pause: the page keeps playing and keeps its position, so taking audio
 // back is one keypress rather than a re-seek.
 function applyAudioMute(muted) {
-  for (const tab of tabs) {
+  for (const tab of soleWindows.tabs) {
     if (!tab.isDestroyed()) tab.webContents.setAudioMuted(muted);
   }
 }
 
 function broadcastAudioState() {
-  for (const tab of tabs) {
+  for (const tab of soleWindows.tabs) {
     sendToTabFrames(tab, "tweb-audio-state", { muted: audioMutedByOther, owner: audioOwnerPane });
   }
 }
@@ -1788,7 +1998,7 @@ function reconcileAudio({ claiming = false } = {}) {
   // Recorded on the pane so a runtime holding several arbitrates in memory rather than through
   // the file. The file stays the boundary between *runtimes* — per-pane engines running beside a
   // host share nothing else — but panes inside one runtime do not need to publish to it and poll.
-  recordAudio(solePane, { audible });
+  recordAudio(currentPane(), { audible });
   if (audible) audioSilentSince = null;
   else if (audioSilentSince === null) audioSilentSince = now;
 
@@ -1868,7 +2078,7 @@ function startAudioCoordination() {
   audioTimer.unref();
 }
 
-function installPageEnhancements(tab = win) {
+function installPageEnhancements(tab = soleWindows.win) {
   if (!tab || tab.isDestroyed()) return;
   void tab.webContents.executeJavaScript(`(() => {
     document.getElementById('__tweb_status__')?.remove();
@@ -2043,7 +2253,7 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
 // The preload receives the two flags separately and drives the mode indicator and
 // each gate independently.
 function broadcastShortcutMode() {
-  for (const tab of tabs) {
+  for (const tab of soleWindows.tabs) {
     sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   }
 }
@@ -2053,7 +2263,7 @@ function applyShortcutMode() {
   pageInsertMode = false;
   broadcastShortcutMode();
   // Once passthrough is armed (vimium off), focus so the page can receive keys.
-  if (!vimiumShortcutsEnabled && win && !win.isDestroyed()) win.webContents.focus();
+  if (!vimiumShortcutsEnabled && soleWindows.win && !soleWindows.win.isDestroyed()) soleWindows.win.webContents.focus();
   // A Ghostty config reload or a pane restart can reset one side only, so reconcile
   // always runs even when the value already matches.
   reconcileTmuxPassthrough();
@@ -2096,30 +2306,30 @@ function toggleBrowserShortcuts() {
 }
 
 function activateTab(index) {
-  if (tabs.length === 0) {
-    win = null;
-    activeTabIndex = -1;
+  if (soleWindows.tabs.length === 0) {
+    soleWindows.win = null;
+    soleWindows.activeTabIndex = -1;
     return;
   }
-  const normalized = ((index % tabs.length) + tabs.length) % tabs.length;
-  activeTabIndex = normalized;
-  win = tabs[normalized];
+  const normalized = ((index % soleWindows.tabs.length) + soleWindows.tabs.length) % soleWindows.tabs.length;
+  soleWindows.activeTabIndex = normalized;
+  soleWindows.win = soleWindows.tabs[normalized];
   mouseClicks.reset();
   pageInsertMode = false;
   // The preload mirrors this flag and skips redundant IPC, so tell the tab we
   // just cleared it. Without this its focused input keeps thinking native
   // delivery is armed and its keys go back through the renderer, where they
   // arrive with keyCode 0.
-  sendToTabFrames(win, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+  sendToTabFrames(soleWindows.win, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   // The other tab's caret says nothing about this one, and its preload only
-  // reports on focus — which switching tabs does not fire.
+  // reports on focus — which switching soleWindows.tabs does not fire.
   moveTerminalCaret(null);
   // Zoom is shared per origin in Chromium, so a sibling tab on the same host can
   // have moved it. Only the active tab is ever painted, so restoring this tab's
   // own factor on activation is what makes zoom look per-tab.
-  const zoomFactor = tabZoomFactors.get(win) ?? defaultZoomFactor;
-  if (!win.isDestroyed() && win.webContents.getZoomFactor() !== zoomFactor) {
-    win.webContents.setZoomFactor(zoomFactor);
+  const zoomFactor = tabZoomFactors.get(soleWindows.win) ?? defaultZoomFactor;
+  if (!soleWindows.win.isDestroyed() && soleWindows.win.webContents.getZoomFactor() !== zoomFactor) {
+    soleWindows.win.webContents.setZoomFactor(zoomFactor);
   }
   // Cell size in CSS pixels depends on the zoom just restored.
   broadcastCellMetrics();
@@ -2127,26 +2337,26 @@ function activateTab(index) {
   // id and replaces it in place. Deleting would uncover the bare terminal until
   // the new tab paints, which reads as a flicker on every switch.
   updatePaintingState();
-  win.webContents.invalidate();
+  soleWindows.win.webContents.invalidate();
   updatePaneTitle();
   sendTabState();
   scheduleWindowSessionSave();
-  if (debugLogging) console.error(`tweb: tab active ${tabLabel(win, normalized)}`);
+  if (debugLogging) console.error(`tweb: tab active ${tabLabel(soleWindows.win, normalized)}`);
 }
 
 function cycleTab(direction) {
-  if (tabs.length > 1) activateTab(activeTabIndex + direction);
+  if (soleWindows.tabs.length > 1) activateTab(soleWindows.activeTabIndex + direction);
 }
 
-function closeTab(index = activeTabIndex) {
-  const tab = tabs[index];
+function closeTab(index = soleWindows.activeTabIndex) {
+  const tab = soleWindows.tabs[index];
   if (!tab || tab.isDestroyed()) return;
   const url = tab.webContents.getURL();
   if (isRestorableUrl(url)) {
-    closedTabs.push(url);
-    if (closedTabs.length > 25) closedTabs.shift();
+    soleWindows.closedTabs.push(url);
+    if (soleWindows.closedTabs.length > 25) soleWindows.closedTabs.shift();
   }
-  if (tabs.length === 1) {
+  if (soleWindows.tabs.length === 1) {
     app.quit();
     return;
   }
@@ -2154,7 +2364,7 @@ function closeTab(index = activeTabIndex) {
 }
 
 function restoreClosedTab() {
-  const url = closedTabs.pop();
+  const url = soleWindows.closedTabs.pop();
   if (url) createTab(url, true);
 }
 
@@ -2354,9 +2564,9 @@ function compactHistory() {
 
 function omniboxModel() {
   const history = readGlobalHistory();
-  // Open tabs always outrank history entries.
+  // Open soleWindows.tabs always outrank history entries.
   const base = history.length;
-  const tabEntries = tabs.flatMap((candidate, index) => {
+  const tabEntries = soleWindows.tabs.flatMap((candidate, index) => {
     if (candidate.isDestroyed()) return [];
     const url = tabSessionUrls.get(candidate) || candidate.webContents.getURL() || "about:blank";
     return [{
@@ -2364,11 +2574,11 @@ function omniboxModel() {
       index,
       url,
       title: candidate.webContents.getTitle() || url,
-      recency: base + tabs.length - index,
+      recency: base + soleWindows.tabs.length - index,
     }];
   });
   return {
-    current: win && !win.isDestroyed() ? tabSessionUrls.get(win) || win.webContents.getURL() || "" : "",
+    current: soleWindows.win && !soleWindows.win.isDestroyed() ? tabSessionUrls.get(soleWindows.win) || soleWindows.win.webContents.getURL() || "" : "",
     entries: [
       ...tabEntries,
       ...history.map((entry, index) => ({ ...entry, kind: "history", recency: base - index })),
@@ -2378,8 +2588,8 @@ function omniboxModel() {
 
 function tabListModel() {
   return {
-    activeIndex: activeTabIndex,
-    tabs: tabs.map((candidate, index) => ({
+    activeIndex: soleWindows.activeTabIndex,
+    tabs: soleWindows.tabs.map((candidate, index) => ({
       index,
       title: candidate.webContents.getTitle() || "New tab",
       url: candidate.webContents.getURL() || "about:blank",
@@ -2389,21 +2599,21 @@ function tabListModel() {
 
 function tabStateModel() {
   return {
-    activeIndex: activeTabIndex,
-    count: tabs.length,
-    tabs: tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
+    activeIndex: soleWindows.activeTabIndex,
+    count: soleWindows.tabs.length,
+    tabs: soleWindows.tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
       index,
       title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "New tab",
     }]),
   };
 }
 
-function sendTabState(tab = win) {
+function sendTabState(tab = soleWindows.win) {
   sendToMainTabFrame(tab, "tweb-tab-state", tabStateModel());
 }
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  if (!vimiumShortcutsEnabled || tab !== win || tab.isDestroyed()) return;
+  if (!vimiumShortcutsEnabled || tab !== soleWindows.win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
   switch (action) {
@@ -2415,8 +2625,8 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "previous-tab": cycleTab(-1); break;
     case "next-tab": cycleTab(1); break;
-    case "list-tabs":
-      sendToTabFrames(tab, "tweb-tabs", tabListModel());
+    case "list-soleWindows.tabs":
+      sendToTabFrames(tab, "tweb-soleWindows.tabs", tabListModel());
       break;
     case "omnibox-model":
       sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
@@ -2430,14 +2640,14 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       sendToFocusedTabFrame(tab, "tweb-history", deleteHistoryEntries(value?.rows, value?.query));
       break;
     case "activate-tab":
-      if (Number.isInteger(value) && value >= 0 && value < tabs.length) activateTab(value);
+      if (Number.isInteger(value) && value >= 0 && value < soleWindows.tabs.length) activateTab(value);
       break;
     // The tab list closes a specific row; the bare shortcut closes the active tab.
     case "close-tab":
       // Closing from the list keeps it open, so it has to be redrawn — but only
       // then: sending the model unprompted would pop the list open.
       refreshTabListAfterClose = Number.isInteger(value);
-      closeTab(Number.isInteger(value) ? value : activeTabIndex);
+      closeTab(Number.isInteger(value) ? value : soleWindows.activeTabIndex);
       break;
     case "restore-tab": restoreClosedTab(); break;
     case "reload": contents.reload(); break;
@@ -2586,7 +2796,7 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
-  if (tab === win && frame === tab.webContents.mainFrame) {
+  if (tab === soleWindows.win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
   }
@@ -2594,7 +2804,7 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
 
 ipcMain.on("tweb-shortcut", (event, message) => {
   if (!message || typeof message.action !== "string") return;
-  const tab = tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
+  const tab = soleWindows.tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
   if (!tab) return;
   handleNativeShortcut(tab, message.action, message.value, event.senderFrame);
 });
@@ -2644,7 +2854,7 @@ ipcMain.on("tweb-agent-response", (_event, response) => {
 
 // Ask the active page's top frame to run an agent method.
 function agentPageRequest(method, params, timeoutMs = 10000) {
-  const tab = win;
+  const tab = soleWindows.win;
   if (!tab || tab.isDestroyed()) throw new Error("no active tab");
   const id = ++agentRequestSerial;
   return new Promise((resolve, reject) => {
@@ -2658,18 +2868,18 @@ function agentPageRequest(method, params, timeoutMs = 10000) {
 }
 
 function agentDiagnostics() {
-  const tab = win && !win.isDestroyed() ? win : null;
+  const tab = soleWindows.win && !soleWindows.win.isDestroyed() ? soleWindows.win : null;
   const size = tab ? tab.getContentSize() : null;
   const frame = tab ? tabFrames.get(tab)?.image?.getSize() : null;
   return {
-    pane: process.env.TMUX_PANE || null,
+    pane: ownTmuxPane,
     pid: process.pid,
     engineApp: __dirname,
     pane_geometry: {
-      cells: paneCells,
-      pixels: lastViewport ? { width: lastViewport.width, height: lastViewport.height } : null,
-      origin: tmuxOrigin,
-      logical: lastViewport ? logicalContentSize(lastViewport) : null,
+      cells: currentFrames().cells,
+      pixels: currentFrames().viewport ? { width: currentFrames().viewport.width, height: currentFrames().viewport.height } : null,
+      origin: currentFrames().origin,
+      logical: currentFrames().viewport ? logicalContentSize(currentFrames().viewport) : null,
       scaleFactor: renderScaleFactor(),
     },
     window: {
@@ -2679,13 +2889,13 @@ function agentDiagnostics() {
       visible: tab ? tab.isVisible() : null,
     },
     frames: {
-      generation: viewportGeneration,
-      lastSentMsAgo: lastFrameSentAt ? Date.now() - lastFrameSentAt : null,
+      generation: currentFrames().generation,
+      lastSentMsAgo: currentFrames().lastFrameSentAt ? Date.now() - currentFrames().lastFrameSentAt : null,
       lastSize: frame ? { width: frame.width, height: frame.height } : null,
       // A frame whose size does not match the pane is dropped, which is what a
       // pane that stopped following a resize looks like.
-      expected: lastViewport ? renderedFrameSize(lastViewport) : null,
-      rate: activeFrameRate,
+      expected: currentFrames().viewport ? renderedFrameSize(currentFrames().viewport) : null,
+      rate: soleWindows.activeFrameRate,
       adaptive: adaptiveFrameRate,
       // All three resolved rates, not just the one in force. The startup banner was the
       // only place they were stated together, and it wrote into tmux's shared status line.
@@ -2694,16 +2904,16 @@ function agentDiagnostics() {
       // painting on its own — a video, an animation — which is what separates "the pane
       // is throttled" from "the page has nothing new to show".
       rateKind: !adaptiveFrameRate ? "fixed"
-        : activeFrameRate >= maxActiveFrameRate ? "active"
-          : activeFrameRate >= playbackFrameRate ? "playback" : "idle",
-      droppedByBackpressure: droppedGfxFrames,
-      imageId,
+        : soleWindows.activeFrameRate >= maxActiveFrameRate ? "active"
+          : soleWindows.activeFrameRate >= playbackFrameRate ? "playback" : "idle",
+      droppedByBackpressure: currentFrames().droppedGfxFrames,
+      imageId: currentFrames().imageIds.base,
       // How the damage split between the two paths. A pane that feels slow while typing
       // but shows `patches` climbing is slow somewhere other than the frame pipeline;
       // one stuck at 0 during typing means the damage never qualified for a patch.
-      whole: solePane.frames.whole,
-      patches: solePane.frames.patches,
-      patchesPlaced: livePatchIds.length,
+      whole: currentPane().frames.whole,
+      patches: currentPane().frames.patches,
+      patchesPlaced: currentFrames().livePatchIds.length,
       // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
       wholeFormat: rawFramesEnabled ? "raw" : "png",
@@ -2712,7 +2922,7 @@ function agentDiagnostics() {
       vimiumShortcuts: vimiumShortcutsEnabled,
       cmdBypass: cmdBypassEnabled,
       pageInsertMode,
-      terminalVisible: solePane.visible,
+      terminalVisible: currentPane().visible,
       // Whether visibility is coming from the frontend's push or the no-frontend
       // polling fallback, and how stale the last push is. A pane that reads hidden
       // while showing "poll" is a frontend that never pushed, not a tmux problem.
@@ -2725,7 +2935,7 @@ function agentDiagnostics() {
       // to tell "caret parked on the wrong line" from "page never reported one".
       caret: { cell: caretCell, point: lastCaretPoint },
     },
-    tabs: { active: activeTabIndex, count: tabs.length },
+    tabs: { active: soleWindows.activeTabIndex, count: soleWindows.tabs.length },
     // Which pane owns the speakers, and whether this one is making noise. `audible` is
     // read live rather than cached because Chromium is the only thing that knows, and
     // "muted but still playing" is exactly the state this feature has to produce.
@@ -2740,8 +2950,8 @@ function agentDiagnostics() {
 }
 
 function agentContents() {
-  if (!win || win.isDestroyed()) throw new Error("no active tab");
-  return win.webContents;
+  if (!soleWindows.win || soleWindows.win.isDestroyed()) throw new Error("no active tab");
+  return soleWindows.win.webContents;
 }
 
 function agentNativeClick(point) {
@@ -2791,12 +3001,12 @@ async function agentWaitFor(params) {
 
 function agentTabList() {
   return {
-    active: activeTabIndex,
-    tabs: tabs.map((tab, index) => ({
+    active: soleWindows.activeTabIndex,
+    tabs: soleWindows.tabs.map((tab, index) => ({
       index,
       title: tab.isDestroyed() ? "" : tab.webContents.getTitle(),
       url: tab.isDestroyed() ? "" : tab.webContents.getURL(),
-      active: index === activeTabIndex,
+      active: index === soleWindows.activeTabIndex,
     })),
   };
 }
@@ -2805,7 +3015,7 @@ async function agentScreenshot(params) {
   const contents = agentContents();
   // On a hidden pane the hold has already collected a frame at the restored size, and
   // going back to the compositor for a second copy of it is what failed intermittently.
-  const image = agentSurfaceFrame || await contents.capturePage();
+  const image = soleWindows.agentSurfaceFrame || await contents.capturePage();
   if (!params.path) return { png: image.toPNG().toString("base64") };
   const target = path.resolve(params.path);
   writeFileSync(target, image.toPNG());
@@ -2887,7 +3097,7 @@ async function dispatchAgentCommand(method, params) {
       return agentScreenshot(params);
     case "wait":
       return agentWaitFor(params);
-    case "tabs":
+    case "soleWindows.tabs":
       return agentTabList();
     case "tab":
       activateTab(Number(params.index));
@@ -2896,7 +3106,7 @@ async function dispatchAgentCommand(method, params) {
       createTab(normalizeUrl(String(params.url || "about:blank")), true);
       return agentTabList();
     case "tab-close":
-      closeTab(params.index === undefined ? activeTabIndex : Number(params.index));
+      closeTab(params.index === undefined ? soleWindows.activeTabIndex : Number(params.index));
       return agentTabList();
     case "console":
       return { messages: params.clear ? consoleLog.splice(0) : consoleLog.slice(-(params.limit || 100)) };
@@ -2905,7 +3115,7 @@ async function dispatchAgentCommand(method, params) {
     case "status":
       return {
         pid: process.pid,
-        pane: process.env.TMUX_PANE || null,
+        pane: ownTmuxPane,
         tabs: agentTabList(),
       };
     // A peer says the claim changed. Nothing is returned and nothing is trusted — the
@@ -2956,18 +3166,18 @@ const imeSlotCells = Number.isSafeInteger(configuredImeSlotCells) && configuredI
   : 3;
 
 function cellMetrics() {
-  if (!lastViewport || !win || win.isDestroyed()) return null;
-  const logical = logicalContentSize(lastViewport);
-  const zoom = win.webContents.getZoomFactor() || 1;
+  if (!currentFrames().viewport || !soleWindows.win || soleWindows.win.isDestroyed()) return null;
+  const logical = logicalContentSize(currentFrames().viewport);
+  const zoom = soleWindows.win.webContents.getZoomFactor() || 1;
   return {
-    width: logical.width / Math.max(1, paneCells.cols) / zoom,
-    height: logical.height / Math.max(1, paneCells.rows) / zoom,
+    width: logical.width / Math.max(1, currentFrames().cells.cols) / zoom,
+    height: logical.height / Math.max(1, currentFrames().cells.rows) / zoom,
     columns: imeSlotCells,
   };
 }
 
-function broadcastCellMetrics(tab = win) {
-  if (!tab || tab.isDestroyed() || tab !== win) return;
+function broadcastCellMetrics(tab = soleWindows.win) {
+  if (!tab || tab.isDestroyed() || tab !== soleWindows.win) return;
   sendToTabFrames(tab, "tweb-cell-metrics", cellMetrics());
 }
 
@@ -2979,8 +3189,8 @@ function reparkTerminalCaret() {
 }
 
 function moveTerminalCaret(point) {
-  const vp = lastViewport;
-  if (!point || !vp || !win || win.isDestroyed()) {
+  const vp = currentFrames().viewport;
+  if (!point || !vp || !soleWindows.win || soleWindows.win.isDestroyed()) {
     // Unconditionally, not just when a caret was parked: a frame's cursor anchoring can
     // leave a visible cursor at the pane origin even when TWeb never put one there, and in
     // the corner that reads as a caret sitting in the wrong place.
@@ -2988,14 +3198,14 @@ function moveTerminalCaret(point) {
     return;
   }
   const logical = logicalContentSize(vp);
-  const zoom = win.webContents.getZoomFactor() || 1;
-  const cellWidth = logical.width / Math.max(1, paneCells.cols);
-  const cellHeight = logical.height / Math.max(1, paneCells.rows);
+  const zoom = soleWindows.win.webContents.getZoomFactor() || 1;
+  const cellWidth = logical.width / Math.max(1, currentFrames().cells.cols);
+  const cellHeight = logical.height / Math.max(1, currentFrames().cells.rows);
   // Nearest cell edge, not the containing cell: a bar on the left edge is off by
   // at most half a cell that way instead of a whole one.
-  const col = Math.min(paneCells.cols, Math.max(1, Math.round(point.x * zoom / cellWidth) + 1));
+  const col = Math.min(currentFrames().cells.cols, Math.max(1, Math.round(point.x * zoom / cellWidth) + 1));
   const baseline = (point.y + (point.height || 0) * CARET_BASELINE) * zoom;
-  const row = Math.min(paneCells.rows,
+  const row = Math.min(currentFrames().cells.rows,
     Math.max(1, Math.round(baseline / cellHeight - CARET_BASELINE) + 1));
   lastCaretPoint = { x: point.x, y: point.y, height: point.height || 0 };
   if (caretCell && caretCell.row === row && caretCell.col === col) return;
@@ -3082,7 +3292,7 @@ function configureDownloads() {
 function runBrowserContextMenuCommand(tab, action) {
   const state = contextMenuStateByTab.get(tab);
   contextMenuStateByTab.delete(tab);
-  if (!state || tab !== win || tab.isDestroyed()) return;
+  if (!state || tab !== soleWindows.win || tab.isDestroyed()) return;
   if (!state.actions.has(action)) return;
   const { params } = state;
   const contents = tab.webContents;
@@ -3128,7 +3338,7 @@ function runBrowserContextMenuCommand(tab, action) {
 }
 
 function showBrowserContextMenu(tab, inputParams) {
-  if (tab !== win || tab.isDestroyed()) return;
+  if (tab !== soleWindows.win || tab.isDestroyed()) return;
   const contents = tab.webContents;
   const params = {
     x: 0,
@@ -3208,16 +3418,16 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.on("paint", (_event, dirty, image) => {
     // A page painting on its own is what separates video from a static screen, and the
     // frame-rate policy reads it to decide whether to fall all the way to idle.
-    if (tab === win) notePaintActivity();
+    if (tab === soleWindows.win) notePaintActivity();
     const size = image.getSize();
-    const expected = lastViewport && renderedFrameSize(lastViewport);
-    if (loggedFrameGeneration !== viewportGeneration && !image.isEmpty()
+    const expected = currentFrames().viewport && renderedFrameSize(currentFrames().viewport);
+    if (loggedFrameGeneration !== currentFrames().generation && !image.isEmpty()
       && size.width === expected?.width && size.height === expected?.height) {
-      loggedFrameGeneration = viewportGeneration;
+      loggedFrameGeneration = currentFrames().generation;
       if (debugLogging) {
-        const vp = lastViewport || queryViewportSize();
+        const vp = currentFrames().viewport || queryViewportSize();
         console.error(
-          `tweb: frame generation=${viewportGeneration} ${size.width}x${size.height}, `
+          `tweb: frame generation=${currentFrames().generation} ${size.width}x${size.height}, `
           + `pane ${vp.width}x${vp.height}, scale ${renderScaleFactor().toFixed(2)}`
         );
       }
@@ -3286,7 +3496,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     contents.setZoomFactor(zoomFactor);
     contents.invalidate();
     // Autofocused fields report their caret before this zoom lands.
-    if (tab === win) {
+    if (tab === soleWindows.win) {
       broadcastCellMetrics(tab);
       reparkTerminalCaret();
     }
@@ -3337,35 +3547,35 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 }
 
 function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
-  if (tabs.includes(tab)) return tab;
+  if (soleWindows.tabs.includes(tab)) return tab;
   configureTab(tab, initialZoomFactor);
   tabSessionUrls.set(tab, url || "about:blank");
-  tabs.push(tab);
-  const index = tabs.length - 1;
+  soleWindows.tabs.push(tab);
+  const index = soleWindows.tabs.length - 1;
 
   tab.on("closed", () => {
-    const closedIndex = tabs.indexOf(tab);
+    const closedIndex = soleWindows.tabs.indexOf(tab);
     if (closedIndex < 0) return;
-    const wasActive = tab === win;
+    const wasActive = tab === soleWindows.win;
     tabFrames.delete(tab);
     tabZoomFactors.delete(tab);
     tabSessionUrls.delete(tab);
     tabRendererRecoveries.delete(tab);
-    tabs.splice(closedIndex, 1);
-    if (tabs.length === 0) {
-      win = null;
-      activeTabIndex = -1;
+    soleWindows.tabs.splice(closedIndex, 1);
+    if (soleWindows.tabs.length === 0) {
+      soleWindows.win = null;
+      soleWindows.activeTabIndex = -1;
       if (!quitting) app.quit();
       return;
     }
-    if (wasActive) activateTab(Math.min(closedIndex, tabs.length - 1));
+    if (wasActive) activateTab(Math.min(closedIndex, soleWindows.tabs.length - 1));
     else {
-      if (closedIndex < activeTabIndex) activeTabIndex -= 1;
+      if (closedIndex < soleWindows.activeTabIndex) soleWindows.activeTabIndex -= 1;
       sendTabState();
     }
     if (refreshTabListAfterClose) {
       refreshTabListAfterClose = false;
-      sendToTabFrames(win, "tweb-tabs", tabListModel());
+      sendToTabFrames(soleWindows.win, "tweb-soleWindows.tabs", tabListModel());
     }
     scheduleWindowSessionSave();
   });
@@ -3389,7 +3599,7 @@ function createTab(
   url = "about:blank",
   activate = true,
   initialZoomFactor = defaultZoomFactor,
-  showInitialPlaceholder = tabs.length === 0
+  showInitialPlaceholder = soleWindows.tabs.length === 0
 ) {
   const tab = adoptTab(
     new BrowserWindow(browserWindowOptions()),
@@ -3448,69 +3658,63 @@ flex-direction:column;gap:8px">
 <div>No previous page to restore</div><div style="color:#6f747c">Press t to enter an address</div></body>`)}`;
 }
 
-function applyViewport(vp, origin = tmuxOrigin) {
+function applyViewport(vp, origin = currentFrames().origin, frames = currentFrames(), record = currentPane()) {
   if (!vp) return;
-  const previous = lastViewport;
-  const viewportChanged = !lastViewport ||
-    lastViewport.cols !== vp.cols || lastViewport.rows !== vp.rows ||
-    lastViewport.width !== vp.width || lastViewport.height !== vp.height;
-  const originChanged = origin?.left !== tmuxOrigin?.left || origin?.top !== tmuxOrigin?.top;
-  if (!viewportChanged && !originChanged) return;
+  // What changed, and whether anything did, is decided in `frame-context.cjs` — including the
+  // generation bump, which is the thing every drop below keys on.
+  const change = applyFrameViewport(frames, vp, origin);
+  if (!change) return;
 
-  viewportGeneration += 1;
   mouseClicks.reset();
-  if (pendingFrameTimer) {
-    clearTimeout(pendingFrameTimer);
-    pendingFrameTimer = null;
+  if (frames.pendingFrameTimer) {
+    clearTimeout(frames.pendingFrameTimer);
+    frames.pendingFrameTimer = null;
   }
-  pendingFrame = null;
-  pendingGfxFrame = null;
+  frames.pendingFrame = null;
+  frames.pendingGfxFrame = null;
   tabFrames.clear();
   // A patch is positioned in cells of the pane it was cut for. Once the grid changes it
   // describes the wrong region, and unlike the base image it cannot be re-placed into the
   // new one — so it goes now rather than waiting for the next whole frame.
-  deletePatches();
+  deletePatches(frames);
   // A moved pane leaves a placement at the old anchor, and a shrunk one leaves
   // the rows it gave up still covered — usually hiding the pane that just
   // appeared there. Neither is fixed by replacement, so both need a delete;
   // growing is, so it gets none. The delete rides along with the next transfer.
-  const shrank = previous && (vp.cols < previous.cols || vp.rows < previous.rows);
-  if (originChanged || shrank) pendingImageDelete = true;
-  tmuxOrigin = origin;
-  paneCells = { cols: vp.cols, rows: vp.rows };
-  lastViewport = vp;
-  // The record is what a host reads back; `lastViewport`/`tmuxOrigin` stay because the rest of
-  // this file reads them on every frame and hop through the record would buy nothing here.
-  solePane.viewport = vp;
-  solePane.origin = origin;
+  if (change.originChanged || change.shrank) frames.pendingImageDelete = true;
+  // The record is what a host reads back; the context is what this file reads on every frame.
+  record.viewport = vp;
+  record.origin = frames.origin;
   const logical = logicalContentSize(vp);
   if (debugLogging) {
-    const anchor = tmuxOrigin ? `${tmuxOrigin.left},${tmuxOrigin.top}` : "none";
+    const anchor = frames.origin ? `${frames.origin.left},${frames.origin.top}` : "none";
     console.error(
-      `tweb: resize generation=${viewportGeneration} cells=${vp.cols}x${vp.rows} `
+      `tweb: resize generation=${frames.generation} cells=${vp.cols}x${vp.rows} `
       + `pixels=${vp.width}x${vp.height} logical=${logical.width}x${logical.height} origin=${anchor}`
     );
   }
-  if (viewportChanged) {
+  if (change.sizeChanged) {
     // Through the same policy as everything else: resizing every tab to the new pane
     // size unconditionally would re-inflate the collapsed surface of every background
     // tab, and nothing would collapse them again until the next tab switch. A pane
     // resize is exactly when a hidden pane is most likely to be resized.
-    for (const tab of tabs) {
+    for (const tab of soleWindows.tabs) {
       if (tab.isDestroyed()) continue;
-      applySurfacePlan(tab, surfacePlan(tab === win, solePane.visible, logical, surfaceHeldForAgent()));
+      applySurfacePlan(tab, surfacePlan(tab === soleWindows.win, record.visible, logical, surfaceHeldForAgent()));
     }
   }
-  win?.webContents.invalidate();
-  if (solePane.visible) replacePlacement();
+  soleWindows.win?.webContents.invalidate();
+  if (record.visible) replacePlacement(frames);
   broadcastCellMetrics();
   reparkTerminalCaret();
 }
 
-function createWindow(url) {
-  const vp = queryViewportSize();
-  paneCells = { cols: vp.cols, rows: vp.rows };
-  lastViewport = vp;
+function createWindow(url, frames = currentFrames()) {
+  // A hosted pane's geometry came in its ATTACH; a per-pane engine measures its own terminal.
+  // Querying the terminal under hosting would measure the DAEMON's, which has no pane.
+  const vp = frames.viewport || queryViewportSize();
+  frames.cells = { cols: vp.cols, rows: vp.rows };
+  frames.viewport = vp;
 
   const session = readWindowSession();
   if (!session) {
@@ -3527,7 +3731,7 @@ function createWindow(url) {
   if (debugLogging) {
     console.error(`tweb: restored ${session.tabs.length} tabs for tmux window`);
   }
-  return win;
+  return soleWindows.win;
 }
 
 // --- browser input ---
@@ -3557,9 +3761,9 @@ function mouseModifiers(cb) {
 }
 
 function logicalMousePoint(rawX, rawY) {
-  const vp = lastViewport || queryViewportSize();
+  const vp = currentFrames().viewport || queryViewportSize();
   const logical = logicalContentSize(vp);
-  if (process.env.TMUX) {
+  if (paneIsInTmux()) {
     // tmux delivers pane-relative cell coordinates even when 1016 was requested.
     return {
       x: Math.min(logical.width - 1, Math.max(0, Math.floor((rawX - 0.5) * logical.width / vp.cols))),
@@ -3574,15 +3778,15 @@ function logicalMousePoint(rawX, rawY) {
 }
 
 function setBrowserZoom(action) {
-  if (!win) return;
-  const contents = win.webContents;
+  if (!soleWindows.win) return;
+  const contents = soleWindows.win.webContents;
   // Chromium keeps zoom per origin, so getZoomFactor() reports whatever another
   // tab on the same host last set. Step from this tab's own remembered value.
-  const current = tabZoomFactors.get(win) ?? contents.getZoomFactor();
+  const current = tabZoomFactors.get(soleWindows.win) ?? contents.getZoomFactor();
   const next = action === "reset"
     ? defaultZoomFactor
     : Math.min(2, Math.max(0.5, current * (action === "in" ? 1.2 : 1 / 1.2)));
-  tabZoomFactors.set(win, next);
+  tabZoomFactors.set(soleWindows.win, next);
   contents.setZoomFactor(next);
   contents.invalidate();
   broadcastCellMetrics();
@@ -3597,8 +3801,8 @@ function hasZoomModifier(modifiers) {
 }
 
 function dispatchMouse(cb, rawX, rawY, release) {
-  if (!win) return;
-  const contents = win.webContents;
+  if (!soleWindows.win) return;
+  const contents = soleWindows.win.webContents;
   const { x, y } = logicalMousePoint(rawX, rawY);
   const modifiers = mouseModifiers(cb);
   const buttonCode = cb & 3;
@@ -3717,7 +3921,7 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
 }
 
 function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints = []) {
-  if (!win || !key) return;
+  if (!soleWindows.win || !key) return;
   const modifiers = electronModifiers(modifierMask);
   const pressed = eventKind !== 3;
   const control = modifiers.includes("control");
@@ -3734,7 +3938,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   }
 
   if (modifiers.includes("meta") && key.toLowerCase() === "a") {
-    if (pressed) sendToTabFrames(win, "tweb-select-all");
+    if (pressed) sendToTabFrames(soleWindows.win, "tweb-select-all");
     return;
   }
 
@@ -3744,7 +3948,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // terminal selection instead, which is why these need a passthrough entry.
   if (modifiers.includes("meta") && ["c", "v", "x"].includes(key.toLowerCase())) {
     if (pressed) {
-      const contents = win.webContents;
+      const contents = soleWindows.win.webContents;
       if (key.toLowerCase() === "c") contents.copy();
       else if (key.toLowerCase() === "v") contents.paste();
       else contents.cut();
@@ -3792,10 +3996,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // the web app's own shortcut, and those are exactly the handlers that check
   // isTrusted.
   if (!vimiumShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
-    dispatchNativeKey(win.webContents, key, text, modifiers, eventKind);
+    dispatchNativeKey(soleWindows.win.webContents, key, text, modifiers, eventKind);
     return;
   }
-  sendToFocusedTabFrame(win, "tweb-terminal-key", {
+  sendToFocusedTabFrame(soleWindows.win, "tweb-terminal-key", {
     key,
     code: "",
     event: eventKind === 3 ? "keyup" : "keydown",
@@ -3841,8 +4045,8 @@ function dispatchControlByte(byte, extraModifierBits = 0) {
 // formatting and attachments, which insertText cannot deliver. Terminals commonly
 // turn \n into \r on paste, so both sides are normalized before comparing.
 function dispatchPaste(text) {
-  if (!win || !text) return;
-  const contents = win.webContents;
+  if (!soleWindows.win || !text) return;
+  const contents = soleWindows.win.webContents;
   const normalize = (value) => value.replace(/\r\n?/g, "\n");
   const body = normalize(text);
   const fromClipboard = normalize(clipboard.readText()) === body;
@@ -4089,6 +4293,143 @@ function consumeRawInput() {
 
 // --- resize/input control channel ---
 // tweb-pane forwards SIGWINCH and raw terminal input over this pipe.
+
+// What an ATTACH does when there is no page host behind it.
+//
+// The choice here is the whole subject of this seam, so it is written out. A host that RECORDED
+// the pane — registered it, allocated its writer, handed back an agent socket — and did not open
+// a window would be worse than one that refuses: the supervisor would count the attach as
+// accepted, the frontend would stop falling back, and the pane would sit blank forever with
+// every check green. That state was produced once and observed exactly that way.
+//
+// So this refuses, loudly and without recording anything. `hostProtocolVersion()` is null, the
+// engine never printed READY, and a supervisor that never got a handshake is not sending real
+// attaches anyway — this exists so that if one ever arrives, the answer is a diagnostic rather
+// than a half-built registration.
+function handleAttach(command) {
+  if (!hostedRuntime) {
+    // A per-pane engine already serves the pane it was started for. Accepting an attach would
+    // give it a second registration it has no window for.
+    console.error(`tweb: ignoring ATTACH for ${command.paneId}: this engine is not a host`);
+    return;
+  }
+  if (!command.paneId) return;
+
+  // The image id is the caller's, and a base that treads on a live pane's pool is refused rather
+  // than used. An overlap does not fail loudly — it puts one pane's frame in another pane's
+  // rectangle — and a pane that never appears is a better failure than two panes corrupting each
+  // other, because the frontend still has its own engine to fall back to.
+  const collision = collidingImageRange(paneRegistry.list(), command.imageId);
+  if (collision) {
+    console.error(`tweb: refusing ATTACH for ${command.paneId}: image id ${command.imageId}`
+      + ` overlaps ${collision.paneId} (${collision.imageId})`);
+    return;
+  }
+
+  // ONE pane per host, refused explicitly rather than half-accepted.
+  //
+  // The state a pane owns is per-pane throughout: the registry keys it, `frame-context.cjs` holds
+  // the frame pipeline, `pane-windows.cjs` holds the window/tab/rate/surface state, and each has
+  // a test asserting two panes share nothing. What is NOT yet per-pane is the window and tab
+  // plumbing that builds on them — `createTab`, `activateTab`, the tab-keyed maps and the input
+  // dispatch still reach for the sole window context — so a second attach would be recorded and
+  // would then draw into the first pane's window.
+  //
+  // Refusing is the only honest answer to that. A records-only accept is the one unacceptable
+  // outcome of this work: the supervisor counts the attach, the frontend stops falling back, and
+  // the pane sits blank with every check green. A refusal keeps that frontend's own engine, which
+  // is a working browser.
+  if (paneRegistry.size > 0) {
+    console.error(`tweb: refusing ATTACH for ${command.paneId}: this host serves one pane`);
+    return;
+  }
+  if (!hostReady) {
+    console.error(`tweb: refusing ATTACH for ${command.paneId}: the host is not started yet`);
+    return;
+  }
+
+  let record;
+  try {
+    record = createPaneRecord({
+      tmuxServer: command.tmuxServer,
+      paneId: command.paneId,
+      generation: command.generation,
+      tty: command.tty,
+      imageId: command.imageId,
+      viewport: command.viewport,
+      origin: command.origin ?? null,
+      // A pane starts hidden and is revealed by its frontend's VIS push. Assuming visible would
+      // have it paint into a pane nobody is looking at — and with tmux `allow-passthrough=all`,
+      // into whatever window the client IS looking at.
+      visible: false,
+    });
+  } catch (error) {
+    console.error(`tweb: refusing ATTACH for ${command.paneId}: ${error.message}`);
+    return;
+  }
+
+  const { superseded } = paneRegistry.attach(record);
+  if (superseded) closePane(superseded, "superseded");
+
+  const frames = createFrameContext(record, { frameRate: command.frameRate });
+  frameContexts.set(record.key, frames);
+  if (command.viewport) applyFrameViewport(frames, command.viewport, command.origin);
+
+  // The socket is named after the PANE. A daemon-started engine's own `TMUX_PANE` is the
+  // daemon's — measured claiming `agent-%304.sock`, a name in an unrelated pane's namespace.
+  const server = startAgentServer({
+    paneId: record.paneId,
+    dispatch: handleAgentCommand,
+    log: (message) => {
+      if (debugLogging) console.error(`tweb: ${message}`);
+    },
+  });
+  record.agentSocketPath = server.path;
+  paneAgentServers.set(record.key, server);
+  writeProtocolLine(formatOutbound("AGENT", record.paneId, server.path));
+
+  const url = normalizeUrl(command.url || "https://example.com");
+  // Everything below this line is the shipping path, run for the attached pane: the same
+  // `applyViewport`, the same `createWindow`, the same input and agent handling. It reaches the
+  // right pane because every one of them takes the record and the frame context, which is what
+  // the extraction was for. What it does NOT yet do is run twice — see the refusal above.
+  if (command.viewport) applyViewport(command.viewport, command.origin ?? null, frames, record);
+  createWindow(url, frames);
+  markInteractionActivity();
+
+  console.error(`tweb: hosting ${record.paneId} generation=${record.generation}`
+    + ` image=${record.imageId} tty=${record.tty || "-"} url=${url}`);
+}
+
+/** Tears a pane down: its window, its writer, its socket and its image on the terminal. */
+function closePane(record, reason) {
+  const frames = frameContexts.get(record.key);
+  if (frames) {
+    try {
+      terminalCleanup(record);
+    } catch (error) {
+      void error;
+    }
+    frameContexts.delete(record.key);
+  }
+  const server = paneAgentServers.get(record.key);
+  if (server) {
+    server.close();
+    paneAgentServers.delete(record.key);
+  }
+  const writer = paneWriters.get(record.key);
+  if (writer) {
+    void writer.close();
+    paneWriters.delete(record.key);
+  }
+  paneRegistry.detach(record.key);
+  // Before the registry forgets it, since the id is how its files are named. A host serving
+  // panes for hours would otherwise accumulate the frames of every pane it has ever served —
+  // up to 20MB each, and the startup sweep only collects files whose *engine* is gone.
+  cleanupPaneFrameFiles(record);
+  if (debugLogging) console.error(`tweb: closed ${record.paneId}: ${reason}`);
+}
+
 let controlBuffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -4104,16 +4445,34 @@ process.stdin.on("data", (chunk) => {
     // always meant by it — so a frontend that never learns the `@%N` prefix keeps working.
     const command = parseControlLine(line);
     if (!command) continue;
+
+    // ATTACH is dispatched before resolution, because resolution is what it *creates*: the pane
+    // it names is by definition not registered yet, so `resolveTarget` answers null for it and
+    // the line would be dropped in silence. Left below the guard — which is where it sat — a
+    // perfectly well-formed attach did nothing at all, with no error and no log.
+    if (command.kind === "attach") {
+      handleAttach(command);
+      continue;
+    }
+
     // A line addressed to a pane this runtime does not hold is dropped rather than applied to
     // whichever pane happened to be first. With one registration the sole pane always resolves.
     const target = resolveTarget(command, paneRegistry, tmuxServerIdentity);
     if (!target) continue;
 
+    // A detach carrying a stale generation is a message from a pane that has already been
+    // replaced, and `resolveTarget` has already turned that into a miss rather than delivering
+    // it to the successor.
+    if (command.kind === "detach") {
+      closePane(target, "detached");
+      continue;
+    }
+
     if (command.kind === "resize") {
       markInteractionActivity();
       // An absent origin means "leave the anchor where it is". Normalising it to 0,0 would
       // re-anchor the pane at the window's top-left, i.e. draw it over its neighbours.
-      applyViewport(command.viewport, command.origin === undefined ? tmuxOrigin : command.origin);
+      applyViewport(command.viewport, command.origin === undefined ? currentFrames().origin : command.origin);
       continue;
     }
 
@@ -4151,21 +4510,48 @@ app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
 
 app.whenReady().then(() => {
   if (process.platform === "darwin") app.dock?.hide();
+  // A supervisor started this process to host panes, and this build cannot yet. Say so and
+  // stop, rather than doing what a per-pane engine would do next.
+  //
+  // What a per-pane engine does next is the failure mode, not a harmless one: it would open its
+  // own default page and paint it — into stdout, which here is the supervisor's control pipe
+  // rather than any terminal. The requesting pane stays blank while megabytes of graphics go
+  // into a line parser. The supervisor kills an engine that has not declared itself within
+  // READY_TIMEOUT and every frontend falls back to spawning its own engine, which works; this
+  // exits first so nothing is painted anywhere in the meantime.
+  //
+  // TWEB_HOST_PREVIEW is how the page host is exercised before the gate opens. It runs the hosted
+  // path for real — attach, per-pane record, per-pane writer, frames out as addressed events —
+  // WITHOUT declaring the protocol, so `twebd` still refuses and every frontend still falls back.
+  // The harness in `bench/t1-host-harness.py` sets it; nothing else does, so no shipping path can
+  // reach the host until `hostProtocolVersion()` stops returning null.
+  const hostPreview = process.env.TWEB_HOST_PREVIEW === "1";
+  if (hostedRuntime && hostProtocolVersion() === null && !hostPreview) {
+    console.error("tweb: started as a pane host, but this build has no page host — exiting so"
+      + " the supervisor falls back to per-pane engines");
+    app.quit();
+    return;
+  }
   configureDownloads();
   // A backstop, not the mechanism: `browser-window-created` above and the per-tab
   // show/focus/move listeners in `configureTab` are what actually keep a window hidden.
   // This caught anything they missed, twenty times a second, forever — a second is plenty
   // for a safety net whose job is to correct a window nobody can see anyway.
-  // Nothing in the OS ties this process to the frontend that spawned it: a frontend killed
-  // with SIGKILL, or one that crashes, cannot send the SIGTERM that normally stops us. The
+  // Nothing in the OS ties this process to whoever owns it: a frontend killed with SIGKILL,
+  // or a supervisor that crashes, cannot send the SIGTERM that normally stops us. The
   // engine then keeps painting into a pane that has moved on — observed drawing a stale page
   // over two other panes for four hours. Quitting through the normal path is what matters
   // here, because that is what deletes the image from the terminal.
+  //
+  // The owner is resolved once rather than per tick: it cannot change over this process's
+  // life, and re-reading it every second only invites the reading to differ from the one the
+  // rest of startup used.
+  const ownerPid = watchedPid(process.env);
   orphanWatchdog = setInterval(() => {
-    if (!isOrphaned(process.env.TWEB_FRONTEND_PID, process.ppid)) return;
+    if (!isOrphaned(ownerPid, process.ppid)) return;
     clearInterval(orphanWatchdog);
     orphanWatchdog = null;
-    console.error("tweb: frontend is gone, quitting");
+    console.error("tweb: owner is gone, quitting");
     app.quit();
   }, 1000);
   orphanWatchdog.unref();
@@ -4180,6 +4566,19 @@ app.whenReady().then(() => {
     || "https://example.com";
   const currentUrl = normalizeUrl(rawUrl);
 
+  compactHistory();
+  sweepAbandonedFrameFiles();
+
+  // A host has no pane at startup and must not act as though it does: no terminal setup (there is
+  // no terminal), no window (there is no url or geometry yet), no visibility poll (the pane it
+  // would poll is the daemon's) and no agent socket (a socket named after this process is a name
+  // in some other pane's namespace). Everything arrives with the first ATTACH.
+  if (hostedRuntime) {
+    hostReady = true;
+    console.error("tweb: pane host waiting for attach");
+    return;
+  }
+
   terminalSetup();
   if (restoreWindowSession) {
     initializeTmuxVisibility();
@@ -4189,14 +4588,19 @@ app.whenReady().then(() => {
     setImmediate(initializeTmuxVisibility);
   }
   markInteractionActivity();
-  compactHistory();
-  sweepAbandonedFrameFiles();
   agentServer = startAgentServer({
+    // The pane, not the process. `solePaneId` is this pane's registered identity — the same
+    // `%3` on a tmux pane and `pid-<pid>` on a bare terminal that the socket was named after
+    // before, so the shipping path's socket name is unchanged. What changes is where it comes
+    // from: a host resolves the record first and names each pane's socket after that pane.
+    paneId: currentPane().paneId,
+    socketOverride: process.env.TWEB_AGENT_SOCKET || null,
     dispatch: handleAgentCommand,
     log: (message) => {
       if (debugLogging) console.error(`tweb: ${message}`);
     },
   });
+  currentPane().agentSocketPath = agentServer.path;
   // Chromium startup may reset the terminal modified-key mode after the Rust
   // frontend enabled it. Re-declare it from the PTY-owning parent once startup
   // has settled.
@@ -4212,9 +4616,14 @@ app.whenReady().then(() => {
     + ` · zoom ${Math.round(defaultZoomFactor * 100)}%`);
 });
 
-function cleanupFrameFiles() {
-  const paths = [frameFilePath, `${frameFilePath}.tmp`,
-    rawFrameFilePath, `${rawFrameFilePath}.tmp`];
+// The frame files one pane owns. The naming rule lives in pane-registry.cjs beside the id
+// layout it derives from; this only joins it to the userData directory.
+function paneFrameFiles(imageId) {
+  return paneFrameFileNames(process.pid, imageId)
+    .map((name) => path.join(app.getPath("userData"), name));
+}
+
+function removeFrameFiles(paths) {
   for (const filePath of paths) {
     try { unlinkSync(filePath); } catch (error) {
       if (error.code !== "ENOENT" && debugLogging) {
@@ -4222,6 +4631,23 @@ function cleanupFrameFiles() {
       }
     }
   }
+}
+
+// A detaching pane drops its files now rather than at process exit: a host that serves panes
+// for hours would otherwise hold the frames of every pane it has ever served.
+function cleanupPaneFrameFiles(record) {
+  const imageId = Number(record?.imageId);
+  if (!Number.isSafeInteger(imageId)) return;
+  removeFrameFiles(paneFrameFiles(imageId));
+}
+
+function cleanupFrameFiles() {
+  const panes = paneRegistry.list();
+  const ids = new Set(panes.map((record) => Number(record.imageId)).filter(Number.isSafeInteger));
+  // `solePane` is not in the registry on the hosted path and is on the default one, so it is
+  // added by id: a set means naming it twice costs nothing and forgetting it would leak.
+  if (Number.isSafeInteger(Number(solePane?.imageId))) ids.add(Number(solePane.imageId));
+  removeFrameFiles([...ids].flatMap(paneFrameFiles));
 }
 
 // The above only removes this engine's own files, and only if it reaches its exit path. An
@@ -4282,18 +4708,18 @@ app.on("before-quit", () => {
   writeWindowSession();
   quitting = true;
   mouseClicks.reset();
-  if (pendingFrameTimer) {
-    clearTimeout(pendingFrameTimer);
-    pendingFrameTimer = null;
-    pendingFrame = null;
+  if (currentFrames().pendingFrameTimer) {
+    clearTimeout(currentFrames().pendingFrameTimer);
+    currentFrames().pendingFrameTimer = null;
+    currentFrames().pendingFrame = null;
   }
-  pendingGfxFrame = null;
+  currentFrames().pendingGfxFrame = null;
   void gfxWorker.terminate();
   cleanupFrameFiles();
-  if (debugLogging && droppedGfxFrames > 0) {
-    console.error(`tweb: dropped ${droppedGfxFrames} superseded graphics frames`);
+  if (debugLogging && currentFrames().droppedGfxFrames > 0) {
+    console.error(`tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
   }
-  for (const tab of tabs) {
+  for (const tab of soleWindows.tabs) {
     if (!tab.isDestroyed()) tab.webContents.stopPainting();
   }
   restoreTmuxPassthroughClients();

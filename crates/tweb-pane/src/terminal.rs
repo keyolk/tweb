@@ -291,18 +291,32 @@ impl InputModeGuard {
     }
 }
 
+/// The sequence tmux tracks as a pane's modified-key mode.
+///
+/// Named rather than inlined because two paths emit it: the signal handler below on the spawn
+/// path, and the hosted path, which must put it through the pane's serialising writer rather than
+/// straight at stdout. Both must send exactly these bytes and nothing else — mixing a Kitty reset
+/// into the same write can make some tmux parser paths treat the trailing sequence as VT10x input
+/// too.
+pub const TRACKED_KEYBOARD_MODE: &[u8] = b"\x1b[>4;2m";
+
+/// Whether this pane is in a terminal where the mode is tracked at all.
+///
+/// Outside tmux there is nothing tracking a per-pane mode, so re-declaring is a no-op with a
+/// stray escape sequence attached.
+pub fn keyboard_mode_is_tracked() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
 /// Re-declares the modified-key mode tmux tracks on the PTY stdout.
 /// Used when an auxiliary window such as the native DevTools reset the terminal modes.
 pub fn restore_tracked_keyboard_mode() {
-    if std::env::var_os("TMUX").is_none() {
+    if !keyboard_mode_is_tracked() {
         return;
     }
     let stdout = io::stdout();
     let mut lock = stdout.lock();
-    // Emit only the sequence tmux tracks as a pane mode, on its own. Mixing a Kitty reset
-    // into the same write can make some tmux parser paths treat the trailing sequence as
-    // VT10x input too.
-    let _ = lock.write_all(b"\x1b[>4;2m");
+    let _ = lock.write_all(TRACKED_KEYBOARD_MODE);
     let _ = lock.flush();
 }
 

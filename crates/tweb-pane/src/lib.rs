@@ -15,6 +15,7 @@ pub mod display;
 mod engine_app;
 pub mod graphics;
 pub mod hosted;
+pub mod image_id;
 pub mod input;
 pub mod pane_writer;
 pub mod resize;
@@ -320,8 +321,18 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     // Spawn the engine process. stdin is the resize/raw input control channel, and
     // stdout is inherited so the engine writes Kitty graphics to the terminal itself.
     let initial_geometry = terminal::window_geometry();
-    // Kitty image IDs live in a terminal-wide namespace, so each pane process needs its own.
-    let image_id = std::process::id();
+    // Kitty image ids live in a terminal-wide namespace and a pane owns a whole range of it, so
+    // this is allocated from the pane's *identity* rather than from this process. It used to be
+    // `std::process::id()`: pids are consecutive, so two frontends at 30005 and 30007 put the
+    // second one's base image inside the first one's patch pool, and one pane's damage patch then
+    // overwrote the other pane's page. See `image_id`.
+    let image_id = image_id::base_for(
+        twebd::tmux::server_identity_from(std::env::var("TMUX").ok().as_deref())
+            .as_deref()
+            .unwrap_or_default(),
+        &pane,
+        std::process::id(),
+    );
 
     // The daemon path, off unless asked for. Every uncertainty inside this call falls through to
     // the spawn below, which is the path that ships — so a pane that opted in and found no daemon,
@@ -535,6 +546,48 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     Ok(())
 }
 
+/// The geometry a `host` request carries.
+///
+/// A pane that has not been measured yet sends zeroes and no origin rather than a made-up size:
+/// the engine's rule for an unmeasured origin is "leave the anchor alone", which is not what an
+/// origin of `(0, 0)` means — that is the window's top-left, and anchoring there would jump the
+/// pane to the corner for one frame on every cold start.
+fn host_geometry(measured: Option<terminal::WindowGeometry>) -> twebd::protocol::PaneGeometry {
+    match measured {
+        Some(geometry) => twebd::protocol::PaneGeometry {
+            cols: geometry.size.cols,
+            rows: geometry.size.rows,
+            width: u32::from(geometry.size.width),
+            height: u32::from(geometry.size.height),
+            origin: geometry.origin,
+        },
+        None => twebd::protocol::PaneGeometry {
+            cols: 0,
+            rows: 0,
+            width: 0,
+            height: 0,
+            origin: None,
+        },
+    }
+}
+
+/// This pane's tty, for the daemon's diagnostics.
+///
+/// Deliberately *not* a write target: frames come back over the connection and are written by this
+/// process, which is already the sole writer of this pty. An engine that opened this path would be
+/// a second writing process, and no in-process writer can serialise across that.
+fn pane_tty() -> Option<String> {
+    // A tty this process cannot name is not a fault: it only costs the daemon a diagnostic.
+    let path = unsafe { libc::ttyname(0) };
+    if path.is_null() {
+        return None;
+    }
+    unsafe { std::ffi::CStr::from_ptr(path) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
+}
+
 /// What a hosted attempt produced.
 enum HostedOutcome {
     /// The pane ran hosted and has ended. The caller returns.
@@ -584,6 +637,11 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
         frame_rate: options.frame_rate,
         adaptive_frame_rate: options.adaptive_frame_rate,
         restore_session: options.restore_session,
+        // Measured here, not by the engine: a hosted engine's own `$TMUX_PANE` is the daemon's
+        // pane, so it cannot measure any of the N it serves. Sending it with the open is what
+        // keeps the first frame from being painted at a default size and then corrected.
+        geometry: host_geometry(terminal::window_geometry()),
+        tty: pane_tty(),
         engine_executable: executable.display().to_string(),
         engine_app_dir: app_dir.display().to_string(),
     };
@@ -872,10 +930,51 @@ fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_geometry_message, matching_client_ttys, raw_kitty_delete, resolve_electron_paths,
-        tmux_passthrough, PATCH_ID_COUNT,
+        changed_geometry_message, host_geometry, matching_client_ttys, raw_kitty_delete,
+        resolve_electron_paths, tmux_passthrough, PATCH_ID_COUNT,
     };
     use crate::terminal::{WindowGeometry, WindowSize};
+
+    // A pane that has not been measured must not claim a size, and above all must not claim an
+    // origin: `(0, 0)` is the window's top-left, so sending it would anchor the pane in the corner
+    // for one frame on every cold start. "Not measured" and "at the origin" are different facts.
+    #[test]
+    fn an_unmeasured_pane_sends_no_geometry_rather_than_a_made_up_one() {
+        let unmeasured = host_geometry(None);
+        assert_eq!(unmeasured.cols, 0);
+        assert_eq!(unmeasured.rows, 0);
+        assert_eq!(unmeasured.origin, None);
+
+        let measured = host_geometry(Some(WindowGeometry {
+            size: WindowSize {
+                cols: 80,
+                rows: 24,
+                width: 800,
+                height: 480,
+            },
+            origin: Some((20, 3)),
+        }));
+        assert_eq!(measured.cols, 80);
+        assert_eq!(measured.width, 800);
+        assert_eq!(measured.origin, Some((20, 3)));
+    }
+
+    // A measured size with an unmeasured placement is the ordinary first tick: the size comes from
+    // an ioctl and the origin from a tmux query that may not have answered yet.
+    #[test]
+    fn a_measured_size_can_still_have_an_unmeasured_origin() {
+        let geometry = host_geometry(Some(WindowGeometry {
+            size: WindowSize {
+                cols: 80,
+                rows: 24,
+                width: 800,
+                height: 480,
+            },
+            origin: None,
+        }));
+        assert_eq!(geometry.rows, 24);
+        assert_eq!(geometry.origin, None);
+    }
 
     // The engine reserves `PATCH_ID_COUNT` ids after the base for damage patches. The
     // frontend deletes on paths the engine cannot reach, so it has to know about them too —

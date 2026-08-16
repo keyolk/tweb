@@ -23,6 +23,89 @@
 
 const { paneKey } = require("./pane-identity.cjs");
 
+// How many damage-patch ids a pane owns beside its base image.
+//
+// A small fixed pool, cycled: a patch id only has to outlive the frame it patches, and the
+// terminal took 64 in a row without complaint. It lives here rather than beside the frame path
+// because it is a property of the *id layout* — how much room one pane occupies in a namespace
+// shared with every other pane — and the allocator on the other side of the attach has to agree
+// with it exactly.
+const PATCH_ID_COUNT = 8;
+
+// The distance between two panes' bases, if their ranges are not to overlap.
+//
+// The Kitty image id namespace is TERMINAL-WIDE. It is shared not only between the panes of one
+// host but with every per-pane engine still running beside it, and an overlap does not fail
+// loudly — one pane's whole frame simply appears in another pane, or a patch id frees an image
+// a different pane is still placing. Anything that hands out bases must space them by at least
+// this much.
+const IMAGE_ID_STRIDE = PATCH_ID_COUNT + 1;
+
+/**
+ * The image ids a pane owns, derived from its record and from nothing else.
+ *
+ * Never from the engine's process identity: one process hosting N panes has one pid and N panes,
+ * so a pid-derived id would give every pane the same one. The base arrives over the attach from
+ * the caller that already has a collision-free scheme.
+ */
+function paneImageIds(record) {
+  const base = Number(record.imageId);
+  const patchBase = base + 1;
+  return {
+    base,
+    patchBase,
+    patchIds: Array.from({ length: PATCH_ID_COUNT }, (_, slot) => patchBase + slot),
+    // Exclusive, so `last + 1` is the first id another pane may legally start at.
+    end: base + IMAGE_ID_STRIDE,
+  };
+}
+
+/**
+ * The frame file names one pane owns: both formats, and the staging name of each.
+ *
+ * Names rather than paths, so the rule stays testable without a userData directory — the caller
+ * joins them. The shape is a contract with `orphan-watch.cjs`'s FRAME_FILE_PATTERN, which is how
+ * a *killed* engine's files stay collectable at the next startup; this function is what a *live*
+ * engine uses to drop its own, either when a pane detaches or on the way out.
+ *
+ * Per pane rather than per process because one engine can serve N. Two module-level constants
+ * were right when a process was a pane, and became a ReferenceError the moment the paths went
+ * per-pane — thrown from an exit handler, so it took the whole cleanup down with it and every
+ * clean exit leaked its frames until the next sweep.
+ *
+ * @param {number} pid the engine that wrote them
+ * @param {number} imageId the pane's base image id
+ * @returns {string[]} file names, empty when either id is unusable
+ */
+function paneFrameFileNames(pid, imageId) {
+  const owner = Number(pid);
+  const base = Number(imageId);
+  // Positive, not merely an integer: `Number(null)` is 0, which would name a real file that no
+  // pane owns — and `createPaneRecord` refuses an id of 0 for the same reason.
+  if (!Number.isSafeInteger(owner) || owner <= 0) return [];
+  if (!Number.isSafeInteger(base) || base <= 0) return [];
+  return ["rgba", "png"].flatMap((extension) => {
+    const name = `tweb-frame-${owner}-${base}.${extension}`;
+    return [name, `${name}.tmp`];
+  });
+}
+
+/**
+ * The already-registered pane whose image ids a candidate base would tread on, if any.
+ *
+ * Checked rather than assumed because the consequence of an overlap is invisible: no error, just
+ * one pane's image appearing in another pane's rectangle. A caller that finds a collision should
+ * refuse the attach — a pane that never appears is a better failure than two panes corrupting
+ * each other, and the frontend still has its own engine to fall back to.
+ */
+function collidingImageRange(records, candidateImageId) {
+  const candidate = paneImageIds({ imageId: candidateImageId });
+  return records.find((record) => {
+    const owned = paneImageIds(record);
+    return candidate.base < owned.end && owned.base < candidate.end;
+  }) || null;
+}
+
 function sameViewport(left, right) {
   if (!left || !right) return false;
   return left.cols === right.cols && left.rows === right.rows
@@ -260,4 +343,9 @@ module.exports = {
   applySurface,
   applyAudio,
   audioOwnerAmong,
+  paneImageIds,
+  paneFrameFileNames,
+  collidingImageRange,
+  PATCH_ID_COUNT,
+  IMAGE_ID_STRIDE,
 };
