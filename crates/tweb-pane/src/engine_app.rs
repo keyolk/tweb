@@ -131,6 +131,14 @@ const FILES: &[(&str, &str)] = &[
         "pdf-frame.cjs",
         include_str!("../../../electron/pdf-frame.cjs"),
     ),
+    (
+        "extension-policy.cjs",
+        include_str!("../../../electron/extension-policy.cjs"),
+    ),
+    (
+        "extensions.cjs",
+        include_str!("../../../electron/extensions.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.

@@ -68,6 +68,11 @@ const {
   appendedSince,
   compactLines,
 } = require("./history-view.cjs");
+const {
+  extensionsDir,
+  loadExtensions,
+  watchServiceWorkers,
+} = require("./extensions.cjs");
 const { createPaneWriter, fdSink, channelSink } = require("./frame-writer.cjs");
 const { serverIdentityFrom, paneKey } = require("./pane-identity.cjs");
 const {
@@ -3508,6 +3513,40 @@ function cancelTransfer(id) {
   }
 }
 
+// The extensions the user has put in the extensions directory, loaded into the session the
+// pane's windows will use.
+//
+// `session.defaultSession` deliberately, not a partition: `browserWindowOptions()` names no
+// partition, so every tab in this engine already runs in the default session, and loading an
+// extension anywhere else would arm rules for a session no page uses.
+//
+// What is NOT here is any attempt to install, download or update anything. The directory is
+// the interface — see `extension-policy.cjs` for which manifests are accepted and why an
+// unsupported one is refused with a reason rather than loaded and left inert.
+async function setUpExtensions() {
+  const dir = extensionsDir(process.env, app.getPath("userData"));
+  watchServiceWorkers(session.defaultSession, {
+    log: (message) => console.error(`tweb: ${message}`),
+  });
+  try {
+    const results = await loadExtensions(session.defaultSession, dir, {
+      log: (message) => console.error(`tweb: ${message}`),
+      // Source extensions are treated as read-only. Compatibility files belong to TWeb, not
+      // to the downloaded archive, and therefore live beside the rest of TWeb's managed
+      // profile state rather than under the source directory.
+      runtimeRoot: path.join(app.getPath("userData"), "extension-runtime"),
+    });
+    if (results.length > 0) {
+      const loaded = results.filter((result) => result.loaded).length;
+      console.error(`tweb: extensions ${loaded} loaded, ${results.length - loaded} refused`);
+    }
+  } catch (error) {
+    // A broken extensions directory must not stop the browser from starting. The user came
+    // here to read a page.
+    console.error(`tweb: extension setup failed: ${error.message}`);
+  }
+}
+
 function configureDownloads() {
   session.defaultSession.on("will-download", (_event, item) => {
     const destination = availableDownloadPath(item.getFilename());
@@ -5102,7 +5141,7 @@ process.stdin.resume();
 
 app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock?.hide();
   // A supervisor started this process to host panes, and this build cannot yet. Say so and
   // stop, rather than doing what a per-pane engine would do next.
@@ -5174,6 +5213,12 @@ app.whenReady().then(() => {
   }
 
   terminalSetup();
+  // Before the first navigation, not after: a DNR rule enabled once a page has begun loading
+  // does not retroactively block that page's requests, so an ad blocker wired up after
+  // `createWindow` would miss the very first page the user opens. The await is why
+  // `whenReady` is async — a few tens of milliseconds of startup buys a session whose rules
+  // are armed for request one.
+  await setUpExtensions();
   if (restoreWindowSession) {
     initializeTmuxVisibility();
     createWindow(currentUrl);
