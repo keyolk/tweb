@@ -1014,7 +1014,7 @@ test("a successful lpr reports paper, a missing printer says so specifically", (
   const printQueueOutcome = loadPrintQueueOutcome();
 
   // lpr is silent on success, so no error is the only success signal there is.
-  assert.deepEqual(printQueueOutcome(null), { ok: true, message: "sent to the printer" });
+  assert.deepEqual(printQueueOutcome(null), { ok: true, message: "queued for the printer" });
 
   // The two strings macOS CUPS actually emits when no usable default queue exists,
   // captured by running the failures rather than taken from the man page. This is the case
@@ -1064,6 +1064,9 @@ test("paper printing is opt-in and never remaps Ctrl-P", () => {
   // Never awaited: Chromium's own print path wedged the renderer permanently, and blocking
   // the engine on a child process talking to an absent printer rebuilds that failure shape.
   assert.match(main, /execFile\("lpr", \[destination\], \{ timeout: 15_000 \}, \(error, _stdout, stderr\) =>/);
+  // The PDF's completed badge has already scheduled an expiry. The paper result is newer
+  // and promises a full six-second hold, so the stale timer must not erase it early.
+  assert.match(main, /if \(transferBadgeTimer\) \{\s*clearTimeout\(transferBadgeTimer\);\s*transferBadgeTimer = null;/);
   // Ctrl-P is handled in the engine and still routes to the save path, not the paper one.
   assert.match(main, /const print = control && key\.toLowerCase\(\) === "p"/);
   assert.match(main, /else if \(print\) void printPageToPdf\(\);/);

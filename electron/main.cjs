@@ -3768,7 +3768,7 @@ async function printPageToPdf(tab = soleWindows.win, { paper = false } = {}) {
  *                                     deliberately NOT special-cased.
  */
 function printQueueOutcome(error, stderr = "") {
-  if (!error) return { ok: true, message: "sent to the printer" };
+  if (!error) return { ok: true, message: "queued for the printer" };
   const text = String(stderr || error.message || "").trim();
   if (error.code === "ENOENT") {
     return { ok: false, message: "lpr not found — no print system on this machine" };
@@ -3800,6 +3800,12 @@ function printQueueOutcome(error, stderr = "") {
 function sendToPrintQueue(destination, transfer) {
   execFile("lpr", [destination], { timeout: 15_000 }, (error, _stdout, stderr) => {
     const outcome = printQueueOutcome(error, stderr);
+    // The PDF's completed badge scheduled its own expiry before lpr started. It must not
+    // erase this newer result halfway through its six-second hold.
+    if (transferBadgeTimer) {
+      clearTimeout(transferBadgeTimer);
+      transferBadgeTimer = null;
+    }
     // Un-gated for the same reason settleTransfer's line is: the user pressed a key asking
     // for paper and has no other surface on which to learn what happened to it.
     console.error(`tweb: print to paper ${outcome.ok ? "queued" : "failed"} ${destination}: ${outcome.message}`);
