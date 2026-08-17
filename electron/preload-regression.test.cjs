@@ -171,12 +171,30 @@ test("bare open never restores or saves an internal blank page", () => {
   assert.match(main, /if \(!windowSessionPath \|\| soleWindows\.tabs\.length === 0\) return;/);
   assert.match(main, /function writeWindowSessionState\(state\)/);
   assert.match(main, /if \(!windowSessionPath \|\| !state\) return;/);
-  assert.match(main, /windowSessionKeys\(tmuxIdentity\)/);
+  assert.match(main, /claimWindowSessionSlot\(\{/);
   assert.match(main, /for \(const candidate of \[windowSessionPath, legacyWindowSessionPath\]\)/);
   assert.match(main, /restoreWindowSession && !isRestorableUrl\(url\)/);
   assert.match(main, /noWindowSessionPage\(\)/);
   assert.match(main, /if \(!isRestorableUrl\(url\) \|\| url\.startsWith\("tweb-action:"\)\) return;/);
   assert.match(main, /if \(isRestorableUrl\(entry\?\.url\) && !seen\.has\(entry\.url\)\)/);
+});
+
+// Two panes in one tmux window used to hash to one session file, and the last writer
+// silently replaced the other's tabs. The arbitration is an exclusive create plus a
+// pid-checked release, and both are only reachable through a real run — a parse check
+// would not notice either going missing.
+test("the window session slot is claimed exclusively and released only by its owner", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // "wx" IS the arbitration: without it the create truncates a live pane's claim.
+  assert.match(main, /flag: "wx"/);
+  // Liveness has to be the real syscall, not a TTL — a pane sits idle for days.
+  assert.match(main, /isAlive: processAlive,/);
+  // Deleting a claim we do not own is what would hand a live pane's session away.
+  assert.match(main, /if \(!claimIsReleasable\(readFileSync\(claimPath, "utf8"\), process\.pid\)\) return;/);
+  // The release runs on the exit path, after the final save.
+  assert.match(main, /writeWindowSession\(\);\s*releaseWindowSessionClaim\(\);/);
+  // A pane given a URL never restores but still saves, so it needs its own file too.
+  assert.match(main, /resolveWindowSessionPaths\(\);\s*tmuxPlacement =/);
 });
 
 // A client can still report this window while tmux has zoomed a different pane.
@@ -763,8 +781,8 @@ test("visibility matches the pane's live placement, not its startup identity", (
   assert.match(main, /function syncTmuxVisibility\(\)[\s\S]*?"display-message", "-p", "-t", tmuxPlacement\.paneId/);
   assert.match(main, /placement = \{ \.\.\.tmuxPlacement, session, windowId \}/);
   // The save path stays on the startup identity; a moved pane must not silently
-  // adopt another window's stored tabs.
-  assert.match(main, /const keys = windowSessionKeys\(tmuxIdentity\)/);
+  // adopt another window's stored tabs. The slot claim derives from it too.
+  assert.match(main, /identity: tmuxIdentity,/);
   // The in-flight guard has to clear even if spawning throws, or polling stops.
   assert.match(main, /catch \(spawnError\) \{\s*visibilityCheckRunning = false;/);
 });

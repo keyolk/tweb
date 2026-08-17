@@ -108,6 +108,13 @@ installPrintShim();
   let pickerState = null;
   let promptHost = null;
   let searchState = null;
+  // Requests still waiting for a result, and the backstop that un-hides the bar if one
+  // never arrives. See hideSearchBarText for why the bar hides itself while searching.
+  let searchPending = 0;
+  let searchRestoreTimer = null;
+  // An `n`/`N` step waiting for its result so it can end the session with the match selected.
+  let stepSearchPending = false;
+  const FIND_PLACEHOLDER = "Find in page";
   let visualState = null;
   let inspectState = null;
   let tabListState = null;
@@ -2145,16 +2152,130 @@ installPrintShim();
     requestAnimationFrame(() => input.focus());
   }
 
+  // The find bar lives inside the document, so Chromium's find walks it like any other
+  // content and counts the bar's own text: searching "ZEBRA" on a page with three of them
+  // reported 4/4, and stepping stopped on the bar itself (selectionArea y=11, the bar's
+  // own box). Measured, every piece of the bar is searchable — the input's value, the
+  // result span's "1/4", and the "Find in page" placeholder. Chrome does not have this
+  // because its find bar is browser chrome; ours is in the page and has to hide from the
+  // search itself.
+  //
+  // It hides by style rather than by blanking `value`. Blanking was tried first and is
+  // unusable: the field is the one the user is typing into, so a key pressed during the
+  // blank window lands in an empty field — measured in a pane, typing "ZEBRA" left the
+  // field holding "Z". `-webkit-text-security` leaves the value and the caret untouched
+  // and is the only measured exclusion that does not also drop focus.
+  function hideSearchBarText() {
+    if (!searchState || searchState.hidden) return;
+    searchState.hidden = true;
+    searchState.input.style.webkitTextSecurity = "disc";
+    searchState.input.placeholder = "";
+    searchState.result.style.visibility = "hidden";
+  }
+
+  function restoreSearchBarText() {
+    if (!searchState?.hidden) return;
+    searchState.hidden = false;
+    searchState.input.style.webkitTextSecurity = "none";
+    searchState.input.placeholder = FIND_PLACEHOLDER;
+    searchState.result.style.visibility = "visible";
+  }
+
+  // The result event is what normally un-hides the bar. A request that never answers —
+  // the document navigated out from under it — would otherwise leave the bar hidden, so
+  // the timer is the floor rather than the mechanism.
+  function sendFind(query, forward) {
+    hideSearchBarText();
+    searchPending += 1;
+    clearTimeout(searchRestoreTimer);
+    searchRestoreTimer = setTimeout(() => {
+      searchPending = 0;
+      restoreSearchBarText();
+      // A result that never came must not leave the bar open on a keypress that asked to
+      // close it, so the backstop closes as well as un-hides.
+      if (searchState?.closeOnResult) cancelSearch(false);
+    }, 700);
+    send("find", { query, forward });
+  }
+
   function cancelSearch(clearSelection = true, restoreMode = true) {
     if (!searchState) return;
+    clearTimeout(searchRestoreTimer);
+    searchPending = 0;
     searchState.host.remove();
     searchState = null;
     send("stop-find", clearSelection ? "clearSelection" : "keepSelection");
     if (restoreMode) normalMode();
   }
 
+  // Chromium's find moves focus to the match it activates, so after the first keystroke
+  // the find bar's input is no longer focused and its own keydown listener stops firing.
+  // Measured: bar opened → shadow activeElement INPUT; one findInPage later → null, with
+  // document.activeElement back on BODY. Refocusing the input after each result was tried
+  // and is worse than the disease — it re-anchors Chromium's session, so every follow-up
+  // came back at ordinal 1 and the search stopped advancing (measured: y 0, 0, 0 with
+  // refocus against 0, 787, 1582 without).
+  //
+  // So the bar is driven from the document-level handler instead, like the other overlays,
+  // and never depends on holding focus. The editing it needs is only what a one-line query
+  // field needs; anything richer would mean reimplementing a text field.
+  function handleSearchKey(event, key) {
+    if (!searchState) return false;
+    const { input } = searchState;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (key === "Escape") {
+      cancelSearch(true);
+      return true;
+    }
+    if (key === "Enter") {
+      if (input.value) {
+        lastSearch = input.value;
+        // Same query, live session: this advances to the next match rather than restarting
+        // at the first, which is what Enter does in Chrome's find bar.
+        sendFind(lastSearch, !event.shiftKey);
+        // Closing has to wait for the result. `stopFindInPage` issued in the same tick as
+        // a request that opens a new session cancels it outright — measured, a fresh
+        // request followed immediately by stop left scrollY 0 and no selection, while the
+        // same pair with the result awaited in between landed the match and kept it.
+        searchState.closeOnResult = true;
+      }
+      return true;
+    }
+    if (key === "Backspace") {
+      input.value = input.value.slice(0, -1);
+    } else if (key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      input.value += key;
+    } else {
+      return true;
+    }
+    lastSearch = input.value;
+    searchState.result.textContent = "";
+    if (lastSearch) sendFind(lastSearch, true);
+    else send("stop-find", "clearSelection");
+    return true;
+  }
+
+  // `n`/`N` step without a bar, so nothing closes the session afterwards and the match would
+  // stay a compositor-only highlight the page cannot show as a selection. Ending each step
+  // with `keepSelection` is what makes the match visible, the same way Enter does.
+  function stepSearch(forward) {
+    stepSearchPending = true;
+    send("find", { query: lastSearch, forward });
+  }
+
   function showSearch() {
     cancelTransient(false);
+    // An `n` step whose result has not landed yet must not close the session the bar is
+    // about to open: its `keepSelection` would arrive during the first typed request and
+    // cancel it, which is the same race that made Enter lose its match.
+    stepSearchPending = false;
+    // Opening the bar clears whatever the last search left behind. Without this, a second
+    // search whose first request opens a new session while a kept selection from the
+    // previous one is still live loses that selection when the bar closes: measured over
+    // three open/search/close cycles, the first kept "ZEBRA" and every later one came back
+    // empty, and the same three cycles with this stop all kept it.
+    send("stop-find", "clearSelection");
     const host = document.createElement("div");
     host.id = "__tweb_search__";
     host.style.cssText = "position:fixed;right:8px;top:8px;z-index:2147483646;pointer-events:none";
@@ -2164,35 +2285,19 @@ installPrintShim();
     const input = document.createElement("input");
     input.type = "text";
     input.value = lastSearch;
-    input.placeholder = "Find in page";
+    input.placeholder = FIND_PLACEHOLDER;
     input.autocomplete = "off";
     input.style.cssText = "width:min(320px,55vw);padding:4px 6px;border:0;outline:0;background:#303134;color:#fff;font:13px system-ui";
     const result = document.createElement("span");
     result.style.cssText = "min-width:48px;color:#bdc1c6;font:11px ui-monospace,monospace;text-align:right";
-    input.addEventListener("input", () => {
-      lastSearch = input.value;
-      result.textContent = "";
-      if (lastSearch) send("find", { query: lastSearch, forward: true, findNext: false });
-      else send("stop-find", "clearSelection");
-    });
-    input.addEventListener("keydown", (event) => {
-      event.stopPropagation();
-      if (event.code === "Escape") {
-        event.preventDefault();
-        cancelSearch(true);
-      } else if (event.code === "Enter" && input.value) {
-        event.preventDefault();
-        lastSearch = input.value;
-        const direction = event.shiftKey ? false : true;
-        send("find", { query: lastSearch, forward: direction, findNext: false });
-        cancelSearch(false);
-      }
-    });
+    // Typing and Enter/Escape are handled document-level in handleSearchKey, because the
+    // input does not keep focus once a search runs. The input stays focusable so the caret
+    // sits where the user expects, but nothing depends on it receiving keys.
     box.append(input, result);
     shadow.append(box);
     document.documentElement.append(host);
     paintNow();
-    searchState = { host, input, result };
+    searchState = { host, input, result, hidden: false, closeOnResult: false };
     setMode("search");
     requestAnimationFrame(() => input.focus());
   }
@@ -3485,6 +3590,7 @@ installPrintShim();
     if (handleVisualKey(event, key)) return;
     if (handleInspectKey(event, key)) return;
     if (handleTabListKey(event, key)) return;
+    if (handleSearchKey(event, key)) return;
     if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
 
@@ -3535,8 +3641,8 @@ installPrintShim();
       case "b": showTabList(); break;
       case "I": startInspect(); break;
       case "/": showSearch(); break;
-      case "n": if (lastSearch) send("find", { query: lastSearch, forward: true, findNext: true }); else handled = false; break;
-      case "N": if (lastSearch) send("find", { query: lastSearch, forward: false, findNext: true }); else handled = false; break;
+      case "n": if (lastSearch) stepSearch(true); else handled = false; break;
+      case "N": if (lastSearch) stepSearch(false); else handled = false; break;
       case "h": scrollSurfaceBy(-90, 0); break;
       case "j": scrollSurfaceBy(0, 90); break;
       case "k": scrollSurfaceBy(0, -90); break;
@@ -3611,7 +3717,24 @@ installPrintShim();
   });
 
   ipcRenderer.on("tweb-find-result", (_event, result) => {
+    if (stepSearchPending) {
+      stepSearchPending = false;
+      send("stop-find", "keepSelection");
+    }
     if (!searchState) return;
+    // Only the last outstanding request un-hides the bar: typing faster than the search
+    // answers would otherwise put the query back into the document mid-search, and the
+    // next result would count the bar again.
+    searchPending = Math.max(0, searchPending - 1);
+    if (searchPending === 0) {
+      clearTimeout(searchRestoreTimer);
+      restoreSearchBarText();
+      // Enter asked to close once the match it requested had actually landed.
+      if (searchState.closeOnResult) {
+        cancelSearch(false);
+        return;
+      }
+    }
     searchState.result.textContent = result?.matches ? `${result.activeMatchOrdinal}/${result.matches}` : "0/0";
     setMode("search", searchState.result.textContent);
   });
