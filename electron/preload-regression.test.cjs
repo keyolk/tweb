@@ -997,6 +997,14 @@ test("Alt-arrow only navigates when nothing editable has focus", () => {
   assert.match(alt, /!eventIsEditable\(event\)/);
 });
 
+// Reopening the find bar with `/` then pressing Enter without retyping used to send
+// the stale query as a continuation of a session that no longer existed. Clearing
+// `lastSearch` when no result has landed makes the bar open into the same fresh state
+// as the first ever open — no prefilled query, no inherited match.
+test("find bar reopen with no live result clears the last query", () => {
+  assert.match(electron, /if \(!searchState \|\| !searchState\.result\.textContent\) lastSearch = "";/);
+});
+
 // `printQueueOutcome` decides what the user is told about a paper job they cannot see in
 // any queue window, so it is exercised for real rather than matched in the source: the
 // exit status is the only evidence that reaches them. Lifted out of main.cjs and evaluated

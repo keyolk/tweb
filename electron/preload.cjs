@@ -2278,6 +2278,11 @@ installPrintShim();
     // three open/search/close cycles, the first kept "ZEBRA" and every later one came back
     // empty, and the same three cycles with this stop all kept it.
     send("stop-find", "clearSelection");
+    // Clearing the preload-side query too: if a prior session ended, `lastSearch` still
+    // holds its text, and reopening the bar with `/` then pressing Enter without retyping
+    // would send it as a continuation of a session that no longer exists. The bar
+    // should open into a fresh state, same as the first ever open — no query, no match.
+    if (!searchState || !searchState.result.textContent) lastSearch = "";
     const host = document.createElement("div");
     host.id = "__tweb_search__";
     host.style.cssText = "position:fixed;right:8px;top:8px;z-index:2147483646;pointer-events:none";
