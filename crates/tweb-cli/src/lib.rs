@@ -293,7 +293,7 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// Diagnose and configure terminal/tmux/GPU/extension capabilities.
+    /// Diagnose and configure terminal/tmux/GPU capabilities.
     Doctor {
         /// Install the safely managed configuration block, then diagnose again.
         #[arg(long)]

@@ -71,6 +71,8 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/download-state.cjs
 	node --check electron/file-chooser.cjs
 	node --check electron/pdf-frame.cjs
+	node --check electron/extension-policy.cjs
+	node --check electron/extensions.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

@@ -81,6 +81,41 @@ subsystems** — each one parses its arguments and then exits with
 `command not yet implemented`. They are listed here so nobody discovers it mid-migration; see
 [Status](#status).
 
+## Extensions
+
+TWeb loads **unpacked** extensions from its managed source directory at engine startup:
+
+```text
+~/Library/Application Support/tweb-electron/extensions/<extension>/manifest.json
+```
+
+Copy an unpacked extension directory there, then restart every TWeb pane. TWeb never loads from or
+writes to the Chrome profile in place, and it does not parse CRX files or download updates. Load
+order is the sorted directory name. Refused or degraded extensions are explained by
+`tweb engine-log --pane %N`; `loadExtension` succeeding by itself is not treated as evidence that an
+extension works.
+
+The support boundary is measured rather than claimed:
+
+- **uBlock Origin Lite (Manifest V3) works.** TWeb creates a versioned runtime copy under
+  `~/Library/Application Support/tweb-electron/extension-runtime/`, applies a narrow Electron
+  compatibility adapter, and leaves the unpacked source byte-for-byte unchanged. In a real hidden
+  pane its actual EasyList rules removed both known ad requests while leaving the control request
+  intact. On a remote ad-block test page it reduced 99 resource loads to 67 and seven iframes to one.
+- **uBlock Origin (Manifest V2) cannot block here.** Electron 43 does not expose
+  `chrome.webRequest` to extensions. It loads and looks healthy while blocking nothing, so TWeb
+  refuses it with the reason instead of offering false protection.
+- **Manifest V2 content-script-only extensions can work.** This is measured in an offscreen window;
+  MV2 is not rejected merely for its version.
+- **Popup-only extensions do not work.** A tmux pane has no browser toolbar, and Electron does not
+  expose `chrome.action` through which a popup could be opened. Extensions requiring any other
+  missing API are refused rather than partially loaded.
+
+uBlock Origin Lite's popup/dashboard and cosmetic filtering that requires `userScripts` remain
+unavailable. When several Electron engines share one profile, one process owns an extension service
+worker; its DNR rules still apply to the other panes, but filter-list updates require restarting all
+TWeb panes together.
+
 ## Agent control (CLI · MCP)
 
 Finishing frontend work in the terminal means agents have to be able to drive the same browser. A
@@ -555,16 +590,17 @@ carries that workaround for two paths somebody did hit — the context menu at `
 
 Honestly absent, with no code pretending otherwise:
 
-- **Extensions.** Zero hits for `loadExtension`, `session.extensions` or `chrome.runtime` anywhere.
-  The `extension/` directory at the repo root is empty. This costs uBlock Origin — and in a terminal
-  browser ad blocking is not only comfort, since every animated ad is pixels re-encoded and pushed
-  through Kitty graphics — plus 1Password, devtools extensions and anything corporate-mandated.
-  Electron supports only a subset of Chrome's extension API, so **full extension support is not
-  achievable here** and should not be promised.
+- **Extensions are partial, not missing.** Unpacked MV3 extensions with a capability Electron 43
+  exposes can be loaded from the TWeb-managed directory described above. uBlock Origin Lite passes
+  the real-pane blocking bar with a versioned compatibility copy; its popup/dashboard and
+  `userScripts` cosmetic layer do not. MV2 `webRequest` blockers and popup-only extensions are
+  refused rather than loaded inert. See [Extensions](#extensions) for the measured boundary and
+  installation path.
 - **Saved passwords and autofill.** No `Login Data`, no `Web Data` in the profile. Nothing offers to
   save a password and nothing autofills on revisit. This is deliberate: **TWeb should not build its
-  own credential store.** A homegrown one is a security liability and would be strictly worse than the
-  1Password the owner already runs. The correct target is the extension path, which fixes both.
+  own credential store.** A homegrown one is a security liability. 1Password is not yet a substitute
+  here: its popup/native-messaging path was not measured, and popup-only extensions have no usable
+  surface in a tmux pane.
 - **Bookmarks, and any Chrome profile import.** `tweb profile bootstrap` and `tweb profile list` both
   exit with `command not yet implemented` — run against a real Chrome profile to confirm. Nothing
   reads Chrome's bookmarks, extensions or site state. The *import* is the migration blocker, more than
