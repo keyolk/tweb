@@ -2726,6 +2726,11 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "print":
       void printPageToPdf(tab);
       break;
+    // The paper tier is its own action rather than a flag on "print", so nothing that
+    // already asks to print can start putting ink on paper by accident.
+    case "print-paper":
+      void printPageToPdf(tab, { paper: true });
+      break;
     case "downloads-model":
       sendToFocusedTabFrame(tab, "tweb-downloads", downloadsPageModel(value?.query));
       break;
@@ -3709,8 +3714,12 @@ function shimFramePrint(frame) {
  * the half a terminal can do honestly: it writes the PDF next to the user's downloads and
  * says where it went. The badge names it as a PDF rather than claiming the page printed,
  * because silently swallowing a request for paper would be its own surprise.
+ *
+ * `paper` adds the second tier on top of that, never instead of it: the PDF is written and
+ * reported exactly as before, and only then handed to `lpr`. Ctrl-P and `window.print()`
+ * keep their existing meaning.
  */
-async function printPageToPdf(tab = soleWindows.win) {
+async function printPageToPdf(tab = soleWindows.win, { paper = false } = {}) {
   if (!tab || tab.isDestroyed()) return;
   const contents = tab.webContents;
   const destination = availableDownloadPath(printFilename(contents.getTitle(), contents.getURL()));
@@ -3730,11 +3739,76 @@ async function printPageToPdf(tab = soleWindows.win) {
     transfer.total = pdf.length;
     pendingDownloadPaths.delete(destination);
     settleTransfer(transfer, "completed");
+    if (paper) sendToPrintQueue(destination, transfer);
   } catch (error) {
     pendingDownloadPaths.delete(destination);
     settleTransfer(transfer, "interrupted");
     if (debugLogging) console.error(`tweb: print failed: ${error.message}`);
   }
+}
+
+/**
+ * Classify what `lpr` did, so the user is told the truth about a job they cannot see.
+ *
+ * A terminal browser has no print dialog and no queue window, so the exit status is the
+ * ONLY evidence the user will ever get that paper is coming. The one case that has to stay
+ * distinct is "no printer configured": reporting it as a generic failure would leave
+ * someone re-pressing the key at a machine that has no printer at all. `lpr` is silent on
+ * success, so no news is the good news.
+ *
+ * The patterns are the strings macOS CUPS actually emits, captured by running the failures
+ * rather than guessed from the man page — an earlier version of this matched "no default
+ * destination", which real `lpr` never says. Measured on macOS 15:
+ *   PRINTER names a missing queue -> "Error - PRINTER environment variable names default
+ *                                     destination that does not exist."
+ *   lpoptions names a missing one -> "Error - ~/.cups/lpoptions file names default
+ *                                     destination that does not exist."
+ *   `-P` an unknown queue         -> bare "No such file or directory", which is
+ *                                     indistinguishable from a missing FILE and so is
+ *                                     deliberately NOT special-cased.
+ */
+function printQueueOutcome(error, stderr = "") {
+  if (!error) return { ok: true, message: "sent to the printer" };
+  const text = String(stderr || error.message || "").trim();
+  if (error.code === "ENOENT") {
+    return { ok: false, message: "lpr not found — no print system on this machine" };
+  }
+  if (/destination that does not exist|no default destination|unknown destination|is not accepting/i.test(text)) {
+    return { ok: false, message: "no printer configured · PDF in ~/Downloads" };
+  }
+  // Everything else, including the bare "No such file or directory" an unknown `-P` queue
+  // produces, surfaces verbatim. A wrong specific diagnosis is worse than an honest quote.
+  const first = text.split("\n")[0].replace(/^lpr:\s*(Error - )?/i, "").trim();
+  return { ok: false, message: `lpr: ${first || "unknown error"} · PDF saved` };
+}
+
+/**
+ * Hand the PDF that was just written to the print queue.
+ *
+ * The second tier of printing: save-as-PDF is the common case and stays exactly as it was,
+ * and this is opt-in on top of it (`gp`), never a remap of Ctrl-P — silently turning a
+ * save into a paper job would surprise someone who wanted the file.
+ *
+ * Deliberately not awaited. This whole feature exists because Chromium's own print path
+ * wedges the renderer permanently when it tries to open a dialog from an offscreen window;
+ * blocking the engine on a child process that talks to a possibly-absent printer would
+ * reintroduce the failure shape the interception was built to remove. The PDF is already
+ * on disk and already reported before this runs, so a queue that never answers costs the
+ * user nothing they had. The 15-second child-process timeout turns that last shape into an
+ * ordinary failed badge rather than an invisible paper job that waits forever.
+ */
+function sendToPrintQueue(destination, transfer) {
+  execFile("lpr", [destination], { timeout: 15_000 }, (error, _stdout, stderr) => {
+    const outcome = printQueueOutcome(error, stderr);
+    // Un-gated for the same reason settleTransfer's line is: the user pressed a key asking
+    // for paper and has no other surface on which to learn what happened to it.
+    console.error(`tweb: print to paper ${outcome.ok ? "queued" : "failed"} ${destination}: ${outcome.message}`);
+    sendToMainTabFrame(soleWindows.win, "tweb-print-paper", {
+      ok: outcome.ok,
+      message: outcome.message,
+      filename: transfer ? transfer.filename : path.basename(destination),
+    });
+  });
 }
 
 function runBrowserContextMenuCommand(tab, action) {

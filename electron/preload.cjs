@@ -1919,6 +1919,7 @@ installPrintShim();
       ["d · u", "half page down · up"],
       ["gg · G", "top · bottom of page"],
       ["H · L", "history back · forward"],
+      ["Alt-← · Alt-→ · Backspace", "history back · forward — the Chrome keys"],
     ]],
     ["Opening and tabs", [
       ["f · F", "open via hint · open in new tab"],
@@ -1945,6 +1946,7 @@ installPrintShim();
       ["Ctrl-Tab / PgUp / PgDn", "switch browser tab"],
       ["Ctrl-W", "close current browser tab"],
       ["Ctrl-P", "save the page as a PDF in ~/Downloads (a terminal cannot draw a print dialog)"],
+      ["gp", "save the PDF, then send it to the printer with lpr"],
       ["Ctrl-D", "cancel the running download"],
       ["i", "insert mode — page's own shortcuts, Esc returns"],
       ["m", "take audio back — only one pane plays at a time"],
@@ -3592,6 +3594,38 @@ installPrintShim();
     if (handleTabListKey(event, key)) return;
     if (handleSearchKey(event, key)) return;
     if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
+
+    // The keys a Chrome refugee's hands already know. `H`/`L` do the same thing and are
+    // what a vim user reaches for, but nobody arrives with that reflex — they arrive with
+    // this one, and finding it dead is a small silent failure on every mistyped step.
+    //
+    // Alt-arrow rather than Cmd-[: a terminal cannot deliver Cmd combinations to the page
+    // without the bypass mode being on, so binding it here would work only sometimes,
+    // which is worse than not binding it.
+    //
+    // BOTH are bound only when nothing editable has focus, and for the same reason: in a
+    // text field Chrome gives these keys to the field, not to history — Backspace deletes
+    // a character and Alt-arrow moves the caret one word. Measured here without the
+    // editable guard on the Alt-arrow branch: with the caret in an input, `M-Left`
+    // navigated away from the page and took the typed text with it. Losing a half-filled
+    // form to a caret-movement keystroke is exactly the destroy-work case the Backspace
+    // guard already existed to prevent; the two keys need the same guard.
+    if (event.altKey && !event.ctrlKey && !event.metaKey
+      && (key === "ArrowLeft" || key === "ArrowRight")
+      && !eventIsEditable(event)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      send(key === "ArrowLeft" ? "history-back" : "history-forward");
+      return;
+    }
+    if (key === "Backspace" && !event.ctrlKey && !event.metaKey && !event.altKey
+      && !eventIsEditable(event)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      send("history-back");
+      return;
+    }
+
     if (event.ctrlKey || event.metaKey || event.altKey) return;
 
     if (eventIsEditable(event)) {
@@ -3612,6 +3646,10 @@ installPrintShim();
       if (key === "g") scrollSurfaceTo(0);
       else if (key === "h") showHistory();
       else if (key === "d") showDownloads();
+      // Paper is a chord, not Ctrl-P: Ctrl-P keeps meaning save-as-PDF, which is the case
+      // almost every press wants, and silently promoting it to a paper job would surprise
+      // someone who wanted the file.
+      else if (key === "p") send("print-paper");
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
       else return;
       event.preventDefault();
@@ -3781,6 +3819,33 @@ installPrintShim();
     // A transfer badge that waits for the frame clock can miss the completion entirely on
     // an idle page — the one moment the badge exists to cover.
     paintNow();
+  });
+
+  // Paper printing rides the transfer badge rather than `flash`: the outcome of a job the
+  // user cannot see in any queue window needs to outlast 650ms, and "no printer configured"
+  // is the answer they are most likely to get and least able to guess.
+  //
+  // It deliberately overwrites the "✓ file.pdf" the save already posted. The PDF is on disk
+  // either way and `gd` still lists it; what changes is whether the paper the user asked
+  // for is coming, and that is the newer and more surprising fact.
+  ipcRenderer.on("tweb-print-paper", (_event, result) => {
+    if (!result) return;
+    transferState = {
+      text: result.ok ? `⎙ ${result.filename} sent to printer` : `✕ ${result.message}`,
+      tone: result.ok ? "done" : "failed",
+      state: "completed",
+      path: result.message,
+    };
+    renderIndicator();
+    paintNow();
+    // Long enough to read a sentence, since it is the only report of the job there will be.
+    setTimeout(() => {
+      if (transferState && transferState.path === result.message) {
+        transferState = null;
+        renderIndicator();
+        paintNow();
+      }
+    }, 6000);
   });
 
   ipcRenderer.on("tweb-tab-state", (_event, model) => {

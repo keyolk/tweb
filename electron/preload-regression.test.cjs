@@ -957,3 +957,115 @@ test("the page's caret bar is measured the same way as the terminal cursor", () 
   // the caret is.
   assert.match(electron, /function firstCharacterRect\(range\)/);
 });
+
+// Backspace navigating back is the one Chrome reflex that can destroy work: pressed inside
+// a form field it would leave the page and take what was typed with it. The editable check
+// is what makes it safe, so the binding and its guard are pinned together — an edit that
+// keeps the binding and drops the guard is the failure this exists to catch.
+//
+// Electron only: the Tauri preload is a separate file that does not carry these bindings.
+test("Backspace only navigates back when nothing editable has focus", () => {
+  const binding = electron.slice(
+    electron.indexOf('if (key === "Backspace" && !event.ctrlKey'),
+    electron.indexOf("if (event.ctrlKey || event.metaKey || event.altKey) return;"));
+  assert.ok(binding.length > 0, "the Backspace binding must exist");
+  assert.match(binding, /!eventIsEditable\(event\)/);
+  assert.match(binding, /send\("history-back"\)/);
+});
+
+// Alt-arrow rather than Cmd-[: a terminal cannot deliver Cmd combinations to the page
+// unless bypass mode is on, so binding Cmd would work only sometimes — worse than not
+// binding it. This pins the choice so nobody "completes" it with the Cmd variant.
+test("history keys use Alt-arrow, never Cmd", () => {
+  const alt = electron.slice(
+    electron.indexOf("if (event.altKey && !event.ctrlKey && !event.metaKey"),
+    electron.indexOf('if (key === "Backspace" && !event.ctrlKey'));
+  assert.match(alt, /key === "ArrowLeft" \|\| key === "ArrowRight"/);
+  assert.match(alt, /history-back.*history-forward/s);
+  assert.doesNotMatch(alt, /metaKey &&/, "Cmd cannot be delivered reliably through a terminal");
+});
+
+// The same destroy-work case as Backspace, and it was live: measured in a real pane with
+// the caret in an input, `M-Left` navigated away and took the typed text with it. In Chrome
+// these keys belong to the field when one has focus — Alt-arrow moves the caret one word —
+// so the guard is not merely defensive, it is what Chrome does. Pinned separately from the
+// binding above because the binding survived while the guard was missing.
+test("Alt-arrow only navigates when nothing editable has focus", () => {
+  const alt = electron.slice(
+    electron.indexOf("if (event.altKey && !event.ctrlKey && !event.metaKey"),
+    electron.indexOf('if (key === "Backspace" && !event.ctrlKey'));
+  assert.match(alt, /!eventIsEditable\(event\)/);
+});
+
+// `printQueueOutcome` decides what the user is told about a paper job they cannot see in
+// any queue window, so it is exercised for real rather than matched in the source: the
+// exit status is the only evidence that reaches them. Lifted out of main.cjs and evaluated
+// because main.cjs cannot be required outside Electron.
+function loadPrintQueueOutcome() {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const start = main.indexOf("function printQueueOutcome(");
+  assert.ok(start > 0, "printQueueOutcome must exist in main.cjs");
+  const end = main.indexOf("\n}\n", start);
+  // eslint-disable-next-line no-new-func
+  return new Function(`${main.slice(start, end + 2)}\nreturn printQueueOutcome;`)();
+}
+
+test("a successful lpr reports paper, a missing printer says so specifically", () => {
+  const printQueueOutcome = loadPrintQueueOutcome();
+
+  // lpr is silent on success, so no error is the only success signal there is.
+  assert.deepEqual(printQueueOutcome(null), { ok: true, message: "sent to the printer" });
+
+  // The two strings macOS CUPS actually emits when no usable default queue exists,
+  // captured by running the failures rather than taken from the man page. This is the case
+  // a terminal user is most likely to hit and least able to guess, so it must not collapse
+  // into a generic failure — otherwise they re-press the key at a machine with no printer.
+  for (const stderr of [
+    "lpr: Error - PRINTER environment variable names default destination that does not exist.\n",
+    "lpr: Error - ~/.cups/lpoptions file names default destination that does not exist.\n",
+  ]) {
+    const none = printQueueOutcome(new Error("exit 1"), stderr);
+    assert.equal(none.ok, false);
+    assert.match(none.message, /no printer configured/);
+    // The PDF survives a failed paper job, and saying so is what stops it looking like the
+    // whole print was lost.
+    assert.match(none.message, /~\/Downloads/);
+  }
+
+  // No print system at all is a different diagnosis from a misconfigured one.
+  const missing = Object.assign(new Error("spawn lpr ENOENT"), { code: "ENOENT" });
+  assert.match(printQueueOutcome(missing).message, /no print system/);
+
+  // An unknown `-P` queue produces a bare "No such file or directory" — the same string a
+  // missing FILE produces. Guessing between them would put a wrong diagnosis on the badge,
+  // so it is quoted verbatim instead, still saying the PDF survived.
+  const bare = printQueueOutcome(new Error("exit 1"), "lpr: No such file or directory\n");
+  assert.equal(bare.ok, false);
+  assert.match(bare.message, /No such file or directory/);
+  assert.doesNotMatch(bare.message, /no printer configured/);
+  assert.match(bare.message, /PDF saved/);
+
+  // Anything unrecognised keeps its real message but stays one line, so it fits the badge.
+  const other = printQueueOutcome(new Error("exit 1"), "lpr: Error - job queue is full\nsecond line\n");
+  assert.match(other.message, /job queue is full/);
+  assert.doesNotMatch(other.message, /second line/);
+});
+
+// Save-as-PDF is the common case and must keep its meaning: Ctrl-P and a page's own
+// window.print() go on saving, and paper is reached only by the explicit `gp` chord
+// through its own IPC action. A regression here would silently start printing pages.
+test("paper printing is opt-in and never remaps Ctrl-P", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "print":\s*\n\s*void printPageToPdf\(tab\);/);
+  assert.match(main, /case "print-paper":\s*\n\s*void printPageToPdf\(tab, \{ paper: true \}\);/);
+  // The paper hand-off happens only after the PDF has settled, so a failed queue cannot
+  // cost the user the file.
+  assert.match(main, /settleTransfer\(transfer, "completed"\);\s*\n\s*if \(paper\) sendToPrintQueue/);
+  // Never awaited: Chromium's own print path wedged the renderer permanently, and blocking
+  // the engine on a child process talking to an absent printer rebuilds that failure shape.
+  assert.match(main, /execFile\("lpr", \[destination\], \{ timeout: 15_000 \}, \(error, _stdout, stderr\) =>/);
+  // Ctrl-P is handled in the engine and still routes to the save path, not the paper one.
+  assert.match(main, /const print = control && key\.toLowerCase\(\) === "p"/);
+  assert.match(main, /else if \(print\) void printPageToPdf\(\);/);
+  assert.match(electron, /else if \(key === "p"\) send\("print-paper"\);/);
+});
