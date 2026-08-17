@@ -42,7 +42,9 @@ const {
   surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry, restoredLayoutScript,
 } = require("./surface-policy.cjs");
 const { pressEvents } = require("./agent-key.cjs");
+const { pdfKeyAction, pdfViewportScript, findPdfFrame } = require("./pdf-frame.cjs");
 const { recoveryDecision } = require("./renderer-recovery.cjs");
+const { IDLE: FIND_IDLE, findStep, endStep } = require("./find-session.cjs");
 const { withHistoryLock } = require("./history-lock.cjs");
 const {
   parseClaim,
@@ -53,10 +55,11 @@ const {
   HEARTBEAT_MS: AUDIO_HEARTBEAT_MS,
 } = require("./audio-owner.cjs");
 const {
+  claimIsReleasable,
+  claimWindowSessionSlot,
   isRestorableUrl,
   normalizeWindowSession,
   windowSessionForSave,
-  windowSessionKeys,
 } = require("./window-session.cjs");
 const {
   parseHistoryLines,
@@ -157,6 +160,7 @@ let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
 let windowSessionPath = null;
 let legacyWindowSessionPath = null;
+let windowSessionClaimPath = null;
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let orphanWatchdog = null;
@@ -172,6 +176,9 @@ const readyFrameKeysByTab = new WeakMap();
 // Context-menu URLs come from Chromium's hit test, not renderer input. Keep them
 // here so a compromised page can only choose among the actions we displayed.
 const contextMenuStateByTab = new WeakMap();
+// Whether Chromium currently holds an open find session for a tab. See find-session.cjs:
+// the renderer emits nothing at all for a follow-up request with no session behind it.
+const findSessionByTab = new WeakMap();
 function commandLineValue(name) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -794,14 +801,7 @@ function initializeTmuxVisibility() {
         windowIndex,
         paneId: ownTmuxPane,
       };
-      const keys = windowSessionKeys(tmuxIdentity);
-      if (keys) {
-        const directory = path.join(app.getPath("userData"), "window-sessions");
-        windowSessionPath = path.join(directory, `${keys.primary}.json`);
-        legacyWindowSessionPath = keys.legacy
-          ? path.join(directory, `${keys.legacy}.json`)
-          : null;
-      }
+      resolveWindowSessionPaths();
       tmuxPlacement = { session, windowId, paneId: ownTmuxPane };
     }
     originalPaneTitle = titleParts.join("\t");
@@ -1631,6 +1631,80 @@ function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize
 function tabLabel(tab, index) {
   const title = tab.webContents.getTitle() || tab.webContents.getURL() || "New tab";
   return `${index + 1}/${soleWindows.tabs.length} ${title}`;
+}
+
+// Two browser panes split into ONE tmux window used to hash to one session file and
+// silently overwrite each other's tabs. Each engine now claims a per-window slot and
+// keys on it; see window-session.cjs for why a slot rather than the pane id, and for
+// the guarantee that slot 0 still hashes exactly as the old key did.
+//
+// Not gated on TWEB_RESTORE_SESSION: a pane given a URL never restores but still SAVES,
+// and it needs its own file to save into just as much.
+function resolveWindowSessionPaths() {
+  const directory = path.join(app.getPath("userData"), "window-sessions");
+  try {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: window session dir failed: ${error.message}`);
+  }
+  const claim = claimWindowSessionSlot({
+    identity: tmuxIdentity,
+    directory,
+    pid: process.pid,
+    paneId: ownTmuxPane,
+    now: Date.now(),
+    io: {
+      readClaim: (file) => {
+        try {
+          return readFileSync(file, "utf8");
+        } catch (_) {
+          return null;
+        }
+      },
+      // "wx" is the whole arbitration: the create fails rather than truncating when
+      // another engine got there first, so two panes cannot both believe they claimed.
+      createClaim: (file, text) => {
+        try {
+          writeFileSync(file, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
+          return true;
+        } catch (_) {
+          return false;
+        }
+      },
+      removeClaim: (file) => {
+        try { unlinkSync(file); } catch {}
+      },
+      isAlive: processAlive,
+    },
+  });
+  if (!claim) return;
+  windowSessionPath = path.join(directory, `${claim.keys.primary}.json`);
+  legacyWindowSessionPath = claim.keys.legacy
+    ? path.join(directory, `${claim.keys.legacy}.json`)
+    : null;
+  windowSessionClaimPath = claim.claimPath;
+  if (debugLogging) {
+    console.error(`tweb: window session slot ${claim.slot} (claimed=${claim.claimed})`);
+  }
+}
+
+// The claim file is deleted only by the process named in it, and only on a clean exit.
+// A SIGKILLed engine leaves its claim behind, which costs nothing: the next pane in that
+// window reads it, finds the pid gone, and takes the slot over. Deleting a claim we do
+// not own is the one thing that could hand a LIVE pane's session to a second pane, so
+// the pid check is not optional.
+function releaseWindowSessionClaim() {
+  if (!windowSessionClaimPath) return;
+  const claimPath = windowSessionClaimPath;
+  windowSessionClaimPath = null;
+  try {
+    if (!claimIsReleasable(readFileSync(claimPath, "utf8"), process.pid)) return;
+    unlinkSync(claimPath);
+  } catch (error) {
+    if (error.code !== "ENOENT" && debugLogging) {
+      console.error(`tweb: window session claim release failed: ${error.message}`);
+    }
+  }
 }
 
 function writeWindowSessionState(state) {
@@ -2685,14 +2759,16 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "find": {
       const query = String(value?.query || "");
       if (query) {
-        contents.findInPage(query, {
-          forward: value?.forward !== false,
-          findNext: Boolean(value?.findNext),
-        });
+        const step = findStep(findSessionByTab.get(tab) ?? FIND_IDLE, query, value?.forward !== false);
+        findSessionByTab.set(tab, step.state);
+        if (debugLogging) console.error(`tweb: find ${JSON.stringify(query)} findNext=${step.options.findNext} forward=${step.options.forward}`);
+        contents.findInPage(query, step.options);
       }
       break;
     }
     case "stop-find":
+      findSessionByTab.set(tab, endStep().state);
+      if (debugLogging) console.error(`tweb: stop-find ${JSON.stringify(value)}`);
       contents.stopFindInPage(["clearSelection", "keepSelection", "activateSelection"].includes(value) ? value : "clearSelection");
       break;
     case "copy-text":
@@ -3000,6 +3076,9 @@ function agentNativeClick(point) {
 // the Accelerator name.
 function agentPressKey(key, modifiers = []) {
   const contents = agentContents();
+  // Same reason as the real key path: sendInputEvent does not reach a PDF's extension
+  // frame, so `tweb press PageDown` would answer ok while the viewer stayed on page 1.
+  if (routePdfKey(key, modifiers)) return;
   for (const event of pressEvents(key, modifiers)) contents.sendInputEvent(event);
 }
 
@@ -3827,6 +3906,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.on("did-start-navigation", (details) => {
     if (details.isSameDocument || !details.frame) return;
     readyFrameKeys(tab).delete(frameKey(details.frame));
+    // A new document has no find session behind it. Carrying the old flag over would send
+    // the next query as a follow-up to a session that no longer exists, and Chromium
+    // answers that with silence — the exact failure this state exists to prevent.
+    if (details.isMainFrame) findSessionByTab.set(tab, endStep().state);
   });
   contents.on("context-menu", (_event, params) => {
     if (vimiumShortcutsEnabled) showBrowserContextMenu(tab, params);
@@ -3906,6 +3989,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   // offscreen one has no such trigger, so nothing ever comes back without this.
   contents.on("render-process-gone", (_event, details) => {
     const reason = details?.reason;
+    findSessionByTab.set(tab, endStep().state);
     const decision = recoveryDecision(reason, tabRendererRecoveries.get(tab), Date.now());
     tabRendererRecoveries.set(tab, decision.recent);
     if (decision.action === "ignore") return;
@@ -4264,6 +4348,46 @@ function keyName(codepoint) {
   return null;
 }
 
+// Half of a `gg`, kept next to the key path rather than in the pure mapping so the
+// mapping stays a function of its arguments.
+let pdfPendingG = false;
+let pdfPendingGTimer = null;
+
+/// Runs a key inside Chromium's PDF viewer when the tab is showing one.
+///
+/// Returns true when the key was consumed. The reasoning, the measurements behind it, and
+/// what stays out of reach are in electron/pdf-frame.cjs: every input path Chromium offers
+/// leaves the viewer's rendered bytes identical, and calling the viewer's own viewport API
+/// is the only thing that moves it.
+///
+/// Deliberately not awaited by the caller. The script resolves a frame round-trip later,
+/// and a keystroke that waited for it would make held keys stutter; each call reads the
+/// position inside the frame, so two in flight still compose.
+function routePdfKey(key, modifiers) {
+  if (!soleWindows.win || soleWindows.win.isDestroyed()) return false;
+  const frame = findPdfFrame(soleWindows.win.webContents.mainFrame);
+  if (!frame) {
+    pdfPendingG = false;
+    return false;
+  }
+  const next = pdfKeyAction(key, modifiers, { vimium: vimiumShortcutsEnabled, pendingG: pdfPendingG });
+  clearTimeout(pdfPendingGTimer);
+  pdfPendingG = next.pendingG;
+  // The same 800ms the preload gives `g`, so a `g` typed alone does not silently arm a
+  // jump-to-start for the next keystroke minutes later.
+  if (pdfPendingG) pdfPendingGTimer = setTimeout(() => { pdfPendingG = false; }, 800);
+  // A pane nobody is watching has its offscreen surface collapsed, so the viewer's own
+  // viewport height is not the height the user reads the PDF at. See pdf-frame.cjs.
+  const script = pdfViewportScript(next.action, logicalContentSize(currentViewport()).height);
+  if (!script) return next.pendingG;
+  frame.executeJavaScript(script, true).then((result) => {
+    if (debugLogging) console.error(`tweb: pdf key ${key} -> ${JSON.stringify(result)}`);
+  }).catch((error) => {
+    if (debugLogging) console.error(`tweb: pdf key ${key} failed: ${error.message}`);
+  });
+  return true;
+}
+
 // The name sent to the preload is the web-standard KeyboardEvent.key, but
 // sendInputEvent's keyCode only accepts Electron Accelerator names. The arrow keys
 // are named differently in the two schemes, so passing them straight through makes
@@ -4365,6 +4489,11 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
       return;
     }
   }
+
+  // A PDF is rendered by an extension frame the preload never reaches, so both the
+  // passthrough and the vimium key paths below would deliver into an empty document.
+  // Only the press is routed: the viewer has no notion of a key being held.
+  if (pressed && routePdfKey(key, modifiers)) return;
 
   const text = eventKind !== 3
     ? textCodepoints.length > 0
@@ -5091,6 +5220,7 @@ app.on("before-quit", () => {
     windowSessionSaveTimer = null;
   }
   writeWindowSession();
+  releaseWindowSessionClaim();
   quitting = true;
   mouseClicks.reset();
   if (currentFrames().pendingFrameTimer) {

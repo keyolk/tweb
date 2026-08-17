@@ -59,6 +59,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/surface-policy.cjs
 	node --check electron/agent-key.cjs
 	node --check electron/renderer-recovery.cjs
+	node --check electron/find-session.cjs
 	node --check electron/history-lock.cjs
 	node --check electron/frame-writer.cjs
 	node --check electron/pane-identity.cjs
@@ -69,6 +70,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/pane-windows.cjs
 	node --check electron/download-state.cjs
 	node --check electron/file-chooser.cjs
+	node --check electron/pdf-frame.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

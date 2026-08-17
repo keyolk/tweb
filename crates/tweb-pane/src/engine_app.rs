@@ -84,6 +84,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/renderer-recovery.cjs"),
     ),
     (
+        "find-session.cjs",
+        include_str!("../../../electron/find-session.cjs"),
+    ),
+    (
         "history-lock.cjs",
         include_str!("../../../electron/history-lock.cjs"),
     ),
@@ -122,6 +126,10 @@ const FILES: &[(&str, &str)] = &[
     (
         "file-chooser.cjs",
         include_str!("../../../electron/file-chooser.cjs"),
+    ),
+    (
+        "pdf-frame.cjs",
+        include_str!("../../../electron/pdf-frame.cjs"),
     ),
 ];
 
