@@ -3831,7 +3831,7 @@ installPrintShim();
   ipcRenderer.on("tweb-print-paper", (_event, result) => {
     if (!result) return;
     transferState = {
-      text: result.ok ? `⎙ ${result.filename} sent to printer` : `✕ ${result.message}`,
+      text: result.ok ? `⎙ ${result.filename} queued for printer` : `✕ ${result.message}`,
       tone: result.ok ? "done" : "failed",
       state: "completed",
       path: result.message,
