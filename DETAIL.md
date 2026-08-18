@@ -850,13 +850,33 @@ rather than by the most common colour, because the bands carry 34px white text a
 text outnumbers the background (measured `rgb(255,255,255)x2831` against `rgb(255,128,0)x2069`);
 ranking by frequency there measures the font weight, not the channel order.
 
-What was *not* verified: the counter change on a live pane. `tweb diag` reported
-`wholeFormat: "raw"` — the changed path — but `whole` stayed 0 across three panes, because frame
-emission is gated on tmux pane visibility (`recordVisibility` in `main.cjs`) and this session was
-confined to a non-active window. The swap is covered by the two checks above, both of which exercise
-`rawCommands` itself; what remains unmeasured is only whether the ~3.7ms shows up as a lower
-`droppedByBackpressure` under a real scroll. Worth checking on a visible pane before assuming it
-does, since 8.3 established that worker time does not decide input latency.
+**On a live pane the 3.7ms buys nothing, and that is the expected result.** Measured A/B, same
+binary, the swap selected at runtime, on a real 1440x900 pane rendering a page that repaints whole
+frames continuously - 30 seconds of steady state per arm, run in both orders:
+
+```text
+u32        839 frames / 30s   28.0fps   droppedByBackpressure 0
+bytewise   838 frames / 30s   27.9fps   droppedByBackpressure 0
+u32        839 frames / 30s   28.0fps   droppedByBackpressure 0   (order reversed)
+bytewise   839 frames / 30s   28.0fps   droppedByBackpressure 0
+```
+
+Identical, and nothing was ever dropped. This is 8.3's finding arriving again from the other side:
+the worker is not the constraint, so making the worker faster moves no user-visible number. The frame
+rate is pinned by the 30fps cap and the engine keeps up either way with ~3ms of headroom to spare.
+
+Keep the u32 form anyway - it is strictly less work for the same result, and it is the headroom that
+absorbs a larger surface or a slower machine before either becomes a dropped frame. But **do not
+claim it as a speedup.** The honest statement is that a whole frame now costs ~3.7ms less CPU in the
+worker and that this is currently invisible downstream.
+
+Getting this measurement needed a route around the visibility gate: frame emission stops when the
+tmux surface is not on screen (`recordVisibility` in `main.cjs`), so `whole` stayed 0 across three
+attempts opened from a non-active window. Running on a bare PTY outside tmux avoids it - with no
+`tmuxPlacement`, `syncTmuxVisibility` returns immediately and `pane-registry.cjs`'s `visible = true`
+default stands. `bench/` has no harness for this; it is a few lines of `pty.fork` plus a
+`TIOCSWINSZ` to fix the frame size, and worth rebuilding for any future claim about frame
+throughput.
 
 **The tile strategies stay unimplemented, and the damage distribution is why.** DESIGN 7.3 lists
 three, with `detect_capability` hardcoding all three to false. Re-sampled today with `bench/damage.cjs`
