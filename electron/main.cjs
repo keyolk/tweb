@@ -228,6 +228,41 @@ const soleWindows = createPaneWindows({
   maxFrameRate: maxActiveFrameRate,
   adaptive: adaptiveFrameRate,
 });
+// One window context per pane, keyed like `frameContexts` and for the same reason. What lives in
+// here is not only the window: `frameIdleTimer`, `activeFrameRate` and `paintsSinceSettle` are
+// the adaptive frame-rate state, and sharing those across panes would let one pane's video pull
+// another pane's rate up — the tiers are decided by counting THAT pane's paints.
+//
+// The sole pane's entry IS `soleWindows`, so the single-pane path that ships resolves to the same
+// object it always did rather than to a copy of it.
+const paneWindows = new Map();
+
+/**
+ * The window context a pane owns, created on first use.
+ *
+ * Keyed rather than assumed, exactly as `frameContextFor` is. A window resolved for the wrong
+ * pane does not fail loudly — it draws one pane's page into another pane's rectangle, which is
+ * the hazard `attachPane` refuses a second pane to avoid.
+ */
+function windowsFor(record) {
+  const key = record?.key;
+  if (!key) return soleWindows;
+  const existing = paneWindows.get(key);
+  if (existing) return existing;
+  // Per-pane rates, not the process's: a hosted engine serves panes whose frontends were launched
+  // with different `--tweb-frame-rate` settings.
+  const created = createPaneWindows({
+    maxFrameRate: maxActiveFrameRate,
+    adaptive: adaptiveFrameRate,
+  });
+  paneWindows.set(key, created);
+  return created;
+}
+
+/** The window context for the pane a bare call means — the same rule `currentFrames` uses. */
+function currentWindows() {
+  return windowsFor(currentPane());
+}
 const configuredDefaultZoom = Number.parseFloat(process.env.TWEB_DEFAULT_ZOOM || "");
 const defaultZoomFactor = Number.isFinite(configuredDefaultZoom)
   ? Math.min(2, Math.max(0.5, configuredDefaultZoom))
@@ -299,6 +334,9 @@ const solePane = createPaneRecord({
 // the first real attach look like a supersession of a pane that never existed — and would put a
 // record in the registry that nothing is drawing for.
 if (!hostedRuntime) paneRegistry.attach(solePane);
+// The sole pane's window context is registered under its key, so `windowsFor` returns the very
+// object the single-pane path has always used instead of creating a second one beside it.
+paneWindows.set(solePane.key, soleWindows);
 
 // There is deliberately no module-level image id. One process serving N panes has one pid and N
 // image ids, so a constant here would put every pane's frame under the same id — and the Kitty id
@@ -2716,8 +2754,8 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "previous-tab": cycleTab(-1); break;
     case "next-tab": cycleTab(1); break;
-    case "list-soleWindows.tabs":
-      sendToTabFrames(tab, "tweb-soleWindows.tabs", tabListModel());
+    case "list-tabs":
+      sendToTabFrames(tab, "tweb-tabs", tabListModel());
       break;
     case "omnibox-model":
       sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
@@ -3225,7 +3263,7 @@ async function dispatchAgentCommand(method, params) {
       return agentScreenshot(params);
     case "wait":
       return agentWaitFor(params);
-    case "soleWindows.tabs":
+    case "tabs":
       return agentTabList();
     case "tab":
       activateTab(Number(params.index));
@@ -4163,7 +4201,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
     }
     if (refreshTabListAfterClose) {
       refreshTabListAfterClose = false;
-      sendToTabFrames(soleWindows.win, "tweb-soleWindows.tabs", tabListModel());
+      sendToTabFrames(soleWindows.win, "tweb-tabs", tabListModel());
     }
     scheduleWindowSessionSave();
   });
