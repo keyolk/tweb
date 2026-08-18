@@ -346,6 +346,21 @@ function withPaneScope(record, fn) {
   return paneScope.run(resolved, fn);
 }
 
+/**
+ * Runs `fn` once per hosted pane, each time in that pane's scope.
+ *
+ * For the process-wide work that is really per-pane work N times: the hidden-window watchdog
+ * reconciles every window every second, and the quit path tears down every pane. Both used to run
+ * once against whichever pane was first, which for the watchdog meant reconciling pane 2..N's tabs
+ * against pane 1's visibility and frame rate — 84 fallback resolutions in a 15s three-pane run.
+ */
+function forEachPane(fn) {
+  if (!hostedRuntime) return void fn(solePane);
+  const records = paneRegistry.list();
+  if (records.length === 0) return void withPaneScope(solePane, () => fn(solePane));
+  for (const record of records) withPaneScope(record, () => fn(record));
+}
+
 /** Wraps a handler so every call runs in its pane's scope. Registration order does not matter. */
 function bindPane(resolve, handler) {
   return function boundToPane(...handlerArgs) {
@@ -358,7 +373,7 @@ function bindPane(resolve, handler) {
 // so it is counted and reported by `diag` rather than left to be discovered as one pane's input
 // occasionally landing in another. An entry point nobody bound shows up here.
 let unscopedPaneResolutions = 0;
-let loggedUnscopedResolution = false;
+const loggedUnscopedSites = new Set();
 // The tmux server this process sits on. It is the SERVER, not a pane — an engine and the daemon
 // that started it are on the same server, so this is one of the few things a hosted engine can
 // still read from its own environment. Which pane, and whether that pane is in tmux at all, comes
@@ -525,9 +540,12 @@ function currentPane() {
   // Falling back to the first pane is right for exactly one pane and wrong for two, so say so.
   if (paneRegistry.size > 1) {
     unscopedPaneResolutions += 1;
-    if (debugLogging && !loggedUnscopedResolution) {
-      loggedUnscopedResolution = true;
-      console.error(`tweb: pane resolved with no scope\n${new Error("unscoped").stack}`);
+    if (debugLogging) {
+      const stack = new Error("unscoped").stack.split("\n").slice(1, 5).join("\n");
+      if (!loggedUnscopedSites.has(stack)) {
+        loggedUnscopedSites.add(stack);
+        console.error(`tweb: pane resolved with no scope\n${stack}`);
+      }
     }
   }
   return paneRegistry.list()[0] || solePane;
@@ -4083,6 +4101,7 @@ function keepWindowHidden(tab) {
 }
 
 function enforceHiddenWindows() {
+  // Hiding is genuinely process-wide — a window belongs to no pane as far as the OS is concerned.
   for (const window of BrowserWindow.getAllWindows()) keepWindowHidden(window);
   // Surfaces are reconciled on the same tick. A transition calls `updatePaintingState`
   // directly, but a pane that is *born* hidden has no transition to react to — measured:
@@ -4090,7 +4109,11 @@ function enforceHiddenWindows() {
   // zero frames, yet held a full-size surface indefinitely, which is the DESIGN.md 6.5
   // gate failing at the one moment it most obviously should not. The reconciler reads
   // each window's size before writing it, so a tick that has nothing to do costs nothing.
-  updatePaintingState();
+  //
+  // Per pane, because that is what the reconciler decides: this pane's visibility against this
+  // pane's tabs at this pane's frame rate. Run once for the first pane it would have collapsed
+  // every other pane's surfaces against a visibility that was not theirs.
+  forEachPane(() => updatePaintingState());
 }
 
 function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
@@ -5526,22 +5549,27 @@ app.on("before-quit", () => {
   releaseWindowSessionClaim();
   quitting = true;
   mouseClicks.reset();
-  if (currentFrames().pendingFrameTimer) {
-    clearTimeout(currentFrames().pendingFrameTimer);
-    currentFrames().pendingFrameTimer = null;
-    currentFrames().pendingFrame = null;
-  }
-  currentFrames().pendingGfxFrame = null;
   void gfxWorker.terminate();
-  cleanupFrameFiles();
-  if (debugLogging && currentFrames().droppedGfxFrames > 0) {
-    console.error(`tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
-  }
-  for (const tab of currentWindows().tabs) {
-    if (!tab.isDestroyed()) tab.webContents.stopPainting();
-  }
+  // Per pane: each has its own pending frame, its own tabs still painting, and its own image on the
+  // terminal. Running this once for the first pane would leave every other pane's image drawn over
+  // the terminal after the engine is gone — the four-hour stale-page failure, N-1 times over.
+  forEachPane(() => {
+    if (currentFrames().pendingFrameTimer) {
+      clearTimeout(currentFrames().pendingFrameTimer);
+      currentFrames().pendingFrameTimer = null;
+      currentFrames().pendingFrame = null;
+    }
+    currentFrames().pendingGfxFrame = null;
+    cleanupFrameFiles();
+    if (debugLogging && currentFrames().droppedGfxFrames > 0) {
+      console.error(`tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
+    }
+    for (const tab of currentWindows().tabs) {
+      if (!tab.isDestroyed()) tab.webContents.stopPainting();
+    }
+    terminalCleanup();
+  });
   restoreTmuxPassthroughClients();
-  terminalCleanup();
   for (const tty of visibleClientTtys) deleteImageFromClientTty(tty);
   restorePaneTitle();
 });
@@ -5552,9 +5580,12 @@ process.on("exit", () => {
   // The delete that takes each pane's image off the terminal. An exit handler cannot await, so
   // this only works because every pane writer has a synchronous sink — see `fdSink`. Give a
   // writer an async sink and these deletes are dropped, stranding the images.
+  // The record is already in hand, so the delete is written in that pane's scope: `writeGfx` picks
+  // the writer from the ambient pane, and unscoped it would address every pane's delete to the
+  // first one — leaving N-1 images on the terminal, which is precisely what this handler is for.
   for (const record of paneRegistry.list()) {
     try {
-      writeGfx(`a=d,d=I,i=${record.imageId}`, "");
+      withPaneScope(record, () => writeGfx(`a=d,d=I,i=${record.imageId}`, ""));
     } catch (e) {}
   }
 });

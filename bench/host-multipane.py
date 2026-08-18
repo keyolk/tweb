@@ -58,6 +58,26 @@ def visible_line(pane):
     return f"@{pane} VIS {payload.encode('utf8').hex()}\n"
 
 
+def ask_diag(sock_path):
+    """`diag` over a pane's own agent socket, or None if it cannot be reached."""
+    import json
+    import socket as socketmod
+    try:
+        with socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM) as sock:
+            sock.settimeout(4.0)
+            sock.connect(sock_path)
+            sock.sendall(json.dumps({"id": 1, "method": "diag", "params": {}}).encode() + b"\n")
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(1 << 16)
+                if not chunk:
+                    break
+                buf += chunk
+            return json.loads(buf.split(b"\n", 1)[0]).get("result")
+    except Exception:
+        return None
+
+
 def process_tree(root):
     """(procs, rss_mb) for root and everything under it."""
     rows = []
@@ -123,6 +143,8 @@ def main():
     )
 
     frames = {pane: [] for pane, _, _, _ in panes}
+    # Each pane announces its own agent socket, which is how `diag` is asked per pane below.
+    sockets = {}
     crossed = []
     others = []
     attached = False
@@ -154,6 +176,9 @@ def main():
                     if (text.startswith("READY ") or text.startswith("@")) and not attached:
                         attached = True
                         send_all()
+                    for pane, _, _, _ in panes:
+                        if text.startswith(f"@{pane} AGENT "):
+                            sockets[pane] = text.split(" ", 2)[2]
                     matched = False
                     for pane, image_id, _, _ in panes:
                         if text.startswith(f"@{pane} FRAME "):
@@ -183,6 +208,11 @@ def main():
                 break
             procs, rss = process_tree(engine.pid)
             peak_procs, peak_rss = max(peak_procs, procs), max(peak_rss, rss)
+        # While the engine is still up: every pane it could not name from the ambient scope fell
+        # back to the first pane. Painting can be 5/5 while an unbound entry point still routes one
+        # pane's input or session state into another's, and that failure is invisible from out here
+        # — the engine is the only thing that can see it, so ask it.
+        diags = {pane: ask_diag(path) for pane, path in sockets.items()}
     finally:
         try:
             engine.terminate()
@@ -207,6 +237,16 @@ def main():
         print(f"  per pane          {peak_rss/painted:.0f}MB, {peak_procs/painted:.1f} procs")
     print("\n  measured as separate engines (5 real pages): 501MB and 5.0 procs per pane")
 
+    # A count above zero names a real defect even when every pane painted: some entry point resolved
+    # its pane by falling back to the first one.
+    unscoped = 0
+    unreachable = [pane for pane, _, _, _ in panes if not diags.get(pane)]
+    for report in diags.values():
+        if report:
+            unscoped = max(unscoped, int(report.get("panes", {}).get("unscopedResolutions", 0)))
+    print(f"  unscoped panes    {unscoped}"
+          + (f"  ({len(unreachable)} pane(s) did not answer diag)" if unreachable else ""))
+
     if crossed:
         print("\n  CROSSED FRAMES — a pane received another pane's image:")
         for pane, why in crossed[:8]:
@@ -214,10 +254,19 @@ def main():
     if others:
         print(f"\n  engine said: {others[:4]}")
 
-    ok = painted == count and not crossed
+    ok = painted == count and not crossed and unscoped == 0 and not unreachable
+    reasons = []
+    if painted != count:
+        reasons.append(f"{count - painted} pane(s) silent")
+    if crossed:
+        reasons.append(f"{len(crossed)} crossed")
+    if unscoped:
+        reasons.append(f"{unscoped} unscoped pane resolution(s)")
+    if unreachable:
+        reasons.append(f"{len(unreachable)} pane(s) unreachable over their agent socket")
     print(f"\n{'PASS' if ok else 'FAIL'} — "
-          + ("every pane rendered its own image in one engine" if ok
-             else f"{count - painted} pane(s) silent, {len(crossed)} crossed"))
+          + ("every pane rendered its own image in one engine, none resolved by fallback" if ok
+             else ", ".join(reasons)))
     return 0 if ok else 1
 
 
