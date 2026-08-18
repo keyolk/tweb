@@ -139,8 +139,39 @@ test("an addressed line finds its pane, and an unknown address finds nothing", (
   registry.attach(pane);
   assert.equal(resolveTarget(parseControlLine("@%3 VIS 01"), registry, "srv"), pane);
   assert.equal(resolveTarget(parseControlLine("@%9 VIS 01"), registry, "srv"), null);
-  // A right pane id on the wrong server is a different pane.
-  assert.equal(resolveTarget(parseControlLine("@%3 VIS 01"), registry, "other"), null);
+});
+
+// The addressed form carries `@%N` and NO server identity (`engine_wire::control_line`), so the
+// server a hosted engine would narrow by is not the pane's — it is the daemon's `$TMUX`, unset when
+// the daemon was started outside tmux and another server's when it was not.
+//
+// Narrowing by it was the shipped behaviour and it dropped every control line for every hosted
+// pane: measured against a real `twebd`, three panes reported `hosted 3` while all three sat blank,
+// because VIS never reached them. Resolving by id is what the wire actually says.
+test("an addressed line resolves by pane id when the server does not match", () => {
+  const registry = new PaneRegistry();
+  const pane = createPaneRecord({ tmuxServer: "the-pane-server", paneId: "%3", generation: 1, imageId: 1 });
+  registry.attach(pane);
+  // A hosted engine outside tmux passes null; one inside a different tmux server passes that.
+  assert.equal(resolveTarget(parseControlLine("@%3 VIS 01"), registry, null), pane);
+  assert.equal(resolveTarget(parseControlLine("@%3 VIS 01"), registry, "the-daemons-server"), pane);
+  // An id nobody holds still resolves to nothing.
+  assert.equal(resolveTarget(parseControlLine("@%9 VIS 01"), registry, null), null);
+});
+
+// The protection the server check was reaching for does not disappear, it moves: two panes sharing
+// an id make the address ambiguous, so the lookup answers null and `handleAttach` refuses the second
+// pane outright — along with `twebd`, which is the half that matters, since a refusal the daemon
+// does not make leaves a frontend believing its pane is hosted.
+test("an ambiguous pane id resolves to nothing rather than to a guess", () => {
+  const registry = new PaneRegistry();
+  const first = createPaneRecord({ tmuxServer: "server-a", paneId: "%3", generation: 1, imageId: 1 });
+  const second = createPaneRecord({ tmuxServer: "server-b", paneId: "%3", generation: 2, imageId: 100 });
+  registry.attach(first);
+  registry.attach(second);
+  assert.equal(resolveTarget(parseControlLine("@%3 VIS 01"), registry, null), null);
+  // Naming the server disambiguates, which is why the narrow lookup is tried first.
+  assert.equal(resolveTarget(parseControlLine("@%3 VIS 01"), registry, "server-b"), second);
 });
 
 test("an empty registry resolves nothing rather than throwing", () => {

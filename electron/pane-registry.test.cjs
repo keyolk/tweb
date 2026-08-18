@@ -194,6 +194,24 @@ test("a pane's image ids all come from its record", () => {
 
 // The consequence of an overlap is invisible — no error, just one pane's whole frame appearing
 // in another pane's rectangle, or a patch id freeing an image a different pane is still placing.
+// An addressed control line carries `@%N` and no tmux server, so the registry has to answer by id
+// alone — and must refuse to answer at all when two panes share one. Both halves matter: the first
+// is what makes a hosted pane reachable, the second is what stops one pane's keystrokes reaching
+// another pane that happens to have the same id on a different tmux server.
+test("a pane id resolves on any server, and an ambiguous one resolves to nothing", () => {
+  const registry = new PaneRegistry();
+  const pane = createPaneRecord({ tmuxServer: "server-a", paneId: "%3", generation: 1, imageId: 1 });
+  registry.attach(pane);
+  assert.equal(registry.currentById("%3"), pane);
+  assert.equal(registry.currentById("%9"), null);
+  assert.deepEqual(registry.allById("%3"), [pane]);
+
+  const twin = createPaneRecord({ tmuxServer: "server-b", paneId: "%3", generation: 2, imageId: 100 });
+  registry.attach(twin);
+  assert.equal(registry.currentById("%3"), null, "two panes share the id, so there is no answer");
+  assert.equal(registry.allById("%3").length, 2, "and both are visible to the attach refusal");
+});
+
 test("a base that treads on a live pane's range is found before it is used", () => {
   const first = record({ paneId: "%1", generation: 1, imageId: 100 });
   const panes = [first];

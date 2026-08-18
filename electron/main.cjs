@@ -5200,6 +5200,20 @@ function handleAttach(command) {
     return;
   }
 
+  // Two panes with the same id on different tmux servers cannot both be hosted here, because an
+  // addressed control line carries `@%N` and no server — so a second one would make every VIS,
+  // RESIZE and INPUT for that id ambiguous, and `resolveTarget` answers null rather than guessing.
+  // Refusing the second is what keeps the answer unique; that frontend spawns its own engine and
+  // works. The daemon refuses this too, which is the half that matters: an engine-only refusal
+  // would leave the supervisor believing the pane was accepted.
+  const sameId = paneRegistry.allById(command.paneId);
+  if (sameId.length > 0 && sameId.some((record) => record.tmuxServer !== command.tmuxServer)) {
+    const other = sameId.find((record) => record.tmuxServer !== command.tmuxServer);
+    console.error(`tweb: refusing ATTACH for ${command.paneId}: already hosted for tmux server`
+      + ` ${other.tmuxServer || "local"}, and an addressed line cannot tell them apart`);
+    return;
+  }
+
   // A second pane used to be refused here, because the window and tab plumbing reached for one
   // global context and a second attach would have drawn into the first pane's window. That plumbing
   // is per-pane now, and `bench/host-multipane.py` is what says so rather than this comment: 5 panes
@@ -5456,8 +5470,8 @@ app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
 
 app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock?.hide();
-  // A supervisor started this process to host panes, and this build cannot yet. Say so and
-  // stop, rather than doing what a per-pane engine would do next.
+  // A supervisor started this process to host panes and this build cannot. Say so and stop, rather
+  // than doing what a per-pane engine would do next.
   //
   // What a per-pane engine does next is the failure mode, not a harmless one: it would open its
   // own default page and paint it — into stdout, which here is the supervisor's control pipe
@@ -5466,13 +5480,10 @@ app.whenReady().then(async () => {
   // READY_TIMEOUT and every frontend falls back to spawning its own engine, which works; this
   // exits first so nothing is painted anywhere in the meantime.
   //
-  // TWEB_HOST_PREVIEW is how the page host is exercised before the gate opens. It runs the hosted
-  // path for real — attach, per-pane record, per-pane writer, frames out as addressed events —
-  // WITHOUT declaring the protocol, so `twebd` still refuses and every frontend still falls back.
-  // The harness in `bench/t1-host-harness.py` sets it; nothing else does, so no shipping path can
-  // reach the host until `hostProtocolVersion()` stops returning null.
-  const hostPreview = process.env.TWEB_HOST_PREVIEW === "1";
-  if (hostedRuntime && hostProtocolVersion() === null && !hostPreview) {
+  // Unreachable in this build, where `hostProtocolVersion()` is 2. Kept because it is the answer
+  // for any build where it is not — a version bump the daemon has not learned, or a host that is
+  // deliberately disabled — and because an early exit here is what preserves the fallback.
+  if (hostedRuntime && hostProtocolVersion() === null) {
     console.error("tweb: started as a pane host, but this build has no page host — exiting so"
       + " the supervisor falls back to per-pane engines");
     app.quit();
@@ -5520,8 +5531,22 @@ app.whenReady().then(async () => {
   // would poll is the daemon's) and no agent socket (a socket named after this process is a name
   // in some other pane's namespace). Everything arrives with the first ATTACH.
   if (hostedRuntime) {
+    // `hostReady` first, then the declaration, in that order and in this tick. stdin was resumed
+    // before `whenReady` ran, so the daemon's first ATTACH can arrive as soon as READY is out —
+    // declaring first would race it into the `!hostReady` refusal below.
     hostReady = true;
-    console.error("tweb: pane host waiting for attach");
+    const protocol = hostProtocolVersion();
+    if (protocol === null) {
+      // Unreachable from the guard above, which exits when the version is null. Kept because the
+      // two answers must not drift: an engine that got here without a version to declare would
+      // sit silent until the supervisor's READY_TIMEOUT, which is a ten-second stall rather than
+      // the immediate fallback that guard buys.
+      console.error("tweb: pane host cannot declare a protocol version");
+      app.quit();
+      return;
+    }
+    writeProtocolLine(`READY ${protocol}\n`);
+    console.error(`tweb: pane host ready (protocol ${protocol}), waiting for attach`);
     return;
   }
 
