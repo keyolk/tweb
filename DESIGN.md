@@ -378,19 +378,21 @@ The first pane pays the 10s handshake; the daemon then remembers the engine is u
 every later pane falls back in **24 ms**. The daemon does not respawn the engine per attempt —
 sampled over 60s, `twebd` held 0 children and 0.0% CPU.
 
-Behind that gate the page host is real and renders. `bench/t1-host-harness.py` speaks the
-supervisor's side of the protocol to an engine started with `TWEB_MULTIPANE=1` and every pane
-identity variable removed, and reads back an agent socket named after the pane and whole frames
-addressed to it, carrying the image id **from the ATTACH** rather than from the process:
+`bench/t1-host-harness.py` speaks the supervisor's side of the protocol to an engine started with
+`TWEB_MULTIPANE=1` and every pane identity variable removed, and reads back the declaration, an agent
+socket named after the pane, and whole frames addressed to it carrying the image id **from the
+ATTACH** rather than from the process:
 
 ```text
-READY:  NONE — the engine did not declare itself a host
+READY:  READY 2
 AGENT:  @%3 AGENT /tmp/t1harness/agent-%3.sock
-FRAME:  ESC_G a=T,i=4242,C=1,c=100,r=30,z=-1,f=32,s=1000,v=600,t=f,q=2;<base64 path>
+FRAME:  ESC_G a=T,i=4242,C=1,c=100,r=30,z=-1,f=32,o=z,s=1000,v=600,t=f,q=2;<base64 path>
 ```
 
-The host runs only under `TWEB_HOST_PREVIEW=1`, which nothing but that harness sets. So the host is
-**measurable before it is declared**, which is the order this had to happen in.
+For most of this work that first line read `NONE`: the host ran under a `TWEB_HOST_PREVIEW=1` flag
+that nothing but the harnesses set, so it was **measurable before it was declared**, which is the
+order this had to happen in. The flag is gone now that the declaration is real — a switch that can
+no longer change anything reads as a feature.
 
 **N panes now render in one engine.** `bench/host-multipane.py` attaches five panes to one host and
 gates on seven things, each of which was verified to FAIL when the state it guards is put back the
@@ -434,10 +436,33 @@ would fall back silently, so `diag` counts every unscoped resolution and the har
 The harness only found the placement and eviction crossings after it stopped putting every pane in
 one tmux window on one tty: N pushes that happen to agree make shared state look correct.
 
-**The gate is still shut, and now for one reason only.** `hostProtocolVersion()` returns null, so
-`twebd` never learns a host exists and every frontend spawns its own engine. Opening it needs the
-supervisor's READY handshake confirmed against a host serving N panes — not measured by a harness
-that speaks its protocol, but exercised by the daemon that will.
+**The gate is open, and the daemon was what proved it had to be tested.** `hostProtocolVersion()`
+returns 2, the engine writes `READY 2` the moment it is ready to receive an attach, and the daemon
+accepts exactly that number — anything else and it kills the engine, which is a pane falling back to
+its own engine and working.
+
+`bench/daemon-e2e.py` is what stands behind that, and it earned its place immediately: it starts a
+real `twebd`, sends real `host` requests over its socket, and the daemon spawns the engine itself.
+Five panes, `hosted 5/5`, each rendering a frame carrying its own image id, one engine
+(`engine running (pid …)`), no crossed frames.
+
+It found a shipping defect the engine-level harness could not see. Addressed control lines were
+resolved with `registry.current(paneId, tmuxServerIdentity)`, and a hosted engine's
+`tmuxServerIdentity` comes from its own `$TMUX` — which is the *daemon's*, unset when the daemon was
+started outside tmux and another server's when it was not. So every `VIS`, `RESIZE` and `INPUT` for
+every hosted pane was dropped in silence: `twebd status` said `hosted 3` while all three panes sat
+blank. The wire carries `@%N` and no server (`engine_wire::control_line`), so resolving by pane id is
+what it actually says, and the protection the server check was reaching for moves to where ambiguity
+can be refused rather than guessed at — two panes sharing an id are refused by the daemon *and* the
+engine, because a refusal the daemon does not make leaves a frontend believing its pane is hosted.
+
+The e2e's own first verdict was a false PASS, which is worth recording: it counted frame *events*,
+and each pane's one event was an 11-byte cursor-hide sequence. It now requires a frame carrying that
+pane's own image id, which made the broken state fail without any negative control being staged.
+
+**What is still not on by default:** a frontend only asks the daemon when `TWEB_DAEMON=1` is set, so
+a default install still spawns one engine per pane. That is the last switch, and it is a
+user-visible behaviour change rather than a capability question.
 
 #### What survives the collapse from N processes to one
 

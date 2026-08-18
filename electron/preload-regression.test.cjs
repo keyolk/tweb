@@ -949,6 +949,21 @@ test("whole frames reach the terminal through the pane's writer, not the worker"
 // `"list-tabs"`, and the agent method became `"soleWindows.tabs"` while the CLI asked for
 // `"tabs"`. Measured on a live pane: `tweb tabs` answered `unknown method "tabs"` and the tab
 // list never reached the UI. Nothing failed at build time and no test noticed.
+// The host protocol version is a literal in two languages, linked by nothing but string equality:
+// `hostProtocolVersion()` in JS and `PROTOCOL_VERSION` in `crates/twebd/src/protocol.rs`. The daemon
+// kills an engine whose version differs (`engine_host::spawn_engine`), so a drift here does not
+// corrupt anything — but it silently disables hosting for every pane, and both sides individually
+// look correct. This is the same shape as the tab wire names below, which shipped broken in #29.
+test("the engine and the daemon agree on the host protocol version", () => {
+  const { hostProtocolVersion } = require("./hosted-runtime.cjs");
+  const rust = fs.readFileSync(
+    path.join(__dirname, "..", "crates", "twebd", "src", "protocol.rs"), "utf8");
+  const declared = /pub const PROTOCOL_VERSION: u32 = (\d+);/.exec(rust);
+  assert.ok(declared, "PROTOCOL_VERSION not found in crates/twebd/src/protocol.rs");
+  assert.equal(hostProtocolVersion(), Number(declared[1]),
+    "the engine declares a version the daemon refuses, which disables hosting silently");
+});
+
 test("the tab wire names agree across main, preload and the CLI", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");

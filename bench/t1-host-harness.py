@@ -45,9 +45,6 @@ def main():
     os.makedirs(runtime, exist_ok=True)
     env = dict(os.environ)
     env["TWEB_MULTIPANE"] = "1"
-    # Runs the page host WITHOUT declaring the protocol, so `twebd` still refuses and every
-    # frontend still falls back. This is what lets the host be measured before the gate opens.
-    env["TWEB_HOST_PREVIEW"] = "1"
     env["TWEB_SUPERVISOR_PID"] = str(os.getpid())
     env["TWEB_RUNTIME_DIR"] = runtime
     env["TWEB_USER_DATA_DIR"] = os.path.join(runtime, "ud")
@@ -64,8 +61,9 @@ def main():
 
     events = []
     attached = False
-    # The gate keeps READY unsent, so the attach goes out on a timer as well: what is being
-    # measured is whether a hosted pane RENDERS, which is the question the gate turns on.
+    # READY now arrives (the gate is open), and the attach is sent as soon as it does — see the
+    # stdout loop. The timer stays as a fallback so this harness still measures rendering against a
+    # build whose gate is shut, which is the state every earlier run of it recorded.
     attach_at = time.time() + 3.0
     deadline = time.time() + seconds
     os.set_blocking(engine.stdout.fileno(), False)
@@ -116,6 +114,9 @@ def main():
     other = [e for e in events if e not in ready and e not in frames and e not in agent]
 
     print(f"READY:  {ready or 'NONE — the engine did not declare itself a host'}")
+    if ready:
+        print("        the daemon accepts exactly this version; anything else and it kills the"
+              " engine and the pane falls back")
     print(f"AGENT:  {agent or 'none'}")
     print(f"FRAME:  {len(frames)} event(s)")
     for event in frames[:2]:

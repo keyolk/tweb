@@ -32,16 +32,25 @@ function isHostedRuntime(env = {}) {
 /**
  * The host protocol version this engine speaks, or null when it cannot host.
  *
- * Returned as a value rather than written out here so the ONE place that declares capability is
- * a call site the supervisor's handshake can be read against. Declaring it is the LAST wire in
- * the hosting work: an engine that says READY before it can genuinely paint a hosted pane makes
- * `twebd` stop refusing, which takes the frontend's fallback away and leaves a blank pane with
- * no diagnostic. Refusing is safe; a records-only accept is worse than no accept at all.
+ * Returned as a value rather than written out here so the ONE place that declares capability is a
+ * call site the supervisor's handshake can be read against. This was the LAST wire in the hosting
+ * work, and it stayed null while the host could not genuinely paint: an engine that says READY too
+ * early makes `twebd` stop refusing, which takes the frontend's fallback away and leaves a blank
+ * pane with no diagnostic. That state was observed during #28 with `make check` green.
  *
- * Null until the page host behind it is real and measured.
+ * It is 2 now because the host serves N panes and the measurement says so rather than this comment:
+ * `bench/host-multipane.py` runs five panes in one engine and gates on each rendering its own image
+ * id, no crossed frames, no pane resolved by falling back to the first, its own tmux placement and
+ * client set, input parsed per pane, modes isolated, and a detached pane's windows torn down while
+ * the others keep running — every gate verified to fail when the state it guards is shared again.
+ *
+ * The number must equal `PROTOCOL_VERSION` in `crates/twebd/src/protocol.rs`, and only string
+ * equality links them, so a test in `preload-regression.test.cjs` reads that file and compares.
+ * The daemon refuses any other value (`engine_host::spawn_engine`), and refusal means the pane
+ * spawns its own engine and works — so a mismatch degrades rather than blanking a pane.
  */
 function hostProtocolVersion() {
-  return null;
+  return 2;
 }
 
 module.exports = { isHostedRuntime, hostProtocolVersion };

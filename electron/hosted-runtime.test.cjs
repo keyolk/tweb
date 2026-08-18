@@ -25,21 +25,43 @@ test("nothing else is read as hosting", () => {
   assert.equal(isHostedRuntime({ TWEB_FRONTEND_PID: "4242" }), false);
 });
 
-// THE GATE. An engine that declares a host protocol makes `twebd` stop refusing the attach,
-// which takes the frontend's fallback away. Declaring it before a hosted pane genuinely renders
-// produces a blank pane with no diagnostic — the one unacceptable outcome, and the state
-// actually observed during #28 while `make check` was green.
-test("no host protocol is declared until there is a page host behind it", () => {
-  assert.equal(hostProtocolVersion(), null);
+// THE GATE, now open. An engine that declares a host protocol makes `twebd` stop refusing the
+// attach, which takes the frontend's fallback away — so this stayed null while a hosted pane could
+// not genuinely render, a state observed during #28 with `make check` green.
+//
+// What replaced "it must be null" is not "it must be 2" for its own sake: the number is only
+// meaningful if the daemon accepts it, and the daemon accepts exactly `PROTOCOL_VERSION`. That
+// agreement is asserted against the Rust source in `preload-regression.test.cjs`, because only
+// string equality links the two languages. Here the invariant is narrower and still worth pinning:
+// a version at all, and a whole positive one, since `parse_event` parses it as an integer and a
+// float or a string would come back as `None` — an engine the daemon silently never sees as ready.
+test("the engine declares a whole, positive host protocol version", () => {
+  const version = hostProtocolVersion();
+  assert.notEqual(version, null, "the host protocol is declared now that N panes render");
+  assert.equal(typeof version, "number");
+  assert.ok(Number.isInteger(version) && version > 0,
+    `the daemon parses this as an integer, got ${version}`);
 });
 
-// The declaration is a single line on stdout that the supervisor's handshake waits for. As long
-// as nothing writes it, the gate cannot be opened by accident from somewhere else in the engine.
-test("nothing in the engine writes a READY line", () => {
+// The declaration is one line on stdout that the supervisor's handshake waits for, and it must be
+// written from ONE place: an engine that declares itself twice, or from a module that runs before
+// the host is ready to receive an attach, races the daemon's first ATTACH into a refusal.
+test("exactly one place declares READY, and it carries the version", () => {
+  const writers = [];
   for (const name of fs.readdirSync(__dirname)) {
     if (!name.endsWith(".cjs") || name.endsWith(".test.cjs")) continue;
     const source = fs.readFileSync(path.join(__dirname, name), "utf8");
-    assert.doesNotMatch(source, /["'`]READY /,
-      `${name} must not declare a host protocol while hostProtocolVersion() is null`);
+    for (const match of source.matchAll(/["'`]READY [^"'`]*["'`]/g)) {
+      writers.push({ name, text: match[0] });
+    }
   }
+  assert.equal(writers.length, 1,
+    `exactly one declaration expected, found ${JSON.stringify(writers)}`);
+  assert.equal(writers[0].name, "main.cjs");
+  // Interpolated rather than hardcoded, so the version cannot drift from the one function that
+  // answers for it.
+  assert.match(writers[0].text, /READY \$\{protocol\}/);
+  // The daemon reads this with `lines()`, so a declaration without a newline hangs its handshake
+  // until some later line flushes it — a ten-second stall instead of an attach.
+  assert.match(writers[0].text, /\\n/);
 });
