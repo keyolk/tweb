@@ -165,9 +165,18 @@ const tabPanes = new Map();
 // Recovery attempts per tab, so a page that crashes its renderer on every load stops being
 // reloaded instead of looping forever. See renderer-recovery.cjs.
 const tabRendererRecoveries = new Map();
+// Shared on purpose, and shared BEYOND this process: `historyPath` is one file per user-data
+// directory that every pane and every engine appends to under a lock, because history is the user's,
+// not the pane's. See `historyLockPath`.
 const navigationHistory = [];
 let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
+// Deliberately not per-pane, because in a host it is never set: `resolveWindowSessionPaths` runs only
+// where `tmuxIdentity` was built from the process's own `$TMUX_PANE`, and `ownTmuxPane` is null for a
+// hosted runtime. So `writeWindowSession` returns on its first guard and a host saves no session at
+// all. Restoring per-pane sessions in a host needs the claim to key off the ATTACH identity rather
+// than the process — a separate piece of work, and one that has to arbitrate against the per-pane
+// engines that may still hold those slots.
 let windowSessionPath = null;
 let legacyWindowSessionPath = null;
 let windowSessionClaimPath = null;
@@ -592,6 +601,8 @@ function frameFilePathFor(frames, format) {
 // failing — see `noteRawFrameFailure`.
 let rawFramesEnabled = frameTransport === "file"
   && process.env.TWEB_RAW_FRAMES !== "0";
+// Shared on purpose: it dedupes ONE log line per frame generation. N panes bump each other's value,
+// so a host logs that line less often than it could — the cost of getting this wrong is log noise.
 let loggedFrameGeneration = -1;
 // Whole frames the worker deflated, against `whole` for the total. The ratio is the only outside
 // view of the sampling decision in `gfx-worker.cjs`: 0 on a text-heavy page means compression
@@ -2124,6 +2135,13 @@ const audioClaimPath = path.join(runtimeDir(), "audio-owner.json");
 // null while this instance is making noise; otherwise when the silence started.
 let audioSilentSince = Date.now();
 let audioMutedByOther = false;
+// UNRESOLVED for a host serving N panes. The claim is arbitrated through a file so that separate
+// per-pane ENGINES can agree on who owns the speakers, and inside one process these three variables
+// are that agreement for all of its panes at once — so pane A going audible mutes pane B by the same
+// mechanism that mutes another engine. That may even be what a user wants, but it is not a decision
+// this change made, and it needs the claim to distinguish "another process" from "another pane in
+// this process" before it can be one. Left shared, and named as unresolved rather than left to be
+// discovered.
 let audioOwnerPane = null;
 let audioTimer = null;
 
@@ -5153,18 +5171,15 @@ function consumeRawInput() {
 // --- resize/input control channel ---
 // tweb-pane forwards SIGWINCH and raw terminal input over this pipe.
 
-// What an ATTACH does when there is no page host behind it.
+// What an ATTACH does, and what it refuses.
 //
-// The choice here is the whole subject of this seam, so it is written out. A host that RECORDED
-// the pane — registered it, allocated its writer, handed back an agent socket — and did not open
-// a window would be worse than one that refuses: the supervisor would count the attach as
-// accepted, the frontend would stop falling back, and the pane would sit blank forever with
-// every check green. That state was produced once and observed exactly that way.
+// Every refusal below records NOTHING. That asymmetry is the subject of this seam: a host that
+// registered the pane, allocated its writer and handed back an agent socket without opening a
+// window would be worse than one that refuses, because the supervisor would count the attach as
+// accepted, the frontend would stop falling back, and the pane would sit blank forever with every
+// check green. That state was produced once and observed exactly that way.
 //
-// So this refuses, loudly and without recording anything. `hostProtocolVersion()` is null, the
-// engine never printed READY, and a supervisor that never got a handshake is not sending real
-// attaches anyway — this exists so that if one ever arrives, the answer is a diagnostic rather
-// than a half-built registration.
+// A refusal leaves the frontend its own engine, which is a working browser.
 function handleAttach(command) {
   if (!hostedRuntime) {
     // A per-pane engine already serves the pane it was started for. Accepting an attach would
@@ -5185,27 +5200,18 @@ function handleAttach(command) {
     return;
   }
 
-  // ONE pane per host, refused explicitly rather than half-accepted.
+  // A second pane used to be refused here, because the window and tab plumbing reached for one
+  // global context and a second attach would have drawn into the first pane's window. That plumbing
+  // is per-pane now, and `bench/host-multipane.py` is what says so rather than this comment: 5 panes
+  // in one engine, each rendering its own image id, no crossed frames, no pane resolved by falling
+  // back to the first, each holding its own tmux placement and client set, input parsed per pane,
+  // modes isolated, and a detached pane's windows torn down while the others keep running. Every one
+  // of those gates was verified to fail when the state it guards is put back the way it was.
   //
-  // The state a pane owns is per-pane throughout: the registry keys it, `frame-context.cjs` holds
-  // the frame pipeline, `pane-windows.cjs` holds the window/tab/rate/surface state, and each has
-  // a test asserting two panes share nothing. What is NOT yet per-pane is the window and tab
-  // plumbing that builds on them — `createTab`, `activateTab`, the tab-keyed maps and the input
-  // dispatch still reach for the sole window context — so a second attach would be recorded and
-  // would then draw into the first pane's window.
-  //
-  // Refusing is the only honest answer to that. A records-only accept is the one unacceptable
-  // outcome of this work: the supervisor counts the attach, the frontend stops falling back, and
-  // the pane sits blank with every check green. A refusal keeps that frontend's own engine, which
-  // is a working browser.
-  // TWEB_MULTIPANE_EXPERIMENT lifts this for `bench/host-multipane.py` only. It is how the work
-  // below the refusal gets measured before it is finished: `twebd` still refuses because
-  // `hostProtocolVersion()` is null, so no shipping path can reach a half-built host either way.
-  // Nothing but the harness sets it.
-  if (paneRegistry.size > 0 && process.env.TWEB_MULTIPANE_EXPERIMENT !== "1") {
-    console.error(`tweb: refusing ATTACH for ${command.paneId}: this host serves one pane`);
-    return;
-  }
+  // `twebd` still refuses to use a host, independently, because `hostProtocolVersion()` returns
+  // null. That is the gate that decides whether any of this is reached in a shipping build, and
+  // opening it is a separate decision — the supervisor's READY handshake has to be confirmed
+  // against a host that serves N panes, not just measured by a harness that speaks its protocol.
   if (!hostReady) {
     console.error(`tweb: refusing ATTACH for ${command.paneId}: the host is not started yet`);
     return;
