@@ -5261,11 +5261,65 @@ function handleAttach(command) {
 }
 
 /** Tears a pane down: its window, its writer, its socket and its image on the terminal. */
+const panesClosing = new Set();
+
 function closePane(record, reason) {
+  // Destroying this pane's tabs fires their `closed` handlers, and the "last tab closed" branch
+  // there calls back into here for the same pane. The second pass would run against state the first
+  // is halfway through dismantling, and measured, it let 10 frames out after the DETACH.
+  if (panesClosing.has(record.key)) return;
+  panesClosing.add(record.key);
+  try {
+    closePaneOnce(record, reason);
+  } finally {
+    panesClosing.delete(record.key);
+  }
+}
+
+function closePaneOnce(record, reason) {
+  // The pane's windows go first, and inside its own scope: they are per-pane now, and a window left
+  // running keeps painting frames addressed to a pane the registry no longer holds. Measured with
+  // three panes and a DETACH of the middle one: `%10` received a frame carrying `i=5242` — %11's
+  // image id — 19 pane resolutions fell back to the first pane, and `%12` stopped painting
+  // altogether. Destroying the windows is what stops all three.
+  withPaneScope(record, () => {
+    const windows = paneWindows.get(record.key);
+    if (windows) {
+      // `destroy()` fires `closed`, and that handler resolves its pane from `tabPanes` — so the
+      // mapping has to outlive the destroy. Clearing it first sent the handler to the first pane
+      // instead: measured on a DETACH of the middle pane, %10 received a frame carrying i=5242
+      // (%11's image id), 20 resolutions fell back, and %12 stopped painting.
+      for (const tab of windows.tabs.slice()) {
+        if (tab.isDestroyed()) continue;
+        tab.webContents.stopPainting();
+        tab.destroy();
+      }
+      for (const tab of windows.tabs.slice()) {
+        tabPanes.delete(tab);
+        tabFrames.delete(tab);
+        tabZoomFactors.delete(tab);
+        tabSessionUrls.delete(tab);
+        tabRendererRecoveries.delete(tab);
+      }
+      windows.tabs.length = 0;
+      windows.win = null;
+      windows.activeTabIndex = -1;
+      if (windows.frameIdleTimer) {
+        clearTimeout(windows.frameIdleTimer);
+        windows.frameIdleTimer = null;
+      }
+      paneWindows.delete(record.key);
+    }
+    paneInputStates.delete(record.key);
+  });
+
   const frames = frameContexts.get(record.key);
   if (frames) {
     try {
-      terminalCleanup(record);
+      // In this pane's scope: `terminalCleanup` writes the image delete through `paneWrite`, which
+      // picks the writer from the ambient pane. Unscoped it addressed the delete to the first pane,
+      // leaving this pane's image on its terminal.
+      withPaneScope(record, () => terminalCleanup(record));
     } catch (error) {
       void error;
     }

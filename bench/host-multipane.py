@@ -182,6 +182,8 @@ def main():
     frames_at_repush = {}
     input_probed = False
     probe_at = None
+    detach_at = None
+    detached = None
     recorder_installed = {}
     deadline = time.time() + seconds
     peak_procs, peak_rss = 0, 0.0
@@ -205,12 +207,25 @@ def main():
         synthesised in B out of bytes A sent. Each pane records what its page actually received,
         which is what the `keys` check below reads back.
         """
-        a, b = panes[0][0], panes[1][0]
+        a, b = panes[0][0], panes[-1][0]
         engine.stdin.write(input_line(a, "1b5b"))       # ESC [ — deliberately incomplete
         engine.stdin.write(input_line(b, "5b5b5b"))     # [[[ in the OTHER pane
         engine.stdin.flush()
         print(f"  [probe] t={time.time() - started:.1f}s partial escape to {a}, [[[ to {b}",
               flush=True)
+
+    def detach_middle():
+        """DETACH the middle pane and leave the rest running.
+
+        Two failures this catches. The engine must not quit — one pane running out of tabs used to
+        call `app.quit()`, which for a host is every other pane's page gone too. And the detached
+        pane's windows must actually stop: they are per-pane now, so a `closePane` that forgets them
+        leaves offscreen windows painting frames for a pane the registry no longer has.
+        """
+        pane = panes[len(panes) // 2][0]
+        engine.stdin.write(f"@{pane} DETACH\n".encode())
+        engine.stdin.flush()
+        return pane
 
     def repush_first():
         """Re-assert the FIRST pane's visibility after every other pane has pushed its own.
@@ -277,6 +292,9 @@ def main():
                 send_all()
                 repush_at = time.time() + (seconds - 3.0) * 0.6
                 probe_at = time.time() + (seconds - 3.0) * 0.3
+            if detach_at is not None and time.time() > detach_at:
+                detach_at = None
+                detached = detach_middle()
             if repush_at is not None and time.time() > repush_at:
                 repush_at = None
                 frames_at_repush = {pane: len(frames[pane]) for pane, _, _, _ in panes}
@@ -290,6 +308,7 @@ def main():
                     recorder_installed[pane_] = agent_call(path_, "eval", {"script": KEY_RECORDER})
                 interleave_input()
                 input_probed = True
+                detach_at = time.time() + 4.0
             if engine.poll() is not None:
                 break
             # `ps -eo` over every process on the box, once per loop iteration, made the loop the
@@ -340,6 +359,10 @@ def main():
     # A count above zero names a real defect even when every pane painted: some entry point resolved
     # its pane by falling back to the first one.
     first_pane = panes[0][0]
+    try:
+        log = open(os.path.join(runtime, "engine.err"), "r", errors="replace").read()
+    except OSError:
+        log = ""
 
     # Each pane pushed its own window and its own client tty, so each pane's own `diag` must report
     # its own back. State held once per process reports whichever pane pushed last for every pane,
@@ -367,10 +390,6 @@ def main():
     # %10's client, because it read %10's tty set as its own and every entry looked like a client
     # that had gone away.
     evicted = []
-    try:
-        log = open(os.path.join(runtime, "engine.err"), "r", errors="replace").read()
-    except OSError:
-        log = ""
     for line in log.splitlines():
         if "image evicted from" in line:
             evicted.append(line.split("tweb: ", 1)[-1].strip())
@@ -381,7 +400,7 @@ def main():
     # nothing complete, must have received nothing at all.
     crossed_input = []
     if input_probed and len(panes) >= 2:
-        a, b = panes[0][0], panes[1][0]
+        a, b = panes[0][0], panes[-1][0]
         got_a = (keys.get(a) or {}).get("value") if isinstance(keys.get(a), dict) else keys.get(a)
         got_b = (keys.get(b) or {}).get("value") if isinstance(keys.get(b), dict) else keys.get(b)
         if got_b != "[[[":
@@ -393,16 +412,43 @@ def main():
         if got_a not in ("", "[Escape"):
             crossed_input.append(f"{a} received {got_a!r}, was sent only a partial escape")
 
+    # After a DETACH: the other panes must still be painting, and the detached one must have stopped.
+    # A survivor with nothing to redraw sends no frames, and these are static pages — so silence is
+    # not the signal. What must not happen is the detached pane still painting into a pane the
+    # registry no longer holds; that the survivors are still alive is what the `unreachable` check
+    # covers, by excluding only the detached one.
+    detach_problems = []
+    if detached:
+        # The engine's own log is the clock: everything before `closed <pane>` was in flight while
+        # the DETACH sat unparsed, which is ordinary. A FRAME after it is a window still painting for
+        # a pane the registry has dropped.
+        closed_at = None
+        for index, line in enumerate(log.splitlines()):
+            if f"closed {detached}:" in line:
+                closed_at = index
+                break
+        if closed_at is None:
+            detach_problems.append(f"engine never reported closing {detached}")
+        else:
+            after = sum(1 for line in log.splitlines()[closed_at + 1:]
+                        if "frame sent" in line or "patch sent" in line)
+            if after > 0:
+                detach_problems.append(f"frames still sent after {detached} closed ({after})")
+
     unscoped = 0
-    unreachable = [pane for pane, _, _, _ in panes if not diags.get(pane)]
+    unreachable = [pane for pane, _, _, _ in panes
+                   if pane != detached and not diags.get(pane)]
     for report in diags.values():
         if report:
             unscoped = max(unscoped, int(report.get("panes", {}).get("unscopedResolutions", 0)))
     if input_probed:
-        print(f"  recorder          installed={recorder_installed}, alive={alive}")
+        probed = [panes[0][0], panes[-1][0]]
         print(f"  input keys        "
               + ", ".join(f"{pane}={(keys.get(pane) or {}).get('value', keys.get(pane))!r}"
-                          for pane, _, _, _ in panes[:2]))
+                          for pane in probed))
+    if detached:
+        print(f"  detach            {detached} closed, "
+              + ("no frames after" if not detach_problems else detach_problems[0]))
     print(f"  evictions         {len(evicted)}"
           + (f"  — {evicted[0]}" if evicted else "  (no client stopped watching)"))
     print(f"  own placement     {count - len(misplaced)}/{count} panes"
@@ -418,7 +464,7 @@ def main():
         print(f"\n  engine said: {others[:4]}")
 
     ok = (painted == count and not crossed and unscoped == 0 and not unreachable
-          and not misplaced and not evicted and not crossed_input)
+          and not misplaced and not evicted and not crossed_input and not detach_problems)
     reasons = []
     if painted != count:
         reasons.append(f"{count - painted} pane(s) silent")
@@ -434,6 +480,8 @@ def main():
         reasons.append(f"{len(evicted)} image(s) deleted off a client still watching the pane")
     if crossed_input:
         reasons.append(f"input crossed panes ({crossed_input[0]})")
+    if detach_problems:
+        reasons.append(detach_problems[0])
     print(f"\n{'PASS' if ok else 'FAIL'} — "
           + ("every pane rendered its own image in one engine, none resolved by fallback" if ok
              else ", ".join(reasons)))
