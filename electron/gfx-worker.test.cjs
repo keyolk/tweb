@@ -5,8 +5,11 @@ const test = require("node:test");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { directCommands, fileCommands, rawCommands, frameCommands, swapBytewise, swapU32, CHUNK } =
-  require("./gfx-worker.cjs");
+const zlib = require("node:zlib");
+const {
+  directCommands, fileCommands, rawCommands, frameCommands, swapBytewise, swapU32,
+  maybeDeflate, CHUNK,
+} = require("./gfx-worker.cjs");
 
 function temporaryFile(name) {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tweb-gfx-test-")), name);
@@ -104,6 +107,91 @@ test("a full-size raw frame swaps every pixel", () => {
 
   assert.deepEqual(fs.readFileSync(filePath), expected);
   fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+});
+
+// Frames whose content compresses well enough to be worth it.
+//
+// The write is the only thing that drops frames (DETAIL.md 8.5), and `o=z` is what removes most
+// of it — but only for content that actually compresses. These two cases are the decision.
+function textLikeFrame(bytes) {
+  const buffer = Buffer.allocUnsafe(bytes);
+  for (let i = 0; i < bytes; i += 4) {
+    const ink = ((i >> 4) ^ (i >> 11)) & 1 && (i % 389) < 60;
+    buffer[i] = ink ? 32 : 250;
+    buffer[i + 1] = ink ? 32 : 250;
+    buffer[i + 2] = ink ? 32 : 250;
+    buffer[i + 3] = 255;
+  }
+  return buffer;
+}
+
+function photoLikeFrame(bytes) {
+  const buffer = Buffer.allocUnsafe(bytes);
+  let seed = 12345;
+  for (let i = 0; i < bytes; i += 4) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    const value = (seed >>> 16) & 0xff;
+    buffer[i] = value;
+    buffer[i + 1] = (value + ((seed >>> 8) & 7)) & 0xff;
+    buffer[i + 2] = (value + (seed & 7)) & 0xff;
+    buffer[i + 3] = 255;
+  }
+  return buffer;
+}
+
+test("compressible pixels are deflated, and inflate back to the original bytes", () => {
+  const pixels = textLikeFrame(4 * 1024 * 1024);
+  const result = maybeDeflate(pixels);
+
+  assert.equal(result.compressed, true);
+  assert.ok(result.payload.length < pixels.length / 4, "a text frame must compress several fold");
+  // The terminal inflates this, so anything but a byte-exact roundtrip is a corrupted frame —
+  // and it would be corrupted invisibly, since the escape sequence is identical either way.
+  assert.deepEqual(zlib.inflateSync(result.payload), pixels);
+});
+
+// The case that makes this a decision rather than a default. Photo pixels compress ~2x and cost
+// ~109ms on a whole frame — three times the 33.3ms a 30fps cap allows, against a write of ~10ms.
+// Compressing them is strictly worse than not, so the sample must catch it.
+test("incompressible pixels are left alone", () => {
+  const pixels = photoLikeFrame(4 * 1024 * 1024);
+  const result = maybeDeflate(pixels);
+
+  assert.equal(result.compressed, false);
+  assert.equal(result.payload, pixels, "the original buffer must pass through, not a copy");
+});
+
+test("a raw frame declares o=z only when it actually compressed the payload", () => {
+  const compressible = temporaryFile("text.rgba");
+  const commands = rawCommands(
+    message({ filePath: compressible, width: 1024, height: 768 }),
+    textLikeFrame(1024 * 768 * 4),
+  );
+  assert.match(commands[0].header, /,o=z,/, "a deflated payload must be declared o=z");
+  // What lands on disk is the compressed payload; a header that lied about it would be decoded
+  // as raw pixels and drawn as noise.
+  assert.ok(fs.readFileSync(compressible).length < 1024 * 768 * 4);
+  fs.rmSync(path.dirname(compressible), { recursive: true, force: true });
+
+  const incompressible = temporaryFile("photo.rgba");
+  const raw = rawCommands(
+    message({ filePath: incompressible, width: 1024, height: 768 }),
+    photoLikeFrame(1024 * 768 * 4),
+  );
+  assert.doesNotMatch(raw[0].header, /o=z/, "an uncompressed payload must not claim o=z");
+  assert.equal(fs.readFileSync(incompressible).length, 1024 * 768 * 4);
+  fs.rmSync(path.dirname(incompressible), { recursive: true, force: true });
+});
+
+// Small frames skip sampling entirely — a patch is already far below the write cost that makes
+// compression worth considering, and sampling one would cost more than it could save. The floor
+// is two sample-widths, so the sample is a fraction of the frame rather than most of it.
+test("a frame too small to sample is transmitted uncompressed", () => {
+  const pixels = textLikeFrame(64 * 1024);
+  const result = maybeDeflate(pixels);
+
+  assert.equal(result.compressed, false);
+  assert.equal(result.payload, pixels);
 });
 
 test("a direct frame is chunked with m=1 continuations", () => {

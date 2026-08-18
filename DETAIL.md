@@ -924,9 +924,10 @@ said - no `node:ffi`, zero native dependencies, no `/dev/shm` on macOS, so it ne
 and the napi/node-gyp toolchain that comes with it - but the thing it would buy is now measured
 rather than argued: **~24% of whole frames at 2880x1800/30fps, currently dropped.**
 
-The recommendation is to build it if whole-frame throughput at Retina size matters, and not to
-otherwise; that is a roadmap call, and this section's job is only to make sure it is made against
-numbers. *Reopens on:* nothing - this is now a decision, not an open question.
+**Superseded by 8.6.** The recommendation above was to build the addon if whole-frame throughput at
+Retina size mattered. It stopped being necessary: `o=z` buys the same ~24% back with `zlib`, and 8.6
+has the measurements. Read this section for why the write is the bottleneck, and 8.6 for what was
+done about it.
 
 Getting this measurement needed a route around the visibility gate: frame emission stops when the
 tmux surface is not on screen (`recordVisibility` in `main.cjs`), so `whole` stayed 0 across three
@@ -956,6 +957,90 @@ branch could not be reached in the primary configuration anyway: a capability qu
 and responses do not come back through tmux passthrough (DESIGN 7.3), which is why `q=2` is on every
 sequence. *Reopens on:* a measured workload with sustained mid-sized damage, or a bare-tty
 configuration becoming primary.
+
+### 8.6 Addendum — the frame drops are fixed, and not by SHM (2026-08-18)
+
+8.5 ended with the write identified as the only source of dropped frames and SHM as the way to
+remove it, blocked on a native addon. Both halves turned out to be answerable without one. The
+drops are gone; the fix is four lines of `zlib` and a decision about when to use them.
+
+**First, the addon shortcut that does not work — recorded so nobody spends a day on it.** 8.4's
+reasoning was that Node cannot call `shm_open`. True, but Node does not need to: `crates/tweb-pane`
+already depends on `libc` and already spawns the engine, so the Rust parent could create the object
+and let the child inherit the fd. Node writes to numeric fds happily. Measured
+(`bench/shm-fd-inherit.py`):
+
+```text
+fd inherits fine     child fstat: size=20742144, mode=2720
+pwrite  -> ESPIPE    a shm object is not seekable
+write   -> ENXIO     a shm object does not support write() at all
+mmap    -> OK        the only way in, and Node has no mmap
+```
+
+So the blocker was never naming the object — passing the fd solves that completely. It is that a
+POSIX shm object on macOS is a *mapping, not a stream*, and every route into it goes through `mmap`,
+which nothing in Node's surface reaches. The addon requirement is real and one layer deeper than
+8.4 stated.
+
+**Second, and this is the fix: the protocol already compresses.** `o=z` declares a deflated payload
+and the terminal inflates it before decoding, so what reaches the disk is the compressed bytes. It
+had never been probed here, so `bench/gfx-deflate.py` asks Ghostty 1.3.1 directly — on a bare tty,
+since responses do not survive tmux passthrough:
+
+```text
+A. uncompressed, t=f          OK
+B. o=z deflated, t=f          OK          16384B -> 111B
+C. o=z with corrupt data      EINVAL: decompression failed
+D. o=z over t=d (direct)      OK
+```
+
+C is the case that makes B mean something: a terminal that answered OK to a corrupt deflate stream
+would not be decompressing at all. This one rejects it by name, so the acceptance in B is real.
+
+**It is not a free win, which is why it ships as a decision rather than a default.** Deflate is
+paid in CPU on the frame it saves on disk, and for some content that is a bad trade:
+
+```text
+text-like frame     20.7MB -> 0.9MB    deflate ~21ms      worth it
+mixed (measured)    20.7MB -> 2.5MB    deflate ~44ms      marginal
+photo-like frame    20.7MB -> 10.0MB   deflate ~109ms     3x the whole 33.3ms budget, alone
+```
+
+Compressing a photo costs more than writing it. So the choice is made per frame, from a sample —
+deflating a few contiguous chunks and letting their ratio stand in for the frame's. That prediction
+is good enough for a threshold and cheap enough not to matter:
+
+```text
+                sample     full
+photo 20.7MB     2.74x     2.08x      correctly below the 4x threshold
+text  20.7MB    39.07x    39.22x      correctly above
+```
+
+The sampling method is worth stating because the obvious one is wrong. Taking one pixel every
+`stride` bytes looks more representative and destroys exactly the local redundancy deflate lives
+on — and its error depends on the frame size, so it fails invisibly at some sizes and not others.
+Measured on photo pixels that really compress 2.08x, a strided sample reported **14.25x** on a
+4.2MB frame and **1.97x** on a 20.7MB one. Contiguous chunks preserve the runs and track the real
+ratio at every size.
+
+**Result on a live engine**, same PTY harness and workload 8.5 used — deliberately the worst case,
+a canvas repainting random colours, which is the content least friendly to compression:
+
+```text
+before (8.5)    805 frames / 30s   droppedByBackpressure 244, 240, 134
+after           803 frames / 30s   droppedByBackpressure 0, 1
+```
+
+**The drops are gone.** The frame rate is unchanged because it was never the problem — it is pinned
+by the 30fps cap, and 8.3's finding that the worker does not decide latency still holds. What
+changed is that frames stopped being discarded on the way out.
+
+**What this does to the SHM item: it closes it.** The thing SHM was going to buy — the ~24% of whole
+frames the file write was discarding — has been bought without it. A native addon would still make
+the write cheaper in absolute terms, but there is no longer a user-visible number waiting on it.
+*Reopens on:* a measured workload that drops frames again with `o=z` in place (uncompressible
+content at a frame rate above 30, most plausibly), at which point the addon is the next lever and
+`bench/shm-fd-inherit.py` records why it has to be a real addon.
 
 ## 9. A component and interface structure built for extension
 

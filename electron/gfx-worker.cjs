@@ -12,6 +12,7 @@
 // frame written to it is not a frame at all, it is a corrupted protocol stream.
 
 const { mkdirSync, renameSync, unlinkSync, writeFileSync } = require("node:fs");
+const { deflateSync } = require("node:zlib");
 const path = require("node:path");
 const { parentPort } = require("node:worker_threads");
 const os = require("node:os");
@@ -77,6 +78,97 @@ function swapU32(src32, dst32) {
   }
 }
 
+// Deflate, when it is cheaper than the write it saves.
+//
+// The frame write is the only thing that drops frames — DETAIL.md 8.5 measured its p99 at 164%
+// of the 33.3ms a 30fps cap allows, and a probe that skipped the write took
+// `droppedByBackpressure` from ~244 to 0. `o=z` is the protocol's own answer: the terminal
+// inflates the payload, so the bytes that reach the disk are the compressed ones. Ghostty 1.3.1
+// really decompresses it, and `bench/gfx-deflate.py` proves that rather than assuming it — a
+// deliberately corrupt stream is answered `EINVAL: decompression failed`, which is the evidence
+// that a plain OK on a valid stream means something.
+//
+// It is emphatically NOT a free win, which is why this is a decision and not a default:
+//
+//     text-like frame     20.7MB -> 0.9MB   deflate ~21ms   worth it
+//     photo-like frame    20.7MB -> 10.0MB  deflate ~109ms  three times the whole budget
+//
+// Compressing a photo costs more than writing it. So the choice has to be made per frame, and
+// it has to be made without paying the very cost it is trying to avoid.
+const SAMPLE_BYTES = 512 * 1024;
+
+// Deflate a sample of the frame and let its ratio stand in for the whole.
+//
+// Measured to predict well enough for a threshold decision: a text frame samples at ~27x and
+// compresses at ~39x, a photo samples at ~2x and compresses at ~2.1x. The sample costs a few ms
+// against the 12-107ms of the real thing, so a wrong guess is cheap and a right one is most of
+// the saving.
+//
+// Sampled as a handful of CONTIGUOUS CHUNKS, not as scattered pixels. Taking one pixel every
+// `stride` bytes looks more representative and is actively wrong: it discards exactly the local
+// redundancy deflate lives on, and worse, its error depends on the stride. Measured on
+// photo-like pixels, which really compress 2.08x:
+//
+//     4.2MB frame (stride 8)    sampled 14.25x     — would have compressed a photo
+//     8.4MB frame (stride 16)   sampled 12.89x     — same
+//     20.7MB frame (stride 36)  sampled  1.97x     — right, but only by luck of the stride
+//
+// Chunks preserve the runs deflate would find, so the sample compresses like the frame does.
+// Several of them spread across the frame rather than one: any single region can be atypical —
+// a page has a blank margin, a photo has a flat sky — and one unlucky window would answer for
+// everything.
+const SAMPLE_CHUNKS = 8;
+
+function sampleRatio(rgba) {
+  if (rgba.length <= SAMPLE_BYTES * 2) return null;
+  const chunk = Math.floor(SAMPLE_BYTES / SAMPLE_CHUNKS) & ~3;
+  const span = Math.floor(rgba.length / SAMPLE_CHUNKS);
+  const parts = [];
+  for (let i = 0; i < SAMPLE_CHUNKS; i += 1) {
+    // Offset into the middle of each span, so the first chunk is not the frame's top edge —
+    // which on a page is uniform background and compresses unlike anything else on screen.
+    const start = Math.min(rgba.length - chunk, i * span + ((span - chunk) >> 1));
+    parts.push(rgba.subarray(start, start + chunk));
+  }
+  const sample = Buffer.concat(parts);
+  return sample.length / deflateSync(sample, { level: 1 }).length;
+}
+
+// Below this, compressing costs more than it saves.
+//
+// The write scales with the bytes written and deflate scales with the bytes read, so the trade is
+// roughly "does the ratio beat the cost of one pass over the frame". At 4x a 20.7MB frame becomes
+// 5.2MB — the write drops well under budget — while the deflate stays near the ~20ms that a
+// compressible frame costs. Photo content lands at 2.1x and is correctly excluded; the two page
+// profiles that produce scroll frames at all land at 8x and 23x and are correctly included.
+const MIN_RATIO = 4;
+
+// Level 1. Higher levels are not worth measuring twice: on real frames L2 and L3 changed the
+// ratio by under 5% (23x vs 23x on text, 8x vs 9x on mixed) for the same or more time.
+const DEFLATE_LEVEL = 1;
+
+/**
+ * The payload to transmit, and whether it is deflated.
+ *
+ * Returns the original buffer when compression would not pay, so the caller's fallback is the
+ * shipping behaviour rather than a slower version of it.
+ */
+function maybeDeflate(rgba) {
+  let ratio;
+  try {
+    ratio = sampleRatio(rgba);
+  } catch {
+    // A sampling failure must not cost the frame; the uncompressed path always works.
+    return { payload: rgba, compressed: false };
+  }
+  if (ratio === null || ratio < MIN_RATIO) return { payload: rgba, compressed: false };
+  try {
+    return { payload: deflateSync(rgba, { level: DEFLATE_LEVEL }), compressed: true };
+  } catch {
+    return { payload: rgba, compressed: false };
+  }
+}
+
 // Raw pixels, no PNG container. `f=32` is independent of the transfer medium, so the same
 // file transport carries them — and the encode the main thread used to pay for disappears:
 // measured 101ms for a photo, against ~2ms to hand the bitmap over.
@@ -104,9 +196,13 @@ function rawCommands(message, bgra) {
   } else {
     swapBytewise(bgra, rgba);
   }
+  // `o=z` tells the terminal the payload is deflated; it inflates before decoding, so `f=32`
+  // and the file medium are unchanged either way.
+  const { payload, compressed } = maybeDeflate(rgba);
+  const options = compressed ? ",o=z" : "";
   return [{
-    header: `${message.header},f=32,s=${message.width},v=${message.height},t=f,q=2`,
-    payload: writeFrameFile(message.filePath, rgba),
+    header: `${message.header},f=32${options},s=${message.width},v=${message.height},t=f,q=2`,
+    payload: writeFrameFile(message.filePath, payload),
   }];
 }
 
@@ -156,5 +252,6 @@ if (parentPort) {
 }
 
 module.exports = {
-  directCommands, fileCommands, rawCommands, frameCommands, swapBytewise, swapU32, CHUNK,
+  directCommands, fileCommands, rawCommands, frameCommands, swapBytewise, swapU32,
+  maybeDeflate, sampleRatio, CHUNK, MIN_RATIO,
 };
