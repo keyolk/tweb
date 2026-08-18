@@ -18,6 +18,8 @@ const { parentPort } = require("node:worker_threads");
 const os = require("node:os");
 
 const CHUNK = 3072;
+// What the last whole frame did, surfaced on the worker's reply — see `rawCommands`.
+let lastFrameCompressed = false;
 const LITTLE_ENDIAN = os.endianness() === "LE";
 const frameFiles = new Set();
 
@@ -147,6 +149,17 @@ const MIN_RATIO = 4;
 // ratio by under 5% (23x vs 23x on text, 8x vs 9x on mixed) for the same or more time.
 const DEFLATE_LEVEL = 1;
 
+// The escape hatch, matching `TWEB_RAW_FRAMES=0` next door.
+//
+// `o=z` is verified on both implementations that matter here — Ghostty 1.3.1 and kitty itself,
+// each rejecting a corrupt stream by name rather than merely accepting a valid one — so this is
+// not hedging against a suspected bug. It exists because of how such a bug would present: the
+// sequence carries `q=2`, so a terminal that dislikes `o=z` cannot say so, and
+// `noteRawFrameFailure` never fires because the worker succeeded. The failure would be a blank
+// or corrupt image with nothing in any log, and a user who hits that on some terminal neither
+// probe covered needs a way back that does not involve editing this file.
+const DEFLATE_ENABLED = process.env.TWEB_DEFLATE_FRAMES !== "0";
+
 /**
  * The payload to transmit, and whether it is deflated.
  *
@@ -154,6 +167,7 @@ const DEFLATE_LEVEL = 1;
  * shipping behaviour rather than a slower version of it.
  */
 function maybeDeflate(rgba) {
+  if (!DEFLATE_ENABLED) return { payload: rgba, compressed: false };
   let ratio;
   try {
     ratio = sampleRatio(rgba);
@@ -200,6 +214,10 @@ function rawCommands(message, bgra) {
   // and the file medium are unchanged either way.
   const { payload, compressed } = maybeDeflate(rgba);
   const options = compressed ? ",o=z" : "";
+  // Reported back so `tweb diag` can show whether compression is actually engaging. Without it
+  // the sampling decision is invisible: a frame that should compress and does not looks exactly
+  // like one that should not, and the first symptom would be dropped frames with no cause.
+  lastFrameCompressed = compressed;
   return [{
     header: `${message.header},f=32${options},s=${message.width},v=${message.height},t=f,q=2`,
     payload: writeFrameFile(message.filePath, payload),
@@ -243,8 +261,9 @@ if (parentPort) {
     // worker is still busy — it would never dispatch again and would freeze on its last frame.
     const paneKey = message?.paneKey ?? null;
     try {
+      lastFrameCompressed = false;
       const commands = message.type === "frame" ? frameCommands(message) : [];
-      parentPort.postMessage({ type: "ready", paneKey, commands });
+      parentPort.postMessage({ type: "ready", paneKey, commands, compressed: lastFrameCompressed });
     } catch (error) {
       parentPort.postMessage({ type: "error", paneKey, message: error.message, commands: [] });
     }

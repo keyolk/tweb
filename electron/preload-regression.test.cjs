@@ -908,7 +908,10 @@ test("whole frames reach the terminal through the pane's writer, not the worker"
   // pane they belong to. A reply that dropped the key would strand that pane believing the
   // worker is busy — measured: every whole frame silently dropped, stdout down to 11 bytes,
   // while frames.whole, the log lines and the frame file on disk all still said "working".
-  assert.match(worker, /postMessage\(\{ type: "ready", paneKey, commands \}\)/);
+  // Matched on the two fields that carry the invariant rather than on the whole literal: the
+  // reply gained a `compressed` flag for diag (DETAIL.md 8.6) and this assertion failed, which
+  // is a test protecting its own punctuation instead of the behaviour it names.
+  assert.match(worker, /postMessage\(\{ type: "ready", paneKey, commands[,}]/);
   assert.match(worker, /postMessage\(\{ type: "error", paneKey,/);
 
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
