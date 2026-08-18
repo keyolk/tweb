@@ -844,6 +844,14 @@ rather than by the most common colour, because the bands carry 34px white text a
 text outnumbers the background (measured `rgb(255,255,255)x2831` against `rgb(255,128,0)x2069`);
 ranking by frequency there measures the font weight, not the channel order.
 
+What was *not* verified: the counter change on a live pane. `tweb diag` reported
+`wholeFormat: "raw"` — the changed path — but `whole` stayed 0 across three panes, because frame
+emission is gated on tmux pane visibility (`recordVisibility` in `main.cjs`) and this session was
+confined to a non-active window. The swap is covered by the two checks above, both of which exercise
+`rawCommands` itself; what remains unmeasured is only whether the ~3.7ms shows up as a lower
+`droppedByBackpressure` under a real scroll. Worth checking on a visible pane before assuming it
+does, since 8.3 established that worker time does not decide input latency.
+
 **The tile strategies stay unimplemented, and the damage distribution is why.** DESIGN 7.3 lists
 three, with `detect_capability` hardcoding all three to false. Re-sampled today with `bench/damage.cjs`
 on all three page profiles, this engine, this Electron:
