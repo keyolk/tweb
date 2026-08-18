@@ -129,8 +129,10 @@ test("switching tabs replaces the image instead of deleting it", () => {
 test("overlays ask for a paint instead of waiting for the frame clock", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "repaint":/);
-  assert.match(main, /const wasIdle = isThrottled\(soleWindows\);/);
-  assert.match(main, /if \(wasIdle && soleWindows\.win && !soleWindows\.win\.isDestroyed\(\) && currentPane\(\)\.visible\)\s*\{?\s*soleWindows\.win\.webContents\.invalidate\(\);/);
+  assert.match(main, new RegExp(`const wasIdle = isThrottled\\((?:soleWindows|currentWindows\\(\\))\\);`));
+  assert.match(main, new RegExp(
+    `if \\(wasIdle && (?:soleWindows|currentWindows\\(\\))\\.win && !(?:soleWindows|currentWindows\\(\\))\\.win\\.isDestroyed\\(\\)`
+    + ` && currentPane\\(\\)\\.visible\\)\\s*\\{?\\s*(?:soleWindows|currentWindows\\(\\))\\.win\\.webContents\\.invalidate\\(\\);`));
   assert.match(electron, /function paintNow\(\)/);
   // Every transient overlay mount requests a paint. The persistent mode/tab
   // indicator additionally repaints when its hover popover opens or closes.
@@ -168,7 +170,8 @@ test("bare open never restores or saves an internal blank page", () => {
   assert.match(main, /require\("\.\/window-session\.cjs"\)/);
   assert.match(main, /if \(showingLoadError \|\| !isRestorableUrl\(url\)\) return;/);
   assert.match(main, /const state = windowSessionForSave\(/);
-  assert.match(main, /if \(!windowSessionPath \|\| soleWindows\.tabs\.length === 0\) return;/);
+  assert.match(main, new RegExp(
+    `if \\(!windowSessionPath \\|\\| (?:soleWindows|currentWindows\\(\\))\\.tabs\\.length === 0\\) return;`));
   assert.match(main, /function writeWindowSessionState\(state\)/);
   assert.match(main, /if \(!windowSessionPath \|\| !state\) return;/);
   assert.match(main, /claimWindowSessionSlot\(\{/);
@@ -715,7 +718,9 @@ test("insert mode delivers native keys to the page", () => {
   // The preload skips redundant IPC, so every engine-side reset has to tell the
   // page — otherwise native delivery never re-arms after a tab switch.
   assert.match(electron, /engineNativeKeys = false;/);
-  assert.match(main, /pageInsertMode = false;\s*\/\/ The preload mirrors this flag[\s\S]*?sendToTabFrames\(soleWindows\.win, "tweb-shortcuts-mode"/);
+  assert.match(main, new RegExp(
+    `pageInsertMode = false;\\s*\\/\\/ The preload mirrors this flag[\\s\\S]*?`
+    + `sendToTabFrames\\((?:soleWindows|currentWindows\\(\\))\\.win, "tweb-shortcuts-mode"`));
 });
 
 // Cmd-V never arrives as a key — Ghostty emits no PTY encoding for Cmd combos,
