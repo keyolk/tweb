@@ -920,6 +920,39 @@ test("whole frames reach the terminal through the pane's writer, not the worker"
   assert.match(commands, /paneWrite\(graphicsPassthrough\(raw\)\)/);
 });
 
+// Wire names are matched by string equality across three process boundaries, so a rename on one
+// side is invisible until someone tries the feature.
+//
+// This is not hypothetical. A bulk rename of the `soleWindows` variable in #29 rewrote the
+// LITERALS too, and the result shipped: main.cjs sent `"tweb-soleWindows.tabs"` while preload
+// listened for `"tweb-tabs"`, main.cjs matched `case "list-soleWindows.tabs"` while preload sent
+// `"list-tabs"`, and the agent method became `"soleWindows.tabs"` while the CLI asked for
+// `"tabs"`. Measured on a live pane: `tweb tabs` answered `unknown method "tabs"` and the tab
+// list never reached the UI. Nothing failed at build time and no test noticed.
+test("the tab wire names agree across main, preload and the CLI", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+
+  // 1. The IPC channel main pushes the tab model on, and preload receives it on.
+  assert.match(main, /sendToTabFrames\([^)]*"tweb-tabs"/,
+    "main must publish the tab model on tweb-tabs");
+  assert.match(preload, /ipcRenderer\.on\("tweb-tabs"/,
+    "preload must listen on the channel main publishes on");
+
+  // 2. The command preload sends to open the tab list, and the case main dispatches it by.
+  assert.match(preload, /send\("list-tabs"\)/, "preload must request the list as list-tabs");
+  assert.match(main, /case "list-tabs":/, "main must handle the command preload sends");
+
+  // 3. The agent method the Rust CLI asks for (`Command::Tabs` maps to "tabs" in lib.rs).
+  assert.match(main, /case "tabs":/, "main must expose the agent method the CLI calls");
+
+  // A rename that moves the variable but not the wire is the failure this guards, so assert the
+  // clobbered spellings are gone rather than only that the right ones are present.
+  for (const wrong of ["tweb-soleWindows.tabs", "list-soleWindows.tabs", '"soleWindows.tabs"']) {
+    assert.ok(!main.includes(wrong), `main.cjs still carries the clobbered name ${wrong}`);
+  }
+});
+
 // The pane inherits the shell's cursor: a visible block in the top-left corner. Nothing
 // hid it until a caret was parked, so from load through picking a visual target the cursor
 // sat in the corner — which reads as the caret having started there, since the corner is
