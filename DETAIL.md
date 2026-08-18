@@ -706,6 +706,12 @@ write 20.7MB + rename            p50 17.69ms    p90 64.72ms
 whole worker pass, as it ships   p50 11.58ms
 ```
 
+**The 17.69ms write above is wrong — see 8.5.** It is a benchmark artifact, not the shipping path's
+cost: writes to 20MB files are bimodal and dominated by writeback pressure, so a benchmark measures
+whatever disk state it happens to create. Under sustained scroll-like load the figure is p50 6.11ms
+with a p99 of 36.92ms. The conclusion below survives the correction — the write is still the larger
+term and a Rust bridge still cannot touch it — but do not quote the number.
+
 8.3 attributed the worker's 12.5–24.3ms to "a BGRA→RGBA pass plus a 20MB write" without splitting
 them. The write is the larger term, and its p90 alone is 9× the entire swap. A Rust bridge cannot
 touch it.
