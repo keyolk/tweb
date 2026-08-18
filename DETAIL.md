@@ -814,9 +814,13 @@ is unavailable, `electron/package.json` has zero native dependencies, and macOS 
 the pwrite line above is no longer an unreachable number. A fresh `shm_open` object per frame gives
 the same fresh-object guarantee `rename` gives, without the disk, so **~p50 2.8ms / p99 3.6ms is what
 SHM would buy: roughly 3ms of p50 and 33ms of p99 tail per whole frame.** That is a real number
-against a real cost (a native addon, a napi/node-gyp toolchain, per-platform binaries), and it is a
-decision for whoever owns the roadmap rather than a measurement question. *Reopens on:* the engine
-gaining a native module for any other reason, at which point this is nearly free.
+against a real cost (a native addon, a napi/node-gyp toolchain, per-platform binaries).
+
+That was as far as microbenchmarks could take it, and it understates the case: measured on the real
+pipeline further down, the disk write is not merely slower than SHM would be — it is the **only**
+thing discarding frames at the real frame size, and removing it takes `droppedByBackpressure` from
+~244 to 0. Read the two together before deciding; the paragraph beginning "At the real payload" has
+the numbers that matter.
 
 **Shipped: the u32 swap.** 8.4 measured it (7.43ms → 2.94ms, reproduced here as 6.58ms → 2.90ms) and
 left it unapplied, so `rawCommands` was still paying ~3.7ms per whole frame for a change requiring no
@@ -850,9 +854,9 @@ rather than by the most common colour, because the bands carry 34px white text a
 text outnumbers the background (measured `rgb(255,255,255)x2831` against `rgb(255,128,0)x2069`);
 ranking by frequency there measures the font weight, not the channel order.
 
-**On a live pane the 3.7ms buys nothing, and that is the expected result.** Measured A/B, same
-binary, the swap selected at runtime, on a real 1440x900 pane rendering a page that repaints whole
-frames continuously - 30 seconds of steady state per arm, run in both orders:
+**At a quarter of the real payload the 3.7ms buys nothing.** Measured A/B, same binary, the swap
+selected at runtime, rendering a page that repaints whole frames continuously - 30 seconds of steady
+state per arm, run in both orders:
 
 ```text
 u32        839 frames / 30s   28.0fps   droppedByBackpressure 0
@@ -869,6 +873,43 @@ Keep the u32 form anyway - it is strictly less work for the same result, and it 
 absorbs a larger surface or a slower machine before either becomes a dropped frame. But **do not
 claim it as a speedup.** The honest statement is that a whole frame now costs ~3.7ms less CPU in the
 worker and that this is currently invisible downstream.
+
+**At the real payload the picture reverses, and it identifies the bottleneck.** The run above was
+5.2MB per frame: the PTY was 1440x900, and a rendered frame is the viewport's own pixel size
+(`renderedFrameSize`), not that size again multiplied by a scale factor. Every figure in 8.1/8.3/8.4
+is 2880x1800 = 20.7MB. Repeating the same sustained run at that size:
+
+```text
+u32        805 frames / 30s   26.8fps   droppedByBackpressure 244
+bytewise   806 frames / 30s   26.9fps   droppedByBackpressure 266
+u32        805 frames / 30s   26.8fps   droppedByBackpressure 240
+bytewise   806 frames / 30s   26.9fps   droppedByBackpressure 192
+```
+
+Backpressure is real at the real size - roughly a quarter of frames discarded - and **the swap does
+not touch it.** The arms are indistinguishable, and the lowest count of the four belongs to bytewise.
+So the conclusion above survives in the form that matters: the channel swap is not the constraint at
+either payload size. It is 3.7ms of CPU that no user-visible number is waiting on.
+
+What *is* the constraint was then measured directly, by a probe that skips the frame write and
+returns the path as though the frame had reached the terminal for free - which is exactly the term an
+SHM transfer removes:
+
+```text
+u32 (writes the file)      dropped 244, 240, 134
+no write at all            dropped 0, 0
+```
+
+**The disk write is the entire source of the drops.** That reframes the SHM item one last time. It is
+no longer "priced but invisible": at the real frame size, on the real pipeline, the file medium is
+the only thing discarding frames, and removing it removes all of them. The blocker is still what 8.4
+said - no `node:ffi`, zero native dependencies, no `/dev/shm` on macOS, so it needs a native addon
+and the napi/node-gyp toolchain that comes with it - but the thing it would buy is now measured
+rather than argued: **~24% of whole frames at 2880x1800/30fps, currently dropped.**
+
+The recommendation is to build it if whole-frame throughput at Retina size matters, and not to
+otherwise; that is a roadmap call, and this section's job is only to make sure it is made against
+numbers. *Reopens on:* nothing - this is now a decision, not an open question.
 
 Getting this measurement needed a route around the visibility gate: frame emission stops when the
 tmux surface is not on screen (`recordVisibility` in `main.cjs`), so `whole` stayed 0 across three

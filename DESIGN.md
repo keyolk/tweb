@@ -1050,7 +1050,13 @@ making it impossible. What the shipping file path relies on instead is `rename`:
 opened the frame file holds *that inode*, so renaming a new file over the name cannot disturb the
 bytes it is reading. Any replacement for the file medium has to reproduce that fresh-object property
 rather than merely add distance — a fresh `shm_open` object per frame does; writing in place into a
-preallocated ring does not. DETAIL.md 8.5 has the measurements and what SHM would be worth.
+preallocated ring does not.
+
+What that would be worth is measured rather than argued. At 2880x1800 and a 30fps cap the file write
+is the only thing discarding frames: roughly a quarter of whole frames are dropped, and a probe that
+skips the write takes `droppedByBackpressure` to zero. Removing the disk from this path is therefore
+the one change with a demonstrated effect on frame throughput — which is what an SHM transfer is, and
+why it needs a native addon this engine does not yet have. DETAIL.md 8.5 has the runs.
 
 #### The damage and tile strategy
 
