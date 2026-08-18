@@ -1104,7 +1104,7 @@ function noteRawFrameFailure() {
   if (rawFrameFailures < RAW_FRAME_FAILURE_LIMIT) return;
   rawFramesEnabled = false;
   console.error(`tweb: raw frames failed ${rawFrameFailures}x, falling back to PNG`);
-  if (soleWindows.win && !soleWindows.win.isDestroyed() && currentPane().visible) soleWindows.win.webContents.invalidate();
+  if (currentWindows().win && !currentWindows().win.isDestroyed() && currentPane().visible) currentWindows().win.webContents.invalidate();
 }
 
 gfxWorker.on("message", (message) => {
@@ -1268,7 +1268,7 @@ function terminalCleanup(record = currentPane()) {
 
 // --- frame transfer ---
 
-function applyActiveFrameRate(rate, windows = soleWindows, record = currentPane()) {
+function applyActiveFrameRate(rate, windows = currentWindows(), record = currentPane()) {
   // Both mutators suppress a redundant call, and that matters beyond saving a syscall:
   // `setFrameRate` provokes a paint of its own, and the playback tier is decided by counting
   // paints over a window, so re-applying the current tier feeds the detector its own noise.
@@ -1286,17 +1286,17 @@ function markInteractionActivity() {
   // Raising the rate only affects future paints, so coming out of the idle rate
   // would otherwise leave the last idle frame on screen for a whole interval —
   // a quarter second of "nothing happened" after a keypress.
-  const wasIdle = isThrottled(soleWindows);
+  const wasIdle = isThrottled(currentWindows());
   applyActiveFrameRate(maxActiveFrameRate);
-  if (wasIdle && soleWindows.win && !soleWindows.win.isDestroyed() && currentPane().visible) soleWindows.win.webContents.invalidate();
-  if (soleWindows.frameIdleTimer) clearTimeout(soleWindows.frameIdleTimer);
+  if (wasIdle && currentWindows().win && !currentWindows().win.isDestroyed() && currentPane().visible) currentWindows().win.webContents.invalidate();
+  if (currentWindows().frameIdleTimer) clearTimeout(currentWindows().frameIdleTimer);
   // The paints this interaction is about to cause say nothing about whether the page
   // paints on its own, which is the only thing the settle decides — so the count starts
   // fresh. It does not need a handicap beyond that: over a 700ms window, echoing a
   // keystroke is one or two paints while an animating page is dozens, and the threshold
   // sits between them.
-  soleWindows.paintsSinceSettle = 0;
-  soleWindows.frameIdleTimer = setTimeout(settleFrameRate, 700);
+  currentWindows().paintsSinceSettle = 0;
+  currentWindows().frameIdleTimer = setTimeout(settleFrameRate, 700);
 }
 
 // Where the rate lands once the active window expires: the playback rate while the page is
@@ -1304,23 +1304,23 @@ function markInteractionActivity() {
 // so a video that ends drops the rest of the way and a static page that starts an animation
 // picks up without needing a keystroke.
 function settleFrameRate() {
-  soleWindows.frameIdleTimer = null;
+  currentWindows().frameIdleTimer = null;
   // Dropping the rate while a page is still loading stops offscreen painting
   // almost entirely: measured on google.com, the page committed at 1.4s and the
   // next frame did not go out until 5.4s. Stay at the active rate until the load
   // settles — that is precisely when the screen is changing anyway.
-  if (soleWindows.win && !soleWindows.win.isDestroyed() && soleWindows.win.webContents.isLoading()) {
+  if (currentWindows().win && !currentWindows().win.isDestroyed() && currentWindows().win.webContents.isLoading()) {
     markInteractionActivity();
     return;
   }
   // Judge against the paints that arrived over the window just ended, then reset the
   // count. Reading a timestamp instead would count the paint that changing the rate
   // itself provokes, and a static page would hold the playback rate forever.
-  const settled = settledFrameRate(soleWindows.paintsSinceSettle, frameRates);
-  soleWindows.paintsSinceSettle = 0;
+  const settled = settledFrameRate(currentWindows().paintsSinceSettle, frameRates);
+  currentWindows().paintsSinceSettle = 0;
   applyActiveFrameRate(settled.rate);
   if (settled.painting) {
-    soleWindows.frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
+    currentWindows().frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
   }
 }
 
@@ -1328,10 +1328,10 @@ function settleFrameRate() {
 // runs — and at the idle rate nothing would raise it again. Arm the timer so the next
 // settle sees the paints and moves up to the playback rate.
 function notePaintActivity() {
-  soleWindows.paintsSinceSettle += 1;
-  if (!adaptiveFrameRate || soleWindows.frameIdleTimer) return;
-  if (soleWindows.activeFrameRate >= playbackFrameRate) return;
-  soleWindows.frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
+  currentWindows().paintsSinceSettle += 1;
+  if (!adaptiveFrameRate || currentWindows().frameIdleTimer) return;
+  if (currentWindows().activeFrameRate >= playbackFrameRate) return;
+  currentWindows().frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
 }
 
 // A placement the next frame will not fully cover has to be deleted, but the
@@ -1495,7 +1495,7 @@ function flushPendingFrame() {
   currentFrames().pendingFrameTimer = null;
   const frame = currentFrames().pendingFrame;
   currentFrames().pendingFrame = null;
-  if (!frame || frame.tab !== soleWindows.win || frame.generation !== currentFrames().generation || !currentPane().visible) return;
+  if (!frame || frame.tab !== currentWindows().win || frame.generation !== currentFrames().generation || !currentPane().visible) return;
   sendFrameNow(frame.image, frame.generation);
 }
 
@@ -1520,9 +1520,9 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   // to zero. Nothing reads a background tab's frame: `repaintActiveTab` only ever asks for
   // `soleWindows.win`, and `activateTab` calls `invalidate()`, so a switched-to tab paints fresh either
   // way. Dropping the entry is what makes it converge.
-  if (tab === soleWindows.win) tabFrames.set(tab, { image, generation });
+  if (tab === currentWindows().win) tabFrames.set(tab, { image, generation });
   else tabFrames.delete(tab);
-  if (tab !== soleWindows.win || !currentPane().visible) return;
+  if (tab !== currentWindows().win || !currentPane().visible) return;
   // Small damage goes out immediately as a patch instead of waiting for the frame
   // interval — the wait exists to pace whole-frame encodes, and a patch costs a
   // thousandth of one. A caret keeping up with the keyboard is the whole point.
@@ -1533,19 +1533,19 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   currentFrames().pendingFrame = { tab, image, generation };
   if (currentFrames().pendingFrameTimer) return;
   const elapsed = Date.now() - currentFrames().lastFrameSentAt;
-  const delay = immediate ? 0 : Math.max(0, soleWindows.frameIntervalMs - elapsed);
+  const delay = immediate ? 0 : Math.max(0, currentWindows().frameIntervalMs - elapsed);
   currentFrames().pendingFrameTimer = setTimeout(flushPendingFrame, delay);
 }
 
 function repaintActiveTab() {
-  if (!currentPane().visible || !soleWindows.win || soleWindows.win.isDestroyed()) return;
-  const frame = tabFrames.get(soleWindows.win);
+  if (!currentPane().visible || !currentWindows().win || currentWindows().win.isDestroyed()) return;
+  const frame = tabFrames.get(currentWindows().win);
   if (frame && frame.generation === currentFrames().generation && !frame.image.isEmpty()) {
-    queueFrame(soleWindows.win, frame.image, true);
+    queueFrame(currentWindows().win, frame.image, true);
     if (debugLogging) console.error("tweb: visibility repaint");
     return;
   }
-  soleWindows.win.webContents.invalidate();
+  currentWindows().win.webContents.invalidate();
 }
 
 // --- viewport size query ---
@@ -1678,7 +1678,7 @@ function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize
 
 function tabLabel(tab, index) {
   const title = tab.webContents.getTitle() || tab.webContents.getURL() || "New tab";
-  return `${index + 1}/${soleWindows.tabs.length} ${title}`;
+  return `${index + 1}/${currentWindows().tabs.length} ${title}`;
 }
 
 // Two browser panes split into ONE tmux window used to hash to one session file and
@@ -1793,14 +1793,14 @@ function readWindowSession() {
 }
 
 function writeWindowSession() {
-  if (!windowSessionPath || soleWindows.tabs.length === 0) return;
-  const state = windowSessionForSave(soleWindows.tabs.flatMap((tab) => {
+  if (!windowSessionPath || currentWindows().tabs.length === 0) return;
+  const state = windowSessionForSave(currentWindows().tabs.flatMap((tab) => {
     if (tab.isDestroyed()) return [];
     return [{
       url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
       zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor,
     }];
-  }), soleWindows.activeTabIndex, defaultZoomFactor);
+  }), currentWindows().activeTabIndex, defaultZoomFactor);
   // A bare startup used to replace the last useful session with about:blank
   // after 100 ms. Preserve the existing file until a real page commits.
   writeWindowSessionState(state);
@@ -1851,11 +1851,11 @@ function updatePaintingState() {
   // the cache is empty, which is the same path a resize generation bump takes.
   if (!currentPane().visible) tabFrames.clear();
   const held = surfaceHeldForAgent();
-  for (const tab of soleWindows.tabs) {
+  for (const tab of currentWindows().tabs) {
     if (tab.isDestroyed()) continue;
-    const plan = surfacePlan(tab === soleWindows.win, currentPane().visible, logicalContentSize(currentViewport()), held);
+    const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
-    tab.webContents.setFrameRate(plan.painting ? soleWindows.activeFrameRate : 1);
+    tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
     applySurfacePlan(tab, plan);
     // Read before write, like the resize above: `startPainting()` on a tab that is
     // already painting *provokes a paint*, and this reconciler runs every second, so
@@ -1893,7 +1893,7 @@ function applySurfacePlan(tab, plan) {
   // Recorded before the resize, and only for the tab that is this pane's active one: the
   // record's `logical` is the size a restore goes back to, and reading it off a collapsed
   // surface is how the agent API came back with innerHeight=1.
-  if (tab === soleWindows.win) {
+  if (tab === currentWindows().win) {
     recordSurface(currentPane(), { collapsed: plan.height <= 1, logical: { width: plan.width, height: plan.height } });
   }
   tab.setContentSize(plan.width, plan.height);
@@ -1918,7 +1918,7 @@ function applySurfacePlan(tab, plan) {
 // for anyone who ever ran one agent command.
 const AGENT_SURFACE_HOLD_TTL_MS = 30_000;
 
-function surfaceHeldForAgent(windows = soleWindows) {
+function surfaceHeldForAgent(windows = currentWindows()) {
   const state = surfaceHeld(windows, Date.now());
   // The watchdog tick that notices the expiry is also the one that collapses the surface again,
   // so a leak costs bytes for a bounded window rather than forever. Reported once: the count is
@@ -1994,7 +1994,7 @@ function awaitRestoredFrame(contents) {
 /// — the cost is paid only by the case that was broken. The hold is on THIS pane: one pane's
 /// agent call must not restore another's surface, which would undo the collapse for every pane
 /// at once rather than for the one being driven.
-async function withAgentSurface(method, body, windows = soleWindows, record = currentPane()) {
+async function withAgentSurface(method, body, windows = currentWindows(), record = currentPane()) {
   const tab = windows.win;
   if (record.visible || !agentNeedsGeometry(method) || !tab || tab.isDestroyed()) {
     return body();
@@ -2088,7 +2088,7 @@ function clearAudioClaim() {
 }
 
 function anyTabAudible() {
-  for (const tab of soleWindows.tabs) {
+  for (const tab of currentWindows().tabs) {
     if (tab.isDestroyed()) continue;
     // A muted tab reports itself as not audible, so the instance that gave audio up
     // would never notice it is still playing. Its own claim state answers instead.
@@ -2101,13 +2101,13 @@ function anyTabAudible() {
 // Mute, never pause: the page keeps playing and keeps its position, so taking audio
 // back is one keypress rather than a re-seek.
 function applyAudioMute(muted) {
-  for (const tab of soleWindows.tabs) {
+  for (const tab of currentWindows().tabs) {
     if (!tab.isDestroyed()) tab.webContents.setAudioMuted(muted);
   }
 }
 
 function broadcastAudioState() {
-  for (const tab of soleWindows.tabs) {
+  for (const tab of currentWindows().tabs) {
     sendToTabFrames(tab, "tweb-audio-state", { muted: audioMutedByOther, owner: audioOwnerPane });
   }
 }
@@ -2207,7 +2207,7 @@ function startAudioCoordination() {
   audioTimer.unref();
 }
 
-function installPageEnhancements(tab = soleWindows.win) {
+function installPageEnhancements(tab = currentWindows().win) {
   if (!tab || tab.isDestroyed()) return;
   void tab.webContents.executeJavaScript(`(() => {
     document.getElementById('__tweb_status__')?.remove();
@@ -2382,7 +2382,7 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
 // The preload receives the two flags separately and drives the mode indicator and
 // each gate independently.
 function broadcastShortcutMode() {
-  for (const tab of soleWindows.tabs) {
+  for (const tab of currentWindows().tabs) {
     sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   }
 }
@@ -2392,7 +2392,7 @@ function applyShortcutMode() {
   pageInsertMode = false;
   broadcastShortcutMode();
   // Once passthrough is armed (vimium off), focus so the page can receive keys.
-  if (!vimiumShortcutsEnabled && soleWindows.win && !soleWindows.win.isDestroyed()) soleWindows.win.webContents.focus();
+  if (!vimiumShortcutsEnabled && currentWindows().win && !currentWindows().win.isDestroyed()) currentWindows().win.webContents.focus();
   // A Ghostty config reload or a pane restart can reset one side only, so reconcile
   // always runs even when the value already matches.
   reconcileTmuxPassthrough();
@@ -2435,30 +2435,30 @@ function toggleBrowserShortcuts() {
 }
 
 function activateTab(index) {
-  if (soleWindows.tabs.length === 0) {
-    soleWindows.win = null;
-    soleWindows.activeTabIndex = -1;
+  if (currentWindows().tabs.length === 0) {
+    currentWindows().win = null;
+    currentWindows().activeTabIndex = -1;
     return;
   }
-  const normalized = ((index % soleWindows.tabs.length) + soleWindows.tabs.length) % soleWindows.tabs.length;
-  soleWindows.activeTabIndex = normalized;
-  soleWindows.win = soleWindows.tabs[normalized];
+  const normalized = ((index % currentWindows().tabs.length) + currentWindows().tabs.length) % currentWindows().tabs.length;
+  currentWindows().activeTabIndex = normalized;
+  currentWindows().win = currentWindows().tabs[normalized];
   mouseClicks.reset();
   pageInsertMode = false;
   // The preload mirrors this flag and skips redundant IPC, so tell the tab we
   // just cleared it. Without this its focused input keeps thinking native
   // delivery is armed and its keys go back through the renderer, where they
   // arrive with keyCode 0.
-  sendToTabFrames(soleWindows.win, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+  sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
   // The other tab's caret says nothing about this one, and its preload only
   // reports on focus — which switching soleWindows.tabs does not fire.
   moveTerminalCaret(null);
   // Zoom is shared per origin in Chromium, so a sibling tab on the same host can
   // have moved it. Only the active tab is ever painted, so restoring this tab's
   // own factor on activation is what makes zoom look per-tab.
-  const zoomFactor = tabZoomFactors.get(soleWindows.win) ?? defaultZoomFactor;
-  if (!soleWindows.win.isDestroyed() && soleWindows.win.webContents.getZoomFactor() !== zoomFactor) {
-    soleWindows.win.webContents.setZoomFactor(zoomFactor);
+  const zoomFactor = tabZoomFactors.get(currentWindows().win) ?? defaultZoomFactor;
+  if (!currentWindows().win.isDestroyed() && currentWindows().win.webContents.getZoomFactor() !== zoomFactor) {
+    currentWindows().win.webContents.setZoomFactor(zoomFactor);
   }
   // Cell size in CSS pixels depends on the zoom just restored.
   broadcastCellMetrics();
@@ -2466,26 +2466,26 @@ function activateTab(index) {
   // id and replaces it in place. Deleting would uncover the bare terminal until
   // the new tab paints, which reads as a flicker on every switch.
   updatePaintingState();
-  soleWindows.win.webContents.invalidate();
+  currentWindows().win.webContents.invalidate();
   updatePaneTitle();
   sendTabState();
   scheduleWindowSessionSave();
-  if (debugLogging) console.error(`tweb: tab active ${tabLabel(soleWindows.win, normalized)}`);
+  if (debugLogging) console.error(`tweb: tab active ${tabLabel(currentWindows().win, normalized)}`);
 }
 
 function cycleTab(direction) {
-  if (soleWindows.tabs.length > 1) activateTab(soleWindows.activeTabIndex + direction);
+  if (currentWindows().tabs.length > 1) activateTab(currentWindows().activeTabIndex + direction);
 }
 
-function closeTab(index = soleWindows.activeTabIndex) {
-  const tab = soleWindows.tabs[index];
+function closeTab(index = currentWindows().activeTabIndex) {
+  const tab = currentWindows().tabs[index];
   if (!tab || tab.isDestroyed()) return;
   const url = tab.webContents.getURL();
   if (isRestorableUrl(url)) {
-    soleWindows.closedTabs.push(url);
-    if (soleWindows.closedTabs.length > 25) soleWindows.closedTabs.shift();
+    currentWindows().closedTabs.push(url);
+    if (currentWindows().closedTabs.length > 25) currentWindows().closedTabs.shift();
   }
-  if (soleWindows.tabs.length === 1) {
+  if (currentWindows().tabs.length === 1) {
     app.quit();
     return;
   }
@@ -2493,7 +2493,7 @@ function closeTab(index = soleWindows.activeTabIndex) {
 }
 
 function restoreClosedTab() {
-  const url = soleWindows.closedTabs.pop();
+  const url = currentWindows().closedTabs.pop();
   if (url) createTab(url, true);
 }
 
@@ -2695,7 +2695,7 @@ function omniboxModel() {
   const history = readGlobalHistory();
   // Open soleWindows.tabs always outrank history entries.
   const base = history.length;
-  const tabEntries = soleWindows.tabs.flatMap((candidate, index) => {
+  const tabEntries = currentWindows().tabs.flatMap((candidate, index) => {
     if (candidate.isDestroyed()) return [];
     const url = tabSessionUrls.get(candidate) || candidate.webContents.getURL() || "about:blank";
     return [{
@@ -2703,11 +2703,11 @@ function omniboxModel() {
       index,
       url,
       title: candidate.webContents.getTitle() || url,
-      recency: base + soleWindows.tabs.length - index,
+      recency: base + currentWindows().tabs.length - index,
     }];
   });
   return {
-    current: soleWindows.win && !soleWindows.win.isDestroyed() ? tabSessionUrls.get(soleWindows.win) || soleWindows.win.webContents.getURL() || "" : "",
+    current: currentWindows().win && !currentWindows().win.isDestroyed() ? tabSessionUrls.get(currentWindows().win) || currentWindows().win.webContents.getURL() || "" : "",
     entries: [
       ...tabEntries,
       ...history.map((entry, index) => ({ ...entry, kind: "history", recency: base - index })),
@@ -2717,8 +2717,8 @@ function omniboxModel() {
 
 function tabListModel() {
   return {
-    activeIndex: soleWindows.activeTabIndex,
-    tabs: soleWindows.tabs.map((candidate, index) => ({
+    activeIndex: currentWindows().activeTabIndex,
+    tabs: currentWindows().tabs.map((candidate, index) => ({
       index,
       title: candidate.webContents.getTitle() || "New tab",
       url: candidate.webContents.getURL() || "about:blank",
@@ -2728,21 +2728,21 @@ function tabListModel() {
 
 function tabStateModel() {
   return {
-    activeIndex: soleWindows.activeTabIndex,
-    count: soleWindows.tabs.length,
-    tabs: soleWindows.tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
+    activeIndex: currentWindows().activeTabIndex,
+    count: currentWindows().tabs.length,
+    tabs: currentWindows().tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
       index,
       title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "New tab",
     }]),
   };
 }
 
-function sendTabState(tab = soleWindows.win) {
+function sendTabState(tab = currentWindows().win) {
   sendToMainTabFrame(tab, "tweb-tab-state", tabStateModel());
 }
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  if (!vimiumShortcutsEnabled || tab !== soleWindows.win || tab.isDestroyed()) return;
+  if (!vimiumShortcutsEnabled || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
   switch (action) {
@@ -2795,14 +2795,14 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       resolveFileChooser(tab, value);
       break;
     case "activate-tab":
-      if (Number.isInteger(value) && value >= 0 && value < soleWindows.tabs.length) activateTab(value);
+      if (Number.isInteger(value) && value >= 0 && value < currentWindows().tabs.length) activateTab(value);
       break;
     // The tab list closes a specific row; the bare shortcut closes the active tab.
     case "close-tab":
       // Closing from the list keeps it open, so it has to be redrawn — but only
       // then: sending the model unprompted would pop the list open.
       refreshTabListAfterClose = Number.isInteger(value);
-      closeTab(Number.isInteger(value) ? value : soleWindows.activeTabIndex);
+      closeTab(Number.isInteger(value) ? value : currentWindows().activeTabIndex);
       break;
     case "restore-tab": restoreClosedTab(); break;
     case "reload": contents.reload(); break;
@@ -2953,7 +2953,7 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
-  if (tab === soleWindows.win && frame === tab.webContents.mainFrame) {
+  if (tab === currentWindows().win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
     // A download outlives the page that started it — clicking a link can navigate and
@@ -2965,7 +2965,7 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
 
 ipcMain.on("tweb-shortcut", (event, message) => {
   if (!message || typeof message.action !== "string") return;
-  const tab = soleWindows.tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
+  const tab = currentWindows().tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
   if (!tab) return;
   handleNativeShortcut(tab, message.action, message.value, event.senderFrame);
 });
@@ -3015,7 +3015,7 @@ ipcMain.on("tweb-agent-response", (_event, response) => {
 
 // Ask the active page's top frame to run an agent method.
 function agentPageRequest(method, params, timeoutMs = 10000) {
-  const tab = soleWindows.win;
+  const tab = currentWindows().win;
   if (!tab || tab.isDestroyed()) throw new Error("no active tab");
   const id = ++agentRequestSerial;
   return new Promise((resolve, reject) => {
@@ -3029,7 +3029,7 @@ function agentPageRequest(method, params, timeoutMs = 10000) {
 }
 
 function agentDiagnostics() {
-  const tab = soleWindows.win && !soleWindows.win.isDestroyed() ? soleWindows.win : null;
+  const tab = currentWindows().win && !currentWindows().win.isDestroyed() ? currentWindows().win : null;
   const size = tab ? tab.getContentSize() : null;
   const frame = tab ? tabFrames.get(tab)?.image?.getSize() : null;
   return {
@@ -3056,7 +3056,7 @@ function agentDiagnostics() {
       // A frame whose size does not match the pane is dropped, which is what a
       // pane that stopped following a resize looks like.
       expected: currentFrames().viewport ? renderedFrameSize(currentFrames().viewport) : null,
-      rate: soleWindows.activeFrameRate,
+      rate: currentWindows().activeFrameRate,
       adaptive: adaptiveFrameRate,
       // All three resolved rates, not just the one in force. The startup banner was the
       // only place they were stated together, and it wrote into tmux's shared status line.
@@ -3065,8 +3065,8 @@ function agentDiagnostics() {
       // painting on its own — a video, an animation — which is what separates "the pane
       // is throttled" from "the page has nothing new to show".
       rateKind: !adaptiveFrameRate ? "fixed"
-        : soleWindows.activeFrameRate >= maxActiveFrameRate ? "active"
-          : soleWindows.activeFrameRate >= playbackFrameRate ? "playback" : "idle",
+        : currentWindows().activeFrameRate >= maxActiveFrameRate ? "active"
+          : currentWindows().activeFrameRate >= playbackFrameRate ? "playback" : "idle",
       droppedByBackpressure: currentFrames().droppedGfxFrames,
       imageId: currentFrames().imageIds.base,
       // How the damage split between the two paths. A pane that feels slow while typing
@@ -3098,7 +3098,7 @@ function agentDiagnostics() {
       // to tell "caret parked on the wrong line" from "page never reported one".
       caret: { cell: caretCell, point: lastCaretPoint },
     },
-    tabs: { active: soleWindows.activeTabIndex, count: soleWindows.tabs.length },
+    tabs: { active: currentWindows().activeTabIndex, count: currentWindows().tabs.length },
     // Which pane owns the speakers, and whether this one is making noise. `audible` is
     // read live rather than cached because Chromium is the only thing that knows, and
     // "muted but still playing" is exactly the state this feature has to produce.
@@ -3113,8 +3113,8 @@ function agentDiagnostics() {
 }
 
 function agentContents() {
-  if (!soleWindows.win || soleWindows.win.isDestroyed()) throw new Error("no active tab");
-  return soleWindows.win.webContents;
+  if (!currentWindows().win || currentWindows().win.isDestroyed()) throw new Error("no active tab");
+  return currentWindows().win.webContents;
 }
 
 function agentNativeClick(point) {
@@ -3167,12 +3167,12 @@ async function agentWaitFor(params) {
 
 function agentTabList() {
   return {
-    active: soleWindows.activeTabIndex,
-    tabs: soleWindows.tabs.map((tab, index) => ({
+    active: currentWindows().activeTabIndex,
+    tabs: currentWindows().tabs.map((tab, index) => ({
       index,
       title: tab.isDestroyed() ? "" : tab.webContents.getTitle(),
       url: tab.isDestroyed() ? "" : tab.webContents.getURL(),
-      active: index === soleWindows.activeTabIndex,
+      active: index === currentWindows().activeTabIndex,
     })),
   };
 }
@@ -3181,7 +3181,7 @@ async function agentScreenshot(params) {
   const contents = agentContents();
   // On a hidden pane the hold has already collected a frame at the restored size, and
   // going back to the compositor for a second copy of it is what failed intermittently.
-  const image = soleWindows.agentSurfaceFrame || await contents.capturePage();
+  const image = currentWindows().agentSurfaceFrame || await contents.capturePage();
   if (!params.path) return { png: image.toPNG().toString("base64") };
   const target = path.resolve(params.path);
   writeFileSync(target, image.toPNG());
@@ -3272,7 +3272,7 @@ async function dispatchAgentCommand(method, params) {
       createTab(normalizeUrl(String(params.url || "about:blank")), true);
       return agentTabList();
     case "tab-close":
-      closeTab(params.index === undefined ? soleWindows.activeTabIndex : Number(params.index));
+      closeTab(params.index === undefined ? currentWindows().activeTabIndex : Number(params.index));
       return agentTabList();
     case "console":
       return { messages: params.clear ? consoleLog.splice(0) : consoleLog.slice(-(params.limit || 100)) };
@@ -3332,9 +3332,9 @@ const imeSlotCells = Number.isSafeInteger(configuredImeSlotCells) && configuredI
   : 3;
 
 function cellMetrics() {
-  if (!currentFrames().viewport || !soleWindows.win || soleWindows.win.isDestroyed()) return null;
+  if (!currentFrames().viewport || !currentWindows().win || currentWindows().win.isDestroyed()) return null;
   const logical = logicalContentSize(currentFrames().viewport);
-  const zoom = soleWindows.win.webContents.getZoomFactor() || 1;
+  const zoom = currentWindows().win.webContents.getZoomFactor() || 1;
   return {
     width: logical.width / Math.max(1, currentFrames().cells.cols) / zoom,
     height: logical.height / Math.max(1, currentFrames().cells.rows) / zoom,
@@ -3342,8 +3342,8 @@ function cellMetrics() {
   };
 }
 
-function broadcastCellMetrics(tab = soleWindows.win) {
-  if (!tab || tab.isDestroyed() || tab !== soleWindows.win) return;
+function broadcastCellMetrics(tab = currentWindows().win) {
+  if (!tab || tab.isDestroyed() || tab !== currentWindows().win) return;
   sendToTabFrames(tab, "tweb-cell-metrics", cellMetrics());
 }
 
@@ -3356,7 +3356,7 @@ function reparkTerminalCaret() {
 
 function moveTerminalCaret(point) {
   const vp = currentFrames().viewport;
-  if (!point || !vp || !soleWindows.win || soleWindows.win.isDestroyed()) {
+  if (!point || !vp || !currentWindows().win || currentWindows().win.isDestroyed()) {
     // Unconditionally, not just when a caret was parked: a frame's cursor anchoring can
     // leave a visible cursor at the pane origin even when TWeb never put one there, and in
     // the corner that reads as a caret sitting in the wrong place.
@@ -3364,7 +3364,7 @@ function moveTerminalCaret(point) {
     return;
   }
   const logical = logicalContentSize(vp);
-  const zoom = soleWindows.win.webContents.getZoomFactor() || 1;
+  const zoom = currentWindows().win.webContents.getZoomFactor() || 1;
   const cellWidth = logical.width / Math.max(1, currentFrames().cells.cols);
   const cellHeight = logical.height / Math.max(1, currentFrames().cells.rows);
   // Nearest cell edge, not the containing cell: a bar on the left edge is off by
@@ -3493,7 +3493,7 @@ function downloadsPageModel(query = "") {
  * case, and without the timer its badge would sit over the page until something else
  * happened to redraw it.
  */
-function sendTransferState(tab = soleWindows.win) {
+function sendTransferState(tab = currentWindows().win) {
   if (transferBadgeTimer) {
     clearTimeout(transferBadgeTimer);
     transferBadgeTimer = null;
@@ -3503,7 +3503,7 @@ function sendTransferState(tab = soleWindows.win) {
   if (summary && summary.state !== "progressing") {
     transferBadgeTimer = setTimeout(() => {
       transferBadgeTimer = null;
-      sendToMainTabFrame(soleWindows.win, "tweb-transfer", transferSummary(transfers, Date.now()));
+      sendToMainTabFrame(currentWindows().win, "tweb-transfer", transferSummary(transfers, Date.now()));
     }, SETTLED_HOLD_MS + 100);
   }
 }
@@ -3803,7 +3803,7 @@ function shimFramePrint(frame) {
  * reported exactly as before, and only then handed to `lpr`. Ctrl-P and `window.print()`
  * keep their existing meaning.
  */
-async function printPageToPdf(tab = soleWindows.win, { paper = false } = {}) {
+async function printPageToPdf(tab = currentWindows().win, { paper = false } = {}) {
   if (!tab || tab.isDestroyed()) return;
   const contents = tab.webContents;
   const destination = availableDownloadPath(printFilename(contents.getTitle(), contents.getURL()));
@@ -3893,7 +3893,7 @@ function sendToPrintQueue(destination, transfer) {
     // Un-gated for the same reason settleTransfer's line is: the user pressed a key asking
     // for paper and has no other surface on which to learn what happened to it.
     console.error(`tweb: print to paper ${outcome.ok ? "queued" : "failed"} ${destination}: ${outcome.message}`);
-    sendToMainTabFrame(soleWindows.win, "tweb-print-paper", {
+    sendToMainTabFrame(currentWindows().win, "tweb-print-paper", {
       ok: outcome.ok,
       message: outcome.message,
       filename: transfer ? transfer.filename : path.basename(destination),
@@ -3904,7 +3904,7 @@ function sendToPrintQueue(destination, transfer) {
 function runBrowserContextMenuCommand(tab, action) {
   const state = contextMenuStateByTab.get(tab);
   contextMenuStateByTab.delete(tab);
-  if (!state || tab !== soleWindows.win || tab.isDestroyed()) return;
+  if (!state || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (!state.actions.has(action)) return;
   const { params } = state;
   const contents = tab.webContents;
@@ -3950,7 +3950,7 @@ function runBrowserContextMenuCommand(tab, action) {
 }
 
 function showBrowserContextMenu(tab, inputParams) {
-  if (tab !== soleWindows.win || tab.isDestroyed()) return;
+  if (tab !== currentWindows().win || tab.isDestroyed()) return;
   const contents = tab.webContents;
   const params = {
     x: 0,
@@ -4033,7 +4033,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.on("paint", (_event, dirty, image) => {
     // A page painting on its own is what separates video from a static screen, and the
     // frame-rate policy reads it to decide whether to fall all the way to idle.
-    if (tab === soleWindows.win) notePaintActivity();
+    if (tab === currentWindows().win) notePaintActivity();
     const size = image.getSize();
     const expected = currentFrames().viewport && renderedFrameSize(currentFrames().viewport);
     if (loggedFrameGeneration !== currentFrames().generation && !image.isEmpty()
@@ -4121,7 +4121,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     contents.setZoomFactor(zoomFactor);
     contents.invalidate();
     // Autofocused fields report their caret before this zoom lands.
-    if (tab === soleWindows.win) {
+    if (tab === currentWindows().win) {
       broadcastCellMetrics(tab);
       reparkTerminalCaret();
     }
@@ -4173,35 +4173,35 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 }
 
 function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
-  if (soleWindows.tabs.includes(tab)) return tab;
+  if (currentWindows().tabs.includes(tab)) return tab;
   configureTab(tab, initialZoomFactor);
   tabSessionUrls.set(tab, url || "about:blank");
-  soleWindows.tabs.push(tab);
-  const index = soleWindows.tabs.length - 1;
+  currentWindows().tabs.push(tab);
+  const index = currentWindows().tabs.length - 1;
 
   tab.on("closed", () => {
-    const closedIndex = soleWindows.tabs.indexOf(tab);
+    const closedIndex = currentWindows().tabs.indexOf(tab);
     if (closedIndex < 0) return;
-    const wasActive = tab === soleWindows.win;
+    const wasActive = tab === currentWindows().win;
     tabFrames.delete(tab);
     tabZoomFactors.delete(tab);
     tabSessionUrls.delete(tab);
     tabRendererRecoveries.delete(tab);
-    soleWindows.tabs.splice(closedIndex, 1);
-    if (soleWindows.tabs.length === 0) {
-      soleWindows.win = null;
-      soleWindows.activeTabIndex = -1;
+    currentWindows().tabs.splice(closedIndex, 1);
+    if (currentWindows().tabs.length === 0) {
+      currentWindows().win = null;
+      currentWindows().activeTabIndex = -1;
       if (!quitting) app.quit();
       return;
     }
-    if (wasActive) activateTab(Math.min(closedIndex, soleWindows.tabs.length - 1));
+    if (wasActive) activateTab(Math.min(closedIndex, currentWindows().tabs.length - 1));
     else {
-      if (closedIndex < soleWindows.activeTabIndex) soleWindows.activeTabIndex -= 1;
+      if (closedIndex < currentWindows().activeTabIndex) currentWindows().activeTabIndex -= 1;
       sendTabState();
     }
     if (refreshTabListAfterClose) {
       refreshTabListAfterClose = false;
-      sendToTabFrames(soleWindows.win, "tweb-tabs", tabListModel());
+      sendToTabFrames(currentWindows().win, "tweb-tabs", tabListModel());
     }
     scheduleWindowSessionSave();
   });
@@ -4225,7 +4225,7 @@ function createTab(
   url = "about:blank",
   activate = true,
   initialZoomFactor = defaultZoomFactor,
-  showInitialPlaceholder = soleWindows.tabs.length === 0
+  showInitialPlaceholder = currentWindows().tabs.length === 0
 ) {
   const tab = adoptTab(
     new BrowserWindow(browserWindowOptions()),
@@ -4324,12 +4324,12 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
     // size unconditionally would re-inflate the collapsed surface of every background
     // tab, and nothing would collapse them again until the next tab switch. A pane
     // resize is exactly when a hidden pane is most likely to be resized.
-    for (const tab of soleWindows.tabs) {
+    for (const tab of currentWindows().tabs) {
       if (tab.isDestroyed()) continue;
-      applySurfacePlan(tab, surfacePlan(tab === soleWindows.win, record.visible, logical, surfaceHeldForAgent()));
+      applySurfacePlan(tab, surfacePlan(tab === currentWindows().win, record.visible, logical, surfaceHeldForAgent()));
     }
   }
-  soleWindows.win?.webContents.invalidate();
+  currentWindows().win?.webContents.invalidate();
   if (record.visible) replacePlacement(frames);
   broadcastCellMetrics();
   reparkTerminalCaret();
@@ -4357,7 +4357,7 @@ function createWindow(url, frames = currentFrames()) {
   if (debugLogging) {
     console.error(`tweb: restored ${session.tabs.length} tabs for tmux window`);
   }
-  return soleWindows.win;
+  return currentWindows().win;
 }
 
 // --- browser input ---
@@ -4404,15 +4404,15 @@ function logicalMousePoint(rawX, rawY) {
 }
 
 function setBrowserZoom(action) {
-  if (!soleWindows.win) return;
-  const contents = soleWindows.win.webContents;
+  if (!currentWindows().win) return;
+  const contents = currentWindows().win.webContents;
   // Chromium keeps zoom per origin, so getZoomFactor() reports whatever another
   // tab on the same host last set. Step from this tab's own remembered value.
-  const current = tabZoomFactors.get(soleWindows.win) ?? contents.getZoomFactor();
+  const current = tabZoomFactors.get(currentWindows().win) ?? contents.getZoomFactor();
   const next = action === "reset"
     ? defaultZoomFactor
     : Math.min(2, Math.max(0.5, current * (action === "in" ? 1.2 : 1 / 1.2)));
-  tabZoomFactors.set(soleWindows.win, next);
+  tabZoomFactors.set(currentWindows().win, next);
   contents.setZoomFactor(next);
   contents.invalidate();
   broadcastCellMetrics();
@@ -4427,8 +4427,8 @@ function hasZoomModifier(modifiers) {
 }
 
 function dispatchMouse(cb, rawX, rawY, release) {
-  if (!soleWindows.win) return;
-  const contents = soleWindows.win.webContents;
+  if (!currentWindows().win) return;
+  const contents = currentWindows().win.webContents;
   const { x, y } = logicalMousePoint(rawX, rawY);
   const modifiers = mouseModifiers(cb);
   const buttonCode = cb & 3;
@@ -4528,8 +4528,8 @@ let pdfPendingGTimer = null;
 /// and a keystroke that waited for it would make held keys stutter; each call reads the
 /// position inside the frame, so two in flight still compose.
 function routePdfKey(key, modifiers) {
-  if (!soleWindows.win || soleWindows.win.isDestroyed()) return false;
-  const frame = findPdfFrame(soleWindows.win.webContents.mainFrame);
+  if (!currentWindows().win || currentWindows().win.isDestroyed()) return false;
+  const frame = findPdfFrame(currentWindows().win.webContents.mainFrame);
   if (!frame) {
     pdfPendingG = false;
     return false;
@@ -4587,7 +4587,7 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
 }
 
 function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints = []) {
-  if (!soleWindows.win || !key) return;
+  if (!currentWindows().win || !key) return;
   const modifiers = electronModifiers(modifierMask);
   const pressed = eventKind !== 3;
   const control = modifiers.includes("control");
@@ -4604,7 +4604,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   }
 
   if (modifiers.includes("meta") && key.toLowerCase() === "a") {
-    if (pressed) sendToTabFrames(soleWindows.win, "tweb-select-all");
+    if (pressed) sendToTabFrames(currentWindows().win, "tweb-select-all");
     return;
   }
 
@@ -4614,7 +4614,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // terminal selection instead, which is why these need a passthrough entry.
   if (modifiers.includes("meta") && ["c", "v", "x"].includes(key.toLowerCase())) {
     if (pressed) {
-      const contents = soleWindows.win.webContents;
+      const contents = currentWindows().win.webContents;
       if (key.toLowerCase() === "c") contents.copy();
       else if (key.toLowerCase() === "v") contents.paste();
       else contents.cut();
@@ -4674,10 +4674,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // the web app's own shortcut, and those are exactly the handlers that check
   // isTrusted.
   if (!vimiumShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
-    dispatchNativeKey(soleWindows.win.webContents, key, text, modifiers, eventKind);
+    dispatchNativeKey(currentWindows().win.webContents, key, text, modifiers, eventKind);
     return;
   }
-  sendToFocusedTabFrame(soleWindows.win, "tweb-terminal-key", {
+  sendToFocusedTabFrame(currentWindows().win, "tweb-terminal-key", {
     key,
     code: "",
     event: eventKind === 3 ? "keyup" : "keydown",
@@ -4723,8 +4723,8 @@ function dispatchControlByte(byte, extraModifierBits = 0) {
 // formatting and attachments, which insertText cannot deliver. Terminals commonly
 // turn \n into \r on paste, so both sides are normalized before comparing.
 function dispatchPaste(text) {
-  if (!soleWindows.win || !text) return;
-  const contents = soleWindows.win.webContents;
+  if (!currentWindows().win || !text) return;
+  const contents = currentWindows().win.webContents;
   const normalize = (value) => value.replace(/\r\n?/g, "\n");
   const body = normalize(text);
   const fromClipboard = normalize(clipboard.readText()) === body;
@@ -5404,7 +5404,7 @@ app.on("before-quit", () => {
   if (debugLogging && currentFrames().droppedGfxFrames > 0) {
     console.error(`tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
   }
-  for (const tab of soleWindows.tabs) {
+  for (const tab of currentWindows().tabs) {
     if (!tab.isDestroyed()) tab.webContents.stopPainting();
   }
   restoreTmuxPassthroughClients();
