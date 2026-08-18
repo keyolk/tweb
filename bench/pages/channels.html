@@ -1,0 +1,16 @@
+<!doctype html><meta charset=utf-8>
+<style>
+ body{margin:0;font:700 34px/1.1 -apple-system,system-ui,sans-serif;color:#fff}
+ div{height:11.1vh;display:flex;align-items:center;padding-left:24px;letter-spacing:.02em}
+</style>
+<!-- 채널 순서 오류는 R<->B 교환으로 나타난다. 순수 R/B 밴드는 서로 바뀌고,
+     G/흰/검정은 불변이므로 "이미지가 나왔다" 와 "채널이 맞다" 가 구분된다. -->
+<div style="background:#ff0000">RED   band - must read RED</div>
+<div style="background:#0000ff">BLUE  band - must read BLUE</div>
+<div style="background:#00ff00;color:#000">GREEN band - unchanged by any swap</div>
+<div style="background:#ff8000">ORANGE - red-dominant, must stay warm</div>
+<div style="background:#0080ff">AZURE  - blue-dominant, must stay cool</div>
+<div style="background:#ffffff;color:#000">WHITE - unchanged</div>
+<div style="background:#000000">BLACK - unchanged</div>
+<div style="background:#ff00ff">MAGENTA - R+B, unchanged by an R/B swap</div>
+<div style="background:#00ffff;color:#000">CYAN - G+B, becomes YELLOW if swapped</div>

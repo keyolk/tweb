@@ -5,7 +5,7 @@ const test = require("node:test");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { directCommands, fileCommands, rawCommands, frameCommands, CHUNK } =
+const { directCommands, fileCommands, rawCommands, frameCommands, swapBytewise, swapU32, CHUNK } =
   require("./gfx-worker.cjs");
 
 function temporaryFile(name) {
@@ -44,6 +44,65 @@ test("a raw frame swaps BGRA to RGBA and declares its own dimensions", () => {
   // A raw file carries no dimensions of its own, so s=/v= above are the only thing that says
   // how to read it — which is why they are asserted alongside the pixels.
   assert.deepEqual(fs.readFileSync(filePath), Buffer.from([0x30, 0x20, 0x10, 0x40]));
+  fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+});
+
+// The u32 swap is an optimisation, so what has to be true of it is that it is indistinguishable
+// from the loop it replaces — 6.58ms against 2.90ms on a 2880x1800 frame is only worth having if
+// the bytes agree. A channel-order error here is not a crash, it is a plausible image with red
+// and blue exchanged, which is exactly the kind of defect a test catches and an eye does not.
+test("the u32 swap agrees with the bytewise loop on every byte", () => {
+  // Every byte value in every channel position, so no mask can be wrong and still pass.
+  const bgra = Buffer.allocUnsafe(256 * 4);
+  for (let i = 0; i < bgra.length; i += 1) bgra[i] = (i * 7 + (i >>> 2)) & 0xff;
+
+  const expected = Buffer.allocUnsafe(bgra.length);
+  swapBytewise(bgra, expected);
+
+  const actual = Buffer.alloc(bgra.length);
+  const aligned = (buffer) => {
+    // A pooled buffer lands at an arbitrary offset; these views need both ends 4-byte aligned.
+    assert.equal(buffer.byteOffset & 3, 0, "test fixture must be 4-byte aligned");
+    return new Uint32Array(buffer.buffer, buffer.byteOffset, buffer.length >>> 2);
+  };
+  swapU32(aligned(bgra), aligned(actual));
+
+  assert.deepEqual(actual, expected);
+});
+
+// The guard, not the fast path. `Buffer.allocUnsafe` under 4KB comes out of a shared pool at an
+// offset nobody chose, so a misaligned frame is a real input — and a Uint32Array view over one
+// throws RangeError, which would lose the frame outright rather than merely render it slowly.
+test("a raw frame at a misaligned offset still swaps correctly", () => {
+  const filePath = temporaryFile("frame.rgba");
+  const backing = Buffer.alloc(4 + 8);
+  const bgra = backing.subarray(1, 9);
+  bgra.set([0x10, 0x20, 0x30, 0x40, 0x11, 0x22, 0x33, 0x44]);
+  assert.notEqual(bgra.byteOffset & 3, 0, "fixture must actually be misaligned");
+
+  rawCommands(message({ filePath, width: 2, height: 1 }), bgra);
+
+  assert.deepEqual(
+    fs.readFileSync(filePath),
+    Buffer.from([0x30, 0x20, 0x10, 0x40, 0x33, 0x22, 0x11, 0x44]),
+  );
+  fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+});
+
+// A whole frame's worth, through the aligned path, so the shipping size is covered by something
+// other than the four-byte fixtures above.
+test("a full-size raw frame swaps every pixel", () => {
+  const filePath = temporaryFile("frame.rgba");
+  const width = 64;
+  const height = 32;
+  const bgra = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < bgra.length; i += 1) bgra[i] = (i * 31) & 0xff;
+  const expected = Buffer.allocUnsafe(bgra.length);
+  swapBytewise(bgra, expected);
+
+  rawCommands(message({ filePath, width, height }), bgra);
+
+  assert.deepEqual(fs.readFileSync(filePath), expected);
   fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
 });
 
