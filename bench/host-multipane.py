@@ -49,12 +49,17 @@ def attach_line(pane, image_id, url, left):
     return (f"@{pane} ATTACH - 1 {image_id} 30 1 0 80 24 800 480 {left} 0 - {url}\n")
 
 
-def visible_line(pane):
+def visible_line(pane, window, tty):
     # The frontend's tmux client listing, not a boolean: line 0 is the pane's own placement and
     # the rest are clients. One client viewing this pane's window is what uncollapses the
     # surface; `VIS 1` would leave it collapsed and the run would measure silence.
-    payload = (f"harness\t@1\t{pane}\n"
-               f"/dev/ttys999\tharness\t@1\t0\t{pane}\troot")
+    #
+    # Each pane gets its OWN window and its own client tty, which is the realistic shape and the
+    # one that can expose shared state: every pane in one window on one tty makes N pushes that
+    # happen to agree, so a placement or tty set held once per process instead of once per pane
+    # would look correct. Panes in different windows disagree, which is the point.
+    payload = (f"harness\t{window}\t{pane}\n"
+               f"{tty}\tharness\t{window}\t0\t{pane}\troot")
     return f"@{pane} VIS {payload.encode('utf8').hex()}\n"
 
 
@@ -121,6 +126,9 @@ def main():
     ]
     panes = [(f"%{10 + i}", IMAGE_ID_BASE + i * IMAGE_ID_STRIDE, urls[i % len(urls)], i * 810)
              for i in range(count)]
+    # Pane i lives in window @(i+1), viewed by its own client tty.
+    windows = {pane: f"@{i + 1}" for i, (pane, _, _, _) in enumerate(panes)}
+    ttys_of = {pane: f"/dev/ttys{900 + i}" for i, (pane, _, _, _) in enumerate(panes)}
 
     runtime = os.environ.get("TWEB_RUNTIME_DIR", "/tmp/host-multipane")
     os.makedirs(runtime, exist_ok=True)
@@ -149,6 +157,8 @@ def main():
     others = []
     attached = False
     attach_at = time.time() + 3.0
+    repush_at = None
+    frames_at_repush = {}
     deadline = time.time() + seconds
     peak_procs, peak_rss = 0, 0.0
     os.set_blocking(engine.stdout.fileno(), False)
@@ -157,7 +167,24 @@ def main():
     def send_all():
         for pane, image_id, url, left in panes:
             engine.stdin.write(attach_line(pane, image_id, url, left).encode())
-            engine.stdin.write(visible_line(pane).encode())
+            engine.stdin.write(visible_line(pane, windows[pane], ttys_of[pane]).encode())
+        engine.stdin.flush()
+
+    def repush_first():
+        """Re-assert the FIRST pane's visibility after every other pane has pushed its own.
+
+        This is the ordering that catches per-process state standing in for per-pane state. The
+        push is diffed against the tty set the engine believes this pane's clients are, so a set
+        held once per process holds the LAST pane's clients — and every one of this pane's own
+        clients then reads as "stopped showing this pane", which sends a Kitty delete to a terminal
+        that is still displaying it. The pane goes blank while still being watched.
+
+        The pane not painting afterwards is NOT the signal: an identical push is not a transition,
+        so `becameVisible` is false and a static page correctly has nothing to redraw. The signal is
+        the delete, which the engine logs.
+        """
+        pane = panes[0][0]
+        engine.stdin.write(visible_line(pane, windows[pane], ttys_of[pane]).encode())
         engine.stdin.flush()
 
     try:
@@ -176,6 +203,7 @@ def main():
                     if (text.startswith("READY ") or text.startswith("@")) and not attached:
                         attached = True
                         send_all()
+                        repush_at = time.time() + (seconds - 3.0) / 2
                     for pane, _, _, _ in panes:
                         if text.startswith(f"@{pane} AGENT "):
                             sockets[pane] = text.split(" ", 2)[2]
@@ -204,6 +232,11 @@ def main():
             if not attached and time.time() > attach_at:
                 attached = True
                 send_all()
+                repush_at = time.time() + (seconds - 3.0) / 2
+            if repush_at is not None and time.time() > repush_at:
+                repush_at = None
+                frames_at_repush = {pane: len(frames[pane]) for pane, _, _, _ in panes}
+                repush_first()
             if engine.poll() is not None:
                 break
             procs, rss = process_tree(engine.pid)
@@ -229,7 +262,9 @@ def main():
         if got:
             painted += 1
         host = url.split("/")[2]
-        print(f"  {pane:5s} i={image_id:<6d} {len(got):4d} frames  {total:6.1f}MB  {host}")
+        after = len(got) - frames_at_repush.get(pane, len(got))
+        print(f"  {pane:5s} i={image_id:<6d} {len(got):4d} frames  {total:6.1f}MB"
+              + f"  {after:3d} after re-push  {host}")
 
     print(f"\n  panes painted     {painted}/{count}")
     print(f"  process tree      {peak_procs} procs, {peak_rss:.0f}MB peak")
@@ -239,11 +274,51 @@ def main():
 
     # A count above zero names a real defect even when every pane painted: some entry point resolved
     # its pane by falling back to the first one.
+    first_pane = panes[0][0]
+
+    # Each pane pushed its own window and its own client tty, so each pane's own `diag` must report
+    # its own back. State held once per process reports whichever pane pushed last for every pane,
+    # which is a pane believing it lives in another pane's window — the placement its frames are
+    # addressed by and the tty its image is deleted from.
+    misplaced = []
+    for pane, _, _, _ in panes:
+        report = diags.get(pane)
+        if not report:
+            continue
+        state = report.get("input", {}) or {}
+        placement = state.get("tmuxPlacement") or {}
+        ttys = state.get("visibleClientTtys") or []
+        if placement.get("windowId") != windows[pane]:
+            misplaced.append(f"{pane} in window {placement.get('windowId')}, pushed {windows[pane]}")
+        elif ttys != [ttys_of[pane]]:
+            misplaced.append(f"{pane} sees clients {ttys}, pushed [{ttys_of[pane]}]")
+
+    # The engine logs every image it takes off a client tty. Every client in this run keeps watching
+    # its pane for the whole run, so a legitimate eviction is impossible: any eviction at all is a
+    # pane deleting an image off a terminal that is still displaying it.
+    #
+    # The pane and the tty in the line are what name the defect. Measured with visibility state
+    # shared per process: `image evicted from /dev/ttys900 for %11` — pane %11 deleting the image on
+    # %10's client, because it read %10's tty set as its own and every entry looked like a client
+    # that had gone away.
+    evicted = []
+    try:
+        log = open(os.path.join(runtime, "engine.err"), "r", errors="replace").read()
+    except OSError:
+        log = ""
+    for line in log.splitlines():
+        if "image evicted from" in line:
+            evicted.append(line.split("tweb: ", 1)[-1].strip())
+
     unscoped = 0
     unreachable = [pane for pane, _, _, _ in panes if not diags.get(pane)]
     for report in diags.values():
         if report:
             unscoped = max(unscoped, int(report.get("panes", {}).get("unscopedResolutions", 0)))
+    print(f"  evictions         {len(evicted)}"
+          + (f"  — {evicted[0]}" if evicted else "  (no client stopped watching)"))
+    print(f"  own placement     {count - len(misplaced)}/{count} panes"
+          + (f"  — {misplaced[0]}" if misplaced else ""))
     print(f"  unscoped panes    {unscoped}"
           + (f"  ({len(unreachable)} pane(s) did not answer diag)" if unreachable else ""))
 
@@ -254,7 +329,8 @@ def main():
     if others:
         print(f"\n  engine said: {others[:4]}")
 
-    ok = painted == count and not crossed and unscoped == 0 and not unreachable
+    ok = (painted == count and not crossed and unscoped == 0 and not unreachable
+          and not misplaced and not evicted)
     reasons = []
     if painted != count:
         reasons.append(f"{count - painted} pane(s) silent")
@@ -264,6 +340,10 @@ def main():
         reasons.append(f"{unscoped} unscoped pane resolution(s)")
     if unreachable:
         reasons.append(f"{len(unreachable)} pane(s) unreachable over their agent socket")
+    if misplaced:
+        reasons.append(f"{len(misplaced)} pane(s) hold another pane's tmux placement")
+    if evicted:
+        reasons.append(f"{len(evicted)} image(s) deleted off a client still watching the pane")
     print(f"\n{'PASS' if ok else 'FAIL'} — "
           + ("every pane rendered its own image in one engine, none resolved by fallback" if ok
              else ", ".join(reasons)))

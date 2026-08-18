@@ -163,6 +163,25 @@ function createPaneRecord({
     // Whole/patch counters are per-pane because `tweb diag` reports them per-pane, and a shared
     // counter would attribute one pane's frames to another.
     frames: { whole: 0, patches: 0 },
+    // Where this pane lives right now, who is looking at it, and how we know.
+    //
+    // Per-pane because panes in one engine sit in DIFFERENT tmux windows watched by DIFFERENT
+    // clients. Held once per process, the last pane to push its listing overwrote every other
+    // pane's — measured with three panes: %11, pushed as window @2, reported @1. A pane holding
+    // another pane's placement addresses its frames by the wrong window and deletes its image
+    // from a tty that is still showing it.
+    //
+    // `source` and `pushedAt` follow because the poll fallback is armed per pane: a frontend that
+    // pushes for one pane says nothing about another whose frontend is older or absent.
+    visibility: {
+      placement: null,
+      clientTtys: new Set(),
+      source: "startup",
+      pushedAt: null,
+      checkRunning: false,
+      pollTimer: null,
+      fallbackTimer: null,
+    },
   };
 }
 

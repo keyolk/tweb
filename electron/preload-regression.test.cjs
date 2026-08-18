@@ -197,7 +197,7 @@ test("the window session slot is claimed exclusively and released only by its ow
   // The release runs on the exit path, after the final save.
   assert.match(main, /writeWindowSession\(\);\s*releaseWindowSessionClaim\(\);/);
   // A pane given a URL never restores but still saves, so it needs its own file too.
-  assert.match(main, /resolveWindowSessionPaths\(\);\s*tmuxPlacement =/);
+  assert.match(main, /resolveWindowSessionPaths\(\);\s*vis\(\)\.placement =/);
 });
 
 // A client can still report this window while tmux has zoomed a different pane.
@@ -210,8 +210,10 @@ test("another pane owning tmux zoom hides the browser image", () => {
   assert.match(main, /paneId: ownTmuxPane/);
   // Both the frontend's push and the no-frontend fallback poll run this one function,
   // so the zoom handling and the per-client delete cannot drift apart.
-  assert.match(main, /const next = visibleTmuxClientTtys\(clients, tmuxPlacement\);/);
-  assert.match(main, /if \(!next\.has\(tty\)\) deleteImageFromClientTty\(tty\);/);
+  assert.match(main, /const next = visibleTmuxClientTtys\(clients, vis\(\)\.placement\);/);
+  // The invariant is that a client no longer showing this pane gets the delete, whatever the loop
+  // is spelled like — it now logs the eviction first, which `bench/host-multipane.py` gates on.
+  assert.match(main, /if \(next\.has\(tty\)\) continue;[\s\S]*?deleteImageFromClientTty\(tty\);/);
   assert.match(main, /if \(becameVisible\) repaintActiveTab\(\);/);
 });
 
@@ -775,21 +777,26 @@ test("agent socket refuses a path longer than sun_path", () => {
 // keeps its id but changes window, every client match fails, and painting stops.
 test("visibility matches the pane's live placement, not its startup identity", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /let tmuxPlacement = null;/);
+  // The live placement lives on the pane's record, not in a module variable: panes in one engine
+  // sit in different tmux windows, and one shared placement had the last pane to push overwrite
+  // every other pane's — measured with three panes, %11 pushed as @2 and reported @1.
+  const registry = fs.readFileSync(path.join(__dirname, "pane-registry.cjs"), "utf8");
+  assert.match(registry, /visibility: \{\s*placement: null,/);
+  assert.match(main, /function vis\(\) \{\s*return currentPane\(\)\.visibility;/);
   // The frontend re-resolves placement through `-t <pane id>` on every tick and the
   // push carries the result, so the engine adopts the pane's current window rather
   // than the one it started in.
   assert.match(main, /applyClientListing\(push\.clients, push\.placement\)/);
-  assert.match(main, /function applyClientListing\(clients, placement\) \{\s*tmuxPlacement = placement;/);
-  assert.match(main, /visibleTmuxClientTtys\(clients, tmuxPlacement\)/);
+  assert.match(main, /function applyClientListing\(clients, placement\) \{\s*vis\(\)\.placement = placement;/);
+  assert.match(main, /visibleTmuxClientTtys\(clients, vis\(\)\.placement\)/);
   // The no-frontend fallback keeps re-resolving it for itself.
-  assert.match(main, /function syncTmuxVisibility\(\)[\s\S]*?"display-message", "-p", "-t", tmuxPlacement\.paneId/);
-  assert.match(main, /placement = \{ \.\.\.tmuxPlacement, session, windowId \}/);
+  assert.match(main, /function syncTmuxVisibility\(\)[\s\S]*?"display-message", "-p", "-t", vis\(\)\.placement\.paneId/);
+  assert.match(main, /placement = \{ \.\.\.vis\(\)\.placement, session, windowId \}/);
   // The save path stays on the startup identity; a moved pane must not silently
   // adopt another window's stored tabs. The slot claim derives from it too.
   assert.match(main, /identity: tmuxIdentity,/);
   // The in-flight guard has to clear even if spawning throws, or polling stops.
-  assert.match(main, /catch \(spawnError\) \{\s*visibilityCheckRunning = false;/);
+  assert.match(main, /catch \(spawnError\) \{\s*vis\(\)\.checkRunning = false;/);
 });
 
 // The engine is launched directly by tests and by hand, where no frontend exists to push
@@ -798,10 +805,12 @@ test("visibility matches the pane's live placement, not its startup identity", (
 test("visibility falls back to polling when no push arrives", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /const delay = process\.env\.TWEB_FRONTEND_PID \? VISIBILITY_PUSH_GRACE_MS : 0;/);
-  assert.match(main, /if \(visibilitySource === "push"\) return;\s*visibilitySource = "poll";/);
+  // Armed per pane: a frontend that pushes for one pane says nothing about another whose frontend
+  // is older or absent, so the source and the timers are on the record like the placement.
+  assert.match(main, /if \(vis\(\)\.source === "push"\) return;\s*vis\(\)\.source = "poll";/);
   // The first push disarms both timers for good.
-  assert.match(main, /visibilitySource = "push";/);
-  assert.match(main, /if \(visibilityPollTimer\) \{\s*clearTimeout\(visibilityPollTimer\);/);
+  assert.match(main, /vis\(\)\.source = "push";/);
+  assert.match(main, /if \(vis\(\)\.pollTimer\) \{\s*clearTimeout\(vis\(\)\.pollTimer\);/);
 });
 // Chromium's sendInputEvent takes Accelerator key codes, and it silently drops
 // names it does not know: measured in offscreen Chromium, keyDown with

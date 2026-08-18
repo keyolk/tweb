@@ -143,17 +143,15 @@ let cmdBypassEnabled = false;
 // `allow-passthrough=all`, which forwards a hidden pane's passthrough to whatever window the
 // client is actually viewing, it is the only thing between a hidden pane and drawing over the
 // user's visible one. A second copy of it is therefore the one piece of state that must not exist.
-let visibilityCheckRunning = false;
-let visibleClientTtys = new Set();
+
 const passthroughClientTables = new Map();
 let tmuxIdentity = null;
-// Where this pane lives *right now*. `tmuxIdentity` is the startup identity and
-// stays pinned because the window-session save path is derived from it, but a
-// pane moves: `break-pane` gives it a new window id and `join-pane` can change
-// its session too. Matching clients against the startup window then fails for
-// every client, the pane looks hidden, and painting stops — the pane freezes
-// after being moved. Visibility therefore tracks the live placement instead.
-let tmuxPlacement = null;
+// Where this pane lives *right now* is `vis().placement`, on the pane's record. `tmuxIdentity`
+// above is the startup identity and stays pinned because the window-session save path is derived
+// from it, but a pane moves: `break-pane` gives it a new window id and `join-pane` can change its
+// session too. Matching clients against the startup window then fails for every client, the pane
+// looks hidden, and painting stops — the pane freezes after being moved. Visibility therefore
+// tracks the live placement instead.
 let originalPaneTitle = null;
 const tabFrames = new Map();
 const tabZoomFactors = new Map();
@@ -927,18 +925,18 @@ function initializeTmuxVisibility() {
         paneId: ownTmuxPane,
       };
       resolveWindowSessionPaths();
-      tmuxPlacement = { session, windowId, paneId: ownTmuxPane };
+      vis().placement = { session, windowId, paneId: ownTmuxPane };
     }
     originalPaneTitle = titleParts.join("\t");
 
-    if (tmuxPlacement) {
+    if (vis().placement) {
       const clients = execFileSync(
         "tmux",
         ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
         { encoding: "utf8", timeout: 1000 }
       );
-      visibleClientTtys = visibleTmuxClientTtys(clients, tmuxPlacement);
-      recordVisibility(currentPane(), visibleClientTtys.size > 0);
+      vis().clientTtys = visibleTmuxClientTtys(clients, vis().placement);
+      recordVisibility(currentPane(), vis().clientTtys.size > 0);
     }
   } catch (error) {
     if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
@@ -965,47 +963,59 @@ function initializeTmuxVisibility() {
 // watchdog, so there is no need to re-arm afterwards.
 const VISIBILITY_PUSH_GRACE_MS = 2000;
 const VISIBILITY_POLL_MS = 250;
-let visibilityPollTimer = null;
-let visibilityFallbackTimer = null;
-let visibilitySource = "startup";
-let lastVisibilityPushAt = null;
+
+// This pane's visibility state, which lives on its record — see `createPaneRecord` for why it is
+// not one set of module variables. Every read below goes through here so the ambient pane decides
+// which pane's placement, clients and poll timer are meant.
+function vis() {
+  return currentPane().visibility;
+}
 
 function armVisibilityFallback() {
   if (!ownTmuxPane) return;
   const delay = process.env.TWEB_FRONTEND_PID ? VISIBILITY_PUSH_GRACE_MS : 0;
-  visibilityFallbackTimer = setTimeout(() => {
-    visibilityFallbackTimer = null;
-    if (visibilitySource === "push") return;
-    visibilitySource = "poll";
+  vis().fallbackTimer = setTimeout(() => {
+    vis().fallbackTimer = null;
+    if (vis().source === "push") return;
+    vis().source = "poll";
     if (debugLogging) console.error("tweb: visibility falling back to polling tmux");
     scheduleVisibilityCheck();
   }, delay);
-  visibilityFallbackTimer.unref();
+  vis().fallbackTimer.unref();
 }
 
 function scheduleVisibilityCheck() {
-  if (visibilityPollTimer) clearTimeout(visibilityPollTimer);
-  visibilityPollTimer = setTimeout(() => {
-    visibilityPollTimer = null;
+  if (vis().pollTimer) clearTimeout(vis().pollTimer);
+  vis().pollTimer = setTimeout(() => {
+    vis().pollTimer = null;
     syncTmuxVisibility();
     scheduleVisibilityCheck();
   }, VISIBILITY_POLL_MS);
-  visibilityPollTimer.unref();
+  vis().pollTimer.unref();
 }
 
 // Applies a client listing to this pane. Shared by the push and the fallback poll so the
 // two cannot drift — the tty bookkeeping below is the part that has to stay identical.
 function applyClientListing(clients, placement) {
-  tmuxPlacement = placement;
-  const next = visibleTmuxClientTtys(clients, tmuxPlacement);
+  vis().placement = placement;
+  const next = visibleTmuxClientTtys(clients, vis().placement);
   const wasVisible = currentPane().visible;
   // A client that stopped showing this pane keeps the image placed on it, so the delete
   // goes to that tty directly.
-  for (const tty of visibleClientTtys) {
-    if (!next.has(tty)) deleteImageFromClientTty(tty);
+  for (const tty of vis().clientTtys) {
+    if (next.has(tty)) continue;
+    // Logged because it is a pane going blank, and the two reasons for it are indistinguishable
+    // from the outside: a client that really stopped showing this pane, or this pane reading
+    // another pane's client set and evicting itself from a terminal still watching it. That second
+    // one is what per-pane visibility state exists to prevent, and `bench/host-multipane.py`
+    // gates on this line.
+    if (debugLogging) {
+      console.error(`tweb: image evicted from ${tty} for ${currentPane().paneId}`);
+    }
+    deleteImageFromClientTty(tty);
   }
-  const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
-  visibleClientTtys = next;
+  const becameVisible = [...next].some((tty) => !vis().clientTtys.has(tty));
+  vis().clientTtys = next;
   const changed = recordVisibility(currentPane(), next.size > 0);
   if (changed) {
     updatePaintingState();
@@ -1021,21 +1031,21 @@ function applyClientListing(clients, placement) {
 function applyVisibilityPush(hex) {
   const push = parseVisibilityPush(hex);
   if (!push) return;
-  if (visibilityFallbackTimer) {
-    clearTimeout(visibilityFallbackTimer);
-    visibilityFallbackTimer = null;
+  if (vis().fallbackTimer) {
+    clearTimeout(vis().fallbackTimer);
+    vis().fallbackTimer = null;
   }
-  if (visibilityPollTimer) {
-    clearTimeout(visibilityPollTimer);
-    visibilityPollTimer = null;
+  if (vis().pollTimer) {
+    clearTimeout(vis().pollTimer);
+    vis().pollTimer = null;
   }
-  visibilitySource = "push";
-  lastVisibilityPushAt = Date.now();
+  vis().source = "push";
+  vis().pushedAt = Date.now();
   if (debugLogging
-    && (push.placement.session !== tmuxPlacement?.session
-      || push.placement.windowId !== tmuxPlacement?.windowId)) {
+    && (push.placement.session !== vis().placement?.session
+      || push.placement.windowId !== vis().placement?.windowId)) {
     console.error(
-      `tweb: pane moved ${tmuxPlacement?.session}:${tmuxPlacement?.windowId}`
+      `tweb: pane moved ${vis().placement?.session}:${vis().placement?.windowId}`
       + ` -> ${push.placement.session}:${push.placement.windowId}`
     );
   }
@@ -1044,21 +1054,21 @@ function applyVisibilityPush(hex) {
 }
 
 function syncTmuxVisibility() {
-  if (!tmuxPlacement || visibilityCheckRunning) return;
-  visibilityCheckRunning = true;
+  if (!vis().placement || vis().checkRunning) return;
+  vis().checkRunning = true;
   // Re-resolve where the pane is before matching clients. A pane that was moved
   // by break-pane/join-pane keeps its id but changes window (and possibly
   // session); matching against a stale window makes every client miss and the
   // pane look hidden, which stops painting until the process restarts.
   execFile(
     "tmux",
-    ["display-message", "-p", "-t", tmuxPlacement.paneId, "#{session_name}\t#{window_id}"],
+    ["display-message", "-p", "-t", vis().placement.paneId, "#{session_name}\t#{window_id}"],
     { encoding: "utf8", timeout: 1000 },
     (placementError, placementOut) => {
-      let placement = tmuxPlacement;
+      let placement = vis().placement;
       if (!placementError) {
         const [session, windowId] = String(placementOut).trim().split("\t");
-        if (session && windowId) placement = { ...tmuxPlacement, session, windowId };
+        if (session && windowId) placement = { ...vis().placement, session, windowId };
       }
       // The flag is cleared in the inner callback. If spawning it throws, clear
       // it here instead — otherwise visibility polling stops for good.
@@ -1068,19 +1078,19 @@ function syncTmuxVisibility() {
           ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
           { encoding: "utf8", timeout: 1000 },
           (error, stdout) => {
-            visibilityCheckRunning = false;
+            vis().checkRunning = false;
             if (error) return;
             // A push can land while this poll is still in flight: clearing the timer
             // does not recall an execFile already running. Its answer predates the
             // push, so applying it would put the engine back on stale state that
             // nothing corrects until the next change.
-            if (visibilitySource === "push") return;
+            if (vis().source === "push") return;
             applyClientListing(stdout, placement);
             reconcileTmuxPassthrough();
           }
         );
       } catch (spawnError) {
-        visibilityCheckRunning = false;
+        vis().checkRunning = false;
         if (debugLogging) console.error(`tweb: visibility poll failed: ${spawnError.message}`);
       }
     }
@@ -3188,10 +3198,10 @@ function agentDiagnostics() {
       // Whether visibility is coming from the frontend's push or the no-frontend
       // polling fallback, and how stale the last push is. A pane that reads hidden
       // while showing "poll" is a frontend that never pushed, not a tmux problem.
-      visibilitySource,
-      visibilityPushAgeMs: lastVisibilityPushAt === null ? null : Date.now() - lastVisibilityPushAt,
-      visibleClientTtys: [...visibleClientTtys],
-      tmuxPlacement,
+      visibilitySource: vis().source,
+      visibilityPushAgeMs: vis().pushedAt === null ? null : Date.now() - vis().pushedAt,
+      visibleClientTtys: [...vis().clientTtys],
+      tmuxPlacement: vis().placement,
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
       // Where IME preedit will land. Comparing cell against point is the only way
       // to tell "caret parked on the wrong line" from "page never reported one".
@@ -5568,9 +5578,11 @@ app.on("before-quit", () => {
       if (!tab.isDestroyed()) tab.webContents.stopPainting();
     }
     terminalCleanup();
+    // Each pane's image is placed on the clients watching THAT pane's window, which after the move
+    // to per-pane visibility state are a different set per pane.
+    for (const tty of vis().clientTtys) deleteImageFromClientTty(tty);
   });
   restoreTmuxPassthroughClients();
-  for (const tty of visibleClientTtys) deleteImageFromClientTty(tty);
   restorePaneTitle();
 });
 
