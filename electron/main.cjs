@@ -22,6 +22,7 @@ const {
 } = require("node:fs");
 const { execFile, execFileSync } = require("node:child_process");
 const { Worker } = require("node:worker_threads");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const net = require("node:net");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
@@ -135,34 +136,47 @@ let quitting = false;
 //   vimium off + bypass on  = P (passthrough)
 //   vimium on  + bypass on  = N-vim (both)
 //   vimium off + bypass off = D (web only)
-let vimiumShortcutsEnabled = true;
-let cmdBypassEnabled = false;
+// The shortcut mode is per-pane, on the input state beside the parse buffer it steers. A user
+// switching one pane to passthrough is saying it about THAT pane's page; shared, one Ctrl-;
+// re-routed every pane's keys at once, and a pane in insert mode made every other pane's typing go
+// native. Same for the insert-mode mirror below.
 // Pane visibility lives in the registry record, not in a variable beside it. It is the gate on
 // frame send, frame rate, and the surface plan — and on a terminal with tmux
 // `allow-passthrough=all`, which forwards a hidden pane's passthrough to whatever window the
 // client is actually viewing, it is the only thing between a hidden pane and drawing over the
 // user's visible one. A second copy of it is therefore the one piece of state that must not exist.
-let visibilityCheckRunning = false;
-let visibleClientTtys = new Set();
+
 const passthroughClientTables = new Map();
 let tmuxIdentity = null;
-// Where this pane lives *right now*. `tmuxIdentity` is the startup identity and
-// stays pinned because the window-session save path is derived from it, but a
-// pane moves: `break-pane` gives it a new window id and `join-pane` can change
-// its session too. Matching clients against the startup window then fails for
-// every client, the pane looks hidden, and painting stops — the pane freezes
-// after being moved. Visibility therefore tracks the live placement instead.
-let tmuxPlacement = null;
+// Where this pane lives *right now* is `vis().placement`, on the pane's record. `tmuxIdentity`
+// above is the startup identity and stays pinned because the window-session save path is derived
+// from it, but a pane moves: `break-pane` gives it a new window id and `join-pane` can change its
+// session too. Matching clients against the startup window then fails for every client, the pane
+// looks hidden, and painting stops — the pane freezes after being moved. Visibility therefore
+// tracks the live placement instead.
 let originalPaneTitle = null;
 const tabFrames = new Map();
 const tabZoomFactors = new Map();
 const tabSessionUrls = new Map();
+// The pane a tab belongs to. Every event a tab emits — paint above all — arrives with the tab and
+// nothing else, so this is what turns that into a pane. Read at fire time and never captured when a
+// handler is registered: `configureTab` runs before `adoptTab` records the mapping.
+const tabPanes = new Map();
 // Recovery attempts per tab, so a page that crashes its renderer on every load stops being
 // reloaded instead of looping forever. See renderer-recovery.cjs.
 const tabRendererRecoveries = new Map();
+// Shared on purpose, and shared BEYOND this process: `historyPath` is one file per user-data
+// directory that every pane and every engine appends to under a lock, because history is the user's,
+// not the pane's. See `historyLockPath`.
 const navigationHistory = [];
 let navigationSerial = 0;
 const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
+// Deliberately not per-pane, because in a host it is never set: `resolveWindowSessionPaths` runs only
+// where `tmuxIdentity` was built from the process's own `$TMUX_PANE`, and `ownTmuxPane` is null for a
+// hosted runtime. So `writeWindowSession` returns on its first guard and a host saves no session at
+// all. Restoring per-pane sessions in a host needs the claim to key off the ATTACH identity rather
+// than the process — a separate piece of work, and one that has to arbitrate against the per-pane
+// engines that may still hold those slots.
 let windowSessionPath = null;
 let legacyWindowSessionPath = null;
 let windowSessionClaimPath = null;
@@ -170,8 +184,6 @@ let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let orphanWatchdog = null;
 let agentServer = null;
-// Mirrors the preload's insert mode so key dispatch knows to go native.
-let pageInsertMode = false;
 // Set while a close came from the tab list, so the list can be redrawn once the
 // tab has actually left `soleWindows.tabs`.
 let refreshTabListAfterClose = false;
@@ -310,6 +322,65 @@ const configuredPaneImageId = Number.isSafeInteger(configuredImageId) && configu
 // used by a flag is a seam nothing proves, and this one carries every frame the shipping build
 // draws.
 const paneRegistry = new PaneRegistry();
+
+// Which pane the code currently running belongs to.
+//
+// A host serving N panes has to answer that at roughly 240 call sites, and threading a parameter
+// through all of them is not the shape of the problem: the frame-rate policy defers with
+// `setTimeout(settleFrameRate, 700)` and settles with no tab in hand, the agent surface path
+// resumes after an `await`, and `setWindowOpenHandler` opens a tab from a `setImmediate`. None of
+// those callbacks has a pane argument to receive.
+//
+// So the pane travels with the execution instead. Verified under Electron 43 rather than assumed:
+// a `paint` handler registered outside any store reads `undefined` (native emit captures nothing at
+// registration, which is why every entry point below binds explicitly), a store established inside
+// the handler survives both a `setTimeout` and an `await` continuation, and a timer bound to a
+// second pane reads that second pane — not the first.
+//
+// `run` and never `enterWith`: the latter leaks into the rest of the tick, which for an event
+// dispatch means into whatever the emitter does next.
+const paneScope = new AsyncLocalStorage();
+
+/**
+ * Runs `fn` as work belonging to `record`.
+ *
+ * `record` may be resolved lazily by passing a function, because a tab's pane is not always known
+ * when a handler is registered — `configureTab` runs before `adoptTab` records the mapping.
+ */
+function withPaneScope(record, fn) {
+  const resolved = typeof record === "function" ? record() : record;
+  if (!resolved) return fn();
+  return paneScope.run(resolved, fn);
+}
+
+/**
+ * Runs `fn` once per hosted pane, each time in that pane's scope.
+ *
+ * For the process-wide work that is really per-pane work N times: the hidden-window watchdog
+ * reconciles every window every second, and the quit path tears down every pane. Both used to run
+ * once against whichever pane was first, which for the watchdog meant reconciling pane 2..N's tabs
+ * against pane 1's visibility and frame rate — 84 fallback resolutions in a 15s three-pane run.
+ */
+function forEachPane(fn) {
+  if (!hostedRuntime) return void fn(solePane);
+  const records = paneRegistry.list();
+  if (records.length === 0) return void withPaneScope(solePane, () => fn(solePane));
+  for (const record of records) withPaneScope(record, () => fn(record));
+}
+
+/** Wraps a handler so every call runs in its pane's scope. Registration order does not matter. */
+function bindPane(resolve, handler) {
+  return function boundToPane(...handlerArgs) {
+    return withPaneScope(() => resolve(...handlerArgs), () => handler.apply(this, handlerArgs));
+  };
+}
+
+// A pane the ambient scope could not name, in a host that serves more than one. Every such
+// resolution silently falls back to the first pane, which is the bug this whole change removes —
+// so it is counted and reported by `diag` rather than left to be discovered as one pane's input
+// occasionally landing in another. An entry point nobody bound shows up here.
+let unscopedPaneResolutions = 0;
+const loggedUnscopedSites = new Set();
 // The tmux server this process sits on. It is the SERVER, not a pane — an engine and the daemon
 // that started it are on the same server, so this is one of the few things a hosted engine can
 // still read from its own environment. Which pane, and whether that pane is in tmux at all, comes
@@ -470,7 +541,21 @@ function writerFor(record) {
 // A second attached pane is refused (see `handleAttach`), which is what keeps this answer
 // unambiguous. It is the piece that has to become a parameter before a host serves two.
 function currentPane() {
-  return hostedRuntime ? (paneRegistry.list()[0] || solePane) : solePane;
+  if (!hostedRuntime) return solePane;
+  const scoped = paneScope.getStore();
+  if (scoped) return scoped;
+  // Falling back to the first pane is right for exactly one pane and wrong for two, so say so.
+  if (paneRegistry.size > 1) {
+    unscopedPaneResolutions += 1;
+    if (debugLogging) {
+      const stack = new Error("unscoped").stack.split("\n").slice(1, 5).join("\n");
+      if (!loggedUnscopedSites.has(stack)) {
+        loggedUnscopedSites.add(stack);
+        console.error(`tweb: pane resolved with no scope\n${stack}`);
+      }
+    }
+  }
+  return paneRegistry.list()[0] || solePane;
 }
 
 // The frame context those bytes belong to, by the same rule and for the same reason. The two are
@@ -516,6 +601,8 @@ function frameFilePathFor(frames, format) {
 // failing — see `noteRawFrameFailure`.
 let rawFramesEnabled = frameTransport === "file"
   && process.env.TWEB_RAW_FRAMES !== "0";
+// Shared on purpose: it dedupes ONE log line per frame generation. N panes bump each other's value,
+// so a host logs that line less often than it could — the cost of getting this wrong is log noise.
 let loggedFrameGeneration = -1;
 // Whole frames the worker deflated, against `whole` for the total. The ratio is the only outside
 // view of the sampling decision in `gfx-worker.cjs`: 0 on a text-heavy page means compression
@@ -790,7 +877,7 @@ function switchTmuxClientTable(tty, table) {
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
   if (!ownTmuxPane) return;
   const paneId = ownTmuxPane;
-  const passthroughArmed = !vimiumShortcutsEnabled;
+  const passthroughArmed = !inputState().vimium;
 
   for (const [tty, originalTable] of [...passthroughClientTables]) {
     const state = states.get(tty);
@@ -849,18 +936,18 @@ function initializeTmuxVisibility() {
         paneId: ownTmuxPane,
       };
       resolveWindowSessionPaths();
-      tmuxPlacement = { session, windowId, paneId: ownTmuxPane };
+      vis().placement = { session, windowId, paneId: ownTmuxPane };
     }
     originalPaneTitle = titleParts.join("\t");
 
-    if (tmuxPlacement) {
+    if (vis().placement) {
       const clients = execFileSync(
         "tmux",
         ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
         { encoding: "utf8", timeout: 1000 }
       );
-      visibleClientTtys = visibleTmuxClientTtys(clients, tmuxPlacement);
-      recordVisibility(currentPane(), visibleClientTtys.size > 0);
+      vis().clientTtys = visibleTmuxClientTtys(clients, vis().placement);
+      recordVisibility(currentPane(), vis().clientTtys.size > 0);
     }
   } catch (error) {
     if (debugLogging) console.error(`tweb: visibility init failed: ${error.message}`);
@@ -887,47 +974,59 @@ function initializeTmuxVisibility() {
 // watchdog, so there is no need to re-arm afterwards.
 const VISIBILITY_PUSH_GRACE_MS = 2000;
 const VISIBILITY_POLL_MS = 250;
-let visibilityPollTimer = null;
-let visibilityFallbackTimer = null;
-let visibilitySource = "startup";
-let lastVisibilityPushAt = null;
+
+// This pane's visibility state, which lives on its record — see `createPaneRecord` for why it is
+// not one set of module variables. Every read below goes through here so the ambient pane decides
+// which pane's placement, clients and poll timer are meant.
+function vis() {
+  return currentPane().visibility;
+}
 
 function armVisibilityFallback() {
   if (!ownTmuxPane) return;
   const delay = process.env.TWEB_FRONTEND_PID ? VISIBILITY_PUSH_GRACE_MS : 0;
-  visibilityFallbackTimer = setTimeout(() => {
-    visibilityFallbackTimer = null;
-    if (visibilitySource === "push") return;
-    visibilitySource = "poll";
+  vis().fallbackTimer = setTimeout(() => {
+    vis().fallbackTimer = null;
+    if (vis().source === "push") return;
+    vis().source = "poll";
     if (debugLogging) console.error("tweb: visibility falling back to polling tmux");
     scheduleVisibilityCheck();
   }, delay);
-  visibilityFallbackTimer.unref();
+  vis().fallbackTimer.unref();
 }
 
 function scheduleVisibilityCheck() {
-  if (visibilityPollTimer) clearTimeout(visibilityPollTimer);
-  visibilityPollTimer = setTimeout(() => {
-    visibilityPollTimer = null;
+  if (vis().pollTimer) clearTimeout(vis().pollTimer);
+  vis().pollTimer = setTimeout(() => {
+    vis().pollTimer = null;
     syncTmuxVisibility();
     scheduleVisibilityCheck();
   }, VISIBILITY_POLL_MS);
-  visibilityPollTimer.unref();
+  vis().pollTimer.unref();
 }
 
 // Applies a client listing to this pane. Shared by the push and the fallback poll so the
 // two cannot drift — the tty bookkeeping below is the part that has to stay identical.
 function applyClientListing(clients, placement) {
-  tmuxPlacement = placement;
-  const next = visibleTmuxClientTtys(clients, tmuxPlacement);
+  vis().placement = placement;
+  const next = visibleTmuxClientTtys(clients, vis().placement);
   const wasVisible = currentPane().visible;
   // A client that stopped showing this pane keeps the image placed on it, so the delete
   // goes to that tty directly.
-  for (const tty of visibleClientTtys) {
-    if (!next.has(tty)) deleteImageFromClientTty(tty);
+  for (const tty of vis().clientTtys) {
+    if (next.has(tty)) continue;
+    // Logged because it is a pane going blank, and the two reasons for it are indistinguishable
+    // from the outside: a client that really stopped showing this pane, or this pane reading
+    // another pane's client set and evicting itself from a terminal still watching it. That second
+    // one is what per-pane visibility state exists to prevent, and `bench/host-multipane.py`
+    // gates on this line.
+    if (debugLogging) {
+      console.error(`tweb: image evicted from ${tty} for ${currentPane().paneId}`);
+    }
+    deleteImageFromClientTty(tty);
   }
-  const becameVisible = [...next].some((tty) => !visibleClientTtys.has(tty));
-  visibleClientTtys = next;
+  const becameVisible = [...next].some((tty) => !vis().clientTtys.has(tty));
+  vis().clientTtys = next;
   const changed = recordVisibility(currentPane(), next.size > 0);
   if (changed) {
     updatePaintingState();
@@ -943,21 +1042,21 @@ function applyClientListing(clients, placement) {
 function applyVisibilityPush(hex) {
   const push = parseVisibilityPush(hex);
   if (!push) return;
-  if (visibilityFallbackTimer) {
-    clearTimeout(visibilityFallbackTimer);
-    visibilityFallbackTimer = null;
+  if (vis().fallbackTimer) {
+    clearTimeout(vis().fallbackTimer);
+    vis().fallbackTimer = null;
   }
-  if (visibilityPollTimer) {
-    clearTimeout(visibilityPollTimer);
-    visibilityPollTimer = null;
+  if (vis().pollTimer) {
+    clearTimeout(vis().pollTimer);
+    vis().pollTimer = null;
   }
-  visibilitySource = "push";
-  lastVisibilityPushAt = Date.now();
+  vis().source = "push";
+  vis().pushedAt = Date.now();
   if (debugLogging
-    && (push.placement.session !== tmuxPlacement?.session
-      || push.placement.windowId !== tmuxPlacement?.windowId)) {
+    && (push.placement.session !== vis().placement?.session
+      || push.placement.windowId !== vis().placement?.windowId)) {
     console.error(
-      `tweb: pane moved ${tmuxPlacement?.session}:${tmuxPlacement?.windowId}`
+      `tweb: pane moved ${vis().placement?.session}:${vis().placement?.windowId}`
       + ` -> ${push.placement.session}:${push.placement.windowId}`
     );
   }
@@ -966,21 +1065,21 @@ function applyVisibilityPush(hex) {
 }
 
 function syncTmuxVisibility() {
-  if (!tmuxPlacement || visibilityCheckRunning) return;
-  visibilityCheckRunning = true;
+  if (!vis().placement || vis().checkRunning) return;
+  vis().checkRunning = true;
   // Re-resolve where the pane is before matching clients. A pane that was moved
   // by break-pane/join-pane keeps its id but changes window (and possibly
   // session); matching against a stale window makes every client miss and the
   // pane look hidden, which stops painting until the process restarts.
   execFile(
     "tmux",
-    ["display-message", "-p", "-t", tmuxPlacement.paneId, "#{session_name}\t#{window_id}"],
+    ["display-message", "-p", "-t", vis().placement.paneId, "#{session_name}\t#{window_id}"],
     { encoding: "utf8", timeout: 1000 },
     (placementError, placementOut) => {
-      let placement = tmuxPlacement;
+      let placement = vis().placement;
       if (!placementError) {
         const [session, windowId] = String(placementOut).trim().split("\t");
-        if (session && windowId) placement = { ...tmuxPlacement, session, windowId };
+        if (session && windowId) placement = { ...vis().placement, session, windowId };
       }
       // The flag is cleared in the inner callback. If spawning it throws, clear
       // it here instead — otherwise visibility polling stops for good.
@@ -990,19 +1089,19 @@ function syncTmuxVisibility() {
           ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_id}"],
           { encoding: "utf8", timeout: 1000 },
           (error, stdout) => {
-            visibilityCheckRunning = false;
+            vis().checkRunning = false;
             if (error) return;
             // A push can land while this poll is still in flight: clearing the timer
             // does not recall an execFile already running. Its answer predates the
             // push, so applying it would put the engine back on stale state that
             // nothing corrects until the next change.
-            if (visibilitySource === "push") return;
+            if (vis().source === "push") return;
             applyClientListing(stdout, placement);
             reconcileTmuxPassthrough();
           }
         );
       } catch (spawnError) {
-        visibilityCheckRunning = false;
+        vis().checkRunning = false;
         if (debugLogging) console.error(`tweb: visibility poll failed: ${spawnError.message}`);
       }
     }
@@ -1126,7 +1225,12 @@ gfxWorker.on("message", (message) => {
     console.error(`tweb: graphics completion for an unknown pane: ${message?.paneKey}`);
     return;
   }
-  handleGfxWorkerReady(message?.commands, frames);
+  // Scoped to the pane the completion belongs to: dispatching the queue reads the frame-rate state
+  // and the window, and doing that against another pane's is how one pane's frame lands in
+  // another's rectangle.
+  withPaneScope(frames.record, () => {
+    handleGfxWorkerReady(message?.commands, frames);
+  });
 });
 gfxWorker.on("error", (error) => {
   // The worker is gone, so every pane's in-flight hand-off is gone with it. Leaving any of them
@@ -1205,7 +1309,7 @@ function terminalSetup() {
   // whatever the shell left behind, which is a visible block in the top-left corner. There
   // is nothing for it to mean until a caret is parked on one — and sitting in the corner it
   // reads as the caret having started there. Hide it until something parks it.
-  caretHidden = true;
+  inputState().caretHidden = true;
   try {
     paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`);
   } catch (error) {
@@ -2031,6 +2135,13 @@ const audioClaimPath = path.join(runtimeDir(), "audio-owner.json");
 // null while this instance is making noise; otherwise when the silence started.
 let audioSilentSince = Date.now();
 let audioMutedByOther = false;
+// UNRESOLVED for a host serving N panes. The claim is arbitrated through a file so that separate
+// per-pane ENGINES can agree on who owns the speakers, and inside one process these three variables
+// are that agreement for all of its panes at once — so pane A going audible mutes pane B by the same
+// mechanism that mutes another engine. That may even be what a user wants, but it is not a decision
+// this change made, and it needs the claim to distinguish "another process" from "another pane in
+// this process" before it can be one. Left shared, and named as unresolved rather than left to be
+// discovered.
 let audioOwnerPane = null;
 let audioTimer = null;
 
@@ -2383,16 +2494,16 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
 // each gate independently.
 function broadcastShortcutMode() {
   for (const tab of currentWindows().tabs) {
-    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
   }
 }
 
 // Applies the correct combination of the two flags and runs the follow-up work once.
 function applyShortcutMode() {
-  pageInsertMode = false;
+  inputState().insertMode = false;
   broadcastShortcutMode();
   // Once passthrough is armed (vimium off), focus so the page can receive keys.
-  if (!vimiumShortcutsEnabled && currentWindows().win && !currentWindows().win.isDestroyed()) currentWindows().win.webContents.focus();
+  if (!inputState().vimium && currentWindows().win && !currentWindows().win.isDestroyed()) currentWindows().win.webContents.focus();
   // A Ghostty config reload or a pane restart can reset one side only, so reconcile
   // always runs even when the value already matches.
   reconcileTmuxPassthrough();
@@ -2402,13 +2513,13 @@ function applyShortcutMode() {
   // whole session shares — one pane's mode change interrupting every other pane.
   if (debugLogging) {
     console.error(`tweb: mode ${modeLabel()}`
-      + ` (vimium=${vimiumShortcutsEnabled} bypass=${cmdBypassEnabled})`);
+      + ` (vimium=${inputState().vimium} bypass=${inputState().bypass})`);
   }
 }
 
 function modeLabel() {
-  const v = vimiumShortcutsEnabled;
-  const b = cmdBypassEnabled;
+  const v = inputState().vimium;
+  const b = inputState().bypass;
   if (v && !b) return "bypass OFF";
   if (!v && b) return "web bypass ON";
   if (v && b) return "shortcuts and bypass ON";
@@ -2416,12 +2527,12 @@ function modeLabel() {
 }
 
 function setCmdBypassEnabled(enabled) {
-  cmdBypassEnabled = enabled;
+  inputState().bypass = enabled;
   applyShortcutMode();
 }
 
 function setVimiumShortcutsEnabled(enabled) {
-  vimiumShortcutsEnabled = enabled;
+  inputState().vimium = enabled;
   applyShortcutMode();
 }
 
@@ -2431,7 +2542,7 @@ function setBrowserShortcutsEnabled(enabled) {
 }
 
 function toggleBrowserShortcuts() {
-  setCmdBypassEnabled(!cmdBypassEnabled);
+  setCmdBypassEnabled(!inputState().bypass);
 }
 
 function activateTab(index) {
@@ -2443,13 +2554,13 @@ function activateTab(index) {
   const normalized = ((index % currentWindows().tabs.length) + currentWindows().tabs.length) % currentWindows().tabs.length;
   currentWindows().activeTabIndex = normalized;
   currentWindows().win = currentWindows().tabs[normalized];
-  mouseClicks.reset();
-  pageInsertMode = false;
+  inputState().clicks.reset();
+  inputState().insertMode = false;
   // The preload mirrors this flag and skips redundant IPC, so tell the tab we
   // just cleared it. Without this its focused input keeps thinking native
   // delivery is armed and its keys go back through the renderer, where they
   // arrive with keyCode 0.
-  sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+  sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
   // The other tab's caret says nothing about this one, and its preload only
   // reports on focus — which switching soleWindows.tabs does not fire.
   moveTerminalCaret(null);
@@ -2742,7 +2853,7 @@ function sendTabState(tab = currentWindows().win) {
 }
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  if (!vimiumShortcutsEnabled || tab !== currentWindows().win || tab.isDestroyed()) return;
+  if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
   switch (action) {
@@ -2875,7 +2986,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     }
     case "insert-mode":
-      pageInsertMode = Boolean(value);
+      inputState().insertMode = Boolean(value);
       break;
     // Take the speakers back from whichever pane holds them. Only ever a deliberate
     // keypress: a page starting playback in a muted pane does not get to do this.
@@ -2942,17 +3053,21 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
   }
 }
 
-ipcMain.on("tweb-preload-ready", (event, info) => {
+// The three IPC handlers all reach a window, so each resolves its pane from the tab that sent the
+// message. `event.sender` is the only pane evidence an IPC message carries.
+ipcMain.on("tweb-preload-ready", bindPane(
+  (event) => tabPanes.get(BrowserWindow.fromWebContents(event.sender)),
+  (event, info) => {
   const tab = BrowserWindow.fromWebContents(event.sender);
   const frame = event.senderFrame;
   if (!tab || !frame || frame.isDestroyed() || frame.detached) return;
   // A fresh document starts in normal mode, so the mirror has to follow.
-  if (frame === tab.webContents.mainFrame) pageInsertMode = false;
+  if (frame === tab.webContents.mainFrame) inputState().insertMode = false;
   const key = frameKey(frame);
   if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
-  event.reply("tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+  event.reply("tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
   if (tab === currentWindows().win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
@@ -2961,14 +3076,16 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
     // with the old document and never come back.
     event.reply("tweb-transfer", transferSummary(transfers, Date.now()));
   }
-});
+}));
 
-ipcMain.on("tweb-shortcut", (event, message) => {
+ipcMain.on("tweb-shortcut", bindPane(
+  (event) => tabPanes.get(BrowserWindow.fromWebContents(event.sender)),
+  (event, message) => {
   if (!message || typeof message.action !== "string") return;
   const tab = currentWindows().tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
   if (!tab) return;
   handleNativeShortcut(tab, message.action, message.value, event.senderFrame);
-});
+}));
 
 // --- agent bridge ---
 
@@ -2984,6 +3101,8 @@ function recordConsoleMessage(entry) {
   if (consoleLog.length > consoleLogLimit) consoleLog.splice(0, consoleLog.length - consoleLogLimit);
 }
 
+// Deliberately not pane-scoped: `recordConsoleMessage` appends to one process-wide ring buffer that
+// `tweb console` reads, and each entry carries its own page url. Nothing here reaches a window.
 function watchConsole(contents) {
   contents.on("console-message", (...args) => {
     // Electron ≥ 36 passes a single event object; older builds pass positionals.
@@ -3081,22 +3200,30 @@ function agentDiagnostics() {
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
       wholeCompressed: compressedWholeFrames,
     },
+    panes: {
+      hosted: paneRegistry.size,
+      // How many times a pane had to be resolved with no ambient scope while more than one was
+      // hosted. Every one of those fell back to the first pane, so this is not a statistic — it is
+      // an entry point nobody bound, and the symptom would be one pane's input or frame
+      // occasionally landing in another's rectangle. It must stay 0.
+      unscopedResolutions: unscopedPaneResolutions,
+    },
     input: {
-      vimiumShortcuts: vimiumShortcutsEnabled,
-      cmdBypass: cmdBypassEnabled,
-      pageInsertMode,
+      vimiumShortcuts: inputState().vimium,
+      cmdBypass: inputState().bypass,
+      pageInsertMode: inputState().insertMode,
       terminalVisible: currentPane().visible,
       // Whether visibility is coming from the frontend's push or the no-frontend
       // polling fallback, and how stale the last push is. A pane that reads hidden
       // while showing "poll" is a frontend that never pushed, not a tmux problem.
-      visibilitySource,
-      visibilityPushAgeMs: lastVisibilityPushAt === null ? null : Date.now() - lastVisibilityPushAt,
-      visibleClientTtys: [...visibleClientTtys],
-      tmuxPlacement,
+      visibilitySource: vis().source,
+      visibilityPushAgeMs: vis().pushedAt === null ? null : Date.now() - vis().pushedAt,
+      visibleClientTtys: [...vis().clientTtys],
+      tmuxPlacement: vis().placement,
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
       // Where IME preedit will land. Comparing cell against point is the only way
       // to tell "caret parked on the wrong line" from "page never reported one".
-      caret: { cell: caretCell, point: lastCaretPoint },
+      caret: { cell: inputState().caretCell, point: inputState().caretPoint },
     },
     tabs: { active: currentWindows().activeTabIndex, count: currentWindows().tabs.length },
     // Which pane owns the speakers, and whether this one is making noise. `audible` is
@@ -3298,8 +3425,9 @@ async function dispatchAgentCommand(method, params) {
 // the pane origin — so Korean input composes off in a corner instead of at the
 // field. Park the cursor on the cell holding the web caret and show it only
 // while a field is focused.
-let caretCell = null;
-let lastCaretPoint = null;
+// Per-pane, on the input state: the coordinates are written to the pane's own terminal through
+// `paneWrite`, so a shared cell parked every pane's cursor at whichever pane last reported a caret —
+// and a hidden flag shared means one pane's blur leaves another pane's cursor showing.
 // A block cursor covers the cell it sits on, so the parked cursor hid the page's
 // own caret and the character next to it. Ask for a steady bar (DECSCUSR 6): it
 // draws on the cell's left edge, which is where a text caret belongs anyway.
@@ -3310,14 +3438,15 @@ const CARET_SHAPE_RESET = CSI("0 q");
 // cell *centres* floated a composing syllable a row above tall page text.
 const CARET_BASELINE = 0.78;
 
-let caretHidden = false;
+
 
 function unparkTerminalCaret() {
-  caretCell = null;
-  lastCaretPoint = null;
+  const input = inputState();
+  input.caretCell = null;
+  input.caretPoint = null;
   // Reported on every frame with no caret, so it writes only on the transition.
-  if (caretHidden) return;
-  caretHidden = true;
+  if (input.caretHidden) return;
+  input.caretHidden = true;
   try { paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
 }
 
@@ -3351,7 +3480,7 @@ function broadcastCellMetrics(tab = currentWindows().win) {
 // a pane resize moves the cell under a caret that never "moved" — and the report
 // that would correct it never comes. Recompute from the last one instead.
 function reparkTerminalCaret() {
-  if (lastCaretPoint) moveTerminalCaret(lastCaretPoint);
+  if (inputState().caretPoint) moveTerminalCaret(inputState().caretPoint);
 }
 
 function moveTerminalCaret(point) {
@@ -3373,14 +3502,14 @@ function moveTerminalCaret(point) {
   const baseline = (point.y + (point.height || 0) * CARET_BASELINE) * zoom;
   const row = Math.min(currentFrames().cells.rows,
     Math.max(1, Math.round(baseline / cellHeight - CARET_BASELINE) + 1));
-  lastCaretPoint = { x: point.x, y: point.y, height: point.height || 0 };
-  if (caretCell && caretCell.row === row && caretCell.col === col) return;
-  caretCell = { row, col };
+  inputState().caretPoint = { x: point.x, y: point.y, height: point.height || 0 };
+  if (inputState().caretCell && inputState().caretCell.row === row && inputState().caretCell.col === col) return;
+  inputState().caretCell = { row, col };
   writeTerminalCaret(row, col);
 }
 
 function writeTerminalCaret(row, col) {
-  caretHidden = false;
+  inputState().caretHidden = false;
   try {
     paneWrite(`${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
   } catch (error) {
@@ -3397,8 +3526,9 @@ function writeTerminalCaret(row, col) {
 // Rewriting the same position is a few bytes and idempotent, so the caret is simply
 // re-asserted after anything that moves the cursor.
 function reassertTerminalCaret() {
-  if (!caretCell) return;
-  writeTerminalCaret(caretCell.row, caretCell.col);
+  const input = inputState();
+  if (!input.caretCell) return;
+  writeTerminalCaret(input.caretCell.row, input.caretCell.col);
 }
 
 // The page reports CSS pixels but sendInputEvent takes unzoomed window
@@ -3653,10 +3783,12 @@ function attachChooserDebugger(tab) {
     if (debugLogging) console.error(`tweb: chooser debugger attach failed: ${error.message}`);
     return false;
   }
-  contents.debugger.on("message", (_event, method, params) => {
+  // Bound like configureTab's handlers and for the same reason: the chooser prompt is drawn into
+  // the pane, so it has to be drawn into THIS tab's pane.
+  contents.debugger.on("message", bindPane(() => tabPanes.get(tab), (_event, method, params) => {
     if (method !== "Page.fileChooserOpened") return;
     openFileChooser(tab, params);
-  });
+  }));
   contents.debugger.on("detach", () => fileChooserByTab.delete(tab));
   void contents.debugger.sendCommand("Page.enable")
     .then(() => contents.debugger.sendCommand("Page.setInterceptFileChooserDialog", { enabled: true }))
@@ -4000,6 +4132,7 @@ function keepWindowHidden(tab) {
 }
 
 function enforceHiddenWindows() {
+  // Hiding is genuinely process-wide — a window belongs to no pane as far as the OS is concerned.
   for (const window of BrowserWindow.getAllWindows()) keepWindowHidden(window);
   // Surfaces are reconciled on the same tick. A transition calls `updatePaintingState`
   // directly, but a pane that is *born* hidden has no transition to react to — measured:
@@ -4007,20 +4140,37 @@ function enforceHiddenWindows() {
   // zero frames, yet held a full-size surface indefinitely, which is the DESIGN.md 6.5
   // gate failing at the one moment it most obviously should not. The reconciler reads
   // each window's size before writing it, so a tick that has nothing to do costs nothing.
-  updatePaintingState();
+  //
+  // Per pane, because that is what the reconciler decides: this pane's visibility against this
+  // pane's tabs at this pane's frame rate. Run once for the first pane it would have collapsed
+  // every other pane's surfaces against a visibility that was not theirs.
+  forEachPane(() => updatePaintingState());
 }
 
 function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
+  // Every handler registered below runs as work belonging to this tab's pane.
+  //
+  // Registration cannot capture the pane: verified under Electron 43 that a `paint` handler
+  // registered outside a store reads `undefined`, and `configureTab` runs before `adoptTab` records
+  // the mapping anyway. So the pane is resolved when the handler fires, from the tab it fires for.
+  //
+  // Registered through these three rather than one wrap per handler, so a handler added later is
+  // bound by writing it in the same style as the rest — the failure mode of the per-handler form is
+  // that the one somebody forgets falls back to the first pane and silently draws into it.
+  const scoped = (handler) => bindPane(() => tabPanes.get(tab), handler);
+  const onContents = (event, handler) => contents.on(event, scoped(handler));
+  const onTab = (event, handler) => tab.on(event, scoped(handler));
+  const setWindowOpenHandler = (handler) => contents.setWindowOpenHandler(scoped(handler));
   const contents = tab.webContents;
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
   attachChooserDebugger(tab);
   // A frame with no preload gets its print shim from here; see shimFramePrint.
-  contents.on("frame-created", (_event, details) => shimFramePrint(details.frame));
-  tab.on("show", keepHidden);
-  tab.on("focus", keepHidden);
-  tab.on("move", keepHidden);
-  contents.on("preload-error", (_event, preloadPath, error) => {
+  onContents("frame-created", (_event, details) => shimFramePrint(details.frame));
+  onTab("show", keepHidden);
+  onTab("focus", keepHidden);
+  onTab("move", keepHidden);
+  onContents("preload-error", (_event, preloadPath, error) => {
     console.error(`tweb: preload failed ${preloadPath}: ${error.stack || error.message}`);
   });
   watchConsole(contents);
@@ -4030,7 +4180,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.setFrameRate(1);
   // A muted instance opening a tab must not leak audio through the new one.
   contents.setAudioMuted(audioMutedByOther);
-  contents.on("paint", (_event, dirty, image) => {
+  onContents("paint", (_event, dirty, image) => {
     // A page painting on its own is what separates video from a static screen, and the
     // frame-rate policy reads it to decide whether to fall all the way to idle.
     if (tab === currentWindows().win) notePaintActivity();
@@ -4055,7 +4205,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   // Before Electron attaches our custom offscreen child, it can surface the macOS OffScreenView
   // placeholder as a native popup. Deny the original request and open the URL directly in a
   // separate TWeb tab, which keeps the native popup from ever being created.
-  contents.setWindowOpenHandler((details) => {
+  setWindowOpenHandler((details) => {
     const target = details.url || "about:blank";
     // Middle-click and window.open share this path, and Chrome treats them differently:
     // window.open takes you to the new tab, middle-click deliberately does not. The whole
@@ -4067,7 +4217,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     return { action: "deny" };
   });
 
-  contents.on("did-start-navigation", (details) => {
+  onContents("did-start-navigation", (details) => {
     if (details.isSameDocument || !details.frame) return;
     readyFrameKeys(tab).delete(frameKey(details.frame));
     // A new document has no find session behind it. Carrying the old flag over would send
@@ -4075,10 +4225,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     // answers that with silence — the exact failure this state exists to prevent.
     if (details.isMainFrame) findSessionByTab.set(tab, endStep().state);
   });
-  contents.on("context-menu", (_event, params) => {
-    if (vimiumShortcutsEnabled) showBrowserContextMenu(tab, params);
+  onContents("context-menu", (_event, params) => {
+    if (inputState().vimium) showBrowserContextMenu(tab, params);
   });
-  contents.on("media-started-playing", () => {
+  onContents("media-started-playing", () => {
     // Audibility is not known at the moment playback starts — a track whose output has
     // not opened yet reports silent — so the claim is left to the poll, which asks again
     // every tick. This only shortens the wait when the answer is already in.
@@ -4092,13 +4242,13 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
       reconcileAudio();
     }, 250);
   });
-  contents.on("media-paused", () => {
+  onContents("media-paused", () => {
     if (debugLogging) console.error("tweb: media paused");
     // The release itself is debounced in reconcileAudio; this only makes the pane
     // notice its own silence on the next tick rather than several ticks later.
     reconcileAudio();
   });
-  contents.on("found-in-page", (_event, result) => {
+  onContents("found-in-page", (_event, result) => {
     sendToTabFrames(tab, "tweb-find-result", result);
   });
 
@@ -4109,13 +4259,13 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
   };
-  contents.on("did-navigate", (_event, url) => recordNavigation(url));
-  contents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
+  onContents("did-navigate", (_event, url) => recordNavigation(url));
+  onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
     if (isMainFrame) recordNavigation(url);
   });
 
   let initialZoomApplied = false;
-  contents.on("did-finish-load", () => {
+  onContents("did-finish-load", () => {
     showingLoadError = false;
     const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
     contents.setZoomFactor(zoomFactor);
@@ -4130,18 +4280,18 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
       if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
     }
     installPageEnhancements(tab);
-    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
     if (debugLogging) {
       console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
     }
   });
-  tab.on("page-title-updated", (_event, title) => {
+  onTab("page-title-updated", (_event, title) => {
     const url = tabSessionUrls.get(tab) || contents.getURL();
     recordNavigationHistory(url, title);
     sendTabState();
     if (debugLogging) console.error(`tweb: title ${title}`);
   });
-  contents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
+  onContents("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
     if (!isMainFrame || code === -3 || showingLoadError) return;
     showingLoadError = true;
     console.error(`tweb: failed to load ${failedUrl}: ${description} (${code})`);
@@ -4151,7 +4301,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   // engine keeps answering `tweb status` with a healthy pid, and the pane holds the last image
   // it was sent. Chromium restarts a *visible* window's renderer on its next paint; an
   // offscreen one has no such trigger, so nothing ever comes back without this.
-  contents.on("render-process-gone", (_event, details) => {
+  onContents("render-process-gone", (_event, details) => {
     const reason = details?.reason;
     findSessionByTab.set(tab, endStep().state);
     const decision = recoveryDecision(reason, tabRendererRecoveries.get(tab), Date.now());
@@ -4173,13 +4323,19 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 }
 
 function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
+  // The pane whose scope we were called in — `attachPane` establishes it, and a tab opened from an
+  // existing tab inherits it through that tab's bound handlers. Recorded before `configureTab` so
+  // the handlers it registers can resolve this tab the first time they fire.
+  const record = currentPane();
+  tabPanes.set(tab, record);
   if (currentWindows().tabs.includes(tab)) return tab;
   configureTab(tab, initialZoomFactor);
   tabSessionUrls.set(tab, url || "about:blank");
   currentWindows().tabs.push(tab);
   const index = currentWindows().tabs.length - 1;
 
-  tab.on("closed", () => {
+  tab.on("closed", bindPane(() => tabPanes.get(tab), () => {
+    tabPanes.delete(tab);
     const closedIndex = currentWindows().tabs.indexOf(tab);
     if (closedIndex < 0) return;
     const wasActive = tab === currentWindows().win;
@@ -4191,7 +4347,12 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
     if (currentWindows().tabs.length === 0) {
       currentWindows().win = null;
       currentWindows().activeTabIndex = -1;
-      if (!quitting) app.quit();
+      // One pane running out of tabs is that pane closing, not the process ending. A per-pane
+      // engine serves exactly one, so its last tab IS the last tab and quitting is right; a host
+      // serving others would take them all down with it.
+      if (quitting) return;
+      if (hostedRuntime && paneRegistry.size > 1) closePane(record, "last tab closed");
+      else app.quit();
       return;
     }
     if (wasActive) activateTab(Math.min(closedIndex, currentWindows().tabs.length - 1));
@@ -4204,7 +4365,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
       sendToTabFrames(currentWindows().win, "tweb-tabs", tabListModel());
     }
     scheduleWindowSessionSave();
-  });
+  }));
 
   if (activate) activateTab(index);
   else {
@@ -4291,7 +4452,7 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
   const change = applyFrameViewport(frames, vp, origin);
   if (!change) return;
 
-  mouseClicks.reset();
+  inputState().clicks.reset();
   if (frames.pendingFrameTimer) {
     clearTimeout(frames.pendingFrameTimer);
     frames.pendingFrameTimer = null;
@@ -4362,11 +4523,43 @@ function createWindow(url, frames = currentFrames()) {
 
 // --- browser input ---
 
-let rawInput = Buffer.alloc(0);
-let rawInputFlushTimer = null;
-const paste = new PasteState();
-const utf8Decoder = new StringDecoder("utf8");
-const mouseClicks = new MouseClickState();
+// This pane's input-stream state, on its record.
+//
+// One buffer for N panes crosses input, and not subtly: `ESC [` is an incomplete sequence, so the
+// parser keeps it and waits for the final byte — and the next pane's INPUT line appends to that same
+// buffer. Measured with three panes, sending `ESC [` to %10 and `jjj` to %11: %11's page received
+// `[Escape` and no `j` at all, while %10 received nothing. The flush timer is per-pane for the same
+// reason: armed in one pane's scope, it delivers a leftover ESC to whichever pane's bytes are in the
+// buffer when it fires.
+//
+// The paste body, the UTF-8 decoder's split-codepoint carry, and the click-count state are all the
+// same input stream and cross the same way — a paste in one pane swallowing another's typing, a
+// multi-byte character split across panes, a double-click assembled from two panes' clicks.
+const paneInputStates = new Map();
+
+function inputState() {
+  const record = currentPane();
+  let state = paneInputStates.get(record.key);
+  if (!state) {
+    state = {
+      raw: Buffer.alloc(0),
+      flushTimer: null,
+      paste: new PasteState(),
+      decoder: new StringDecoder("utf8"),
+      clicks: new MouseClickState(),
+      // Where this pane's terminal cursor is parked for IME preedit, and whether it is showing.
+      caretCell: null,
+      caretPoint: null,
+      caretHidden: false,
+      // The shortcut mode, and the mirror of the preload's insert mode that key dispatch reads.
+      vimium: true,
+      bypass: false,
+      insertMode: false,
+    };
+    paneInputStates.set(record.key, state);
+  }
+  return state;
+}
 
 function electronModifiers(mask) {
   const bits = Math.max(0, mask - 1);
@@ -4430,6 +4623,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
   if (!currentWindows().win) return;
   const contents = currentWindows().win.webContents;
   const { x, y } = logicalMousePoint(rawX, rawY);
+  const clicks = inputState().clicks;
   const modifiers = mouseModifiers(cb);
   const buttonCode = cb & 3;
   const motion = (cb & 32) !== 0;
@@ -4437,7 +4631,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
 
   if (wheel) {
     const direction = buttonCode === 0 ? 1 : buttonCode === 1 ? -1 : 0;
-    if (vimiumShortcutsEnabled && direction !== 0 && hasZoomModifier(modifiers)) {
+    if (inputState().vimium && direction !== 0 && hasZoomModifier(modifiers)) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
@@ -4463,11 +4657,11 @@ function dispatchMouse(cb, rawX, rawY, release) {
   if (!motion && button) type = release ? "mouseUp" : "mouseDown";
   let clickCount = 0;
   if (type === "mouseDown") {
-    clickCount = mouseClicks.press(button, x, y);
+    clickCount = clicks.press(button, x, y);
   } else if (type === "mouseUp") {
-    clickCount = mouseClicks.release(button).count;
+    clickCount = clicks.release(button).count;
   } else {
-    mouseClicks.move(button, x, y);
+    clicks.move(button, x, y);
   }
   contents.sendInputEvent({
     type,
@@ -4534,7 +4728,7 @@ function routePdfKey(key, modifiers) {
     pdfPendingG = false;
     return false;
   }
-  const next = pdfKeyAction(key, modifiers, { vimium: vimiumShortcutsEnabled, pendingG: pdfPendingG });
+  const next = pdfKeyAction(key, modifiers, { vimium: inputState().vimium, pendingG: pdfPendingG });
   clearTimeout(pdfPendingGTimer);
   pdfPendingG = next.pendingG;
   // The same 800ms the preload gives `g`, so a `g` typed alone does not silently arm a
@@ -4624,12 +4818,12 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
 
   // Ctrl-C quits the pane only in browser shortcut mode. In web passthrough mode it goes to
   // the page as an ordinary KeyboardEvent.
-  if (vimiumShortcutsEnabled && key.toLowerCase() === "c" && control) {
+  if (inputState().vimium && key.toLowerCase() === "c" && control) {
     if (pressed) app.quit();
     return;
   }
 
-  if (vimiumShortcutsEnabled) {
+  if (inputState().vimium) {
     const tabCycle = control && (key === "Tab" || key === "PageDown" || key === "PageUp");
     const tabClose = control && key.toLowerCase() === "w";
     const print = control && key.toLowerCase() === "p";
@@ -4673,7 +4867,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // Cmd combinations always go native: they exist only because the user wants
   // the web app's own shortcut, and those are exactly the handlers that check
   // isTrusted.
-  if (!vimiumShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
+  if (!inputState().vimium || inputState().insertMode || modifiers.includes("meta")) {
     dispatchNativeKey(currentWindows().win.webContents, key, text, modifiers, eventKind);
     return;
   }
@@ -4753,7 +4947,7 @@ function dispatchText(buffer) {
       offset += 1;
       continue;
     }
-    const text = utf8Decoder.write(buffer.subarray(offset));
+    const text = inputState().decoder.write(buffer.subarray(offset));
     for (const char of text) {
       const codepoint = char.codePointAt(0);
       const modifierMask = codepoint >= 65 && codepoint <= 90 ? 2 : 1;
@@ -4784,7 +4978,7 @@ function dispatchPrivateShortcut(code) {
   }
   // Ctrl-: — vimium toggle. Leaves bypass alone.
   if (code === 5014) {
-    setVimiumShortcutsEnabled(!vimiumShortcutsEnabled);
+    setVimiumShortcutsEnabled(!inputState().vimium);
     return;
   }
   // The legacy forced ON/OFF sequences — under the new flags they force bypass.
@@ -4794,12 +4988,12 @@ function dispatchPrivateShortcut(code) {
   }
   const cmdKey = CMD_PRIVATE_KEYS.get(code);
   if (cmdKey) {
-    // 1 + meta(8). Sent to the page regardless of cmdBypassEnabled — in any mode,
+    // 1 + meta(8). Sent to the page regardless of the bypass flag — in any mode,
     // what the user pressed is that web app's Cmd shortcut.
     dispatchNamedKey(cmdKey, 9);
     return;
   }
-  if (vimiumShortcutsEnabled) {
+  if (inputState().vimium) {
     if (code === 5002 || code === 5007) setBrowserZoom("in");
     else if (code === 5003) setBrowserZoom("out");
     else if (code === 5004) setBrowserZoom("reset");
@@ -4819,109 +5013,114 @@ function dispatchPrivateShortcut(code) {
 }
 
 function scheduleRawInputFlush() {
-  if (rawInputFlushTimer || rawInput.length === 0) return;
-  rawInputFlushTimer = setTimeout(() => {
-    rawInputFlushTimer = null;
-    if (rawInput[0] === 0x1b) {
+  // Captured once, and the timer closes over it: the ambient scope carries into the callback, but
+  // resolving again there would re-read a map for a pane we already have in hand.
+  const input = inputState();
+  if (input.flushTimer || input.raw.length === 0) return;
+  input.flushTimer = setTimeout(() => {
+    input.flushTimer = null;
+    if (input.raw[0] === 0x1b) {
       // An ESC-prefixed sequence that ends without further bytes is a real Escape key. After a
       // short disambiguation window, deliver that first ESC and re-parse the rest.
       dispatchKey(27);
-      rawInput = rawInput.subarray(1);
+      input.raw = input.raw.subarray(1);
       consumeRawInput();
     }
   }, 35);
 }
 
 function consumeRawInput() {
+  // One lookup for the whole parse: this pane's buffer, paste state and decoder.
+  const input = inputState();
   for (;;) {
-    if (rawInput.length === 0) return;
+    if (input.raw.length === 0) return;
 
     // A paste body is never parsed as escape sequences. It can hold arbitrary bytes
     // including ESC, and everything up to the closing bracket is text to paste.
-    if (paste.active) {
-      const chunk = rawInput;
-      rawInput = Buffer.alloc(0);
-      const done = paste.push(chunk);
+    if (input.paste.active) {
+      const chunk = input.raw;
+      input.raw = Buffer.alloc(0);
+      const done = input.paste.push(chunk);
       if (!done) return;
       if (done.dropped) {
         if (debugLogging) console.error("tweb: paste exceeded limit, dropped");
         return;
       }
-      rawInput = done.rest;
+      input.raw = done.rest;
       dispatchPaste(done.text);
       continue;
     }
 
-    const escape = rawInput.indexOf(0x1b);
+    const escape = input.raw.indexOf(0x1b);
     if (escape > 0) {
-      dispatchText(rawInput.subarray(0, escape));
-      rawInput = rawInput.subarray(escape);
+      dispatchText(input.raw.subarray(0, escape));
+      input.raw = input.raw.subarray(escape);
       continue;
     }
     if (escape < 0) {
-      dispatchText(rawInput);
-      rawInput = Buffer.alloc(0);
+      dispatchText(input.raw);
+      input.raw = Buffer.alloc(0);
       return;
     }
 
-    const input = rawInput.toString("utf8");
+    const decoded = input.raw.toString("utf8");
 
     // Start of a bracketed paste. Ghostty never encodes Cmd-V as a key; the whole
     // event is paste_from_clipboard writing the clipboard into the PTY. On the
     // opening bracket, collect the body that follows and handle it as one paste.
-    if (paste.begins(rawInput)) {
+    if (input.paste.begins(input.raw)) {
       // Stops the ESC-disambiguation timer from firing mid-paste and committing the
       // body's first byte as an Escape key.
-      if (rawInputFlushTimer) {
-        clearTimeout(rawInputFlushTimer);
-        rawInputFlushTimer = null;
+      if (input.flushTimer) {
+        clearTimeout(input.flushTimer);
+        input.flushTimer = null;
       }
-      paste.start();
-      rawInput = rawInput.subarray(PASTE_START.length);
+      input.paste.start();
+      input.raw = input.raw.subarray(PASTE_START.length);
       continue;
     }
 
     // Focus reporting is not used. An ESC[I/ESC[O left over from a previous run or from
     // tmux/terminal state is never forwarded as browser text or a shell string either.
-    const focus = /^\x1b\[[IO]/.exec(input);
+    const focus = /^\x1b\[[IO]/.exec(decoded);
     if (focus) {
-      rawInput = rawInput.subarray(Buffer.byteLength(focus[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(focus[0]));
       continue;
     }
 
     // 5001-5012 are the existing shortcuts, 5013-5019 the mode toggles
     // (5014 = Ctrl-:), and 5020 and up the Cmd combinations.
-    let match = /^\x1b\[(50(?:0[1-9]|1[0-9]|[2-9][0-9]))~/.exec(input);
+    let match = /^\x1b\[(50(?:0[1-9]|1[0-9]|[2-9][0-9]))~/.exec(decoded);
     if (match) {
       dispatchPrivateShortcut(Number(match[1]));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(input);
+    match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(decoded);
     if (match) {
       dispatchMouse(Number(match[1]), Number(match[2]), Number(match[3]), match[4] === "m");
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[([0-9]+)(?::[0-9]+)*(?:;([0-9]+)(?::([123]))?)?(?:;([0-9:]+))?u/.exec(input);
+    match = /^\x1b\[([0-9]+)(?::[0-9]+)*(?:;([0-9]+)(?::([123]))?)?(?:;([0-9:]+))?u/.exec(decoded);
     if (match) {
       const text = match[4] ? match[4].split(":").map(Number).filter(Number.isFinite) : [];
       dispatchKey(Number(match[1]), Number(match[2] || 1), Number(match[3] || 1), text);
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[(?:1;([2-8]))?([ABCDHF])/.exec(input);
+    match = /^\x1b\[(?:1;([2-8]))?([ABCDHF])/.exec(decoded);
     if (match) {
       const keys = { A: "ArrowUp", B: "ArrowDown", C: "ArrowRight", D: "ArrowLeft", H: "Home", F: "End" };
       dispatchNamedKey(keys[match[2]], Number(match[1] || 1));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[(\d+)(?:;([2-8]))?~/.exec(input);
+    match = /^\x1b\[(\d+)(?:;([2-8]))?~/.exec(decoded);
     if (match) {
       const keys = {
         1: "Home", 2: "Insert", 3: "Delete", 4: "End", 5: "PageUp", 6: "PageDown",
@@ -4929,25 +5128,25 @@ function consumeRawInput() {
         18: "F7", 19: "F8", 20: "F9", 21: "F10", 23: "F11", 24: "F12",
       };
       if (keys[match[1]]) dispatchNamedKey(keys[match[1]], Number(match[2] || 1));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1bO([P-SABCDHF])/.exec(input);
+    match = /^\x1bO([P-SABCDHF])/.exec(decoded);
     if (match) {
       const keys = {
         P: "F1", Q: "F2", R: "F3", S: "F4",
         A: "ArrowUp", B: "ArrowDown", C: "ArrowRight", D: "ArrowLeft", H: "Home", F: "End",
       };
       dispatchNamedKey(keys[match[1]]);
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[27;([2-8]);(\d+)~/.exec(input);
+    match = /^\x1b\[27;([2-8]);(\d+)~/.exec(decoded);
     if (match) {
       dispatchKey(Number(match[2]), Number(match[1]));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
@@ -4958,32 +5157,29 @@ function consumeRawInput() {
 
     // If the escape sequence is still incomplete, wait for the next INPUT chunk.
     // A lone ESC is settled as the Escape key once the short disambiguation window passes.
-    if (/^\x1b(?:\[|\[<|O)?[0-9;:<]*$/.test(input)) {
+    if (/^\x1b(?:\[|\[<|O)?[0-9;:<]*$/.test(decoded)) {
       scheduleRawInputFlush();
       return;
     }
 
     // An unrecognized ESC is delivered as the Escape key, consuming just that one byte.
     dispatchKey(27);
-    rawInput = rawInput.subarray(1);
+    input.raw = input.raw.subarray(1);
   }
 }
 
 // --- resize/input control channel ---
 // tweb-pane forwards SIGWINCH and raw terminal input over this pipe.
 
-// What an ATTACH does when there is no page host behind it.
+// What an ATTACH does, and what it refuses.
 //
-// The choice here is the whole subject of this seam, so it is written out. A host that RECORDED
-// the pane — registered it, allocated its writer, handed back an agent socket — and did not open
-// a window would be worse than one that refuses: the supervisor would count the attach as
-// accepted, the frontend would stop falling back, and the pane would sit blank forever with
-// every check green. That state was produced once and observed exactly that way.
+// Every refusal below records NOTHING. That asymmetry is the subject of this seam: a host that
+// registered the pane, allocated its writer and handed back an agent socket without opening a
+// window would be worse than one that refuses, because the supervisor would count the attach as
+// accepted, the frontend would stop falling back, and the pane would sit blank forever with every
+// check green. That state was produced once and observed exactly that way.
 //
-// So this refuses, loudly and without recording anything. `hostProtocolVersion()` is null, the
-// engine never printed READY, and a supervisor that never got a handshake is not sending real
-// attaches anyway — this exists so that if one ever arrives, the answer is a diagnostic rather
-// than a half-built registration.
+// A refusal leaves the frontend its own engine, which is a working browser.
 function handleAttach(command) {
   if (!hostedRuntime) {
     // A per-pane engine already serves the pane it was started for. Accepting an attach would
@@ -5004,23 +5200,18 @@ function handleAttach(command) {
     return;
   }
 
-  // ONE pane per host, refused explicitly rather than half-accepted.
+  // A second pane used to be refused here, because the window and tab plumbing reached for one
+  // global context and a second attach would have drawn into the first pane's window. That plumbing
+  // is per-pane now, and `bench/host-multipane.py` is what says so rather than this comment: 5 panes
+  // in one engine, each rendering its own image id, no crossed frames, no pane resolved by falling
+  // back to the first, each holding its own tmux placement and client set, input parsed per pane,
+  // modes isolated, and a detached pane's windows torn down while the others keep running. Every one
+  // of those gates was verified to fail when the state it guards is put back the way it was.
   //
-  // The state a pane owns is per-pane throughout: the registry keys it, `frame-context.cjs` holds
-  // the frame pipeline, `pane-windows.cjs` holds the window/tab/rate/surface state, and each has
-  // a test asserting two panes share nothing. What is NOT yet per-pane is the window and tab
-  // plumbing that builds on them — `createTab`, `activateTab`, the tab-keyed maps and the input
-  // dispatch still reach for the sole window context — so a second attach would be recorded and
-  // would then draw into the first pane's window.
-  //
-  // Refusing is the only honest answer to that. A records-only accept is the one unacceptable
-  // outcome of this work: the supervisor counts the attach, the frontend stops falling back, and
-  // the pane sits blank with every check green. A refusal keeps that frontend's own engine, which
-  // is a working browser.
-  if (paneRegistry.size > 0) {
-    console.error(`tweb: refusing ATTACH for ${command.paneId}: this host serves one pane`);
-    return;
-  }
+  // `twebd` still refuses to use a host, independently, because `hostProtocolVersion()` returns
+  // null. That is the gate that decides whether any of this is reached in a shipping build, and
+  // opening it is a separate decision — the supervisor's READY handshake has to be confirmed
+  // against a host that serves N panes, not just measured by a harness that speaks its protocol.
   if (!hostReady) {
     console.error(`tweb: refusing ATTACH for ${command.paneId}: the host is not started yet`);
     return;
@@ -5057,7 +5248,9 @@ function handleAttach(command) {
   // daemon's — measured claiming `agent-%304.sock`, a name in an unrelated pane's namespace.
   const server = startAgentServer({
     paneId: record.paneId,
-    dispatch: handleAgentCommand,
+    // Scoped to this record: `tweb click`, `tweb screenshot` and the rest reach a window, and the
+    // socket is what says which pane asked. A host has one socket per pane for exactly this.
+    dispatch: (method, params) => withPaneScope(record, () => handleAgentCommand(method, params)),
     log: (message) => {
       if (debugLogging) console.error(`tweb: ${message}`);
     },
@@ -5071,20 +5264,79 @@ function handleAttach(command) {
   // `applyViewport`, the same `createWindow`, the same input and agent handling. It reaches the
   // right pane because every one of them takes the record and the frame context, which is what
   // the extraction was for. What it does NOT yet do is run twice — see the refusal above.
-  if (command.viewport) applyViewport(command.viewport, command.origin ?? null, frames, record);
-  createWindow(url, frames);
-  markInteractionActivity();
+  // Run as work belonging to this record, which is what makes `createWindow` reach THIS pane's
+  // window context and what gives the tab it creates its `tabPanes` entry — every handler that tab
+  // registers resolves back here from that entry, including `paint`.
+  withPaneScope(record, () => {
+    if (command.viewport) applyViewport(command.viewport, command.origin ?? null, frames, record);
+    createWindow(url, frames);
+    markInteractionActivity();
+  });
 
   console.error(`tweb: hosting ${record.paneId} generation=${record.generation}`
     + ` image=${record.imageId} tty=${record.tty || "-"} url=${url}`);
 }
 
 /** Tears a pane down: its window, its writer, its socket and its image on the terminal. */
+const panesClosing = new Set();
+
 function closePane(record, reason) {
+  // Destroying this pane's tabs fires their `closed` handlers, and the "last tab closed" branch
+  // there calls back into here for the same pane. The second pass would run against state the first
+  // is halfway through dismantling, and measured, it let 10 frames out after the DETACH.
+  if (panesClosing.has(record.key)) return;
+  panesClosing.add(record.key);
+  try {
+    closePaneOnce(record, reason);
+  } finally {
+    panesClosing.delete(record.key);
+  }
+}
+
+function closePaneOnce(record, reason) {
+  // The pane's windows go first, and inside its own scope: they are per-pane now, and a window left
+  // running keeps painting frames addressed to a pane the registry no longer holds. Measured with
+  // three panes and a DETACH of the middle one: `%10` received a frame carrying `i=5242` — %11's
+  // image id — 19 pane resolutions fell back to the first pane, and `%12` stopped painting
+  // altogether. Destroying the windows is what stops all three.
+  withPaneScope(record, () => {
+    const windows = paneWindows.get(record.key);
+    if (windows) {
+      // `destroy()` fires `closed`, and that handler resolves its pane from `tabPanes` — so the
+      // mapping has to outlive the destroy. Clearing it first sent the handler to the first pane
+      // instead: measured on a DETACH of the middle pane, %10 received a frame carrying i=5242
+      // (%11's image id), 20 resolutions fell back, and %12 stopped painting.
+      for (const tab of windows.tabs.slice()) {
+        if (tab.isDestroyed()) continue;
+        tab.webContents.stopPainting();
+        tab.destroy();
+      }
+      for (const tab of windows.tabs.slice()) {
+        tabPanes.delete(tab);
+        tabFrames.delete(tab);
+        tabZoomFactors.delete(tab);
+        tabSessionUrls.delete(tab);
+        tabRendererRecoveries.delete(tab);
+      }
+      windows.tabs.length = 0;
+      windows.win = null;
+      windows.activeTabIndex = -1;
+      if (windows.frameIdleTimer) {
+        clearTimeout(windows.frameIdleTimer);
+        windows.frameIdleTimer = null;
+      }
+      paneWindows.delete(record.key);
+    }
+    paneInputStates.delete(record.key);
+  });
+
   const frames = frameContexts.get(record.key);
   if (frames) {
     try {
-      terminalCleanup(record);
+      // In this pane's scope: `terminalCleanup` writes the image delete through `paneWrite`, which
+      // picks the writer from the ambient pane. Unscoped it addressed the delete to the first pane,
+      // leaving this pane's image on its terminal.
+      withPaneScope(record, () => terminalCleanup(record));
     } catch (error) {
       void error;
     }
@@ -5146,40 +5398,56 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
 
-    if (command.kind === "resize") {
-      markInteractionActivity();
-      // An absent origin means "leave the anchor where it is". Normalising it to 0,0 would
-      // re-anchor the pane at the window's top-left, i.e. draw it over its neighbours.
-      applyViewport(command.viewport, command.origin === undefined ? currentFrames().origin : command.origin);
-      continue;
-    }
-
-    // The frontend's pane visibility push — see the pane visibility section. It is not
-    // interaction, so unlike RESIZE/INPUT it deliberately does not mark activity: a
-    // client attaching elsewhere must not count as someone using this pane.
-    if (command.kind === "visibility") {
-      applyVisibilityPush(command.hex);
-      continue;
-    }
-
-    if (command.kind === "input") {
-      markInteractionActivity();
-      if (rawInputFlushTimer) {
-        clearTimeout(rawInputFlushTimer);
-        rawInputFlushTimer = null;
-      }
-      // The escape sequence's raw bytes. Being pre-decoding, it separates "the
-      // terminal never sent it" from "it arrived but was not understood" — this log
-      // is how tmux re-encoding ESC[5020~ into ESC[91;3u5020~ was found. Logging
-      // ordinary typing too would drown it, so only sequences are kept.
-      if (debugLogging && command.hex.startsWith("1b")) {
-        console.error(`tweb: input ${command.hex}`);
-      }
-      rawInput = Buffer.concat([rawInput, Buffer.from(command.hex, "hex")]);
-      consumeRawInput();
-    }
+    // From here the line is addressed to a known pane, so it is handled as that pane's work: a
+    // RESIZE reads that pane's origin, a VIS flips that pane's visibility, and INPUT is delivered
+    // to that pane's active tab.
+    withPaneScope(target, () => handleTargetedCommand(command, target));
   }
 });
+
+/**
+ * A control line whose pane is already resolved.
+ *
+ * Called inside that pane's scope, which is why nothing here takes the record: `applyViewport`,
+ * `applyVisibilityPush` and the input path all reach it the same way every other pane-owned
+ * function does.
+ */
+function handleTargetedCommand(command, target) {
+  void target;
+  if (command.kind === "resize") {
+    markInteractionActivity();
+    // An absent origin means "leave the anchor where it is". Normalising it to 0,0 would
+    // re-anchor the pane at the window's top-left, i.e. draw it over its neighbours.
+    applyViewport(command.viewport, command.origin === undefined ? currentFrames().origin : command.origin);
+    return;
+  }
+
+  // The frontend's pane visibility push — see the pane visibility section. It is not
+  // interaction, so unlike RESIZE/INPUT it deliberately does not mark activity: a
+  // client attaching elsewhere must not count as someone using this pane.
+  if (command.kind === "visibility") {
+    applyVisibilityPush(command.hex);
+    return;
+  }
+
+  if (command.kind === "input") {
+    markInteractionActivity();
+    const input = inputState();
+    if (input.flushTimer) {
+      clearTimeout(input.flushTimer);
+      input.flushTimer = null;
+    }
+    // The escape sequence's raw bytes. Being pre-decoding, it separates "the
+    // terminal never sent it" from "it arrived but was not understood" — this log
+    // is how tmux re-encoding ESC[5020~ into ESC[91;3u5020~ was found. Logging
+    // ordinary typing too would drown it, so only sequences are kept.
+    if (debugLogging && command.hex.startsWith("1b")) {
+      console.error(`tweb: input ${command.hex}`);
+    }
+    input.raw = Buffer.concat([input.raw, Buffer.from(command.hex, "hex")]);
+    consumeRawInput();
+  }
+}
 process.stdin.resume();
 
 // --- app lifecycle ---
@@ -5392,24 +5660,31 @@ app.on("before-quit", () => {
   writeWindowSession();
   releaseWindowSessionClaim();
   quitting = true;
-  mouseClicks.reset();
-  if (currentFrames().pendingFrameTimer) {
-    clearTimeout(currentFrames().pendingFrameTimer);
-    currentFrames().pendingFrameTimer = null;
-    currentFrames().pendingFrame = null;
-  }
-  currentFrames().pendingGfxFrame = null;
   void gfxWorker.terminate();
-  cleanupFrameFiles();
-  if (debugLogging && currentFrames().droppedGfxFrames > 0) {
-    console.error(`tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
-  }
-  for (const tab of currentWindows().tabs) {
-    if (!tab.isDestroyed()) tab.webContents.stopPainting();
-  }
+  // Per pane: each has its own pending frame, its own tabs still painting, and its own image on the
+  // terminal. Running this once for the first pane would leave every other pane's image drawn over
+  // the terminal after the engine is gone — the four-hour stale-page failure, N-1 times over.
+  forEachPane(() => {
+    inputState().clicks.reset();
+    if (currentFrames().pendingFrameTimer) {
+      clearTimeout(currentFrames().pendingFrameTimer);
+      currentFrames().pendingFrameTimer = null;
+      currentFrames().pendingFrame = null;
+    }
+    currentFrames().pendingGfxFrame = null;
+    cleanupFrameFiles();
+    if (debugLogging && currentFrames().droppedGfxFrames > 0) {
+      console.error(`tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
+    }
+    for (const tab of currentWindows().tabs) {
+      if (!tab.isDestroyed()) tab.webContents.stopPainting();
+    }
+    terminalCleanup();
+    // Each pane's image is placed on the clients watching THAT pane's window, which after the move
+    // to per-pane visibility state are a different set per pane.
+    for (const tty of vis().clientTtys) deleteImageFromClientTty(tty);
+  });
   restoreTmuxPassthroughClients();
-  terminalCleanup();
-  for (const tty of visibleClientTtys) deleteImageFromClientTty(tty);
   restorePaneTitle();
 });
 
@@ -5419,9 +5694,12 @@ process.on("exit", () => {
   // The delete that takes each pane's image off the terminal. An exit handler cannot await, so
   // this only works because every pane writer has a synchronous sink — see `fdSink`. Give a
   // writer an async sink and these deletes are dropped, stranding the images.
+  // The record is already in hand, so the delete is written in that pane's scope: `writeGfx` picks
+  // the writer from the ambient pane, and unscoped it would address every pane's delete to the
+  // first one — leaving N-1 images on the terminal, which is precisely what this handler is for.
   for (const record of paneRegistry.list()) {
     try {
-      writeGfx(`a=d,d=I,i=${record.imageId}`, "");
+      withPaneScope(record, () => writeGfx(`a=d,d=I,i=${record.imageId}`, ""));
     } catch (e) {}
   }
 });

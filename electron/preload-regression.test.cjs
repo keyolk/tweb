@@ -197,7 +197,7 @@ test("the window session slot is claimed exclusively and released only by its ow
   // The release runs on the exit path, after the final save.
   assert.match(main, /writeWindowSession\(\);\s*releaseWindowSessionClaim\(\);/);
   // A pane given a URL never restores but still saves, so it needs its own file too.
-  assert.match(main, /resolveWindowSessionPaths\(\);\s*tmuxPlacement =/);
+  assert.match(main, /resolveWindowSessionPaths\(\);\s*vis\(\)\.placement =/);
 });
 
 // A client can still report this window while tmux has zoomed a different pane.
@@ -210,8 +210,10 @@ test("another pane owning tmux zoom hides the browser image", () => {
   assert.match(main, /paneId: ownTmuxPane/);
   // Both the frontend's push and the no-frontend fallback poll run this one function,
   // so the zoom handling and the per-client delete cannot drift apart.
-  assert.match(main, /const next = visibleTmuxClientTtys\(clients, tmuxPlacement\);/);
-  assert.match(main, /if \(!next\.has\(tty\)\) deleteImageFromClientTty\(tty\);/);
+  assert.match(main, /const next = visibleTmuxClientTtys\(clients, vis\(\)\.placement\);/);
+  // The invariant is that a client no longer showing this pane gets the delete, whatever the loop
+  // is spelled like — it now logs the eviction first, which `bench/host-multipane.py` gates on.
+  assert.match(main, /if \(next\.has\(tty\)\) continue;[\s\S]*?deleteImageFromClientTty\(tty\);/);
   assert.match(main, /if \(becameVisible\) repaintActiveTab\(\);/);
 });
 
@@ -690,7 +692,9 @@ test("the mode toggles stay independent across tmux and the engine", () => {
   // In the passthrough table Ctrl-; must return the client to root, or the
   // table keeps re-arming itself after the mode it guards is gone.
   assert.match(main, /passthroughTable, "C-\\\\;"[\s\S]*?switch-client", "-T", "root"/);
-  assert.match(main, /code === 5014[\s\S]*?setVimiumShortcutsEnabled\(!vimiumShortcutsEnabled\)/);
+  // The mode lives on the pane's input state: a user switching one pane to passthrough is saying it
+  // about that pane's page, and shared it re-routed every pane's keys at once.
+  assert.match(main, /code === 5014[\s\S]*?setVimiumShortcutsEnabled\(!inputState\(\)\.vimium\)/);
   assert.match(main, /code === 5011 \|\| code === 5012/);
   assert.match(main, /setCmdBypassEnabled\(code === 5012\)/);
   // The private-sequence regex has to cover the Cmd codes at 5020+; a code
@@ -707,19 +711,19 @@ test("the mode toggles stay independent across tmux and the engine", () => {
 // `e.keyCode === 40` — suggestion lists among them — then ignore ArrowDown.
 test("insert mode delivers native keys to the page", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /if \(!vimiumShortcutsEnabled \|\| pageInsertMode \|\| modifiers\.includes\("meta"\)\) \{/);
+  assert.match(main, /if \(!inputState\(\)\.vimium \|\| inputState\(\)\.insertMode \|\| modifiers\.includes\("meta"\)\) \{/);
   assert.match(main, /case "insert-mode":/);
   // setMode is the single place that mirrors the state, so an editable focus
   // arms native delivery just like an explicit `i` does.
   assert.match(electron, /function setEngineNativeKeys\(enabled\)[\s\S]*?send\("insert-mode", enabled\)/);
   assert.match(electron, /setEngineNativeKeys\(mode === "insert"\)/);
   // The mirror must reset wherever the preload's own flag would.
-  assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) pageInsertMode = false;/);
+  assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) inputState\(\)\.insertMode = false;/);
   // The preload skips redundant IPC, so every engine-side reset has to tell the
   // page — otherwise native delivery never re-arms after a tab switch.
   assert.match(electron, /engineNativeKeys = false;/);
   assert.match(main, new RegExp(
-    `pageInsertMode = false;\\s*\\/\\/ The preload mirrors this flag[\\s\\S]*?`
+    `inputState\\(\\)\\.insertMode = false;\\s*\\/\\/ The preload mirrors this flag[\\s\\S]*?`
     + `sendToTabFrames\\((?:soleWindows|currentWindows\\(\\))\\.win, "tweb-shortcuts-mode"`));
 });
 
@@ -732,10 +736,12 @@ test("Cmd-V arrives as a bracketed paste rather than typed characters", () => {
   const terminal = fs.readFileSync(path.join(root, "crates/tweb-pane/src/terminal.rs"), "utf8");
   assert.match(terminal, /\\x1b\[\?2004h/);
   assert.match(terminal, /\\x1b\[\?2004l/);
-  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{/);
-  assert.match(main, /if \(paste\.active\) \{/);
+  // The paste state and the parse buffer live on the pane's record — one buffer for N panes crossed
+  // input, measured. `input` is the local handle `consumeRawInput` holds.
+  assert.match(main, /if \(input\.paste\.begins\(input\.raw\)\) \{/);
+  assert.match(main, /if \(input\.paste\.active\) \{/);
   // The ESC-disambiguation timer must not fire into a paste body.
-  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{[\s\S]*?clearTimeout\(rawInputFlushTimer\)/);
+  assert.match(main, /if \(input\.paste\.begins\(input\.raw\)\) \{[\s\S]*?clearTimeout\(input\.flushTimer\)/);
   assert.match(main, /function dispatchPaste\(text\)/);
   // A real paste event carries formatting that insertText cannot.
   assert.match(main, /normalize\(clipboard\.readText\(\)\) === body[\s\S]*?contents\.paste\(\)/);
@@ -775,21 +781,26 @@ test("agent socket refuses a path longer than sun_path", () => {
 // keeps its id but changes window, every client match fails, and painting stops.
 test("visibility matches the pane's live placement, not its startup identity", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /let tmuxPlacement = null;/);
+  // The live placement lives on the pane's record, not in a module variable: panes in one engine
+  // sit in different tmux windows, and one shared placement had the last pane to push overwrite
+  // every other pane's — measured with three panes, %11 pushed as @2 and reported @1.
+  const registry = fs.readFileSync(path.join(__dirname, "pane-registry.cjs"), "utf8");
+  assert.match(registry, /visibility: \{\s*placement: null,/);
+  assert.match(main, /function vis\(\) \{\s*return currentPane\(\)\.visibility;/);
   // The frontend re-resolves placement through `-t <pane id>` on every tick and the
   // push carries the result, so the engine adopts the pane's current window rather
   // than the one it started in.
   assert.match(main, /applyClientListing\(push\.clients, push\.placement\)/);
-  assert.match(main, /function applyClientListing\(clients, placement\) \{\s*tmuxPlacement = placement;/);
-  assert.match(main, /visibleTmuxClientTtys\(clients, tmuxPlacement\)/);
+  assert.match(main, /function applyClientListing\(clients, placement\) \{\s*vis\(\)\.placement = placement;/);
+  assert.match(main, /visibleTmuxClientTtys\(clients, vis\(\)\.placement\)/);
   // The no-frontend fallback keeps re-resolving it for itself.
-  assert.match(main, /function syncTmuxVisibility\(\)[\s\S]*?"display-message", "-p", "-t", tmuxPlacement\.paneId/);
-  assert.match(main, /placement = \{ \.\.\.tmuxPlacement, session, windowId \}/);
+  assert.match(main, /function syncTmuxVisibility\(\)[\s\S]*?"display-message", "-p", "-t", vis\(\)\.placement\.paneId/);
+  assert.match(main, /placement = \{ \.\.\.vis\(\)\.placement, session, windowId \}/);
   // The save path stays on the startup identity; a moved pane must not silently
   // adopt another window's stored tabs. The slot claim derives from it too.
   assert.match(main, /identity: tmuxIdentity,/);
   // The in-flight guard has to clear even if spawning throws, or polling stops.
-  assert.match(main, /catch \(spawnError\) \{\s*visibilityCheckRunning = false;/);
+  assert.match(main, /catch \(spawnError\) \{\s*vis\(\)\.checkRunning = false;/);
 });
 
 // The engine is launched directly by tests and by hand, where no frontend exists to push
@@ -798,10 +809,12 @@ test("visibility matches the pane's live placement, not its startup identity", (
 test("visibility falls back to polling when no push arrives", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /const delay = process\.env\.TWEB_FRONTEND_PID \? VISIBILITY_PUSH_GRACE_MS : 0;/);
-  assert.match(main, /if \(visibilitySource === "push"\) return;\s*visibilitySource = "poll";/);
+  // Armed per pane: a frontend that pushes for one pane says nothing about another whose frontend
+  // is older or absent, so the source and the timers are on the record like the placement.
+  assert.match(main, /if \(vis\(\)\.source === "push"\) return;\s*vis\(\)\.source = "poll";/);
   // The first push disarms both timers for good.
-  assert.match(main, /visibilitySource = "push";/);
-  assert.match(main, /if \(visibilityPollTimer\) \{\s*clearTimeout\(visibilityPollTimer\);/);
+  assert.match(main, /vis\(\)\.source = "push";/);
+  assert.match(main, /if \(vis\(\)\.pollTimer\) \{\s*clearTimeout\(vis\(\)\.pollTimer\);/);
 });
 // Chromium's sendInputEvent takes Accelerator key codes, and it silently drops
 // names it does not know: measured in offscreen Chromium, keyDown with
@@ -887,8 +900,10 @@ test("the caret is re-asserted after anything that moves the cursor", () => {
     main.indexOf("function unparkTerminalCaret()") > main.indexOf("function reassertTerminalCaret()")
       ? main.indexOf("function unparkTerminalCaret()")
       : main.length);
-  assert.match(reassert, /if \(!caretCell\) return;/);
-  assert.match(reassert, /writeTerminalCaret\(caretCell\.row, caretCell\.col\)/);
+  // The caret cell is per-pane, on the input state: the coordinates go to that pane's own terminal
+  // through `paneWrite`, so a shared cell parked every pane's cursor where one pane's caret was.
+  assert.match(reassert, /if \(!input\.caretCell\) return;/);
+  assert.match(reassert, /writeTerminalCaret\(input\.caretCell\.row, input\.caretCell\.col\)/);
 
   // Every path that emits graphics: the two inline ones and the one that puts the worker's
   // whole frames on the pane. The last is the one that fires continuously.
@@ -968,20 +983,20 @@ test("the terminal cursor is hidden until a caret is parked on it", () => {
   const setup = main.slice(main.indexOf("function terminalSetup()"),
     main.indexOf("function requestTrackedKeyboardModeRestore()"));
   assert.match(setup, /CSI\("\?25l"\)/);
-  assert.match(setup, /caretHidden = true;/);
+  assert.match(setup, /inputState\(\)\.caretHidden = true;/);
 
   // And a report with no caret hides it unconditionally — a frame's cursor anchoring can
   // leave one visible at the pane origin even when TWeb never placed it.
   const move = main.slice(main.indexOf("function moveTerminalCaret(point)"),
     main.indexOf("function writeTerminalCaret(row, col)"));
   assert.match(move, /unparkTerminalCaret\(\);/);
-  assert.doesNotMatch(move, /if \(caretCell\) unparkTerminalCaret\(\)/,
+  assert.doesNotMatch(move, /if \(input\.caretCell\) unparkTerminalCaret\(\)/,
     "hiding must not be conditional on TWeb having parked the caret itself");
 
   // That runs on every caret-less report, so the write happens only on the transition.
   const unpark = main.slice(main.indexOf("function unparkTerminalCaret()"),
     main.indexOf("// The page draws the IME composition surface"));
-  assert.match(unpark, /if \(caretHidden\) return;/);
+  assert.match(unpark, /if \(input\.caretHidden\) return;/);
 });
 
 // The page draws its own caret bar, separate from the terminal cursor, and it was

@@ -1081,6 +1081,62 @@ the write cheaper in absolute terms, but there is no longer a user-visible numbe
 content at a frame rate above 30, most plausibly), at which point the addon is the next lever and
 `bench/shm-fd-inherit.py` records why it has to be a real addon.
 
+### 8.7 Addendum — one engine, five panes (2026-08-18)
+
+`bench/host-multipane.py` attaches N panes to one hosted engine and asks the question the single-pane
+harness cannot: not "does a hosted pane render" but "does pane A's page stay out of pane B's
+rectangle". Five real pages, five panes:
+
+```text
+  panes painted     5/5                own placement     5/5 panes
+  process tree      8 procs, 1335MB    unscoped panes    0
+  per pane          267MB, 1.6 procs   evictions         0
+  input keys        %10='[Escape', %14='[[['
+  mode isolation    only the toggled pane changed
+  detach            %12 closed, no frames after
+
+  measured as separate engines (5 real pages): 501MB and 5.0 procs per pane
+```
+
+**The measurement that reframed the work.** `%10`'s 34 frames beside `%11`'s 3 is not starvation —
+these are static pages, and a pane with nothing to redraw sends nothing. Frame counts turned out to be
+the *weakest* of the seven gates. The load-bearing ones came from state that crossed while every pane
+painted:
+
+| Gate | What a shared-state failure looks like | Verified by |
+|---|---|---|
+| `unscopedResolutions == 0` | 5/5 painted, **154** pane resolutions fell back to the first | `diag` per pane |
+| own tmux placement | `%11`, pushed as window `@2`, reports `@1` | `diag` per pane |
+| no evictions | `image evicted from /dev/ttys900 for %11` — a pane blanking another's terminal | engine log |
+| input isolation | `%11` receives `[[[Escape[`, `%10` receives nothing | each page's own keydown log, read over that pane's agent socket |
+| mode isolation | `%12 reports cmdBypass=True, was never toggled` | `diag` per pane |
+| detach survival | `%10` receives a frame carrying `i=5242`; `%12` stops painting | FRAME events after the engine's own `closed` line |
+
+Each row was verified to FAIL by putting the state back the way it was — a stashed change, then a
+re-run. A gate nobody has watched fail is not evidence.
+
+**Three ways the harness lied before it told the truth**, all worth recording because each made a
+broken engine look correct:
+
+- **Every pane in one tmux window on one tty.** N pushes that agree make shared placement state look
+  per-pane. Giving each pane its own window and client tty exposed the crossing on the first run.
+- **`ps -eo` over every process, once per loop iteration.** The sampling loop became the slowest thing
+  in the run: a 35s deadline took 94s of wall clock, and control lines written at t=16.7s were still
+  unparsed when it ended. Sampled at 1Hz instead — this is a peak-RSS measurement, and Electron does
+  not allocate 500MB between samples.
+- **Counting frames from when the harness wrote `DETACH`.** The engine parses stdin between frames, so
+  a pane legitimately keeps painting while the line sits unparsed; that reported 10 phantom frames
+  after a close that had not happened yet. The engine's own log is the clock.
+
+And one gate had to be **deleted** for being wrong rather than weak: "the re-pushed pane keeps
+painting". An identical visibility push is not a transition, so `becameVisible` is false and a static
+page correctly has nothing to redraw. That gate failed the *fixed* code. What replaced it is the
+eviction check, which watches the actual hazard — an image deleted off a terminal still displaying it.
+
+**Still shut:** `hostProtocolVersion()` returns null, so `twebd` never learns a host exists. That gate
+needs the supervisor's READY handshake exercised against a host serving N panes, by the daemon rather
+than by a harness that imitates it.
+
 ## 9. A component and interface structure built for extension
 
 > **The traits below exist as Rust source; almost none of them have an implementation.**

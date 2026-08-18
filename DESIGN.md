@@ -392,17 +392,52 @@ FRAME:  ESC_G a=T,i=4242,C=1,c=100,r=30,z=-1,f=32,s=1000,v=600,t=f,q=2;<base64 p
 The host runs only under `TWEB_HOST_PREVIEW=1`, which nothing but that harness sets. So the host is
 **measurable before it is declared**, which is the order this had to happen in.
 
-**What is still missing, and it is why the gate stays shut: one pane per host.** Everything a pane
-owns is per-pane — registry record, frame context, window context, writer, agent socket, image id
-pool, frame file. The tab plumbing on top is not: `createTab`/`activateTab` and the tab-keyed maps
-still reach for the sole window context, so a second attach would be recorded and would then draw
-into the first pane's window. `handleAttach` refuses the second pane rather than accepting it, and
-that frontend keeps its own engine.
+**N panes now render in one engine.** `bench/host-multipane.py` attaches five panes to one host and
+gates on seven things, each of which was verified to FAIL when the state it guards is put back the
+way it was — a gate nobody has seen fail is not a gate:
 
-Declaring `READY 2` in that state would make `twebd` host one pane per engine — which **buys
-nothing**. The entire saving measured above is runtime duplication, and one pane in an Electron that
-hosts nothing else duplicates the runtime exactly as today, with a daemon added on top. The gate
-opens when N panes render in one engine, not before.
+```text
+  %10   i=4242     34 frames    %11   i=5242     3 frames    ...
+  panes painted     5/5          own placement     5/5 panes
+  process tree      8 procs, 1335MB peak            unscoped panes    0
+  per pane          267MB, 1.6 procs                evictions         0
+  input keys        %10='[Escape', %14='[[['        mode isolation    only the toggled pane changed
+  detach            %12 closed, no frames after
+```
+
+Against 501MB and 5.0 processes per pane measured as separate engines on the same five pages: the
+saving is real and it is the runtime duplication, as predicted.
+
+Getting there took one structural decision and five crossings that only a harness could find.
+
+**The pane travels with the execution.** `currentPane()` answered "which pane is this?" with
+`paneRegistry.list()[0]` — always the first — and roughly 240 call sites read it. Threading a
+parameter through them is not the shape of the problem: the frame-rate policy defers with
+`setTimeout(settleFrameRate, 700)` and settles with no tab in hand, the agent surface path resumes
+after an `await`, and `setWindowOpenHandler` opens a tab from a `setImmediate`. None of those
+callbacks has a pane argument to receive. So an `AsyncLocalStorage` carries the pane, established at
+each entry point that knows which pane it is acting for, and `currentPane()` reads it first. Verified
+under Electron 43 rather than assumed: a `paint` handler registered outside a store reads
+`undefined`, a store established inside the handler survives both a `setTimeout` and an `await`
+continuation, and a timer bound to a second pane reads that second pane. An entry point nobody bound
+would fall back silently, so `diag` counts every unscoped resolution and the harness fails on any.
+
+| What crossed | How it showed | Now |
+|---|---|---|
+| Window/frame context | 3 panes attached, 1 painted | Resolved from the ambient pane; `tabPanes` maps each tab back to it |
+| The hidden-window watchdog and the quit path | 5/5 painted with **154** fallback resolutions | `forEachPane` runs both once per pane, in that pane's scope |
+| tmux placement and client ttys | `%11`, pushed as window `@2`, reported `@1` — and evicted `%10`'s image off a terminal still showing it | On the pane record beside `visible` |
+| The input parse buffer | `ESC [` to `%10` and `[[[` to `%11` gave `%11` the string `[[[Escape[` and `%10` nothing | Per-pane buffer, paste state, decoder and click counter |
+| The shortcut mode | One Ctrl-; re-routed every pane's keys | Per-pane, beside the buffer it steers |
+| A detached pane's windows | `%10` received a frame carrying `i=5242` and `%12` stopped painting | `closePane` destroys them, non-reentrantly, in scope |
+
+The harness only found the placement and eviction crossings after it stopped putting every pane in
+one tmux window on one tty: N pushes that happen to agree make shared state look correct.
+
+**The gate is still shut, and now for one reason only.** `hostProtocolVersion()` returns null, so
+`twebd` never learns a host exists and every frontend spawns its own engine. Opening it needs the
+supervisor's READY handshake confirmed against a host serving N panes — not measured by a harness
+that speaks its protocol, but exercised by the daemon that will.
 
 #### What survives the collapse from N processes to one
 
@@ -414,7 +449,7 @@ that do not, is a strict regression rather than a simplification.
 
 | Machinery | Verdict | Why |
 |---|---|---|
-| Audio claim file + heartbeat | **File kept; arbitration between hosted panes collapses to memory** | `audioOwnerAmong` decides between panes that share a process without publishing to a file and polling it. The file stays because a per-pane engine running beside a host shares nothing else with it. The in-memory half is not yet wired — it needs the host. |
+| Audio claim file + heartbeat | **File kept; arbitration between hosted panes is UNRESOLVED** | `audioOwnerAmong` exists to decide between panes sharing a process without publishing to a file and polling it, and it is still not wired. The host now serves N panes, so the question is live rather than hypothetical: inside one process the claim variables make pane A going audible mute pane B by the same mechanism that mutes another engine. That may be what a user wants, but the claim cannot yet tell "another pane here" from "another process", so it is named unresolved in the code rather than left to be discovered. |
 | Orphan watchdog | **Kept and extended** — the opposite of a collapse | A hosted engine outliving its supervisor is the four-hour stale-page hazard with N panes behind it. It now watches `TWEB_FRONTEND_PID` if present, else `TWEB_SUPERVISOR_PID`. |
 | `history.jsonl` filesystem lock | **Kept** | Cross-process contention does not go away: legacy per-pane engines write the same file beside a host. Measured holding under real contention — 331 lines, **0 malformed**, after five concurrent engines wrote it. |
 | Agent socket bind-staging-then-rename | **Kept** | It guards pane-id reuse *across processes* (libuv unlinks the path it bound). An old per-pane engine and a new hosted pane still contend for one pathname. |
