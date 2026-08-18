@@ -5017,7 +5017,11 @@ function handleAttach(command) {
   // outcome of this work: the supervisor counts the attach, the frontend stops falling back, and
   // the pane sits blank with every check green. A refusal keeps that frontend's own engine, which
   // is a working browser.
-  if (paneRegistry.size > 0) {
+  // TWEB_MULTIPANE_EXPERIMENT lifts this for `bench/host-multipane.py` only. It is how the work
+  // below the refusal gets measured before it is finished: `twebd` still refuses because
+  // `hostProtocolVersion()` is null, so no shipping path can reach a half-built host either way.
+  // Nothing but the harness sets it.
+  if (paneRegistry.size > 0 && process.env.TWEB_MULTIPANE_EXPERIMENT !== "1") {
     console.error(`tweb: refusing ATTACH for ${command.paneId}: this host serves one pane`);
     return;
   }
