@@ -14,7 +14,10 @@ What it watches, and why each one:
                             normal typing; whole climbing is scroll or video.
     rate/rateKind           the engine's own throttle. `idle` at rate 4 means the page has
                             nothing to show, so zero drops there proves nothing.
-    rss                     the engine processes, to catch a leak that no frame counter shows.
+    rss                     this pane's own process tree, to catch a leak no frame counter
+                            shows. Scoped to the pid `diag` reports, not to every tweb on the
+                            box: two unrelated instances measured 1174MB and 76MB, and a sum
+                            of both moves when someone opens a pane you are not watching.
 
 Deltas are reported per interval, not as totals, because a total that stopped growing and a
 total that never grew look identical.
@@ -47,24 +50,56 @@ def diag(pane):
         return None
 
 
-def engine_rss():
-    """Resident memory of the whole pane tree, in MB, so a leak shows up as a trend.
+def process_table():
+    """(pid, ppid, rss) for every process, so a tree can be walked without another ps call."""
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
+    rows = []
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2])))
+    return rows
 
-    The Electron processes are what hold the frames; `tweb __pane` itself is a few MB and
-    reporting only it looked like a 4MB browser. Renderer and GPU helpers are separate
-    processes, so all of them count.
+
+def engine_root(data):
+    """The engine pid for the pane being tracked, straight from `tweb diag`.
+
+    `diag` reports `pid` for the pane it was asked about, so there is nothing to infer. An
+    earlier version of this guessed — summing every `tweb __pane` and `Electron Helper` on the
+    box, then picking the newest by pid — and both guesses were wrong in ways that looked like
+    real numbers: the sum reported 1197MB across two unrelated instances, and pgrep returns
+    ascending pids, so "newest" selected an idle 76MB pane while the one under test was playing
+    video at 1174MB.
     """
-    try:
-        out = subprocess.run(["pgrep", "-f", "tweb __pane|tweb-frame-rate|Electron Helper"],
-                             capture_output=True, text=True)
-        pids = [p for p in out.stdout.split() if p]
-        if not pids:
-            return 0.0
-        ps = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(pids)],
-                            capture_output=True, text=True)
-        return sum(int(v) for v in ps.stdout.split() if v.isdigit()) / 1024
-    except Exception:
+    pid = data.get("pid")
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+def engine_rss(root):
+    """Resident memory of one pane's whole process tree, in MB.
+
+    The tree, not the parent: `tweb __pane` is a few MB while the Electron renderer and GPU
+    helpers hold the frames, and reporting only the parent showed a 4MB browser. A live pane
+    playing video measured 1174MB across 8 processes.
+    """
+    if root is None:
         return 0.0
+    rows = process_table()
+    children = {}
+    own = 0
+    for pid, ppid, rss in rows:
+        children.setdefault(ppid, []).append((pid, rss))
+        if pid == root:
+            own = rss
+    total, stack, seen = own, [root], {root}
+    while stack:
+        for pid, rss in children.get(stack.pop(), []):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            total += rss
+            stack.append(pid)
+    return total / 1024
 
 
 def main():
@@ -87,7 +122,7 @@ def main():
             print(f"{time.strftime('%H:%M:%S')} pane gone or unreadable — stopping", flush=True)
             return 0
         frames = data.get("frames", {})
-        rss = engine_rss()
+        rss = engine_rss(engine_root(data))
         sample = {
             "t": time.time(),
             "whole": frames.get("whole", 0),
