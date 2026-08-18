@@ -900,8 +900,10 @@ test("the caret is re-asserted after anything that moves the cursor", () => {
     main.indexOf("function unparkTerminalCaret()") > main.indexOf("function reassertTerminalCaret()")
       ? main.indexOf("function unparkTerminalCaret()")
       : main.length);
-  assert.match(reassert, /if \(!caretCell\) return;/);
-  assert.match(reassert, /writeTerminalCaret\(caretCell\.row, caretCell\.col\)/);
+  // The caret cell is per-pane, on the input state: the coordinates go to that pane's own terminal
+  // through `paneWrite`, so a shared cell parked every pane's cursor where one pane's caret was.
+  assert.match(reassert, /if \(!input\.caretCell\) return;/);
+  assert.match(reassert, /writeTerminalCaret\(input\.caretCell\.row, input\.caretCell\.col\)/);
 
   // Every path that emits graphics: the two inline ones and the one that puts the worker's
   // whole frames on the pane. The last is the one that fires continuously.
@@ -981,20 +983,20 @@ test("the terminal cursor is hidden until a caret is parked on it", () => {
   const setup = main.slice(main.indexOf("function terminalSetup()"),
     main.indexOf("function requestTrackedKeyboardModeRestore()"));
   assert.match(setup, /CSI\("\?25l"\)/);
-  assert.match(setup, /caretHidden = true;/);
+  assert.match(setup, /inputState\(\)\.caretHidden = true;/);
 
   // And a report with no caret hides it unconditionally — a frame's cursor anchoring can
   // leave one visible at the pane origin even when TWeb never placed it.
   const move = main.slice(main.indexOf("function moveTerminalCaret(point)"),
     main.indexOf("function writeTerminalCaret(row, col)"));
   assert.match(move, /unparkTerminalCaret\(\);/);
-  assert.doesNotMatch(move, /if \(caretCell\) unparkTerminalCaret\(\)/,
+  assert.doesNotMatch(move, /if \(input\.caretCell\) unparkTerminalCaret\(\)/,
     "hiding must not be conditional on TWeb having parked the caret itself");
 
   // That runs on every caret-less report, so the write happens only on the transition.
   const unpark = main.slice(main.indexOf("function unparkTerminalCaret()"),
     main.indexOf("// The page draws the IME composition surface"));
-  assert.match(unpark, /if \(caretHidden\) return;/);
+  assert.match(unpark, /if \(input\.caretHidden\) return;/);
 });
 
 // The page draws its own caret bar, separate from the terminal cursor, and it was

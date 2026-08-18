@@ -1298,7 +1298,7 @@ function terminalSetup() {
   // whatever the shell left behind, which is a visible block in the top-left corner. There
   // is nothing for it to mean until a caret is parked on one — and sitting in the corner it
   // reads as the caret having started there. Hide it until something parks it.
-  caretHidden = true;
+  inputState().caretHidden = true;
   try {
     paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`);
   } catch (error) {
@@ -3205,7 +3205,7 @@ function agentDiagnostics() {
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
       // Where IME preedit will land. Comparing cell against point is the only way
       // to tell "caret parked on the wrong line" from "page never reported one".
-      caret: { cell: caretCell, point: lastCaretPoint },
+      caret: { cell: inputState().caretCell, point: inputState().caretPoint },
     },
     tabs: { active: currentWindows().activeTabIndex, count: currentWindows().tabs.length },
     // Which pane owns the speakers, and whether this one is making noise. `audible` is
@@ -3407,8 +3407,9 @@ async function dispatchAgentCommand(method, params) {
 // the pane origin — so Korean input composes off in a corner instead of at the
 // field. Park the cursor on the cell holding the web caret and show it only
 // while a field is focused.
-let caretCell = null;
-let lastCaretPoint = null;
+// Per-pane, on the input state: the coordinates are written to the pane's own terminal through
+// `paneWrite`, so a shared cell parked every pane's cursor at whichever pane last reported a caret —
+// and a hidden flag shared means one pane's blur leaves another pane's cursor showing.
 // A block cursor covers the cell it sits on, so the parked cursor hid the page's
 // own caret and the character next to it. Ask for a steady bar (DECSCUSR 6): it
 // draws on the cell's left edge, which is where a text caret belongs anyway.
@@ -3419,14 +3420,15 @@ const CARET_SHAPE_RESET = CSI("0 q");
 // cell *centres* floated a composing syllable a row above tall page text.
 const CARET_BASELINE = 0.78;
 
-let caretHidden = false;
+
 
 function unparkTerminalCaret() {
-  caretCell = null;
-  lastCaretPoint = null;
+  const input = inputState();
+  input.caretCell = null;
+  input.caretPoint = null;
   // Reported on every frame with no caret, so it writes only on the transition.
-  if (caretHidden) return;
-  caretHidden = true;
+  if (input.caretHidden) return;
+  input.caretHidden = true;
   try { paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
 }
 
@@ -3460,7 +3462,7 @@ function broadcastCellMetrics(tab = currentWindows().win) {
 // a pane resize moves the cell under a caret that never "moved" — and the report
 // that would correct it never comes. Recompute from the last one instead.
 function reparkTerminalCaret() {
-  if (lastCaretPoint) moveTerminalCaret(lastCaretPoint);
+  if (inputState().caretPoint) moveTerminalCaret(inputState().caretPoint);
 }
 
 function moveTerminalCaret(point) {
@@ -3482,14 +3484,14 @@ function moveTerminalCaret(point) {
   const baseline = (point.y + (point.height || 0) * CARET_BASELINE) * zoom;
   const row = Math.min(currentFrames().cells.rows,
     Math.max(1, Math.round(baseline / cellHeight - CARET_BASELINE) + 1));
-  lastCaretPoint = { x: point.x, y: point.y, height: point.height || 0 };
-  if (caretCell && caretCell.row === row && caretCell.col === col) return;
-  caretCell = { row, col };
+  inputState().caretPoint = { x: point.x, y: point.y, height: point.height || 0 };
+  if (inputState().caretCell && inputState().caretCell.row === row && inputState().caretCell.col === col) return;
+  inputState().caretCell = { row, col };
   writeTerminalCaret(row, col);
 }
 
 function writeTerminalCaret(row, col) {
-  caretHidden = false;
+  inputState().caretHidden = false;
   try {
     paneWrite(`${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
   } catch (error) {
@@ -3506,8 +3508,9 @@ function writeTerminalCaret(row, col) {
 // Rewriting the same position is a few bytes and idempotent, so the caret is simply
 // re-asserted after anything that moves the cursor.
 function reassertTerminalCaret() {
-  if (!caretCell) return;
-  writeTerminalCaret(caretCell.row, caretCell.col);
+  const input = inputState();
+  if (!input.caretCell) return;
+  writeTerminalCaret(input.caretCell.row, input.caretCell.col);
 }
 
 // The page reports CSS pixels but sendInputEvent takes unzoomed window
@@ -4526,6 +4529,10 @@ function inputState() {
       paste: new PasteState(),
       decoder: new StringDecoder("utf8"),
       clicks: new MouseClickState(),
+      // Where this pane's terminal cursor is parked for IME preedit, and whether it is showing.
+      caretCell: null,
+      caretPoint: null,
+      caretHidden: false,
       // The shortcut mode, and the mirror of the preload's insert mode that key dispatch reads.
       vimium: true,
       bypass: false,

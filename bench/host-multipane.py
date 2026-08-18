@@ -429,6 +429,24 @@ def main():
     # not the signal. What must not happen is the detached pane still painting into a pane the
     # registry no longer holds; that the survivors are still alive is what the `unreachable` check
     # covers, by excluding only the detached one.
+    # Each pane's terminal cursor is parked for IME preedit through its OWN writer, so a shared cell
+    # put every pane's cursor where one pane's caret was. Panes here show different pages, so two
+    # panes reporting the identical cell is the shared-state signature.
+    caret_cells = {}
+    for pane, _, _, _ in panes:
+        report = diags.get(pane)
+        if not report:
+            continue
+        cell = ((report.get("input", {}) or {}).get("caret") or {}).get("cell")
+        if cell:
+            caret_cells[pane] = (cell.get("row"), cell.get("col"))
+    caret_shared = []
+    seen_cells = {}
+    for pane, cell in caret_cells.items():
+        if cell in seen_cells:
+            caret_shared.append(f"{pane} and {seen_cells[cell]} both report caret cell {cell}")
+        seen_cells[cell] = pane
+
     # Only the first pane was toggled, so only its flags may differ from the defaults.
     mode_leaks = []
     for index, (pane, _, _, _) in enumerate(panes):
@@ -471,6 +489,13 @@ def main():
         print(f"  input keys        "
               + ", ".join(f"{pane}={(keys.get(pane) or {}).get('value', keys.get(pane))!r}"
                           for pane in probed))
+    # Says so when nothing was parked. A check that had no subject must not read as a check that
+    # passed: none of these pages focuses a field on load, so this reports rather than asserts unless
+    # a caret actually appeared.
+    print(f"  caret cells       "
+          + (f"{caret_cells}" if caret_cells
+             else "none parked (no page focused a field — not exercised)")
+          + (f"  — {caret_shared[0]}" if caret_shared else ""))
     print(f"  mode isolation    "
           + ("only the toggled pane changed" if not mode_leaks else mode_leaks[0]))
     if detached:
@@ -492,7 +517,7 @@ def main():
 
     ok = (painted == count and not crossed and unscoped == 0 and not unreachable
           and not misplaced and not evicted and not crossed_input and not detach_problems
-          and not mode_leaks)
+          and not mode_leaks and not caret_shared)
     reasons = []
     if painted != count:
         reasons.append(f"{count - painted} pane(s) silent")
@@ -512,6 +537,8 @@ def main():
         reasons.append(detach_problems[0])
     if mode_leaks:
         reasons.append(mode_leaks[0])
+    if caret_shared:
+        reasons.append(caret_shared[0])
     print(f"\n{'PASS' if ok else 'FAIL'} — "
           + ("every pane rendered its own image in one engine, none resolved by fallback" if ok
              else ", ".join(reasons)))
