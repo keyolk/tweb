@@ -8,6 +8,14 @@ was left on `feat/chrome-muscle-memory-paper-print` so task-1's shared
 §1 at HEAD `947891b`; its working tree merged as **#30**, and **#31** moved three
 more verdicts.
 
+**Final state of this run.** The remaining work has since merged: the paper-print
+result hold as **#33**, extension support as **#34**, and the find-bar reopen
+residue as **#35**. `main` is at `57d4f41`. **Every item §7 ever listed is now
+closed by a merged PR or dispositioned with the condition that would reopen it** —
+see §7 "Disposition of this list". Two limits stand and are stated rather than
+hidden: the PDF viewer's own toolbar is unreachable, and extension support covers
+the measured classes only.
+
 **The standard for this document.** The project owner intends to browse with TWeb
 instead of Chrome, daily. So the question for every capability below is not "is
 this implemented" but "does a person who switched from Chrome hit this, and what
@@ -71,10 +79,10 @@ one pane per window (works) from two (silent data loss).
 | Password / credential autofill | `missing` — honestly absent, not half-built | task-2. Nothing offered to save the password after a successful login: no prompt in the screenshot, `tmux capture-pane -p -t %541` returns zero non-blank lines, engine stderr carries no credential line. Nothing autofilled on revisit: after logging out and returning to `/login`, reading the fields directly gives `user="" pass=""`, and `/tmp/t2/login-revisit.png` (opened) shows both boxes empty — and the form uses proper `autocomplete=username` / `current-password`, so this is not the page's fault. The store does not exist at all: the profile at `~/Library/Application Support/tweb-electron` (1.0 GB) has Cookies, Local Storage, IndexedDB and Service Worker but **no `Login Data` and no `Web Data`** — the Chromium files that hold saved passwords and autofill data. Because cookies do persist, existing sessions survive; the gap bites only at a fresh login. | measured |
 | Print — save as PDF | `broken` at HEAD `947891b` — wedges the renderer; `works` since #30 | task-2's original reproduction at HEAD is retained below: no print handler existed, so `window.print()` fell through to Chromium's invisible native dialog and wedged the renderer. #30 intercepts it in the top frame and dynamically created iframes, writes a real PDF to `~/Downloads`, and labels the action honestly as save-as-PDF. Full before/after evidence is §6.2–§6.3. | HEAD defect measured twice by task-2 and independently replicated by task-4; #30 fix measured in real panes before merge |
 | Print — actual paper via `lpr` | `works` in this run's working tree **for the measured queue hand-off**; physical paper output **not observed and not claimed** | task-2 added opt-in normal-mode chord `gp`; Ctrl-P and page `window.print()` stay unchanged as save-as-PDF. `gp` runs the same `printToPDF` path, writes and reports the PDF **first**, then asynchronously `execFile("lpr", [absolutePdfPath], {timeout:15000})` — no shell, paths with spaces remain one argv item, a hung queue becomes an explicit failure. **Control:** real pane `%630`, Ctrl-P → `~/Downloads/PAGE ONE.pdf`, no CUPS job. **No-printer shape:** panes `%630`/`%632`, real macOS `lpr` with `PRINTER=tweb-no-such-printer` → PDF lands first, then red `no printer configured · PDF in ~/Downloads`; `lpstat -o` empty before/after; screenshot opened and badge fits. **Successful hand-off:** pane `%631`, fake `lpr` at the *final boundary* records exactly one argv line `/Users/gavin.jeong/Downloads/PAGE ONE (3).pdf`; file existed at callback time, 55,777 bytes, mode 0600; engine log order is shortcut → download completed → queued; screenshot opened with green sent-to-printer badge. **Real CUPS acceptance, explicitly not TWeb evidence:** task-2 used `lp -H hold` for a tiny probe, got Canon request id 21, then cancelled it without printing — this proves the machine's queue accepts jobs, not that TWeb produced paper. | measured by task-2 in real panes, engine app verified as workspace tree, real tmux key path. Successful final `lpr` boundary substituted to avoid printing on the owner's printer. Physical ink/paper **unmeasured**; a machine with literally no CUPS subsystem unavailable; ENOENT unit-tested, no-usable-default measured with real `lpr` by overriding `PRINTER` |
-| Extensions | `missing` at HEAD `947891b`; **partially works in this run's tree and passes real-pane acceptance for uBlock Origin Lite on both a causal local fixture and a remote ad-block test page** | At HEAD: no load path, empty repo-root directory, false doctor claim. **Current engine boundary:** MV3 workers/content scripts/dNR work; static rulesets do not auto-enable; MV2 `webRequest` is absent; popup-only has neither toolbar nor `chrome.action`. **Local real-pane causal test:** uBOL pane `%640`, both ad URLs absent from origin, `ad1=0 ad2=0`, control image 300; empty-extension control `%626`, both ads reach origin/render 300. Both screenshots opened. **Remote corroboration:** `https://canyoublockit.com/extreme-test/`, control `%641` → 99 resources / 7 iframes / 54 scripts; uBOL `%642` → 67 / 1 / 51: 32 fewer loads (32.3%), 6/7 iframes removed (85.7%), screenshots opened and non-blank. Local remains stronger causal evidence because its exact expected pattern was derived from EasyList and the server proves which URLs never arrived. **Partial limits:** cosmetic/scriptlets unmeasured and `userScripts` absent; popup/dashboard unreachable; concurrent worker ownership constrains updates. | task-1, actual `tweb __pane` harness, workspace app confirmed, hidden/offscreen/no chrome. Unmodified uBOL source; adapter is versioned runtime copy, source sha256 unchanged. Earlier "profile-level blocker" retracted: full copy of owner's profile blocks; actual causes were bounded-startup race and cross-process scope ownership. Live profile read-only; destructive isolation on copies only. Full evidence §6.7 |
+| Extensions | `missing` at HEAD `947891b`; **merged in #34** — partially works, and passes real-pane acceptance for uBlock Origin Lite on both a causal local fixture and a remote ad-block test page | At HEAD: no load path, empty repo-root directory, false doctor claim. **Current engine boundary:** MV3 workers/content scripts/dNR work; static rulesets do not auto-enable; MV2 `webRequest` is absent; popup-only has neither toolbar nor `chrome.action`. **Local real-pane causal test:** uBOL pane `%640`, both ad URLs absent from origin, `ad1=0 ad2=0`, control image 300; empty-extension control `%626`, both ads reach origin/render 300. Both screenshots opened. **Remote corroboration:** `https://canyoublockit.com/extreme-test/`, control `%641` → 99 resources / 7 iframes / 54 scripts; uBOL `%642` → 67 / 1 / 51: 32 fewer loads (32.3%), 6/7 iframes removed (85.7%), screenshots opened and non-blank. Local remains stronger causal evidence because its exact expected pattern was derived from EasyList and the server proves which URLs never arrived. **Partial limits:** cosmetic/scriptlets unmeasured and `userScripts` absent; popup/dashboard unreachable; concurrent worker ownership constrains updates. | task-1, actual `tweb __pane` harness, workspace app confirmed, hidden/offscreen/no chrome. Unmodified uBOL source; adapter is versioned runtime copy, source sha256 unchanged. Earlier "profile-level blocker" retracted: full copy of owner's profile blocks; actual causes were bounded-startup race and cross-process scope ownership. Live profile read-only; destructive isolation on copies only. Full evidence §6.7 |
 | Bookmarks | `missing` in code — and the shipped CLI command for it is `broken` | task-2. `bookmark` appears nowhere in `electron/` or `crates/`; the only two mentions are documents making promises (`README.md:20` "Chrome profile bootstrap: extensions, bookmarks and general site state are imported policy-aware", `DESIGN.md:1346` `\| Bookmarks \| imported \| a snapshot import \|`). task-2 **ran** the command the README points at, against the owner's real Chrome profile (`~/Library/Application Support/Google/Chrome/Default/Bookmarks` exists on this machine): `tweb profile bootstrap ~/Library/Application\ Support/Google/Chrome/Default` → `Error: command not yet implemented: Profile { action: Bootstrap { source: "…" } }`. Likewise `tweb profile list` → `Error: command not yet implemented: Profile { action: List }`. The subcommand is shipped in the CLI, appears in `tweb --help`, accepts its argument, and then admits it does nothing. Same shape elsewhere: `tweb resource list` → `command not yet implemented`. | measured — run against the real profile path, exact error captured |
 | History | `works` — end to end, and arguably better than Chrome | task-1, pane `%543`, real key path. `g` then `h` → `diag page.mode='history' detail='1/343'`: a real store of 343 visits accumulated from this machine's actual use, not a stub. `/tmp/t1web/history.png`, opened: *Search all history* box, `343 visits`, a `Today` day-group header, per-row timestamp + title + full URL, keyboard legend `↑/↓ move · Enter open · Shift-Enter new tab · Ctrl-D delete · Esc close`, scrollbar. Search works: typing `third` narrowed to `1 visit`, detail `1/343` → `1/1`, showing only `…/pages/third.html`. Open works: Enter on that row → `location.pathname='/pages/third.html'`, `h1='THIRD PAGE'`, overlay closed. Filtering is server-side over the whole file by design (`main.cjs:2636`), so search covers all 343 rather than a rendered slice. | measured |
-| Find-in-page | `broken` at HEAD `947891b` — the bar opened, accepted typing, and found nothing; **fixed in #31**, with one named residual path (§6.6) | task-1, live pane `%543`, engine app `/Users/gavin.jeong/src/keyolk/tweb/electron`, keys via `tmux send-keys`. What looked right: `/` renders a Chrome-styled *Find in page* bar top-right (`/tmp/t1web/find-visible.png`, opened — the bar is there with the query in it), `diag` shows `page.mode=search`, and the engine log shows `tweb: native shortcut find` once per keystroke, so preload→main IPC is intact and `contents.findInPage(query, …)` at `electron/main.cjs:2660` is genuinely called. What was broken: the `found-in-page` event registered at `electron/main.cjs:3476` never fired. Proof rather than inference — preload's handler (`electron/preload.cjs:3200`) writes `0/0` into the result span on *any* result including zero matches; polling that span once a second for 8 seconds with a query that is on the page gives `{t:1,res:""}` … `{t:8,res:""}`: stays empty, never even `0/0`. Consequences, all measured: no match counter, nothing highlighted (`getSelection()` stays `''`), and Enter closed the bar without scrolling to the match (`ZQXWVU-NEEDLE-9271` placed 3000px down: `scrollY` 0 before, 0 after, bar gone, selection empty). Control case ruled out both the harness and the text: `window.find('UNIQUEMARKERALPHA')` in the same pane at the same moment returns `{"windowFind":true,"sel":"UNIQUEMARKERALPHA"}`. **What #31 changed, and the cause was not the one this row inferred:** it was never offscreen focus. Electron's `FindInPageOptions.findNext` means "this request continues an open session", not "go to the next match", so every fresh query went out as a follow-up and Chromium emitted no `found-in-page` at all. Session state now lives in `electron/find-session.cjs`. The project owner verified this personally on clean merged `main`: a word appearing twice shows the counter `1/2`, the active match in orange and the rest in yellow, and on a tall page Enter advances and scrolls (`scrollY` 19 → 2043). **Residual, named in #31 itself:** reopening the bar with `/` and pressing Enter *without retyping* loses the highlight. | HEAD `947891b` state measured by task-1; the fix **not re-measured this run** — owner's clean-`main` verification, cited as reported |
+| Find-in-page | `broken` at HEAD `947891b` — the bar opened, accepted typing, and found nothing; **fixed in #31**, with one named residual path (§6.6) | task-1, live pane `%543`, engine app `/Users/gavin.jeong/src/keyolk/tweb/electron`, keys via `tmux send-keys`. What looked right: `/` renders a Chrome-styled *Find in page* bar top-right (`/tmp/t1web/find-visible.png`, opened — the bar is there with the query in it), `diag` shows `page.mode=search`, and the engine log shows `tweb: native shortcut find` once per keystroke, so preload→main IPC is intact and `contents.findInPage(query, …)` at `electron/main.cjs:2660` is genuinely called. What was broken: the `found-in-page` event registered at `electron/main.cjs:3476` never fired. Proof rather than inference — preload's handler (`electron/preload.cjs:3200`) writes `0/0` into the result span on *any* result including zero matches; polling that span once a second for 8 seconds with a query that is on the page gives `{t:1,res:""}` … `{t:8,res:""}`: stays empty, never even `0/0`. Consequences, all measured: no match counter, nothing highlighted (`getSelection()` stays `''`), and Enter closed the bar without scrolling to the match (`ZQXWVU-NEEDLE-9271` placed 3000px down: `scrollY` 0 before, 0 after, bar gone, selection empty). Control case ruled out both the harness and the text: `window.find('UNIQUEMARKERALPHA')` in the same pane at the same moment returns `{"windowFind":true,"sel":"UNIQUEMARKERALPHA"}`. **What #31 changed, and the cause was not the one this row inferred:** it was never offscreen focus. Electron's `FindInPageOptions.findNext` means "this request continues an open session", not "go to the next match", so every fresh query went out as a follow-up and Chromium emitted no `found-in-page` at all. Session state now lives in `electron/find-session.cjs`. The project owner verified this personally on clean merged `main`: a word appearing twice shows the counter `1/2`, the active match in orange and the rest in yellow, and on a tall page Enter advances and scrolls (`scrollY` 19 → 2043). **Residual, named in #31 itself, and closed in #35:** reopening the bar with `/` and pressing Enter *without retyping* used to lose the highlight; the stale query is now cleared when no result has landed, so the reopen keeps the match and a genuinely absent term reports absent. | HEAD `947891b` state measured by task-1; the fix **not re-measured this run** — owner's clean-`main` verification, cited as reported |
 | Back / forward | `works` (with a caveat that is not the same as broken) at HEAD `947891b`; **`M-Left` / `M-Right` / `BSpace` bound in this run's working tree, and the binding is safe in a text field only after task-2 found and fixed a defect in it** (§6.7) | task-1, live pane `%543`, engine app `/Users/gavin.jeong/src/keyolk/tweb/electron`, driven by `tmux send-keys` (the real key path, not the agent socket). `H`: `/pages/second.html` → `/pages/index.html`. `L`: `/pages/index.html` → `/pages/second.html`. Both fire, and fast. `BSpace`, `M-Left`, `M-Right`: URL unchanged — unbound, and they failed **silently** (no beep, no toast, no hint). **What this run changed:** the project owner wrote a preload-only binding and verified it on pane `%622` (the keys were reaching the preload all along and were being dropped by its `if (event.ctrlKey \|\| event.metaKey \|\| event.altKey) return;` modifier guard; the new block sits above it). **The defect task-2 then found, by verifying independently rather than confirming:** `Backspace` carried a `!eventIsEditable(event)` guard and **`M-Left`/`M-Right` did not.** Measured on pane `%624`, reproduced twice, focus taken by the real key path — with the caret in a field holding `KEEPTHIS`, `M-Left` navigated away and the typed text was gone. That is the same destroy-work case the Backspace guard exists for, and it is Chrome's actual behaviour rather than defensive extra: in Chrome, Alt-arrow inside a field moves the caret one word, it does not navigate. task-2 added the guard to the Alt-arrow branch. **After the fix, all measured on the real key path:** nothing focused → `M-Left` `/second.html`→`/index.html`, `M-Right` `/index.html`→`/second.html`, `BSpace` `/second.html`→`/index.html`, with `H`/`L` as the control in the same pane; field focused → `M-Left` and `M-Right` leave the URL and the value untouched, and `BSpace` deletes a character (`KEEPTHIS`→`KEEPTHI`, selection 8→7) without navigating. task-2 opened the screenshot and confirms a real page, not a blank one. **Caveat task-2 states and does not paper over:** `M-Left` in a field is now *inert* rather than *useful* — `selectionStart` stayed 0, so Chrome's word-left caret motion is **not** implemented and is not being claimed. Not-destructive is what was verified. | HEAD state measured by task-1 (previous run); the binding measured by the project owner on pane `%622`, where author and verifier were the same person; the missing-guard defect and the post-fix behaviour measured **independently** by task-2 on pane `%624`, engine app verified as the workspace tree, control (`H`/`L`) run first through the same harness |
 | Middle-click | `worse-than-Chrome` at HEAD `947891b` — it opens a tab, then steals your place; `works` in the working tree (§6.6) | task-1, pane `%543`, **real mouse path**: genuine SGR-1006 mouse bytes injected with `tmux send-keys -H`, exactly what a physical click produces (not `tweb click`, not the agent socket). Middle press/release (`cb=1`) on `GO TO SECOND`: tabs before `1`, after `[(0, active=False, '…/index.html'), (1, active=True, '…/second.html')]`. A new tab is created — and it is **active**, deactivating the one you were reading. Chrome's middle-click opens in the background, which is the entire point of the gesture: middle-click six links off a results page, keep reading, work through them later. Here the first click yanks you off the page, so clicks two through six land on the wrong document. Cause: `main.cjs:3443` `setWindowOpenHandler` calls `createTab(target, true)` — the second arg is *activate* — and middle-click shares that path with `window.open`. Electron supplies `details.disposition === 'background-tab'`, which Chrome uses to differentiate. | measured |
 | Right-click / context menu | `works` — fully, and context-aware | task-1, pane `%543`, real SGR-1006 mouse bytes via `tmux send-keys -H` (`cb=2` press + release), surface held open. `/tmp/t1web/ctxmenu.png`, opened: a Chrome-looking dark menu rendered **at the pointer** with Chrome's own grouping and order — `Copy`, `Search for "GO TO SECOND"` (picking up the link text, quoted), separator, `Open link in new tab`, `Open link in this tab`, `Save link as`, `Copy link address`. Not a coordinates-only stub: it is built from Chromium's own context-menu params (`main.cjs:3453` → `showBrowserContextMenu` at `3340`, built in `context-menu.cjs`), so editable fields get Undo/Redo/Cut/Copy/Paste/Paste-without-formatting/Select-all, a selection gets Copy + Search, images get their own group. The items execute: a real left click on `Open link in new tab` took tabs from `1` to `[(0, active=False, '…/index.html'), (1, active=True, '…/second.html')]`. Backdrop dismissal verified — a click outside removed the menu and did nothing else. | measured |
@@ -1049,7 +1057,11 @@ Still `missing`, and honestly so: password manager, bookmarks.
 | `page.mode` hangul indicator | filed as "the indicator lies" | **not reproduced** — the indicator is accurate; restated as a discoverability gap, with the older observation left unreconciled |
 | Extensions | `missing` in code | `partially works` — real uBlock Origin Lite blocks in a real hidden pane; MV2 **webRequest-based blockers** permanently impossible; content-script-only MV2 allowed; named limits remain (§6.7) |
 
-### 6.7 This run: ergonomics merged as #32; extensions remain uncommitted
+### 6.7 This run: ergonomics merged as #32; extensions uncommitted *at the time of writing, merged as #34 since*
+
+*(This section is kept in its original tense because it is the record of what was
+true when the work was measured. Everything it describes as uncommitted has since
+merged: #33, #34, #35. The measurements below are unchanged.)*
 
 The run began with a no-commit/push/PR rule for **workers**. The project
 operator had separate explicit session authorization (`gh_merge=allow`) and used
@@ -1288,9 +1300,11 @@ check, is what had to pass.
 
 ## 7. What to do next
 
-*(State at the end of run `s1786972005513-4`. The previous version of this
-section led with find-in-page and the PDF frame; both shipped in #31, so both
-are gone from the list rather than demoted.)*
+*(State at the end of run `s1786972005513-4`, updated after #34 and #35 merged.
+The previous version of this section led with find-in-page and the PDF frame;
+both shipped in #31, so both are gone from the list rather than demoted.
+**Every item this section ever listed is now closed or dispositioned** — see
+"Disposition of this list" at the end.)*
 
 Ordered by what a daily user feels first. Depth over breadth: two things that
 genuinely work beat six that half-work — that is the project's own standard and
@@ -1318,6 +1332,13 @@ So the deferral reason has expired, and extensions is the top item by the
 document's own ranking rather than by a change of mind.
 
 ### Recommendation 1 — extensions, and specifically the class boundary
+
+**Shipped in #34.** What follows is the reasoning that produced it, kept because
+the measurements are the reusable part; the recommendation itself is closed. What
+shipped is the class boundary argued for below — a manifest classifier that
+refuses with a reason, plus the uBO Lite shim rather than static-to-dynamic
+translation, because task-1's result showed the extension arms its own rulesets
+once its worker survives.
 
 The gap is real and daily: every page carries the ad tax, and the owner's own
 Chrome extensions are the concrete thing being given up by switching. What this
@@ -1471,7 +1492,12 @@ What follows from that, in order:
    diagnosis was retracted — but closing the named partial-support limits:
    remote-page behaviour now has independent corroboration; cosmetic
    filtering/scriptlets and update semantics across concurrent panes remain, one
-   measured claim at a time.
+   measured claim at a time. **#34 shipped exactly this**: `extension-policy.cjs`
+   classifies from the manifest and refuses with a stated reason, so a refusal is
+   visible at install time instead of an extension sitting loaded and inert. The
+   two unmeasured items — cosmetic filtering/scriptlets, and update semantics
+   across concurrent panes — are recorded as unmeasured rather than carried as
+   open work.
 
 ### Recommendation 2 — the ergonomics tail
 
@@ -1487,11 +1513,15 @@ What follows from that, in order:
   discoverability: a jamo was interpreted as the command on its physical Latin
   key. task-1's older contradictory observation remains unreconciled (§6.7).
 
-The tail is therefore closed as far as this run can honestly close it. The next
-work is not "finish the cheap wins"; it is closing the explicitly named partial
-extension-support limits above.
+The tail is therefore closed as far as this run can honestly close it. The
+extension-support limits named above were then closed in #34, and the find-bar
+reopen residue in #35 — so this recommendation has no open successor either.
 
 ### Deliberately not recommended, with reasons
+
+Each entry below is **dispositioned, not pending**: the decision is that no work
+is scheduled, and the reason is what would have to change for that to be revisited.
+None of them is waiting on effort or on someone getting to it.
 
 - **A password manager.** Recommended *against* — see §3.1 decision 5. The old
   version of this section said extensions would close the password gap "as a side
@@ -1499,24 +1529,60 @@ extension-support limits above.
   browser extension is popup-UI plus native messaging, and neither has been
   exercised here. A popup has nowhere to draw in a tmux pane, and native
   messaging was never tested. Treat the password gap as open and independent
-  until someone measures it.
+  until someone measures it. *Reopens on:* a measurement of native messaging in
+  this engine, not on a decision to try harder.
 - **A bookmarks UI.** The *import* is the migration blocker; the bar is a GUI
   affordance. See §3.1 decision 8. The README claims were removed in #30.
+  *Reopens on:* someone wanting the import specifically — the bar stays out
+  regardless.
 - **A disk cache cap.** Explicitly not recommended. `userData` is 1.0 GB, 661 MB
   of it Service Worker CacheStorage for YouTube/Gmail/Meet. Chrome does not prune
   those either, so capping would be a regression under this document's own
   standard — silently dropping a site's offline assets to look tidy. Recorded
   because it was the question that started run `s1786880826401-2`, and the answer
-  is "do nothing".
-- **`Cmd`-based shortcuts.** Permanent non-goal, not a backlog item (§4).
+  is "do nothing". *Reopens on:* nothing foreseeable — a cap is a regression by
+  the standard the project is measured against.
+- **`Cmd`-based shortcuts.** Permanent non-goal, not a backlog item (§4). *Does
+  not reopen.*
+- **The shared page host (`READY` declaration).** Not a missing feature: the host
+  is **built and renders**, behind `TWEB_HOST_PREVIEW=1`, and
+  `hostProtocolVersion()` returns `null` on purpose (DESIGN.md §5.1,
+  `electron/hosted-runtime.cjs`). The gate is shut because the tab plumbing still
+  reaches for a single window context, so a second attach would draw into the
+  first pane's window — `handleAttach` refuses it. Declaring `READY 2` today
+  would host **one pane per engine**, which buys nothing: the measured saving is
+  runtime duplication, and one pane in an otherwise empty Electron duplicates the
+  runtime exactly as now, with a daemon added on top. *Reopens on:* N panes
+  rendering in one engine — a specific engineering condition, not a schedule.
 
 ### Closed since this section was first written, kept so the list is auditable
 
 - Print wedge, uploads, download notification, middle-click background tab — #30.
 - Find-in-page, PDF document scrolling, per-window session slot — #31. The PDF
-  one is **partial**: the viewer's own toolbar is still unreachable, and find
-  still loses the highlight if you reopen the bar with `/` and press Enter
-  without retyping.
+  one is **partial**: the viewer's own toolbar is still unreachable.
+- Chrome's back/forward keys (`M-Left`/`M-Right`/`BSpace`, with the editable-field
+  guard task-2 found missing) and the opt-in `gp` paper-print tier — #32, with the
+  result-hold fix in #33. Physical paper output remains unobserved and unclaimed.
+- Extension support, to the measured class boundary — #34. uBO Lite blocks in a
+  real pane; uBlock Origin MV2 is permanently impossible here (`chrome.webRequest`
+  is not exposed to extensions at all); content-script extensions load and run,
+  including offscreen; popup-only, generic-DNR and scripting-only extensions are
+  refused *with a reason at install time* rather than loading silently inert.
+- The find-bar reopen residue named in the #31 entry above — #35. Reopening with
+  `/` and pressing Enter without retyping no longer replays a dead session's
+  query, and a genuinely absent term now reports absent.
+
+### Disposition of this list
+
+**Every item in §7 is now either closed by a merged PR or dispositioned above
+with the condition that would reopen it. Nothing is left in an undecided state.**
+
+That is the honest end of this list, and it is deliberately not the same claim as
+"TWeb is finished". Two named partial limits stand and are recorded rather than
+hidden: the PDF viewer's own toolbar is unreachable, and extension support covers
+the measured classes only — cosmetic filtering/scriptlets and update semantics
+across concurrent panes are unmeasured. Those are the next measurements if this
+document is picked up again; they are not open items on a backlog someone forgot.
 
 ### Two things to carry forward regardless of what gets built next
 
