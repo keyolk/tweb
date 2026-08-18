@@ -692,7 +692,9 @@ test("the mode toggles stay independent across tmux and the engine", () => {
   // In the passthrough table Ctrl-; must return the client to root, or the
   // table keeps re-arming itself after the mode it guards is gone.
   assert.match(main, /passthroughTable, "C-\\\\;"[\s\S]*?switch-client", "-T", "root"/);
-  assert.match(main, /code === 5014[\s\S]*?setVimiumShortcutsEnabled\(!vimiumShortcutsEnabled\)/);
+  // The mode lives on the pane's input state: a user switching one pane to passthrough is saying it
+  // about that pane's page, and shared it re-routed every pane's keys at once.
+  assert.match(main, /code === 5014[\s\S]*?setVimiumShortcutsEnabled\(!inputState\(\)\.vimium\)/);
   assert.match(main, /code === 5011 \|\| code === 5012/);
   assert.match(main, /setCmdBypassEnabled\(code === 5012\)/);
   // The private-sequence regex has to cover the Cmd codes at 5020+; a code
@@ -709,19 +711,19 @@ test("the mode toggles stay independent across tmux and the engine", () => {
 // `e.keyCode === 40` — suggestion lists among them — then ignore ArrowDown.
 test("insert mode delivers native keys to the page", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /if \(!vimiumShortcutsEnabled \|\| pageInsertMode \|\| modifiers\.includes\("meta"\)\) \{/);
+  assert.match(main, /if \(!inputState\(\)\.vimium \|\| inputState\(\)\.insertMode \|\| modifiers\.includes\("meta"\)\) \{/);
   assert.match(main, /case "insert-mode":/);
   // setMode is the single place that mirrors the state, so an editable focus
   // arms native delivery just like an explicit `i` does.
   assert.match(electron, /function setEngineNativeKeys\(enabled\)[\s\S]*?send\("insert-mode", enabled\)/);
   assert.match(electron, /setEngineNativeKeys\(mode === "insert"\)/);
   // The mirror must reset wherever the preload's own flag would.
-  assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) pageInsertMode = false;/);
+  assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) inputState\(\)\.insertMode = false;/);
   // The preload skips redundant IPC, so every engine-side reset has to tell the
   // page — otherwise native delivery never re-arms after a tab switch.
   assert.match(electron, /engineNativeKeys = false;/);
   assert.match(main, new RegExp(
-    `pageInsertMode = false;\\s*\\/\\/ The preload mirrors this flag[\\s\\S]*?`
+    `inputState\\(\\)\\.insertMode = false;\\s*\\/\\/ The preload mirrors this flag[\\s\\S]*?`
     + `sendToTabFrames\\((?:soleWindows|currentWindows\\(\\))\\.win, "tweb-shortcuts-mode"`));
 });
 

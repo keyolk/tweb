@@ -136,8 +136,10 @@ let quitting = false;
 //   vimium off + bypass on  = P (passthrough)
 //   vimium on  + bypass on  = N-vim (both)
 //   vimium off + bypass off = D (web only)
-let vimiumShortcutsEnabled = true;
-let cmdBypassEnabled = false;
+// The shortcut mode is per-pane, on the input state beside the parse buffer it steers. A user
+// switching one pane to passthrough is saying it about THAT pane's page; shared, one Ctrl-;
+// re-routed every pane's keys at once, and a pane in insert mode made every other pane's typing go
+// native. Same for the insert-mode mirror below.
 // Pane visibility lives in the registry record, not in a variable beside it. It is the gate on
 // frame send, frame rate, and the surface plan — and on a terminal with tmux
 // `allow-passthrough=all`, which forwards a hidden pane's passthrough to whatever window the
@@ -173,8 +175,6 @@ let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let orphanWatchdog = null;
 let agentServer = null;
-// Mirrors the preload's insert mode so key dispatch knows to go native.
-let pageInsertMode = false;
 // Set while a close came from the tab list, so the list can be redrawn once the
 // tab has actually left `soleWindows.tabs`.
 let refreshTabListAfterClose = false;
@@ -866,7 +866,7 @@ function switchTmuxClientTable(tty, table) {
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
   if (!ownTmuxPane) return;
   const paneId = ownTmuxPane;
-  const passthroughArmed = !vimiumShortcutsEnabled;
+  const passthroughArmed = !inputState().vimium;
 
   for (const [tty, originalTable] of [...passthroughClientTables]) {
     const state = states.get(tty);
@@ -2476,16 +2476,16 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
 // each gate independently.
 function broadcastShortcutMode() {
   for (const tab of currentWindows().tabs) {
-    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
   }
 }
 
 // Applies the correct combination of the two flags and runs the follow-up work once.
 function applyShortcutMode() {
-  pageInsertMode = false;
+  inputState().insertMode = false;
   broadcastShortcutMode();
   // Once passthrough is armed (vimium off), focus so the page can receive keys.
-  if (!vimiumShortcutsEnabled && currentWindows().win && !currentWindows().win.isDestroyed()) currentWindows().win.webContents.focus();
+  if (!inputState().vimium && currentWindows().win && !currentWindows().win.isDestroyed()) currentWindows().win.webContents.focus();
   // A Ghostty config reload or a pane restart can reset one side only, so reconcile
   // always runs even when the value already matches.
   reconcileTmuxPassthrough();
@@ -2495,13 +2495,13 @@ function applyShortcutMode() {
   // whole session shares — one pane's mode change interrupting every other pane.
   if (debugLogging) {
     console.error(`tweb: mode ${modeLabel()}`
-      + ` (vimium=${vimiumShortcutsEnabled} bypass=${cmdBypassEnabled})`);
+      + ` (vimium=${inputState().vimium} bypass=${inputState().bypass})`);
   }
 }
 
 function modeLabel() {
-  const v = vimiumShortcutsEnabled;
-  const b = cmdBypassEnabled;
+  const v = inputState().vimium;
+  const b = inputState().bypass;
   if (v && !b) return "bypass OFF";
   if (!v && b) return "web bypass ON";
   if (v && b) return "shortcuts and bypass ON";
@@ -2509,12 +2509,12 @@ function modeLabel() {
 }
 
 function setCmdBypassEnabled(enabled) {
-  cmdBypassEnabled = enabled;
+  inputState().bypass = enabled;
   applyShortcutMode();
 }
 
 function setVimiumShortcutsEnabled(enabled) {
-  vimiumShortcutsEnabled = enabled;
+  inputState().vimium = enabled;
   applyShortcutMode();
 }
 
@@ -2524,7 +2524,7 @@ function setBrowserShortcutsEnabled(enabled) {
 }
 
 function toggleBrowserShortcuts() {
-  setCmdBypassEnabled(!cmdBypassEnabled);
+  setCmdBypassEnabled(!inputState().bypass);
 }
 
 function activateTab(index) {
@@ -2537,12 +2537,12 @@ function activateTab(index) {
   currentWindows().activeTabIndex = normalized;
   currentWindows().win = currentWindows().tabs[normalized];
   inputState().clicks.reset();
-  pageInsertMode = false;
+  inputState().insertMode = false;
   // The preload mirrors this flag and skips redundant IPC, so tell the tab we
   // just cleared it. Without this its focused input keeps thinking native
   // delivery is armed and its keys go back through the renderer, where they
   // arrive with keyCode 0.
-  sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+  sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
   // The other tab's caret says nothing about this one, and its preload only
   // reports on focus — which switching soleWindows.tabs does not fire.
   moveTerminalCaret(null);
@@ -2835,7 +2835,7 @@ function sendTabState(tab = currentWindows().win) {
 }
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  if (!vimiumShortcutsEnabled || tab !== currentWindows().win || tab.isDestroyed()) return;
+  if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
   switch (action) {
@@ -2968,7 +2968,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     }
     case "insert-mode":
-      pageInsertMode = Boolean(value);
+      inputState().insertMode = Boolean(value);
       break;
     // Take the speakers back from whichever pane holds them. Only ever a deliberate
     // keypress: a page starting playback in a muted pane does not get to do this.
@@ -3044,12 +3044,12 @@ ipcMain.on("tweb-preload-ready", bindPane(
   const frame = event.senderFrame;
   if (!tab || !frame || frame.isDestroyed() || frame.detached) return;
   // A fresh document starts in normal mode, so the mirror has to follow.
-  if (frame === tab.webContents.mainFrame) pageInsertMode = false;
+  if (frame === tab.webContents.mainFrame) inputState().insertMode = false;
   const key = frameKey(frame);
   if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
-  event.reply("tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+  event.reply("tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
   if (tab === currentWindows().win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
@@ -3191,9 +3191,9 @@ function agentDiagnostics() {
       unscopedResolutions: unscopedPaneResolutions,
     },
     input: {
-      vimiumShortcuts: vimiumShortcutsEnabled,
-      cmdBypass: cmdBypassEnabled,
-      pageInsertMode,
+      vimiumShortcuts: inputState().vimium,
+      cmdBypass: inputState().bypass,
+      pageInsertMode: inputState().insertMode,
       terminalVisible: currentPane().visible,
       // Whether visibility is coming from the frontend's push or the no-frontend
       // polling fallback, and how stale the last push is. A pane that reads hidden
@@ -4205,7 +4205,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     if (details.isMainFrame) findSessionByTab.set(tab, endStep().state);
   });
   onContents("context-menu", (_event, params) => {
-    if (vimiumShortcutsEnabled) showBrowserContextMenu(tab, params);
+    if (inputState().vimium) showBrowserContextMenu(tab, params);
   });
   onContents("media-started-playing", () => {
     // Audibility is not known at the moment playback starts — a track whose output has
@@ -4259,7 +4259,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
       if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
     }
     installPageEnhancements(tab);
-    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: vimiumShortcutsEnabled, bypass: cmdBypassEnabled });
+    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
     if (debugLogging) {
       console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
     }
@@ -4526,6 +4526,10 @@ function inputState() {
       paste: new PasteState(),
       decoder: new StringDecoder("utf8"),
       clicks: new MouseClickState(),
+      // The shortcut mode, and the mirror of the preload's insert mode that key dispatch reads.
+      vimium: true,
+      bypass: false,
+      insertMode: false,
     };
     paneInputStates.set(record.key, state);
   }
@@ -4602,7 +4606,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
 
   if (wheel) {
     const direction = buttonCode === 0 ? 1 : buttonCode === 1 ? -1 : 0;
-    if (vimiumShortcutsEnabled && direction !== 0 && hasZoomModifier(modifiers)) {
+    if (inputState().vimium && direction !== 0 && hasZoomModifier(modifiers)) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
@@ -4699,7 +4703,7 @@ function routePdfKey(key, modifiers) {
     pdfPendingG = false;
     return false;
   }
-  const next = pdfKeyAction(key, modifiers, { vimium: vimiumShortcutsEnabled, pendingG: pdfPendingG });
+  const next = pdfKeyAction(key, modifiers, { vimium: inputState().vimium, pendingG: pdfPendingG });
   clearTimeout(pdfPendingGTimer);
   pdfPendingG = next.pendingG;
   // The same 800ms the preload gives `g`, so a `g` typed alone does not silently arm a
@@ -4789,12 +4793,12 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
 
   // Ctrl-C quits the pane only in browser shortcut mode. In web passthrough mode it goes to
   // the page as an ordinary KeyboardEvent.
-  if (vimiumShortcutsEnabled && key.toLowerCase() === "c" && control) {
+  if (inputState().vimium && key.toLowerCase() === "c" && control) {
     if (pressed) app.quit();
     return;
   }
 
-  if (vimiumShortcutsEnabled) {
+  if (inputState().vimium) {
     const tabCycle = control && (key === "Tab" || key === "PageDown" || key === "PageUp");
     const tabClose = control && key.toLowerCase() === "w";
     const print = control && key.toLowerCase() === "p";
@@ -4838,7 +4842,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // Cmd combinations always go native: they exist only because the user wants
   // the web app's own shortcut, and those are exactly the handlers that check
   // isTrusted.
-  if (!vimiumShortcutsEnabled || pageInsertMode || modifiers.includes("meta")) {
+  if (!inputState().vimium || inputState().insertMode || modifiers.includes("meta")) {
     dispatchNativeKey(currentWindows().win.webContents, key, text, modifiers, eventKind);
     return;
   }
@@ -4949,7 +4953,7 @@ function dispatchPrivateShortcut(code) {
   }
   // Ctrl-: — vimium toggle. Leaves bypass alone.
   if (code === 5014) {
-    setVimiumShortcutsEnabled(!vimiumShortcutsEnabled);
+    setVimiumShortcutsEnabled(!inputState().vimium);
     return;
   }
   // The legacy forced ON/OFF sequences — under the new flags they force bypass.
@@ -4959,12 +4963,12 @@ function dispatchPrivateShortcut(code) {
   }
   const cmdKey = CMD_PRIVATE_KEYS.get(code);
   if (cmdKey) {
-    // 1 + meta(8). Sent to the page regardless of cmdBypassEnabled — in any mode,
+    // 1 + meta(8). Sent to the page regardless of the bypass flag — in any mode,
     // what the user pressed is that web app's Cmd shortcut.
     dispatchNamedKey(cmdKey, 9);
     return;
   }
-  if (vimiumShortcutsEnabled) {
+  if (inputState().vimium) {
     if (code === 5002 || code === 5007) setBrowserZoom("in");
     else if (code === 5003) setBrowserZoom("out");
     else if (code === 5004) setBrowserZoom("reset");

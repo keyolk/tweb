@@ -227,6 +227,17 @@ def main():
         engine.stdin.flush()
         return pane
 
+    def toggle_first_pane_mode():
+        """Ctrl-; in the FIRST pane only.
+
+        The shortcut mode decides whether a key goes to the page natively or through the renderer, so
+        a mode held once per process means one pane's toggle re-routes every pane's keys. `diag`
+        reports the flags per pane, which is what the check below reads.
+        """
+        # ESC [ 5001 ~ — the private code the frontend's passthrough table sends for Ctrl-;.
+        engine.stdin.write(input_line(panes[0][0], "1b5b353030317e"))
+        engine.stdin.flush()
+
     def repush_first():
         """Re-assert the FIRST pane's visibility after every other pane has pushed its own.
 
@@ -308,6 +319,7 @@ def main():
                     recorder_installed[pane_] = agent_call(path_, "eval", {"script": KEY_RECORDER})
                 interleave_input()
                 input_probed = True
+                toggle_first_pane_mode()
                 detach_at = time.time() + 4.0
             if engine.poll() is not None:
                 break
@@ -417,6 +429,19 @@ def main():
     # not the signal. What must not happen is the detached pane still painting into a pane the
     # registry no longer holds; that the survivors are still alive is what the `unreachable` check
     # covers, by excluding only the detached one.
+    # Only the first pane was toggled, so only its flags may differ from the defaults.
+    mode_leaks = []
+    for index, (pane, _, _, _) in enumerate(panes):
+        report = diags.get(pane)
+        if not report:
+            continue
+        state = report.get("input", {}) or {}
+        bypass = state.get("cmdBypass")
+        if index == 0 and bypass is not True:
+            mode_leaks.append(f"{pane} was toggled but reports cmdBypass={bypass}")
+        elif index > 0 and bypass is not False:
+            mode_leaks.append(f"{pane} reports cmdBypass={bypass}, was never toggled")
+
     detach_problems = []
     if detached:
         # The engine's own log is the clock: everything before `closed <pane>` was in flight while
@@ -446,6 +471,8 @@ def main():
         print(f"  input keys        "
               + ", ".join(f"{pane}={(keys.get(pane) or {}).get('value', keys.get(pane))!r}"
                           for pane in probed))
+    print(f"  mode isolation    "
+          + ("only the toggled pane changed" if not mode_leaks else mode_leaks[0]))
     if detached:
         print(f"  detach            {detached} closed, "
               + ("no frames after" if not detach_problems else detach_problems[0]))
@@ -464,7 +491,8 @@ def main():
         print(f"\n  engine said: {others[:4]}")
 
     ok = (painted == count and not crossed and unscoped == 0 and not unreachable
-          and not misplaced and not evicted and not crossed_input and not detach_problems)
+          and not misplaced and not evicted and not crossed_input and not detach_problems
+          and not mode_leaks)
     reasons = []
     if painted != count:
         reasons.append(f"{count - painted} pane(s) silent")
@@ -482,6 +510,8 @@ def main():
         reasons.append(f"input crossed panes ({crossed_input[0]})")
     if detach_problems:
         reasons.append(detach_problems[0])
+    if mode_leaks:
+        reasons.append(mode_leaks[0])
     print(f"\n{'PASS' if ok else 'FAIL'} — "
           + ("every pane rendered its own image in one engine, none resolved by fallback" if ok
              else ", ".join(reasons)))
