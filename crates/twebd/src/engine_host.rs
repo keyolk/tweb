@@ -231,6 +231,24 @@ impl EngineHost {
         self.inner.lock().sinks.len()
     }
 
+    /// A pane already hosted under the same tmux pane id but a *different* tmux server, if any.
+    ///
+    /// The engine addresses control lines `@%N` and carries no server identity, so two panes with
+    /// one id are indistinguishable to it: every `VIS`, `RESIZE` and `INPUT` for that id becomes
+    /// ambiguous and the engine drops it rather than guessing. Refusing the second here is what
+    /// keeps the answer unique — and it has to be refused HERE rather than only in the engine,
+    /// because an engine-only refusal leaves this daemon believing the pane was accepted while the
+    /// frontend stops falling back. That is the records-only accept this whole seam is built to
+    /// avoid.
+    pub fn conflicting_pane_id(&self, key: &PaneKey) -> Option<PaneKey> {
+        self.inner
+            .lock()
+            .sinks
+            .keys()
+            .find(|hosted| hosted.pane == key.pane && hosted.tmux_server != key.tmux_server)
+            .cloned()
+    }
+
     pub fn can_host(&self) -> bool {
         !matches!(self.state(), EngineState::Unavailable { .. })
     }
@@ -805,6 +823,52 @@ mod tests {
         // And it stays refused, so the next pane does not pay for another ten-second start.
         assert!(!host.can_host());
         assert_eq!(host.hosted_pane_count(), 0);
+    }
+
+    // Two panes with one tmux pane id cannot both be hosted here, because the engine addresses
+    // control lines `@%N` and carries no server identity: every `VIS`, `RESIZE` and `INPUT` for that
+    // id would be ambiguous, and the engine answers ambiguity with silence rather than a guess.
+    //
+    // This is the daemon's half of the refusal, and it is the half that matters. An engine-only
+    // refusal leaves the daemon answering `Hosted`, which is the frontend's signal to stop falling
+    // back — so the pane would sit blank with nothing reporting a fault.
+    #[tokio::test]
+    async fn a_pane_id_hosted_for_another_tmux_server_is_reported_as_a_conflict() {
+        let launcher = fake_engine(
+            "pane-id-conflict",
+            &format!(
+                "#!/bin/sh\necho 'READY {}'\nwhile IFS= read -r line; do :; done\n",
+                crate::protocol::PROTOCOL_VERSION,
+            ),
+        );
+        let host = Arc::new(EngineHost::new(launcher));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        host.open(key(), tx, &open_request(), 0)
+            .await
+            .expect("a ready engine hosts");
+
+        // Same pane id, different tmux server: a conflict the caller must refuse.
+        let twin = PaneKey {
+            pane: tweb_core::page::PaneId(3),
+            tmux_server: "another-server".into(),
+        };
+        let conflict = host
+            .conflicting_pane_id(&twin)
+            .expect("the conflict is reported");
+        assert_eq!(conflict.tmux_server, "srv");
+        assert_eq!(conflict.pane, tweb_core::page::PaneId(3));
+
+        // The same pane on the SAME server is the reattach case, not a conflict — supersession
+        // handles that, and treating it as a conflict would refuse every pane whose frontend was
+        // restarted.
+        assert!(host.conflicting_pane_id(&key()).is_none());
+
+        // A different id on another server is not a conflict either.
+        let other = PaneKey {
+            pane: tweb_core::page::PaneId(9),
+            tmux_server: "another-server".into(),
+        };
+        assert!(host.conflicting_pane_id(&other).is_none());
     }
 
     #[tokio::test]

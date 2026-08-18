@@ -13,18 +13,19 @@ Research date: 2026-07-31.
 > written before implementation and are in the present indicative throughout; several of their
 > central claims are the opposite of what ships. Specifically:
 >
-> - **One whole Electron process runs per tmux pane on the shipping path.**
+> - **One Electron process still runs per tmux pane unless `TWEB_DAEMON=1`.**
 >   `crates/tweb-pane/src/lib.rs` spawns one from every `tweb __pane`, and the `BrowserWindow`s
 >   inside it are *tabs of that pane*, never other panes. §4.2's "add a BrowserWindow per pane, not
->   a new Electron process" is now **built behind a closed gate**: the page host exists, renders a
->   hosted pane under `TWEB_HOST_PREVIEW=1`, and refuses a second pane — so §4.1's topology is still
->   what ships. See DESIGN.md §5.1 for the gate and what has to be true before it opens.
-> - **`twebd` routes nothing on the shipping path.** The supervisor exists and `crates/tweb-pane`
->   now references it — `hosted.rs` attaches to a daemon-held page and writes the frames it gets
->   back — but only under `TWEB_DAEMON=1`, and every attach is **refused** today because no engine
->   declares host capability (DESIGN.md §5.1). So what actually carries `RESIZE` / `VIS` / `INPUT`
->   is still newline-framed lines on the engine's **stdin**, written directly by the Rust frontend.
->   Every arrow through `twebd` in §4.3, §4.4, §5.3, §6.1 and §6.3 remains target state.
+>   a new Electron process" is **built and declared** now — the engine answers `READY 2`, five panes
+>   render in one engine (§8.7), and `bench/daemon-e2e.py` shows a real `twebd` hosting them — but a
+>   frontend only asks the daemon when `TWEB_DAEMON=1` is set, so §4.1's topology is what a default
+>   install still runs.
+> - **`twebd` routes a hosted pane's frames when it is asked to.** `hosted.rs` attaches to a
+>   daemon-held page and writes the frames it gets back, and the attach is no longer refused: the
+>   engine declares host capability and the daemon accepts it. On the default path — no
+>   `TWEB_DAEMON=1` — what carries `RESIZE` / `VIS` / `INPUT` is still newline-framed lines on the
+>   engine's **stdin**, written directly by the Rust frontend. The arrows through `twebd` in §4.3,
+>   §4.4, §5.3, §6.1 and §6.3 describe the hosted path rather than the default one.
 > - **The Rust native module / SHM transport named in §4.3 was deleted** — see §8.4, which records
 >   the deletion but does not go back and correct §4.3. Frames go `paint` → `gfx-worker.cjs` → file →
 >   Kitty `t=f` on the inherited stdout.
@@ -1133,9 +1134,25 @@ painting". An identical visibility push is not a transition, so `becameVisible` 
 page correctly has nothing to redraw. That gate failed the *fixed* code. What replaced it is the
 eviction check, which watches the actual hazard — an image deleted off a terminal still displaying it.
 
-**Still shut:** `hostProtocolVersion()` returns null, so `twebd` never learns a host exists. That gate
-needs the supervisor's READY handshake exercised against a host serving N panes, by the daemon rather
-than by a harness that imitates it.
+**Now declared, and the daemon found what the harness could not.** `hostProtocolVersion()` returns 2
+and the engine writes `READY 2`. `bench/daemon-e2e.py` starts a real `twebd`, sends real `host`
+requests, and lets the daemon spawn the engine: five panes, `hosted 5/5`, each rendering a frame
+carrying its own image id, one engine.
+
+That run failed first, on a defect this harness could not reach. Addressed control lines resolved
+through `registry.current(paneId, tmuxServerIdentity)`, and a hosted engine's server identity is the
+*daemon's* `$TMUX` — unset when the daemon started outside tmux, another server's when it did not. So
+every `VIS`, `RESIZE` and `INPUT` for every hosted pane was dropped in silence while `twebd status`
+reported them hosted. Resolving by pane id is what the wire says (`@%N`, no server), and ambiguity is
+refused at attach by the daemon and the engine both.
+
+Two lessons about the e2e itself. Its first verdict was a **false PASS**: it counted frame events,
+and each pane's single event was an 11-byte cursor-hide sequence rather than a picture — requiring a
+frame that carries the pane's own image id turned the broken state into a FAIL with no negative
+control to stage. And a `host` request missing one field (`frame_rate`) came back as
+`{"kind":"error"}` on a connection that stayed open, which read as silence until the harness started
+surfacing errors: the daemon answers a malformed request rather than disconnecting, deliberately, so
+a client built against a later protocol degrades instead of failing opaquely.
 
 ## 9. A component and interface structure built for extension
 

@@ -151,7 +151,20 @@ function parseControlLine(rawLine) {
  */
 function resolveTarget(command, registry, tmuxServer = null) {
   if (!command) return null;
-  if (command.paneId) return registry.current(command.paneId, tmuxServer);
+  if (command.paneId) {
+    // By pane id alone, because that is what the wire carries: `engine_wire::control_line` writes
+    // `@%N <body>` and no server identity. Narrowing by `tmuxServer` here looked right and was not
+    // — the only server identity a hosted engine has is the DAEMON's `$TMUX`, which is unset when
+    // the daemon was started outside tmux and belongs to another server when it was not. Measured
+    // end to end against a real `twebd`: every VIS, RESIZE and INPUT for a hosted pane was dropped
+    // in silence, `twebd status` said `hosted 3`, and all three panes sat blank.
+    //
+    // `tmuxServer` is still honoured when it names a registration, which keeps the per-pane engine
+    // path — where the process's own `$TMUX` IS the pane's — resolving exactly as before.
+    const byServer = registry.current(command.paneId, tmuxServer);
+    if (byServer) return byServer;
+    return registry.currentById(command.paneId);
+  }
   const panes = registry.list();
   return panes.length === 1 ? panes[0] : null;
 }

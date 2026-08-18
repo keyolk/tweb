@@ -154,9 +154,6 @@ def main():
     os.makedirs(runtime, exist_ok=True)
     env = dict(os.environ)
     env["TWEB_MULTIPANE"] = "1"
-    # Runs the host for real without declaring the protocol, so `twebd` keeps refusing and no
-    # shipping path can reach it while this is being measured.
-    env["TWEB_HOST_PREVIEW"] = "1"
     env["TWEB_SUPERVISOR_PID"] = str(os.getpid())
     env["TWEB_RUNTIME_DIR"] = runtime
     env["TWEB_USER_DATA_DIR"] = os.path.join(runtime, "ud")

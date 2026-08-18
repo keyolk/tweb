@@ -173,6 +173,19 @@ pub async fn dispatch(
                 Err(err) => return error(err.to_string()),
             };
             let engine = supervisor.engine_for(&engine_executable, &engine_app_dir);
+            // Before registering anything: the engine cannot tell two panes with one id apart, so a
+            // second one would make every control line for that id ambiguous. Refused here rather
+            // than only in the engine, because a refusal the daemon does not make is a pane the
+            // frontend believes is hosted and never sees painted.
+            if let Some(other) = engine.conflicting_pane_id(&key) {
+                return refused(
+                    RefusalReason::PaneIdConflict,
+                    format!(
+                        "{} is already hosted for tmux server {}",
+                        key.pane, other.tmux_server
+                    ),
+                );
+            }
             // Registering *before* the engine is asked, so that an engine that fails to start
             // leaves nothing behind: the refusal path below drops the registration again.
             let outcome = supervisor.registry.attach(key.clone(), pid, now_ms);
@@ -652,8 +665,12 @@ mod tests {
     }
 
     fn host_request(id: &str, protocol: u32, app_dir: &str) -> Request {
+        host_request_on(id, "srv", protocol, app_dir)
+    }
+
+    fn host_request_on(id: &str, server: &str, protocol: u32, app_dir: &str) -> Request {
         Request::Host {
-            pane: pane(id, "srv"),
+            pane: pane(id, server),
             pid: 1,
             protocol,
             image_id: 4242,

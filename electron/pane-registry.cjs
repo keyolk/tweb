@@ -303,9 +303,44 @@ class PaneRegistry {
     return this.byKey.get(key) || null;
   }
 
-  /** The registration a pane id is currently on, whatever its generation. */
+  /**
+   * The registration a pane id is currently on, whatever its generation.
+   *
+   * `tmuxServer` narrows the lookup when the caller knows which server it means. A hosted engine
+   * does NOT: the addressed control lines it receives carry `@%N` and nothing else, and its own
+   * `$TMUX` is the daemon's — so passing that would look the pane up under the wrong server and
+   * find nothing. Measured end to end: with `twebd` started outside tmux, every VIS, RESIZE and
+   * INPUT for a hosted pane was dropped in silence, and the pane sat blank while the daemon
+   * reported it hosted. See `currentById`.
+   */
   current(paneId, tmuxServer = null) {
     return this.byAddress.get(PaneRegistry.address(tmuxServer, paneId)) || null;
+  }
+
+  /**
+   * The registration for a pane id on ANY server, or null when the answer is not unique.
+   *
+   * This is what an addressed control line resolves through, because that is what the wire says:
+   * the daemon addresses `@%N` and carries no server. Null on ambiguity rather than a guess —
+   * delivering one pane's keystrokes to another pane that happens to share an id is the failure
+   * this whole registry exists to prevent, and `handleAttach` refuses the second such pane so the
+   * ambiguity does not arise in the first place.
+   */
+  currentById(paneId) {
+    const wanted = String(paneId);
+    let found = null;
+    for (const record of this.byKey.values()) {
+      if (record.paneId !== wanted) continue;
+      if (found) return null;
+      found = record;
+    }
+    return found;
+  }
+
+  /** Every registration for a pane id, regardless of server. Used to refuse an ambiguous attach. */
+  allById(paneId) {
+    const wanted = String(paneId);
+    return [...this.byKey.values()].filter((record) => record.paneId === wanted);
   }
 
   /**

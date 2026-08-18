@@ -219,6 +219,12 @@ pub enum RefusalReason {
     /// This daemon has no engine that can host a pane — it could not be started, it crashed past
     /// its restart budget, or the resolved engine app predates hosting.
     EngineUnavailable,
+    /// A pane with this tmux pane id is already hosted for a different tmux server.
+    ///
+    /// The engine addresses control lines by pane id alone, so two panes sharing an id make every
+    /// `VIS`, `RESIZE` and `INPUT` for it ambiguous. Refusing the second keeps the answer unique,
+    /// and a refusal is a pane that spawns its own engine and works.
+    PaneIdConflict,
 }
 
 /// Something the daemon pushes to an attached frontend without being asked.
