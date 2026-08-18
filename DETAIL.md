@@ -757,6 +757,114 @@ tweb-transport`), and 3.98s of the compile of every clean build. The benchmarks 
 because the next person to propose a native module for this should have to beat these numbers rather
 than re-derive them.
 
+### 8.5 Addendum — the SHM and tile items, reopened and closed again (2026-08-18)
+
+8.4 rejected an SHM transfer and a tile pipeline. Both were reopened to ask what had changed. The
+answer is *nothing about the blockers*, but the reopening produced three results 8.4 did not have:
+one correction to a number recorded here, one shipped change, and one item that moves from "blocked"
+to "priced".
+
+**Correction: the 17.69ms write in 8.4 is not the shipping path's cost.** Trying to beat it produced
+29.67ms for the same operation, then 4.67ms, on the same machine within the hour. Interleaving the
+variants explains the spread — the write cost is bimodal and dominated by writeback pressure, not by
+the call shape. A benchmark that writes a few frames has its writes absorbed by the page cache; one
+that writes hundreds of distinct 20MB files does not, and the first version of this measurement was
+accumulating 1.5GB of them. That accumulation, not any property of `writeFileSync`, was the 29.67ms.
+
+Under sustained load resembling a scroll — 300 consecutive whole frames, the same 2880×1800 — the
+shipping path costs:
+
+```text
+write + rename (ships today)          p50  6.11ms   p99  36.92ms
+pwrite into preopened, alternating    p50  2.83ms   p99   3.64ms
+```
+
+So the honest figure for the shipping write is ~6ms with a 37ms tail, not 17.69ms. **The tail is the
+part that matters**: p50 is under a frame budget either way, and what drops frames is the p99.
+
+**The 3.3ms/34ms gap is real but cannot be taken with files.** `rename` is not one of several ways to
+avoid a sheared frame; it is the only one available here, and the reason is `open`/`inode` semantics
+rather than timing. A terminal that has opened the frame file holds *that inode*: renaming a new file
+over the name cannot disturb the bytes it is reading. Writing in place has no such property, and no
+amount of path rotation restores it — a 2-deep or N-deep ring only makes the collision rarer, and
+"rarer" is not a guarantee when the reader's deadline is unbounded. It is unbounded here: the
+sequence is emitted through tmux passthrough with `q=2`, so there is no ACK and no upper bound on
+when the terminal reads. Measured variants and their disposition:
+
+```text
+open(no O_TRUNC) + write + rename     p50  5.89ms   p99  24.35ms   safe, but not actually different
+pwrite preopened + link/unlink swap   p50  3.22ms   p99   8.01ms   unsafe: same inode reused
+```
+
+The first looked like a 2× tail win until the runs were interleaved, at which point the sign flipped
+(round 3: 30.0ms against 7.8ms, p99 1104ms) — noise, and the machine's 20MB write tail is governed by
+system state rather than by call shape. It could not have been anything else: `rename` consumes the
+staging name, so every frame necessarily creates a fresh inode. **Within the file medium there is no
+variant to find. The p99 tail is the price of the safety guarantee, and it is not negotiable.**
+
+**This prices SHM rather than unblocking it.** 8.4's blocker is intact — verified again: `node:ffi`
+is unavailable, `electron/package.json` has zero native dependencies, and macOS has no `/dev/shm`
+(`bench/shm-through-tmux.py` reaches `shm_open` only through Python's `ctypes`). What changed is that
+the pwrite line above is no longer an unreachable number. A fresh `shm_open` object per frame gives
+the same fresh-object guarantee `rename` gives, without the disk, so **~p50 2.8ms / p99 3.6ms is what
+SHM would buy: roughly 3ms of p50 and 33ms of p99 tail per whole frame.** That is a real number
+against a real cost (a native addon, a napi/node-gyp toolchain, per-platform binaries), and it is a
+decision for whoever owns the roadmap rather than a measurement question. *Reopens on:* the engine
+gaining a native module for any other reason, at which point this is nearly free.
+
+**Shipped: the u32 swap.** 8.4 measured it (7.43ms → 2.94ms, reproduced here as 6.58ms → 2.90ms) and
+left it unapplied, so `rawCommands` was still paying ~3.7ms per whole frame for a change requiring no
+new dependency. It is now in `gfx-worker.cjs`, with two guards the benchmark did not need: a
+`Uint32Array` view requires 4-byte alignment at both ends and `Buffer.allocUnsafe` under 4KB comes
+out of a shared pool at an arbitrary offset, so a misaligned buffer falls back to the byte loop
+rather than throwing `RangeError` and losing the frame; and the masks name channels by little-endian
+bit positions, so a big-endian host takes the same fallback.
+
+Note the direction reverses between languages, which is why 8.4's Rust table must not be read as
+advice for the JS: in Rust the u32 form is 2.6× *slower* (LLVM already vectorizes `chunks_exact(4)`
+and the manual shuffle defeats it), while in JS it is 2.3× faster.
+
+Verified two ways, because agreement is not correctness. `gfx-worker.test.cjs` proves `swapU32`
+matches `swapBytewise` byte-for-byte over every channel value, and covers the misaligned fallback —
+but both could be wrong together if Chromium's bitmap were not the byte order both assume. So
+`bench/channel-order.cjs` renders a page of known colours offscreen, runs the real `rawCommands`, and
+reads the colours back out of the file it produced:
+
+```text
+RED     present=5597px  r/b-swapped=0px      ORANGE  present=2069px  r/b-swapped=0px
+BLUE    present=3877px  r/b-swapped=0px      AZURE   present=2646px  r/b-swapped=0px
+CYAN    present=2810px  r/b-swapped=0px
+```
+
+The `r/b-swapped` column is the verdict: for a band whose R and B differ, a channel error moves every
+pixel to the twin colour, so `present>0, swapped=0` is the signature of a correct swap and its exact
+reverse is the signature of a broken one. (Bands with R=B — green, white, black, magenta — are
+invariant under the swap and report equal counts by construction.) The harness judges by *presence*
+rather than by the most common colour, because the bands carry 34px white text and in two of them the
+text outnumbers the background (measured `rgb(255,255,255)x2831` against `rgb(255,128,0)x2069`);
+ranking by frequency there measures the font weight, not the channel order.
+
+**The tile strategies stay unimplemented, and the damage distribution is why.** DESIGN 7.3 lists
+three, with `detect_capability` hardcoding all three to false. Re-sampled today with `bench/damage.cjs`
+on all three page profiles, this engine, this Electron:
+
+```text
+              scroll                              caret
+text     59 frames, dirty p50 400% (2880x1800)   19 frames, dirty p50 0% (15x30, 30x30)
+mixed    58 frames, dirty p50 400% (2880x1800)   18 frames, dirty p50 0% (30x30, 36x30)
+photo    no frames at all                        18 frames, dirty p50 0% (30x30, 36x30)
+```
+
+8.1's finding is unchanged and now confirmed across profiles: damage is **bimodal**. Scrolling is
+whole-frame 100% of the time with no partial damage to exploit, and typing is a caret-sized rect two
+orders of magnitude below any useful tile. A 256×256 adaptive grid is sized for a middle case that
+does not occur, and the shipping code is right to choose between "whole frame" and "crop the damage"
+per frame by measured size rather than by terminal capability. Independently, the per-capability
+branch could not be reached in the primary configuration anyway: a capability query needs a response,
+and responses do not come back through tmux passthrough (DESIGN 7.3), which is why `q=2` is on every
+sequence. *Reopens on:* a measured workload with sustained mid-sized damage, or a bare-tty
+configuration becoming primary.
+
 ## 9. A component and interface structure built for extension
 
 > **The traits below exist as Rust source; almost none of them have an implementation.**

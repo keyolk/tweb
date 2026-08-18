@@ -1042,6 +1042,16 @@ Even on terminals without the GPU fast path, it reduces copies and syscalls comp
 - Never reuse the same transfer buffer before the terminal acknowledges it.
 - Reuse shared-memory names and image IDs from a bounded pool rather than minting them without limit.
 
+The acknowledgement rule above is the load-bearing one, and it is stronger than it looks: there is no
+ACK channel through tmux passthrough (`q=2` is on every sequence precisely because responses do not
+come back), so "before the terminal acknowledges it" has no upper bound in time. A bounded pool of
+buffers therefore cannot satisfy it — rotating between N names makes a collision rarer without ever
+making it impossible. What the shipping file path relies on instead is `rename`: a terminal that has
+opened the frame file holds *that inode*, so renaming a new file over the name cannot disturb the
+bytes it is reading. Any replacement for the file medium has to reproduce that fresh-object property
+rather than merely add distance — a fresh `shm_open` object per frame does; writing in place into a
+preallocated ring does not. DETAIL.md 8.5 has the measurements and what SHM would be worth.
+
 #### The damage and tile strategy
 
 - Preserve Chromium's/Electron's dirty rectangle.
@@ -1077,15 +1087,27 @@ Capabilities are decided by a graphics query, never guessed from the terminal na
 that query can be answered. Inside tmux it cannot be (5.2 has the measurements), which is the single
 biggest constraint on this section.
 
-None of the three strategies above is implemented. `TerminalCapability` carries
-`kitty_animation`/`kitty_placement`/`kitty_shared_memory` fields, but nothing ever queries them —
-`detect_capability` hardcodes all three to false, and the only code that ever read a capability to
-pick a transfer strategy (`KittyGraphicsTransport` in the since-removed `tweb-transport`) consulted
-just `supports_kitty_basic()` and was never on the shipping Electron path. What ships is a single
-strategy: whole frames plus damage patches, chosen per frame by measured damage size rather than by
-terminal capability (DETAIL.md 8.1-8.3). There is no capability tier to market or to surface, so no
-restricted state is shown in the UI either. The only capability-driven fallback that exists is the
-startup gate in 5.2, which refuses to start on a terminal that proved it cannot draw.
+None of the three strategies above is implemented, and this is settled rather than pending.
+`TerminalCapability` carries `kitty_animation`/`kitty_placement`/`kitty_shared_memory` fields, but
+nothing ever queries them — `detect_capability` hardcodes all three to false, and the only code that
+ever read a capability to pick a transfer strategy (`KittyGraphicsTransport` in the since-removed
+`tweb-transport`) consulted just `supports_kitty_basic()` and was never on the shipping Electron
+path. What ships is a single strategy: whole frames plus damage patches, chosen per frame by measured
+damage size rather than by terminal capability (DETAIL.md 8.1-8.3).
+
+Two independent measurements say to keep it that way, both re-taken in DETAIL.md 8.5:
+
+- **The workload has no middle.** Damage is bimodal on every page profile — scrolling is whole-frame
+  100% of the time with no partial damage to exploit, and typing is a caret-sized rect (30×30) two
+  orders of magnitude below any useful tile. A tile grid is sized for a case that does not occur.
+- **The branch is unreachable in the primary configuration.** Choosing per capability requires a
+  query, and a query requires a response; inside tmux there is none, which is why `q=2` is on every
+  sequence.
+
+There is therefore no capability tier to market or to surface, so no restricted state is shown in the
+UI either. The only capability-driven fallback that exists is the startup gate in 5.2, which refuses
+to start on a terminal that proved it cannot draw. This reopens on a measured workload with sustained
+mid-sized damage, or on a bare-tty configuration becoming primary.
 
 ### 7.4 tmux support tiers
 

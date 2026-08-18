@@ -14,8 +14,10 @@
 const { mkdirSync, renameSync, unlinkSync, writeFileSync } = require("node:fs");
 const path = require("node:path");
 const { parentPort } = require("node:worker_threads");
+const os = require("node:os");
 
 const CHUNK = 3072;
+const LITTLE_ENDIAN = os.endianness() === "LE";
 const frameFiles = new Set();
 
 // The payload cap on one Kitty escape. Anything larger arrives as a run of `m=1` continuations.
@@ -50,20 +52,57 @@ function fileCommands(message, png) {
   return [{ header: `${message.header},t=f,q=2`, payload: writeFrameFile(message.filePath, png) }];
 }
 
-// Raw pixels, no PNG container. `f=32` is independent of the transfer medium, so the same
-// file transport carries them — and the encode the main thread used to pay for disappears:
-// measured 101ms for a photo, against ~2ms to hand the bitmap over.
-//
-// Chromium's bitmap is BGRA on macOS and the protocol wants RGBA, so the channels are
-// swapped here rather than on the main thread. This is the one CPU pass over the frame, and
-// at ~10ms for 20MB it is the obvious candidate for SIMD in the native crate later.
-function rawCommands(message, bgra) {
-  const rgba = Buffer.allocUnsafe(bgra.length);
+// One byte at a time. Kept as the fallback for the cases `swapU32` cannot take, and as the
+// definition of correct that `swapU32` is checked against.
+function swapBytewise(bgra, rgba) {
   for (let i = 0; i < bgra.length; i += 4) {
     rgba[i] = bgra[i + 2];
     rgba[i + 1] = bgra[i + 1];
     rgba[i + 2] = bgra[i];
     rgba[i + 3] = bgra[i + 3];
+  }
+}
+
+// One 32-bit read/write per pixel instead of four 8-bit ones. Measured on a 2880x1800 frame:
+// 6.58ms bytewise against 2.90ms here, reproduced across two runs by `bench/convert-bench.cjs`.
+//
+// Little-endian only: the mask positions below name B/G/R/A by their LE bit offsets, and on a
+// big-endian host they would name the wrong channels — silently, since the result is still a
+// plausible image. Guarded at the call site rather than made portable, because every platform
+// this engine runs on is little-endian and an untested branch is worse than an absent one.
+function swapU32(src32, dst32) {
+  for (let i = 0; i < src32.length; i += 1) {
+    const p = src32[i];
+    dst32[i] = (p & 0xff00ff00) | ((p & 0x00ff0000) >>> 16) | ((p & 0x000000ff) << 16);
+  }
+}
+
+// Raw pixels, no PNG container. `f=32` is independent of the transfer medium, so the same
+// file transport carries them — and the encode the main thread used to pay for disappears:
+// measured 101ms for a photo, against ~2ms to hand the bitmap over.
+//
+// Chromium's bitmap is BGRA on macOS and the protocol wants RGBA, so the channels are swapped
+// here rather than on the main thread. This is the one CPU pass over the frame.
+//
+// It is NOT a candidate for a native module, which an earlier comment here claimed. The pass is
+// memory-bandwidth bound: a bare memcpy of the same 20MB costs 0.347ms and the scalar loop
+// 0.431ms, so the whole headroom a SIMD rewrite could win is under 0.1ms — and that measurement
+// is why `tweb-native` was deleted rather than finished. See DETAIL.md 8.4.
+function rawCommands(message, bgra) {
+  const rgba = Buffer.allocUnsafe(bgra.length);
+  // A Uint32Array view needs both ends 4-byte aligned; `Buffer.allocUnsafe` under 4KB comes out
+  // of a shared pool at an arbitrary offset, so this is a real case and not a formality. A
+  // misaligned view throws RangeError, which would kill the frame rather than slow it down.
+  const alignable = (bgra.byteOffset & 3) === 0
+    && (rgba.byteOffset & 3) === 0
+    && (bgra.length & 3) === 0;
+  if (alignable && LITTLE_ENDIAN) {
+    swapU32(
+      new Uint32Array(bgra.buffer, bgra.byteOffset, bgra.length >>> 2),
+      new Uint32Array(rgba.buffer, rgba.byteOffset, rgba.length >>> 2),
+    );
+  } else {
+    swapBytewise(bgra, rgba);
   }
   return [{
     header: `${message.header},f=32,s=${message.width},v=${message.height},t=f,q=2`,
@@ -116,4 +155,6 @@ if (parentPort) {
   });
 }
 
-module.exports = { directCommands, fileCommands, rawCommands, frameCommands, CHUNK };
+module.exports = {
+  directCommands, fileCommands, rawCommands, frameCommands, swapBytewise, swapU32, CHUNK,
+};
