@@ -997,6 +997,12 @@ D. o=z over t=d (direct)      OK
 C is the case that makes B mean something: a terminal that answered OK to a corrupt deflate stream
 would not be decompressing at all. This one rejects it by name, so the acceptance in B is real.
 
+Repeated against kitty — the protocol's own implementation, and a second opinion worth having since
+this ships unconditionally — with the same verdict and its own error text:
+`EINVAL:Failed to inflate image data with error: Z_DATA_ERROR`. Two independent implementations
+accepting valid streams and naming the failure on corrupt ones is what makes `o=z` a base protocol
+feature here rather than a Ghostty extension.
+
 **It is not a free win, which is why it ships as a decision rather than a default.** Deflate is
 paid in CPU on the frame it saves on disk, and for some content that is a bad trade:
 
@@ -1034,6 +1040,21 @@ after           803 frames / 30s   droppedByBackpressure 0, 1
 **The drops are gone.** The frame rate is unchanged because it was never the problem — it is pinned
 by the 30fps cap, and 8.3's finding that the worker does not decide latency still holds. What
 changed is that frames stopped being discarded on the way out.
+
+**Two things this needed that the measurement did not.**
+
+*An off switch.* `o=z` is verified on both implementations that matter — Ghostty 1.3.1 and kitty
+itself, each rejecting a corrupt stream by name rather than merely accepting a valid one — so
+`TWEB_DEFLATE_FRAMES=0` is not hedging against a suspected bug. It exists because of how such a bug
+would present. The sequence carries `q=2`, so a terminal that dislikes `o=z` cannot say so, and
+`noteRawFrameFailure` never fires because the worker succeeded: the symptom would be a blank or
+corrupt image with nothing in any log. `TWEB_RAW_FRAMES=0` exists next door for the same reason and
+this had no equivalent.
+
+*A way to see it working.* `tweb diag` now reports `wholeCompressed` beside `whole`. Without it the
+sampling decision is invisible from outside — a frame that should compress and does not looks
+exactly like one that should not, and the first symptom of a broken threshold would be dropped
+frames with no stated cause. Measured on the churn workload: `whole 322, wholeCompressed 321`.
 
 **What this does to the SHM item: it closes it.** The thing SHM was going to buy — the ~24% of whole
 frames the file write was discarding — has been bought without it. A native addon would still make

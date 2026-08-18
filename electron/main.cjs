@@ -479,6 +479,10 @@ function frameFilePathFor(frames, format) {
 let rawFramesEnabled = frameTransport === "file"
   && process.env.TWEB_RAW_FRAMES !== "0";
 let loggedFrameGeneration = -1;
+// Whole frames the worker deflated, against `whole` for the total. The ratio is the only outside
+// view of the sampling decision in `gfx-worker.cjs`: 0 on a text-heavy page means compression
+// silently stopped engaging, which shows up as dropped frames long before anything says why.
+let compressedWholeFrames = 0;
 const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"));
 gfxWorker.unref();
 
@@ -1071,6 +1075,7 @@ gfxWorker.on("message", (message) => {
     noteRawFrameFailure();
   } else {
     rawFrameFailures = 0;
+    if (message?.compressed) compressedWholeFrames += 1;
   }
   // The completion is routed to the pane whose frame it was, by the key that travelled with the
   // request. A completion applied to the wrong pane would free that pane's image and dispatch
@@ -3035,6 +3040,8 @@ function agentDiagnostics() {
       // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
       wholeFormat: rawFramesEnabled ? "raw" : "png",
+      // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
+      wholeCompressed: compressedWholeFrames,
     },
     input: {
       vimiumShortcuts: vimiumShortcutsEnabled,

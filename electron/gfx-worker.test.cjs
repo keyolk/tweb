@@ -161,6 +161,35 @@ test("incompressible pixels are left alone", () => {
   assert.equal(result.payload, pixels, "the original buffer must pass through, not a copy");
 });
 
+// The escape hatch, and the reason it is not hedging. `o=z` is verified on both Ghostty and
+// kitty, but the sequence carries q=2 — a terminal that dislikes it cannot say so, and
+// `noteRawFrameFailure` never fires because the worker succeeded. A user on some terminal
+// neither probe covered would see a corrupt image with nothing in any log, and needs a way out
+// that is not editing the source.
+test("TWEB_DEFLATE_FRAMES=0 turns compression off", () => {
+  const previous = process.env.TWEB_DEFLATE_FRAMES;
+  // The flag is read at module load, so this asserts against a fresh instance rather than the
+  // one already required above.
+  process.env.TWEB_DEFLATE_FRAMES = "0";
+  delete require.cache[require.resolve("./gfx-worker.cjs")];
+  const disabled = require("./gfx-worker.cjs");
+  try {
+    const pixels = textLikeFrame(4 * 1024 * 1024);
+    assert.equal(disabled.maybeDeflate(pixels).compressed, false);
+    assert.doesNotMatch(
+      disabled.rawCommands(
+        message({ filePath: temporaryFile("off.rgba"), width: 1024, height: 1024 }),
+        pixels,
+      )[0].header,
+      /o=z/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.TWEB_DEFLATE_FRAMES;
+    else process.env.TWEB_DEFLATE_FRAMES = previous;
+    delete require.cache[require.resolve("./gfx-worker.cjs")];
+  }
+});
+
 test("a raw frame declares o=z only when it actually compressed the payload", () => {
   const compressible = temporaryFile("text.rgba");
   const commands = rawCommands(
