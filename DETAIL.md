@@ -1056,6 +1056,24 @@ sampling decision is invisible from outside — a frame that should compress and
 exactly like one that should not, and the first symptom of a broken threshold would be dropped
 frames with no stated cause. Measured on the churn workload: `whole 322, wholeCompressed 321`.
 
+**Observed on a real page the owner was actually using** — a YouTube video, which is the hardest
+case for this feature since encoded video frames are close to incompressible:
+
+```text
+whole 3333    wholeCompressed 806 (24%)    patches 41    dropped 301    rate 30 (active)
+```
+
+Three things worth keeping from that. The sampling threshold behaves as designed on mixed content:
+about a quarter of frames compressed, meaning the video region was correctly refused while the
+surrounding page chrome was taken. The drop count was **static** — `whole` climbed by 299 over the
+same span while `dropped` stayed at 301 — so those drops predate this change rather than continuing
+under it. And the frame files cleaned up when the pane closed (2 to 0), which is the leak path the
+naming rule in `paneFrameFileNames` exists to prevent.
+
+It also marks the honest limit of the fix. Playing video at a size where the whole frame is
+incompressible is exactly the workload that would still drop frames, which is why 8.6's reopen
+condition names it specifically.
+
 **What this does to the SHM item: it closes it.** The thing SHM was going to buy — the ~24% of whole
 frames the file write was discarding — has been bought without it. A native addon would still make
 the write cheaper in absolute terms, but there is no longer a user-visible number waiting on it.
