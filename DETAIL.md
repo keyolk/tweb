@@ -900,7 +900,24 @@ u32 (writes the file)      dropped 244, 240, 134
 no write at all            dropped 0, 0
 ```
 
-**The disk write is the entire source of the drops.** That reframes the SHM item one last time. It is
+**The disk write is the entire source of the drops.**
+
+Why the swap makes no difference to that, stated as budget rather than as a null result
+(`bench/frame-budget.cjs`, same 20.7MB frame, against the 33.3ms a 30fps cap allows):
+
+```text
+whole rawCommands (ships)      p50   12.69ms   p90   41.85ms   p99   57.44ms      38% / 172% of budget
+  of which: swap u32           p50    2.88ms                                       9% of budget
+  of which: swap bytewise      p50    6.76ms                                      20% of budget
+  of which: write (derived)    p50    9.77ms   p90   38.69ms   p99   54.49ms      29% / 164% of budget
+```
+
+The swap is worth 3.9ms, or 12 points of the budget. At p50 that is spare capacity nobody is waiting
+on, and in the tail — where frames are actually lost — the write alone is already at 164% of budget,
+so removing 12 points still leaves it over. That is the arithmetic behind two arms of an A/B being
+indistinguishable: the swap cannot decide a frame that the write has already overrun. It also says
+what a fix has to clear. Anything that leaves the write's p99 above 33.3ms keeps dropping frames no
+matter what else it improves. That reframes the SHM item one last time. It is
 no longer "priced but invisible": at the real frame size, on the real pipeline, the file medium is
 the only thing discarding frames, and removing it removes all of them. The blocker is still what 8.4
 said - no `node:ffi`, zero native dependencies, no `/dev/shm` on macOS, so it needs a native addon
