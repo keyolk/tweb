@@ -22,6 +22,7 @@ const {
 } = require("node:fs");
 const { execFile, execFileSync } = require("node:child_process");
 const { Worker } = require("node:worker_threads");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const net = require("node:net");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
@@ -157,6 +158,10 @@ let originalPaneTitle = null;
 const tabFrames = new Map();
 const tabZoomFactors = new Map();
 const tabSessionUrls = new Map();
+// The pane a tab belongs to. Every event a tab emits — paint above all — arrives with the tab and
+// nothing else, so this is what turns that into a pane. Read at fire time and never captured when a
+// handler is registered: `configureTab` runs before `adoptTab` records the mapping.
+const tabPanes = new Map();
 // Recovery attempts per tab, so a page that crashes its renderer on every load stops being
 // reloaded instead of looping forever. See renderer-recovery.cjs.
 const tabRendererRecoveries = new Map();
@@ -310,6 +315,50 @@ const configuredPaneImageId = Number.isSafeInteger(configuredImageId) && configu
 // used by a flag is a seam nothing proves, and this one carries every frame the shipping build
 // draws.
 const paneRegistry = new PaneRegistry();
+
+// Which pane the code currently running belongs to.
+//
+// A host serving N panes has to answer that at roughly 240 call sites, and threading a parameter
+// through all of them is not the shape of the problem: the frame-rate policy defers with
+// `setTimeout(settleFrameRate, 700)` and settles with no tab in hand, the agent surface path
+// resumes after an `await`, and `setWindowOpenHandler` opens a tab from a `setImmediate`. None of
+// those callbacks has a pane argument to receive.
+//
+// So the pane travels with the execution instead. Verified under Electron 43 rather than assumed:
+// a `paint` handler registered outside any store reads `undefined` (native emit captures nothing at
+// registration, which is why every entry point below binds explicitly), a store established inside
+// the handler survives both a `setTimeout` and an `await` continuation, and a timer bound to a
+// second pane reads that second pane — not the first.
+//
+// `run` and never `enterWith`: the latter leaks into the rest of the tick, which for an event
+// dispatch means into whatever the emitter does next.
+const paneScope = new AsyncLocalStorage();
+
+/**
+ * Runs `fn` as work belonging to `record`.
+ *
+ * `record` may be resolved lazily by passing a function, because a tab's pane is not always known
+ * when a handler is registered — `configureTab` runs before `adoptTab` records the mapping.
+ */
+function withPaneScope(record, fn) {
+  const resolved = typeof record === "function" ? record() : record;
+  if (!resolved) return fn();
+  return paneScope.run(resolved, fn);
+}
+
+/** Wraps a handler so every call runs in its pane's scope. Registration order does not matter. */
+function bindPane(resolve, handler) {
+  return function boundToPane(...handlerArgs) {
+    return withPaneScope(() => resolve(...handlerArgs), () => handler.apply(this, handlerArgs));
+  };
+}
+
+// A pane the ambient scope could not name, in a host that serves more than one. Every such
+// resolution silently falls back to the first pane, which is the bug this whole change removes —
+// so it is counted and reported by `diag` rather than left to be discovered as one pane's input
+// occasionally landing in another. An entry point nobody bound shows up here.
+let unscopedPaneResolutions = 0;
+let loggedUnscopedResolution = false;
 // The tmux server this process sits on. It is the SERVER, not a pane — an engine and the daemon
 // that started it are on the same server, so this is one of the few things a hosted engine can
 // still read from its own environment. Which pane, and whether that pane is in tmux at all, comes
@@ -470,7 +519,18 @@ function writerFor(record) {
 // A second attached pane is refused (see `handleAttach`), which is what keeps this answer
 // unambiguous. It is the piece that has to become a parameter before a host serves two.
 function currentPane() {
-  return hostedRuntime ? (paneRegistry.list()[0] || solePane) : solePane;
+  if (!hostedRuntime) return solePane;
+  const scoped = paneScope.getStore();
+  if (scoped) return scoped;
+  // Falling back to the first pane is right for exactly one pane and wrong for two, so say so.
+  if (paneRegistry.size > 1) {
+    unscopedPaneResolutions += 1;
+    if (debugLogging && !loggedUnscopedResolution) {
+      loggedUnscopedResolution = true;
+      console.error(`tweb: pane resolved with no scope\n${new Error("unscoped").stack}`);
+    }
+  }
+  return paneRegistry.list()[0] || solePane;
 }
 
 // The frame context those bytes belong to, by the same rule and for the same reason. The two are
@@ -1126,7 +1186,12 @@ gfxWorker.on("message", (message) => {
     console.error(`tweb: graphics completion for an unknown pane: ${message?.paneKey}`);
     return;
   }
-  handleGfxWorkerReady(message?.commands, frames);
+  // Scoped to the pane the completion belongs to: dispatching the queue reads the frame-rate state
+  // and the window, and doing that against another pane's is how one pane's frame lands in
+  // another's rectangle.
+  withPaneScope(frames.record, () => {
+    handleGfxWorkerReady(message?.commands, frames);
+  });
 });
 gfxWorker.on("error", (error) => {
   // The worker is gone, so every pane's in-flight hand-off is gone with it. Leaving any of them
@@ -2942,7 +3007,11 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
   }
 }
 
-ipcMain.on("tweb-preload-ready", (event, info) => {
+// The three IPC handlers all reach a window, so each resolves its pane from the tab that sent the
+// message. `event.sender` is the only pane evidence an IPC message carries.
+ipcMain.on("tweb-preload-ready", bindPane(
+  (event) => tabPanes.get(BrowserWindow.fromWebContents(event.sender)),
+  (event, info) => {
   const tab = BrowserWindow.fromWebContents(event.sender);
   const frame = event.senderFrame;
   if (!tab || !frame || frame.isDestroyed() || frame.detached) return;
@@ -2961,14 +3030,16 @@ ipcMain.on("tweb-preload-ready", (event, info) => {
     // with the old document and never come back.
     event.reply("tweb-transfer", transferSummary(transfers, Date.now()));
   }
-});
+}));
 
-ipcMain.on("tweb-shortcut", (event, message) => {
+ipcMain.on("tweb-shortcut", bindPane(
+  (event) => tabPanes.get(BrowserWindow.fromWebContents(event.sender)),
+  (event, message) => {
   if (!message || typeof message.action !== "string") return;
   const tab = currentWindows().tabs.find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === event.sender.id);
   if (!tab) return;
   handleNativeShortcut(tab, message.action, message.value, event.senderFrame);
-});
+}));
 
 // --- agent bridge ---
 
@@ -2984,6 +3055,8 @@ function recordConsoleMessage(entry) {
   if (consoleLog.length > consoleLogLimit) consoleLog.splice(0, consoleLog.length - consoleLogLimit);
 }
 
+// Deliberately not pane-scoped: `recordConsoleMessage` appends to one process-wide ring buffer that
+// `tweb console` reads, and each entry carries its own page url. Nothing here reaches a window.
 function watchConsole(contents) {
   contents.on("console-message", (...args) => {
     // Electron ≥ 36 passes a single event object; older builds pass positionals.
@@ -3080,6 +3153,14 @@ function agentDiagnostics() {
       wholeFormat: rawFramesEnabled ? "raw" : "png",
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
       wholeCompressed: compressedWholeFrames,
+    },
+    panes: {
+      hosted: paneRegistry.size,
+      // How many times a pane had to be resolved with no ambient scope while more than one was
+      // hosted. Every one of those fell back to the first pane, so this is not a statistic — it is
+      // an entry point nobody bound, and the symptom would be one pane's input or frame
+      // occasionally landing in another's rectangle. It must stay 0.
+      unscopedResolutions: unscopedPaneResolutions,
     },
     input: {
       vimiumShortcuts: vimiumShortcutsEnabled,
@@ -3653,10 +3734,12 @@ function attachChooserDebugger(tab) {
     if (debugLogging) console.error(`tweb: chooser debugger attach failed: ${error.message}`);
     return false;
   }
-  contents.debugger.on("message", (_event, method, params) => {
+  // Bound like configureTab's handlers and for the same reason: the chooser prompt is drawn into
+  // the pane, so it has to be drawn into THIS tab's pane.
+  contents.debugger.on("message", bindPane(() => tabPanes.get(tab), (_event, method, params) => {
     if (method !== "Page.fileChooserOpened") return;
     openFileChooser(tab, params);
-  });
+  }));
   contents.debugger.on("detach", () => fileChooserByTab.delete(tab));
   void contents.debugger.sendCommand("Page.enable")
     .then(() => contents.debugger.sendCommand("Page.setInterceptFileChooserDialog", { enabled: true }))
@@ -4011,16 +4094,29 @@ function enforceHiddenWindows() {
 }
 
 function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
+  // Every handler registered below runs as work belonging to this tab's pane.
+  //
+  // Registration cannot capture the pane: verified under Electron 43 that a `paint` handler
+  // registered outside a store reads `undefined`, and `configureTab` runs before `adoptTab` records
+  // the mapping anyway. So the pane is resolved when the handler fires, from the tab it fires for.
+  //
+  // Registered through these three rather than one wrap per handler, so a handler added later is
+  // bound by writing it in the same style as the rest — the failure mode of the per-handler form is
+  // that the one somebody forgets falls back to the first pane and silently draws into it.
+  const scoped = (handler) => bindPane(() => tabPanes.get(tab), handler);
+  const onContents = (event, handler) => contents.on(event, scoped(handler));
+  const onTab = (event, handler) => tab.on(event, scoped(handler));
+  const setWindowOpenHandler = (handler) => contents.setWindowOpenHandler(scoped(handler));
   const contents = tab.webContents;
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
   attachChooserDebugger(tab);
   // A frame with no preload gets its print shim from here; see shimFramePrint.
-  contents.on("frame-created", (_event, details) => shimFramePrint(details.frame));
-  tab.on("show", keepHidden);
-  tab.on("focus", keepHidden);
-  tab.on("move", keepHidden);
-  contents.on("preload-error", (_event, preloadPath, error) => {
+  onContents("frame-created", (_event, details) => shimFramePrint(details.frame));
+  onTab("show", keepHidden);
+  onTab("focus", keepHidden);
+  onTab("move", keepHidden);
+  onContents("preload-error", (_event, preloadPath, error) => {
     console.error(`tweb: preload failed ${preloadPath}: ${error.stack || error.message}`);
   });
   watchConsole(contents);
@@ -4030,7 +4126,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   contents.setFrameRate(1);
   // A muted instance opening a tab must not leak audio through the new one.
   contents.setAudioMuted(audioMutedByOther);
-  contents.on("paint", (_event, dirty, image) => {
+  onContents("paint", (_event, dirty, image) => {
     // A page painting on its own is what separates video from a static screen, and the
     // frame-rate policy reads it to decide whether to fall all the way to idle.
     if (tab === currentWindows().win) notePaintActivity();
@@ -4055,7 +4151,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   // Before Electron attaches our custom offscreen child, it can surface the macOS OffScreenView
   // placeholder as a native popup. Deny the original request and open the URL directly in a
   // separate TWeb tab, which keeps the native popup from ever being created.
-  contents.setWindowOpenHandler((details) => {
+  setWindowOpenHandler((details) => {
     const target = details.url || "about:blank";
     // Middle-click and window.open share this path, and Chrome treats them differently:
     // window.open takes you to the new tab, middle-click deliberately does not. The whole
@@ -4067,7 +4163,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     return { action: "deny" };
   });
 
-  contents.on("did-start-navigation", (details) => {
+  onContents("did-start-navigation", (details) => {
     if (details.isSameDocument || !details.frame) return;
     readyFrameKeys(tab).delete(frameKey(details.frame));
     // A new document has no find session behind it. Carrying the old flag over would send
@@ -4075,10 +4171,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     // answers that with silence — the exact failure this state exists to prevent.
     if (details.isMainFrame) findSessionByTab.set(tab, endStep().state);
   });
-  contents.on("context-menu", (_event, params) => {
+  onContents("context-menu", (_event, params) => {
     if (vimiumShortcutsEnabled) showBrowserContextMenu(tab, params);
   });
-  contents.on("media-started-playing", () => {
+  onContents("media-started-playing", () => {
     // Audibility is not known at the moment playback starts — a track whose output has
     // not opened yet reports silent — so the claim is left to the poll, which asks again
     // every tick. This only shortens the wait when the answer is already in.
@@ -4092,13 +4188,13 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
       reconcileAudio();
     }, 250);
   });
-  contents.on("media-paused", () => {
+  onContents("media-paused", () => {
     if (debugLogging) console.error("tweb: media paused");
     // The release itself is debounced in reconcileAudio; this only makes the pane
     // notice its own silence on the next tick rather than several ticks later.
     reconcileAudio();
   });
-  contents.on("found-in-page", (_event, result) => {
+  onContents("found-in-page", (_event, result) => {
     sendToTabFrames(tab, "tweb-find-result", result);
   });
 
@@ -4109,13 +4205,13 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
   };
-  contents.on("did-navigate", (_event, url) => recordNavigation(url));
-  contents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
+  onContents("did-navigate", (_event, url) => recordNavigation(url));
+  onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
     if (isMainFrame) recordNavigation(url);
   });
 
   let initialZoomApplied = false;
-  contents.on("did-finish-load", () => {
+  onContents("did-finish-load", () => {
     showingLoadError = false;
     const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
     contents.setZoomFactor(zoomFactor);
@@ -4135,13 +4231,13 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
       console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
     }
   });
-  tab.on("page-title-updated", (_event, title) => {
+  onTab("page-title-updated", (_event, title) => {
     const url = tabSessionUrls.get(tab) || contents.getURL();
     recordNavigationHistory(url, title);
     sendTabState();
     if (debugLogging) console.error(`tweb: title ${title}`);
   });
-  contents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
+  onContents("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
     if (!isMainFrame || code === -3 || showingLoadError) return;
     showingLoadError = true;
     console.error(`tweb: failed to load ${failedUrl}: ${description} (${code})`);
@@ -4151,7 +4247,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   // engine keeps answering `tweb status` with a healthy pid, and the pane holds the last image
   // it was sent. Chromium restarts a *visible* window's renderer on its next paint; an
   // offscreen one has no such trigger, so nothing ever comes back without this.
-  contents.on("render-process-gone", (_event, details) => {
+  onContents("render-process-gone", (_event, details) => {
     const reason = details?.reason;
     findSessionByTab.set(tab, endStep().state);
     const decision = recoveryDecision(reason, tabRendererRecoveries.get(tab), Date.now());
@@ -4173,13 +4269,19 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 }
 
 function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
+  // The pane whose scope we were called in — `attachPane` establishes it, and a tab opened from an
+  // existing tab inherits it through that tab's bound handlers. Recorded before `configureTab` so
+  // the handlers it registers can resolve this tab the first time they fire.
+  const record = currentPane();
+  tabPanes.set(tab, record);
   if (currentWindows().tabs.includes(tab)) return tab;
   configureTab(tab, initialZoomFactor);
   tabSessionUrls.set(tab, url || "about:blank");
   currentWindows().tabs.push(tab);
   const index = currentWindows().tabs.length - 1;
 
-  tab.on("closed", () => {
+  tab.on("closed", bindPane(() => tabPanes.get(tab), () => {
+    tabPanes.delete(tab);
     const closedIndex = currentWindows().tabs.indexOf(tab);
     if (closedIndex < 0) return;
     const wasActive = tab === currentWindows().win;
@@ -4191,7 +4293,12 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
     if (currentWindows().tabs.length === 0) {
       currentWindows().win = null;
       currentWindows().activeTabIndex = -1;
-      if (!quitting) app.quit();
+      // One pane running out of tabs is that pane closing, not the process ending. A per-pane
+      // engine serves exactly one, so its last tab IS the last tab and quitting is right; a host
+      // serving others would take them all down with it.
+      if (quitting) return;
+      if (hostedRuntime && paneRegistry.size > 1) closePane(record, "last tab closed");
+      else app.quit();
       return;
     }
     if (wasActive) activateTab(Math.min(closedIndex, currentWindows().tabs.length - 1));
@@ -4204,7 +4311,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
       sendToTabFrames(currentWindows().win, "tweb-tabs", tabListModel());
     }
     scheduleWindowSessionSave();
-  });
+  }));
 
   if (activate) activateTab(index);
   else {
@@ -5061,7 +5168,9 @@ function handleAttach(command) {
   // daemon's — measured claiming `agent-%304.sock`, a name in an unrelated pane's namespace.
   const server = startAgentServer({
     paneId: record.paneId,
-    dispatch: handleAgentCommand,
+    // Scoped to this record: `tweb click`, `tweb screenshot` and the rest reach a window, and the
+    // socket is what says which pane asked. A host has one socket per pane for exactly this.
+    dispatch: (method, params) => withPaneScope(record, () => handleAgentCommand(method, params)),
     log: (message) => {
       if (debugLogging) console.error(`tweb: ${message}`);
     },
@@ -5075,9 +5184,14 @@ function handleAttach(command) {
   // `applyViewport`, the same `createWindow`, the same input and agent handling. It reaches the
   // right pane because every one of them takes the record and the frame context, which is what
   // the extraction was for. What it does NOT yet do is run twice — see the refusal above.
-  if (command.viewport) applyViewport(command.viewport, command.origin ?? null, frames, record);
-  createWindow(url, frames);
-  markInteractionActivity();
+  // Run as work belonging to this record, which is what makes `createWindow` reach THIS pane's
+  // window context and what gives the tab it creates its `tabPanes` entry — every handler that tab
+  // registers resolves back here from that entry, including `paint`.
+  withPaneScope(record, () => {
+    if (command.viewport) applyViewport(command.viewport, command.origin ?? null, frames, record);
+    createWindow(url, frames);
+    markInteractionActivity();
+  });
 
   console.error(`tweb: hosting ${record.paneId} generation=${record.generation}`
     + ` image=${record.imageId} tty=${record.tty || "-"} url=${url}`);
@@ -5150,40 +5264,55 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
 
-    if (command.kind === "resize") {
-      markInteractionActivity();
-      // An absent origin means "leave the anchor where it is". Normalising it to 0,0 would
-      // re-anchor the pane at the window's top-left, i.e. draw it over its neighbours.
-      applyViewport(command.viewport, command.origin === undefined ? currentFrames().origin : command.origin);
-      continue;
-    }
-
-    // The frontend's pane visibility push — see the pane visibility section. It is not
-    // interaction, so unlike RESIZE/INPUT it deliberately does not mark activity: a
-    // client attaching elsewhere must not count as someone using this pane.
-    if (command.kind === "visibility") {
-      applyVisibilityPush(command.hex);
-      continue;
-    }
-
-    if (command.kind === "input") {
-      markInteractionActivity();
-      if (rawInputFlushTimer) {
-        clearTimeout(rawInputFlushTimer);
-        rawInputFlushTimer = null;
-      }
-      // The escape sequence's raw bytes. Being pre-decoding, it separates "the
-      // terminal never sent it" from "it arrived but was not understood" — this log
-      // is how tmux re-encoding ESC[5020~ into ESC[91;3u5020~ was found. Logging
-      // ordinary typing too would drown it, so only sequences are kept.
-      if (debugLogging && command.hex.startsWith("1b")) {
-        console.error(`tweb: input ${command.hex}`);
-      }
-      rawInput = Buffer.concat([rawInput, Buffer.from(command.hex, "hex")]);
-      consumeRawInput();
-    }
+    // From here the line is addressed to a known pane, so it is handled as that pane's work: a
+    // RESIZE reads that pane's origin, a VIS flips that pane's visibility, and INPUT is delivered
+    // to that pane's active tab.
+    withPaneScope(target, () => handleTargetedCommand(command, target));
   }
 });
+
+/**
+ * A control line whose pane is already resolved.
+ *
+ * Called inside that pane's scope, which is why nothing here takes the record: `applyViewport`,
+ * `applyVisibilityPush` and the input path all reach it the same way every other pane-owned
+ * function does.
+ */
+function handleTargetedCommand(command, target) {
+  void target;
+  if (command.kind === "resize") {
+    markInteractionActivity();
+    // An absent origin means "leave the anchor where it is". Normalising it to 0,0 would
+    // re-anchor the pane at the window's top-left, i.e. draw it over its neighbours.
+    applyViewport(command.viewport, command.origin === undefined ? currentFrames().origin : command.origin);
+    return;
+  }
+
+  // The frontend's pane visibility push — see the pane visibility section. It is not
+  // interaction, so unlike RESIZE/INPUT it deliberately does not mark activity: a
+  // client attaching elsewhere must not count as someone using this pane.
+  if (command.kind === "visibility") {
+    applyVisibilityPush(command.hex);
+    return;
+  }
+
+  if (command.kind === "input") {
+    markInteractionActivity();
+    if (rawInputFlushTimer) {
+      clearTimeout(rawInputFlushTimer);
+      rawInputFlushTimer = null;
+    }
+    // The escape sequence's raw bytes. Being pre-decoding, it separates "the
+    // terminal never sent it" from "it arrived but was not understood" — this log
+    // is how tmux re-encoding ESC[5020~ into ESC[91;3u5020~ was found. Logging
+    // ordinary typing too would drown it, so only sequences are kept.
+    if (debugLogging && command.hex.startsWith("1b")) {
+      console.error(`tweb: input ${command.hex}`);
+    }
+    rawInput = Buffer.concat([rawInput, Buffer.from(command.hex, "hex")]);
+    consumeRawInput();
+  }
+}
 process.stdin.resume();
 
 // --- app lifecycle ---
