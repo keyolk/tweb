@@ -2536,7 +2536,7 @@ function activateTab(index) {
   const normalized = ((index % currentWindows().tabs.length) + currentWindows().tabs.length) % currentWindows().tabs.length;
   currentWindows().activeTabIndex = normalized;
   currentWindows().win = currentWindows().tabs[normalized];
-  mouseClicks.reset();
+  inputState().clicks.reset();
   pageInsertMode = false;
   // The preload mirrors this flag and skips redundant IPC, so tell the tab we
   // just cleared it. Without this its focused input keeps thinking native
@@ -4431,7 +4431,7 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
   const change = applyFrameViewport(frames, vp, origin);
   if (!change) return;
 
-  mouseClicks.reset();
+  inputState().clicks.reset();
   if (frames.pendingFrameTimer) {
     clearTimeout(frames.pendingFrameTimer);
     frames.pendingFrameTimer = null;
@@ -4502,11 +4502,35 @@ function createWindow(url, frames = currentFrames()) {
 
 // --- browser input ---
 
-let rawInput = Buffer.alloc(0);
-let rawInputFlushTimer = null;
-const paste = new PasteState();
-const utf8Decoder = new StringDecoder("utf8");
-const mouseClicks = new MouseClickState();
+// This pane's input-stream state, on its record.
+//
+// One buffer for N panes crosses input, and not subtly: `ESC [` is an incomplete sequence, so the
+// parser keeps it and waits for the final byte — and the next pane's INPUT line appends to that same
+// buffer. Measured with three panes, sending `ESC [` to %10 and `jjj` to %11: %11's page received
+// `[Escape` and no `j` at all, while %10 received nothing. The flush timer is per-pane for the same
+// reason: armed in one pane's scope, it delivers a leftover ESC to whichever pane's bytes are in the
+// buffer when it fires.
+//
+// The paste body, the UTF-8 decoder's split-codepoint carry, and the click-count state are all the
+// same input stream and cross the same way — a paste in one pane swallowing another's typing, a
+// multi-byte character split across panes, a double-click assembled from two panes' clicks.
+const paneInputStates = new Map();
+
+function inputState() {
+  const record = currentPane();
+  let state = paneInputStates.get(record.key);
+  if (!state) {
+    state = {
+      raw: Buffer.alloc(0),
+      flushTimer: null,
+      paste: new PasteState(),
+      decoder: new StringDecoder("utf8"),
+      clicks: new MouseClickState(),
+    };
+    paneInputStates.set(record.key, state);
+  }
+  return state;
+}
 
 function electronModifiers(mask) {
   const bits = Math.max(0, mask - 1);
@@ -4570,6 +4594,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
   if (!currentWindows().win) return;
   const contents = currentWindows().win.webContents;
   const { x, y } = logicalMousePoint(rawX, rawY);
+  const clicks = inputState().clicks;
   const modifiers = mouseModifiers(cb);
   const buttonCode = cb & 3;
   const motion = (cb & 32) !== 0;
@@ -4603,11 +4628,11 @@ function dispatchMouse(cb, rawX, rawY, release) {
   if (!motion && button) type = release ? "mouseUp" : "mouseDown";
   let clickCount = 0;
   if (type === "mouseDown") {
-    clickCount = mouseClicks.press(button, x, y);
+    clickCount = clicks.press(button, x, y);
   } else if (type === "mouseUp") {
-    clickCount = mouseClicks.release(button).count;
+    clickCount = clicks.release(button).count;
   } else {
-    mouseClicks.move(button, x, y);
+    clicks.move(button, x, y);
   }
   contents.sendInputEvent({
     type,
@@ -4893,7 +4918,7 @@ function dispatchText(buffer) {
       offset += 1;
       continue;
     }
-    const text = utf8Decoder.write(buffer.subarray(offset));
+    const text = inputState().decoder.write(buffer.subarray(offset));
     for (const char of text) {
       const codepoint = char.codePointAt(0);
       const modifierMask = codepoint >= 65 && codepoint <= 90 ? 2 : 1;
@@ -4959,109 +4984,114 @@ function dispatchPrivateShortcut(code) {
 }
 
 function scheduleRawInputFlush() {
-  if (rawInputFlushTimer || rawInput.length === 0) return;
-  rawInputFlushTimer = setTimeout(() => {
-    rawInputFlushTimer = null;
-    if (rawInput[0] === 0x1b) {
+  // Captured once, and the timer closes over it: the ambient scope carries into the callback, but
+  // resolving again there would re-read a map for a pane we already have in hand.
+  const input = inputState();
+  if (input.flushTimer || input.raw.length === 0) return;
+  input.flushTimer = setTimeout(() => {
+    input.flushTimer = null;
+    if (input.raw[0] === 0x1b) {
       // An ESC-prefixed sequence that ends without further bytes is a real Escape key. After a
       // short disambiguation window, deliver that first ESC and re-parse the rest.
       dispatchKey(27);
-      rawInput = rawInput.subarray(1);
+      input.raw = input.raw.subarray(1);
       consumeRawInput();
     }
   }, 35);
 }
 
 function consumeRawInput() {
+  // One lookup for the whole parse: this pane's buffer, paste state and decoder.
+  const input = inputState();
   for (;;) {
-    if (rawInput.length === 0) return;
+    if (input.raw.length === 0) return;
 
     // A paste body is never parsed as escape sequences. It can hold arbitrary bytes
     // including ESC, and everything up to the closing bracket is text to paste.
-    if (paste.active) {
-      const chunk = rawInput;
-      rawInput = Buffer.alloc(0);
-      const done = paste.push(chunk);
+    if (input.paste.active) {
+      const chunk = input.raw;
+      input.raw = Buffer.alloc(0);
+      const done = input.paste.push(chunk);
       if (!done) return;
       if (done.dropped) {
         if (debugLogging) console.error("tweb: paste exceeded limit, dropped");
         return;
       }
-      rawInput = done.rest;
+      input.raw = done.rest;
       dispatchPaste(done.text);
       continue;
     }
 
-    const escape = rawInput.indexOf(0x1b);
+    const escape = input.raw.indexOf(0x1b);
     if (escape > 0) {
-      dispatchText(rawInput.subarray(0, escape));
-      rawInput = rawInput.subarray(escape);
+      dispatchText(input.raw.subarray(0, escape));
+      input.raw = input.raw.subarray(escape);
       continue;
     }
     if (escape < 0) {
-      dispatchText(rawInput);
-      rawInput = Buffer.alloc(0);
+      dispatchText(input.raw);
+      input.raw = Buffer.alloc(0);
       return;
     }
 
-    const input = rawInput.toString("utf8");
+    const decoded = input.raw.toString("utf8");
 
     // Start of a bracketed paste. Ghostty never encodes Cmd-V as a key; the whole
     // event is paste_from_clipboard writing the clipboard into the PTY. On the
     // opening bracket, collect the body that follows and handle it as one paste.
-    if (paste.begins(rawInput)) {
+    if (input.paste.begins(input.raw)) {
       // Stops the ESC-disambiguation timer from firing mid-paste and committing the
       // body's first byte as an Escape key.
-      if (rawInputFlushTimer) {
-        clearTimeout(rawInputFlushTimer);
-        rawInputFlushTimer = null;
+      if (input.flushTimer) {
+        clearTimeout(input.flushTimer);
+        input.flushTimer = null;
       }
-      paste.start();
-      rawInput = rawInput.subarray(PASTE_START.length);
+      input.paste.start();
+      input.raw = input.raw.subarray(PASTE_START.length);
       continue;
     }
 
     // Focus reporting is not used. An ESC[I/ESC[O left over from a previous run or from
     // tmux/terminal state is never forwarded as browser text or a shell string either.
-    const focus = /^\x1b\[[IO]/.exec(input);
+    const focus = /^\x1b\[[IO]/.exec(decoded);
     if (focus) {
-      rawInput = rawInput.subarray(Buffer.byteLength(focus[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(focus[0]));
       continue;
     }
 
     // 5001-5012 are the existing shortcuts, 5013-5019 the mode toggles
     // (5014 = Ctrl-:), and 5020 and up the Cmd combinations.
-    let match = /^\x1b\[(50(?:0[1-9]|1[0-9]|[2-9][0-9]))~/.exec(input);
+    let match = /^\x1b\[(50(?:0[1-9]|1[0-9]|[2-9][0-9]))~/.exec(decoded);
     if (match) {
       dispatchPrivateShortcut(Number(match[1]));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(input);
+    match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(decoded);
     if (match) {
       dispatchMouse(Number(match[1]), Number(match[2]), Number(match[3]), match[4] === "m");
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[([0-9]+)(?::[0-9]+)*(?:;([0-9]+)(?::([123]))?)?(?:;([0-9:]+))?u/.exec(input);
+    match = /^\x1b\[([0-9]+)(?::[0-9]+)*(?:;([0-9]+)(?::([123]))?)?(?:;([0-9:]+))?u/.exec(decoded);
     if (match) {
       const text = match[4] ? match[4].split(":").map(Number).filter(Number.isFinite) : [];
       dispatchKey(Number(match[1]), Number(match[2] || 1), Number(match[3] || 1), text);
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[(?:1;([2-8]))?([ABCDHF])/.exec(input);
+    match = /^\x1b\[(?:1;([2-8]))?([ABCDHF])/.exec(decoded);
     if (match) {
       const keys = { A: "ArrowUp", B: "ArrowDown", C: "ArrowRight", D: "ArrowLeft", H: "Home", F: "End" };
       dispatchNamedKey(keys[match[2]], Number(match[1] || 1));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[(\d+)(?:;([2-8]))?~/.exec(input);
+    match = /^\x1b\[(\d+)(?:;([2-8]))?~/.exec(decoded);
     if (match) {
       const keys = {
         1: "Home", 2: "Insert", 3: "Delete", 4: "End", 5: "PageUp", 6: "PageDown",
@@ -5069,25 +5099,25 @@ function consumeRawInput() {
         18: "F7", 19: "F8", 20: "F9", 21: "F10", 23: "F11", 24: "F12",
       };
       if (keys[match[1]]) dispatchNamedKey(keys[match[1]], Number(match[2] || 1));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1bO([P-SABCDHF])/.exec(input);
+    match = /^\x1bO([P-SABCDHF])/.exec(decoded);
     if (match) {
       const keys = {
         P: "F1", Q: "F2", R: "F3", S: "F4",
         A: "ArrowUp", B: "ArrowDown", C: "ArrowRight", D: "ArrowLeft", H: "Home", F: "End",
       };
       dispatchNamedKey(keys[match[1]]);
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
-    match = /^\x1b\[27;([2-8]);(\d+)~/.exec(input);
+    match = /^\x1b\[27;([2-8]);(\d+)~/.exec(decoded);
     if (match) {
       dispatchKey(Number(match[2]), Number(match[1]));
-      rawInput = rawInput.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
       continue;
     }
 
@@ -5098,14 +5128,14 @@ function consumeRawInput() {
 
     // If the escape sequence is still incomplete, wait for the next INPUT chunk.
     // A lone ESC is settled as the Escape key once the short disambiguation window passes.
-    if (/^\x1b(?:\[|\[<|O)?[0-9;:<]*$/.test(input)) {
+    if (/^\x1b(?:\[|\[<|O)?[0-9;:<]*$/.test(decoded)) {
       scheduleRawInputFlush();
       return;
     }
 
     // An unrecognized ESC is delivered as the Escape key, consuming just that one byte.
     dispatchKey(27);
-    rawInput = rawInput.subarray(1);
+    input.raw = input.raw.subarray(1);
   }
 }
 
@@ -5331,9 +5361,10 @@ function handleTargetedCommand(command, target) {
 
   if (command.kind === "input") {
     markInteractionActivity();
-    if (rawInputFlushTimer) {
-      clearTimeout(rawInputFlushTimer);
-      rawInputFlushTimer = null;
+    const input = inputState();
+    if (input.flushTimer) {
+      clearTimeout(input.flushTimer);
+      input.flushTimer = null;
     }
     // The escape sequence's raw bytes. Being pre-decoding, it separates "the
     // terminal never sent it" from "it arrived but was not understood" — this log
@@ -5342,7 +5373,7 @@ function handleTargetedCommand(command, target) {
     if (debugLogging && command.hex.startsWith("1b")) {
       console.error(`tweb: input ${command.hex}`);
     }
-    rawInput = Buffer.concat([rawInput, Buffer.from(command.hex, "hex")]);
+    input.raw = Buffer.concat([input.raw, Buffer.from(command.hex, "hex")]);
     consumeRawInput();
   }
 }
@@ -5558,12 +5589,12 @@ app.on("before-quit", () => {
   writeWindowSession();
   releaseWindowSessionClaim();
   quitting = true;
-  mouseClicks.reset();
   void gfxWorker.terminate();
   // Per pane: each has its own pending frame, its own tabs still painting, and its own image on the
   // terminal. Running this once for the first pane would leave every other pane's image drawn over
   // the terminal after the engine is gone — the four-hour stale-page failure, N-1 times over.
   forEachPane(() => {
+    inputState().clicks.reset();
     if (currentFrames().pendingFrameTimer) {
       clearTimeout(currentFrames().pendingFrameTimer);
       currentFrames().pendingFrameTimer = null;

@@ -49,6 +49,10 @@ def attach_line(pane, image_id, url, left):
     return (f"@{pane} ATTACH - 1 {image_id} 30 1 0 80 24 800 480 {left} 0 - {url}\n")
 
 
+def input_line(pane, hex_bytes):
+    return f"@{pane} INPUT {hex_bytes}\n".encode()
+
+
 def visible_line(pane, window, tty):
     # The frontend's tmux client listing, not a boolean: line 0 is the pane's own placement and
     # the rest are clients. One client viewing this pane's window is what uncollapses the
@@ -63,15 +67,16 @@ def visible_line(pane, window, tty):
     return f"@{pane} VIS {payload.encode('utf8').hex()}\n"
 
 
-def ask_diag(sock_path):
-    """`diag` over a pane's own agent socket, or None if it cannot be reached."""
+def agent_call(sock_path, method, params=None):
+    """One request over a pane's own agent socket, or None if it cannot be reached."""
     import json
     import socket as socketmod
     try:
         with socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM) as sock:
-            sock.settimeout(4.0)
+            sock.settimeout(3.0)
             sock.connect(sock_path)
-            sock.sendall(json.dumps({"id": 1, "method": "diag", "params": {}}).encode() + b"\n")
+            request = {"id": 1, "method": method, "params": params or {}}
+            sock.sendall(json.dumps(request).encode() + b"\n")
             buf = b""
             while b"\n" not in buf:
                 chunk = sock.recv(1 << 16)
@@ -81,6 +86,21 @@ def ask_diag(sock_path):
             return json.loads(buf.split(b"\n", 1)[0]).get("result")
     except Exception:
         return None
+
+
+def ask_diag(sock_path):
+    return agent_call(sock_path, "diag")
+
+
+# Installed in each pane so the page records what it actually received. Reading it back per pane is
+# how input crossing is measured rather than inferred: a key one pane was sent must not appear in
+# another pane's log.
+KEY_RECORDER = (
+    "(() => { if (!window.__twebKeys) { window.__twebKeys = [];"
+    " window.addEventListener('keydown', (e) => window.__twebKeys.push(e.key), true); }"
+    " return window.__twebKeys.length; })()"
+)
+KEY_READBACK = "(window.__twebKeys || []).join('')"
 
 
 def process_tree(root):
@@ -150,6 +170,7 @@ def main():
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
     )
 
+    started = time.time()
     frames = {pane: [] for pane, _, _, _ in panes}
     # Each pane announces its own agent socket, which is how `diag` is asked per pane below.
     sockets = {}
@@ -159,8 +180,12 @@ def main():
     attach_at = time.time() + 3.0
     repush_at = None
     frames_at_repush = {}
+    input_probed = False
+    probe_at = None
+    recorder_installed = {}
     deadline = time.time() + seconds
     peak_procs, peak_rss = 0, 0.0
+    sampled_at = 0.0
     os.set_blocking(engine.stdout.fileno(), False)
     buffered = b""
 
@@ -169,6 +194,23 @@ def main():
             engine.stdin.write(attach_line(pane, image_id, url, left).encode())
             engine.stdin.write(visible_line(pane, windows[pane], ttys_of[pane]).encode())
         engine.stdin.flush()
+
+    def interleave_input():
+        """Send pane A a partial escape sequence, then send pane B ordinary text.
+
+        This is the crossing that a single parse buffer produces. `ESC [` is incomplete, so the
+        parser keeps it and waits for the final byte; the next INPUT line appends to that same
+        buffer. Delivered in pane B's scope, pane A's two leftover bytes are parsed as the start of
+        pane B's sequence — so B's first characters are eaten, or worse, `ESC [ A` (cursor up) is
+        synthesised in B out of bytes A sent. Each pane records what its page actually received,
+        which is what the `keys` check below reads back.
+        """
+        a, b = panes[0][0], panes[1][0]
+        engine.stdin.write(input_line(a, "1b5b"))       # ESC [ — deliberately incomplete
+        engine.stdin.write(input_line(b, "5b5b5b"))     # [[[ in the OTHER pane
+        engine.stdin.flush()
+        print(f"  [probe] t={time.time() - started:.1f}s partial escape to {a}, [[[ to {b}",
+              flush=True)
 
     def repush_first():
         """Re-assert the FIRST pane's visibility after every other pane has pushed its own.
@@ -203,7 +245,8 @@ def main():
                     if (text.startswith("READY ") or text.startswith("@")) and not attached:
                         attached = True
                         send_all()
-                        repush_at = time.time() + (seconds - 3.0) / 2
+                        repush_at = time.time() + (seconds - 3.0) * 0.6
+                        probe_at = time.time() + (seconds - 3.0) * 0.3
                     for pane, _, _, _ in panes:
                         if text.startswith(f"@{pane} AGENT "):
                             sockets[pane] = text.split(" ", 2)[2]
@@ -232,20 +275,42 @@ def main():
             if not attached and time.time() > attach_at:
                 attached = True
                 send_all()
-                repush_at = time.time() + (seconds - 3.0) / 2
+                repush_at = time.time() + (seconds - 3.0) * 0.6
+                probe_at = time.time() + (seconds - 3.0) * 0.3
             if repush_at is not None and time.time() > repush_at:
                 repush_at = None
                 frames_at_repush = {pane: len(frames[pane]) for pane, _, _, _ in panes}
                 repush_first()
+            # The input probe runs on its own tick, well before the end: it makes one agent call per
+            # pane, and riding the re-push tick left the engine shutting down before the INPUT lines
+            # were parsed — measured 1 of 5 delivered.
+            if probe_at is not None and time.time() > probe_at and len(sockets) == len(panes):
+                probe_at = None
+                for pane_, path_ in sockets.items():
+                    recorder_installed[pane_] = agent_call(path_, "eval", {"script": KEY_RECORDER})
+                interleave_input()
+                input_probed = True
             if engine.poll() is not None:
                 break
-            procs, rss = process_tree(engine.pid)
-            peak_procs, peak_rss = max(peak_procs, procs), max(peak_rss, rss)
+            # `ps -eo` over every process on the box, once per loop iteration, made the loop the
+            # slowest thing in the run: a 35s deadline took 94s of wall clock, and control lines
+            # written at t=16.7s were still unparsed when it ended. Sampled once a second instead —
+            # this is a peak-RSS measurement, and Electron does not allocate 500MB between samples.
+            if time.time() - sampled_at >= 1.0:
+                sampled_at = time.time()
+                procs, rss = process_tree(engine.pid)
+                peak_procs, peak_rss = max(peak_procs, procs), max(peak_rss, rss)
         # While the engine is still up: every pane it could not name from the ambient scope fell
         # back to the first pane. Painting can be 5/5 while an unbound entry point still routes one
         # pane's input or session state into another's, and that failure is invisible from out here
         # — the engine is the only thing that can see it, so ask it.
         diags = {pane: ask_diag(path) for pane, path in sockets.items()}
+        keys = {pane: agent_call(path, "eval", {"script": KEY_READBACK})
+                for pane, path in sockets.items()} if input_probed else {}
+        # Whether the listener is still installed at readback. A page that navigated after the
+        # recorder was installed loses it, and an empty key log then means nothing.
+        alive = {pane: agent_call(path, "eval", {"script": "!!window.__twebKeys"})
+                 for pane, path in sockets.items()} if input_probed else {}
     finally:
         try:
             engine.terminate()
@@ -310,11 +375,34 @@ def main():
         if "image evicted from" in line:
             evicted.append(line.split("tweb: ", 1)[-1].strip())
 
+    # Pane B was sent `[[[` and pane A two bytes of an incomplete escape (`ESC [`). One parse buffer
+    # for N panes puts A's leftovers at the front of B's, so B sees a synthesised Escape instead of
+    # its own brackets — measured before the fix: `%11 received '[Escape'`. And A, which typed
+    # nothing complete, must have received nothing at all.
+    crossed_input = []
+    if input_probed and len(panes) >= 2:
+        a, b = panes[0][0], panes[1][0]
+        got_a = (keys.get(a) or {}).get("value") if isinstance(keys.get(a), dict) else keys.get(a)
+        got_b = (keys.get(b) or {}).get("value") if isinstance(keys.get(b), dict) else keys.get(b)
+        if got_b != "[[[":
+            crossed_input.append(f"{b} received {got_b!r}, was sent '[[['")
+        # Pane A correctly ends up with `[Escape`: an ESC-prefixed sequence that never completes is a
+        # real Escape key, so after the 35ms disambiguation window the parser delivers `[` and then
+        # the Escape — to A, which is the pane that sent those bytes. What must not appear in A is a
+        # bracket B typed, and A's own two bytes account for exactly the one it has.
+        if got_a not in ("", "[Escape"):
+            crossed_input.append(f"{a} received {got_a!r}, was sent only a partial escape")
+
     unscoped = 0
     unreachable = [pane for pane, _, _, _ in panes if not diags.get(pane)]
     for report in diags.values():
         if report:
             unscoped = max(unscoped, int(report.get("panes", {}).get("unscopedResolutions", 0)))
+    if input_probed:
+        print(f"  recorder          installed={recorder_installed}, alive={alive}")
+        print(f"  input keys        "
+              + ", ".join(f"{pane}={(keys.get(pane) or {}).get('value', keys.get(pane))!r}"
+                          for pane, _, _, _ in panes[:2]))
     print(f"  evictions         {len(evicted)}"
           + (f"  — {evicted[0]}" if evicted else "  (no client stopped watching)"))
     print(f"  own placement     {count - len(misplaced)}/{count} panes"
@@ -330,7 +418,7 @@ def main():
         print(f"\n  engine said: {others[:4]}")
 
     ok = (painted == count and not crossed and unscoped == 0 and not unreachable
-          and not misplaced and not evicted)
+          and not misplaced and not evicted and not crossed_input)
     reasons = []
     if painted != count:
         reasons.append(f"{count - painted} pane(s) silent")
@@ -344,6 +432,8 @@ def main():
         reasons.append(f"{len(misplaced)} pane(s) hold another pane's tmux placement")
     if evicted:
         reasons.append(f"{len(evicted)} image(s) deleted off a client still watching the pane")
+    if crossed_input:
+        reasons.append(f"input crossed panes ({crossed_input[0]})")
     print(f"\n{'PASS' if ok else 'FAIL'} — "
           + ("every pane rendered its own image in one engine, none resolved by fallback" if ok
              else ", ".join(reasons)))

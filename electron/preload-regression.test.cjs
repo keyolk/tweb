@@ -734,10 +734,12 @@ test("Cmd-V arrives as a bracketed paste rather than typed characters", () => {
   const terminal = fs.readFileSync(path.join(root, "crates/tweb-pane/src/terminal.rs"), "utf8");
   assert.match(terminal, /\\x1b\[\?2004h/);
   assert.match(terminal, /\\x1b\[\?2004l/);
-  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{/);
-  assert.match(main, /if \(paste\.active\) \{/);
+  // The paste state and the parse buffer live on the pane's record — one buffer for N panes crossed
+  // input, measured. `input` is the local handle `consumeRawInput` holds.
+  assert.match(main, /if \(input\.paste\.begins\(input\.raw\)\) \{/);
+  assert.match(main, /if \(input\.paste\.active\) \{/);
   // The ESC-disambiguation timer must not fire into a paste body.
-  assert.match(main, /if \(paste\.begins\(rawInput\)\) \{[\s\S]*?clearTimeout\(rawInputFlushTimer\)/);
+  assert.match(main, /if \(input\.paste\.begins\(input\.raw\)\) \{[\s\S]*?clearTimeout\(input\.flushTimer\)/);
   assert.match(main, /function dispatchPaste\(text\)/);
   // A real paste event carries formatting that insertText cannot.
   assert.match(main, /normalize\(clipboard\.readText\(\)\) === body[\s\S]*?contents\.paste\(\)/);
