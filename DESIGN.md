@@ -1052,11 +1052,22 @@ bytes it is reading. Any replacement for the file medium has to reproduce that f
 rather than merely add distance — a fresh `shm_open` object per frame does; writing in place into a
 preallocated ring does not.
 
-What that would be worth is measured rather than argued. At 2880x1800 and a 30fps cap the file write
-is the only thing discarding frames: roughly a quarter of whole frames are dropped, and a probe that
-skips the write takes `droppedByBackpressure` to zero. Removing the disk from this path is therefore
-the one change with a demonstrated effect on frame throughput — which is what an SHM transfer is, and
-why it needs a native addon this engine does not yet have. DETAIL.md 8.5 has the runs.
+What that would be worth was measured rather than argued, and then bought another way. At 2880x1800
+and a 30fps cap the file write was the only thing discarding frames — roughly a quarter of whole
+frames — and a probe that skipped the write took `droppedByBackpressure` to zero.
+
+The fix is not SHM. The protocol compresses: `o=z` declares a deflated payload and the terminal
+inflates it, so the bytes that reach the disk are the compressed ones. Ghostty 1.3.1 really
+decompresses it (`bench/gfx-deflate.py` proves it by having a corrupt stream rejected), and the
+engine now deflates a whole frame when a sampled ratio says it will pay — which excludes photo
+content, where deflate costs three times the frame budget for a 2x saving. Drops went from ~244 per
+30s to 0.
+
+So the shared-memory transfer stays unbuilt, and now has nothing waiting on it. It would still make
+the write cheaper in absolute terms, but no user-visible number depends on that. DETAIL.md 8.5 has
+the diagnosis and 8.6 the fix; `bench/shm-fd-inherit.py` records why an SHM path could never avoid
+a native addon — a macOS shm object is a mapping rather than a stream, so only `mmap` reaches it and
+Node has no `mmap`, whoever opens the object.
 
 #### The damage and tile strategy
 
