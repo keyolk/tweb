@@ -37,6 +37,8 @@ const {
   frameRateTiers,
   playbackWindowMs,
   settledFrameRate,
+  interactionRate,
+  PLAYBACK_BYTE_BUDGET,
 } = require("./frame-rate-policy.cjs");
 const { isOrphaned, watchedPid, abandonedFrameFiles } = require("./orphan-watch.cjs");
 const {
@@ -232,7 +234,6 @@ const adaptiveFrameRate = configuredAdaptiveFrameRate !== undefined
 const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxActiveFrameRate;
 // See frame-rate-policy.cjs for why playback is its own tier and how it is detected.
 const frameRates = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
-const playbackFrameRate = frameRates.playback;
 const playbackWindow = playbackWindowMs(idleFrameRate);
 // The window/tab and frame-rate state for this pane. Like the frame context, the shipping path
 // has exactly one and runs through it — the ceiling is per-pane because a host serves panes
@@ -625,7 +626,11 @@ let loggedFrameGeneration = -1;
 // Whole frames the worker deflated, against `whole` for the total. The ratio is the only outside
 // view of the sampling decision in `gfx-worker.cjs`: 0 on a text-heavy page means compression
 // silently stopped engaging, which shows up as dropped frames long before anything says why.
-let compressedWholeFrames = 0;
+//
+// Per pane, on the frame context, because a host serves N and the ratio is only meaningful against
+// THAT pane's `whole`. As a module-level counter it summed every pane's compressions and reported
+// the sum to each of them: two panes with wildly different content both read 473, which reads as
+// a working ratio for the idle pane and hides the sampling decision for the playing one.
 const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"));
 gfxWorker.unref();
 
@@ -1230,7 +1235,6 @@ gfxWorker.on("message", (message) => {
     noteRawFrameFailure();
   } else {
     rawFrameFailures = 0;
-    if (message?.compressed) compressedWholeFrames += 1;
   }
   // The completion is routed to the pane whose frame it was, by the key that travelled with the
   // request. A completion applied to the wrong pane would free that pane's image and dispatch
@@ -1243,6 +1247,9 @@ gfxWorker.on("message", (message) => {
     console.error(`tweb: graphics completion for an unknown pane: ${message?.paneKey}`);
     return;
   }
+  // Counted after the routing, not before it: the key is what says whose compression this was,
+  // and a count taken above would land on whichever pane happened to ask for its diag.
+  if (message?.type !== "error" && message?.compressed) frames.compressedWholeFrames += 1;
   // Scoped to the pane the completion belongs to: dispatching the queue reads the frame-rate state
   // and the window, and doing that against another pane's is how one pane's frame lands in
   // another's rectangle.
@@ -1409,7 +1416,12 @@ function markInteractionActivity() {
   // would otherwise leave the last idle frame on screen for a whole interval —
   // a quarter second of "nothing happened" after a keypress.
   const wasIdle = isThrottled(currentWindows());
-  applyActiveFrameRate(maxActiveFrameRate);
+  // Capped while the page is painting on its own. Without this the playback budget holds only
+  // between interactions: a hover, a resize, or the `isLoading` branch below hands the pane the
+  // full rate for the next 700ms, which on a large pane is more than twice the bytes the tier
+  // exists to bound. `invalidate()` below is what makes an interaction feel immediate, and it
+  // still runs — the rate only decides what happens after that first paint.
+  applyActiveFrameRate(interactionRate(currentWindows().settledPainting, currentPlaybackTiers()));
   if (wasIdle && currentWindows().win && !currentWindows().win.isDestroyed() && currentPane().visible) currentWindows().win.webContents.invalidate();
   if (currentWindows().frameIdleTimer) clearTimeout(currentWindows().frameIdleTimer);
   // The paints this interaction is about to cause say nothing about whether the page
@@ -1438,12 +1450,31 @@ function settleFrameRate() {
   // Judge against the paints that arrived over the window just ended, then reset the
   // count. Reading a timestamp instead would count the paint that changing the rate
   // itself provokes, and a static page would hold the playback rate forever.
-  const settled = settledFrameRate(currentWindows().paintsSinceSettle, frameRates);
+  //
+  // The tiers are resolved here rather than at startup because the playback rate depends on
+  // how large this pane is right now, and a pane is resized freely while it runs. A resize
+  // during playback is picked up at the next settle — within the 1.5s window — which is soon
+  // enough for a bound on bytes and avoids a second path that recomputes the rate mid-frame.
+  const settled = settledFrameRate(currentWindows().paintsSinceSettle, currentPlaybackTiers());
   currentWindows().paintsSinceSettle = 0;
+  // Remembered for the interaction path, which has no paint count of its own to judge from.
+  currentWindows().settledPainting = settled.painting;
   applyActiveFrameRate(settled.rate);
   if (settled.painting) {
     currentWindows().frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
   }
+}
+
+// The tiers for THIS pane at its current size.
+//
+// `frameRates` is the startup shape, computed before any viewport exists; this is the one that
+// bounds the bytes. Per pane because a host serves panes of different sizes, and a rate derived
+// from another pane's area is exactly the crossing this engine is careful about elsewhere.
+function currentPlaybackTiers() {
+  const viewport = currentFrames().viewport;
+  if (!viewport) return frameRates;
+  const size = renderedFrameSize(viewport);
+  return frameRateTiers(maxActiveFrameRate, adaptiveFrameRate, size.width * size.height);
 }
 
 // A page can start painting long after the last keystroke — a video begins, an animation
@@ -1452,7 +1483,7 @@ function settleFrameRate() {
 function notePaintActivity() {
   currentWindows().paintsSinceSettle += 1;
   if (!adaptiveFrameRate || currentWindows().frameIdleTimer) return;
-  if (currentWindows().activeFrameRate >= playbackFrameRate) return;
+  if (currentWindows().activeFrameRate >= currentPlaybackTiers().playback) return;
   currentWindows().frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
 }
 
@@ -3203,13 +3234,17 @@ function agentDiagnostics() {
       adaptive: adaptiveFrameRate,
       // All three resolved rates, not just the one in force. The startup banner was the
       // only place they were stated together, and it wrote into tmux's shared status line.
-      tiers: { idle: idleFrameRate, playback: playbackFrameRate, max: maxActiveFrameRate },
+      tiers: {
+        idle: idleFrameRate,
+        playback: currentPlaybackTiers().playback,
+        max: maxActiveFrameRate,
+      },
       // Which of the three adaptive rates is in force. `playback` means the page is
       // painting on its own — a video, an animation — which is what separates "the pane
       // is throttled" from "the page has nothing new to show".
       rateKind: !adaptiveFrameRate ? "fixed"
         : currentWindows().activeFrameRate >= maxActiveFrameRate ? "active"
-          : currentWindows().activeFrameRate >= playbackFrameRate ? "playback" : "idle",
+          : currentWindows().activeFrameRate >= currentPlaybackTiers().playback ? "playback" : "idle",
       droppedByBackpressure: currentFrames().droppedGfxFrames,
       imageId: currentFrames().imageIds.base,
       // How the damage split between the two paths. A pane that feels slow while typing
@@ -3221,8 +3256,17 @@ function agentDiagnostics() {
       // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
       wholeFormat: rawFramesEnabled ? "raw" : "png",
+      // How whole frames reach the terminal, and where the setting came from.
+      //
+      // Reported because setting it is silently a no-op on the hosted path, which is the
+      // default: the engine is spawned by the DAEMON, so `TWEB_FRAME_TRANSPORT` on a pane never
+      // reaches `process.env` here — it is the daemon's value, from whenever the daemon started.
+      // Measured the hard way: an experiment run with the variable set on the pane produced a
+      // fresh engine that still wrote frame files, and nothing anywhere said so.
+      transport: frameTransport,
+      transportFromDaemonEnv: hostedRuntime,
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
-      wholeCompressed: compressedWholeFrames,
+      wholeCompressed: currentFrames().compressedWholeFrames,
     },
     panes: {
       hosted: paneRegistry.size,
@@ -5640,7 +5684,8 @@ app.whenReady().then(async () => {
   // asked for instead: `tweb diag` reports `frames.tiers` and the zoom, and the line
   // below goes to the engine log.
   console.error(`tweb: started ${modeLabel()} — toggle Ctrl-; · frame ${adaptiveFrameRate
-    ? `adaptive ${idleFrameRate}/${playbackFrameRate}/${maxActiveFrameRate}`
+    ? `adaptive ${idleFrameRate}/≤${maxActiveFrameRate} (playback ≤${
+      Math.round(PLAYBACK_BYTE_BUDGET / 1e6)}MB/s)`
     : `fixed ${maxActiveFrameRate}`}fps`
     + ` · zoom ${Math.round(defaultZoomFactor * 100)}%`);
 });

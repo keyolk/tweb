@@ -819,14 +819,60 @@ async fn run_hosted_session(
     let _ = options;
     // The read side blocks, so it goes on its own thread: a frame must not wait behind the input
     // loop or the geometry tick.
-    let reason = tokio::task::spawn_blocking(move || hosted::pump(stream, generation, writer))
-        .await
-        .unwrap_or_else(|err| attach::SpawnReason::HostedSessionLost(err.to_string()));
+    let pump = tokio::task::spawn_blocking(move || hosted::pump(stream, generation, writer));
+
+    // Raced against the pump, because on this path a signal is not merely an exit — it is the
+    // only chance this process gets to clean up after itself.
+    //
+    // The spawn path survives an unhandled Ctrl-C: the engine is this process's child, it dies
+    // with the process group, and its own exit path takes the image off the terminal. A hosted
+    // pane's engine belongs to the DAEMON and outlives it, so everything that undoes what this
+    // pane did to the terminal is code HERE — `write_kitty_delete` at the caller, and
+    // `ScreenGuard`'s Drop leaving the alternate screen. Dying by default action runs neither,
+    // which is what left a dead page's pixels on an alternate screen nothing would exit: the
+    // page vanished, a black screen stayed, and the pane was stuck.
+    //
+    // SIGINT is the one the user presses; SIGTERM and SIGHUP are how a session ending or a
+    // terminal closing arrive, and they leave exactly the same mess. Ending as `None` rather
+    // than a `SpawnReason` is the point — this is a pane that finished, not one that lost its
+    // host and should fall back to spawning an engine.
+    let mut sigint = signal_stream(libc::SIGINT);
+    let mut sigterm = signal_stream(libc::SIGTERM);
+    let mut sighup = signal_stream(libc::SIGHUP);
+    let outcome = tokio::select! {
+        finished = pump => Some(
+            finished.unwrap_or_else(|err| attach::SpawnReason::HostedSessionLost(err.to_string())),
+        ),
+        _ = recv_any(&mut sigint) => None,
+        _ = recv_any(&mut sigterm) => None,
+        _ = recv_any(&mut sighup) => None,
+    };
 
     input_handle.abort();
     state_handle.abort();
     control_handle.abort();
-    Some(reason)
+    outcome
+}
+
+/// A signal stream, or `None` when this process cannot install the handler.
+///
+/// Returning an option rather than panicking: a pane that cannot watch for SIGTERM should still
+/// run. It is the same pane as before this existed — it just loses the tidy exit.
+fn signal_stream(number: i32) -> Option<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(number)).ok()
+}
+
+/// Waits for a signal, or forever when there is no stream to wait on.
+///
+/// `select!` needs every arm to be a future; an absent handler must simply never fire rather
+/// than resolving immediately, which would end the session the moment it started.
+async fn recv_any(stream: &mut Option<tokio::signal::unix::Signal>) {
+    match stream {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn find_tauri() -> Result<std::path::PathBuf> {
