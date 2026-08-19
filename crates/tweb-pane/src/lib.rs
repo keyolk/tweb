@@ -607,10 +607,10 @@ enum HostedOutcome {
 async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
     let socket = twebd::paths::socket_path_in(&twebd::paths::runtime_dir());
     let flag = std::env::var(attach::DAEMON_FLAG).ok();
-    // The flag is checked before anything else is done, so a pane that opted out costs nothing:
-    // no binary lookup, no process spawn, no wait.
-    if !attach::flag_enabled(flag.as_deref()) {
-        return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
+    // Decided BEFORE the daemon is started or consulted: a pane that opted out, or one asking for
+    // something a host cannot do, must cost nothing — no binary lookup, no process spawn, no wait.
+    if let Err(reason) = attach::initial_route(flag.as_deref(), options.restore_session) {
+        return HostedOutcome::Spawn(reason);
     }
     // Nothing else starts the supervisor — no service manager entry, no login hook — so a user who
     // has never run `twebd serve` would otherwise never have one, and every pane would fall back
@@ -619,9 +619,6 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
     if let Err(err) = daemon_autostart::ensure_running(&socket) {
         tracing::debug!(%err, "no twebd for this pane");
         return HostedOutcome::Spawn(attach::SpawnReason::DaemonStartFailed(err));
-    }
-    if let Err(reason) = attach::initial_route(flag.as_deref(), socket.exists()) {
-        return HostedOutcome::Spawn(reason);
     }
     // A pane the daemon cannot name is a pane it cannot key, and its whole identity model is
     // (tmux server, pane id). Outside tmux there is no server identity, so there is nothing to

@@ -35,6 +35,17 @@ pub enum Route {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnReason {
     FlagOff,
+    /// The pane asked for its tmux window session back, which a host cannot give it.
+    ///
+    /// Session restore is keyed on the tmux identity of the process that owns the pane, and a host
+    /// has N panes and one process identity — `resolveWindowSessionPaths` runs off `$TMUX_PANE`,
+    /// which for a hosted engine is the daemon's. So a hosted pane saves no session and restores
+    /// none, and a bare `tweb open` on the daemon path opened `about:blank` and sat there: no
+    /// error, no page, indistinguishable from a hang. Measured on a live pane.
+    ///
+    /// Falling back is the honest answer while that is true. A pane that names a URL is unaffected
+    /// and stays hosted, which is most of them.
+    SessionRestoreUnsupported,
     NoSocket,
     /// The daemon was not running and this process could not start one.
     DaemonStartFailed(String),
@@ -51,6 +62,12 @@ impl std::fmt::Display for SpawnReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FlagOff => write!(f, "{DAEMON_FLAG} is off"),
+            Self::SessionRestoreUnsupported => {
+                write!(
+                    f,
+                    "restoring a tmux window session needs this pane's own engine"
+                )
+            }
             Self::NoSocket => write!(f, "no twebd socket"),
             Self::DaemonStartFailed(err) => write!(f, "cannot start twebd: {err}"),
             Self::ConnectFailed(err) => write!(f, "cannot reach twebd: {err}"),
@@ -70,13 +87,22 @@ pub fn flag_enabled(value: Option<&str>) -> bool {
     !matches!(value, Some("") | Some("0") | Some("false"))
 }
 
-/// The route to take before anything has been sent.
-pub fn initial_route(flag: Option<&str>, socket_exists: bool) -> Result<Route, SpawnReason> {
+/// The route to take before the daemon is started or consulted.
+///
+/// Deliberately does not take the socket's existence: the caller starts a daemon when there is no
+/// socket, so "no socket" is not a reason to fall back until that has been tried. `NoSocket` and
+/// `DaemonStartFailed` are reported by the caller after the attempt.
+///
+/// `restore_session` is the pane asking for its tmux window session back — what a bare `tweb open`
+/// means. A host cannot answer that: the session is keyed on the tmux identity of the process that
+/// owns the pane, and a host has N panes and one identity. Hosting such a pane produced a blank
+/// `about:blank` with no error, which reads as a hang.
+pub fn initial_route(flag: Option<&str>, restore_session: bool) -> Result<Route, SpawnReason> {
     if !flag_enabled(flag) {
         return Err(SpawnReason::FlagOff);
     }
-    if !socket_exists {
-        return Err(SpawnReason::NoSocket);
+    if restore_session {
+        return Err(SpawnReason::SessionRestoreUnsupported);
     }
     Ok(Route::Daemon)
 }
@@ -133,20 +159,38 @@ mod tests {
     // all. Nothing about it is touched on this path: no binary lookup, no spawn, no wait.
     #[test]
     fn an_explicit_off_spawns_an_engine_even_with_a_daemon_running() {
-        assert_eq!(initial_route(Some("0"), true), Err(SpawnReason::FlagOff));
+        assert_eq!(initial_route(Some("0"), false), Err(SpawnReason::FlagOff));
         assert_eq!(
-            initial_route(Some("false"), true),
+            initial_route(Some("false"), false),
             Err(SpawnReason::FlagOff)
         );
-        assert_eq!(initial_route(Some(""), true), Err(SpawnReason::FlagOff));
+        assert_eq!(initial_route(Some(""), false), Err(SpawnReason::FlagOff));
     }
 
     #[test]
-    fn no_daemon_falls_back_rather_than_failing() {
-        assert_eq!(initial_route(None, false), Err(SpawnReason::NoSocket));
-        assert_eq!(initial_route(None, true), Ok(Route::Daemon));
-        assert_eq!(initial_route(Some("1"), false), Err(SpawnReason::NoSocket));
-        assert_eq!(initial_route(Some("1"), true), Ok(Route::Daemon));
+    fn an_ordinary_pane_takes_the_daemon() {
+        assert_eq!(initial_route(None, false), Ok(Route::Daemon));
+        assert_eq!(initial_route(Some("1"), false), Ok(Route::Daemon));
+    }
+
+    // A bare `tweb open` asks for its tmux window session back, and a host cannot give it one: the
+    // session is keyed on the tmux identity of the process that owns the pane, and a host has N
+    // panes and one identity. Hosting such a pane opened `about:blank` and sat there — no error, no
+    // page, indistinguishable from a hang. Measured on a live pane, which is where it was found.
+    #[test]
+    fn a_pane_restoring_its_session_uses_its_own_engine() {
+        assert_eq!(
+            initial_route(None, true),
+            Err(SpawnReason::SessionRestoreUnsupported)
+        );
+        // Even when the daemon was asked for explicitly: the flag says "prefer the daemon", not
+        // "give me a blank page rather than my tabs".
+        assert_eq!(
+            initial_route(Some("1"), true),
+            Err(SpawnReason::SessionRestoreUnsupported)
+        );
+        // The opt-out is checked first, so an off pane reports the reason it actually has.
+        assert_eq!(initial_route(Some("0"), true), Err(SpawnReason::FlagOff));
     }
 
     #[test]
