@@ -118,8 +118,39 @@ def main():
     results = []
     panes = []
     try:
-        print("=== 1. no flag, no daemon: does the pane start one? ===")
-        assert daemon_pid(twebd, runtime) is None, "the runtime dir must start clean"
+        print("=== 0. how long until a pane is hosted and painting? ===")
+        # What the user feels. A pane that is hosted, fails, and falls back pays a whole engine
+        # startup before it starts the one that works — so this number is the difference between
+        # the daemon being a saving and being a tax.
+        cold = time.time()
+        warm_pane, warm_pty = start_pane(tweb, runtime, "%600", "https://example.com")
+        panes.append((warm_pane, warm_pty))
+        hosted_at = None
+        while time.time() - cold < 30:
+            if hosted_count(twebd, runtime) >= 1:
+                hosted_at = time.time() - cold
+                break
+            time.sleep(0.25)
+        print(f"  first pane hosted after {hosted_at if hosted_at else '>30'}s (cold: daemon start too)")
+        results.append(("a cold pane is hosted within 15s", hosted_at is not None and hosted_at < 15))
+
+        second_cold = time.time()
+        warm2, warm2_pty = start_pane(tweb, runtime, "%605", "https://example.com")
+        panes.append((warm2, warm2_pty))
+        warm_at = None
+        while time.time() - second_cold < 30:
+            if hosted_count(twebd, runtime) >= 2:
+                warm_at = time.time() - second_cold
+                break
+            time.sleep(0.25)
+        print(f"  second pane hosted after {warm_at if warm_at else '>30'}s (warm: engine up)")
+        results.append(("a warm pane is hosted within 5s", warm_at is not None and warm_at < 5))
+        for handle in (panes.pop(), panes.pop()):
+            stop(*handle)
+        time.sleep(2)
+
+        print("\n=== 1. no flag, no daemon: does the pane start one? ===")
+
         first, first_pty = start_pane(tweb, runtime, "%601", "https://example.com")
         panes.append((first, first_pty))
         time.sleep(settle)

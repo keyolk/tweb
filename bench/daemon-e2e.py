@@ -49,9 +49,12 @@ def host_request(pane, image_id, url, left, tty, electron, app_dir):
         "protocol": PROTOCOL,
         "image_id": image_id,
         "geometry": {"cols": 80, "rows": 24, "width": 800, "height": 480, "origin": [left, 0]},
-        # Diagnostics only — the daemon does not write pane ttys, it returns the bytes and the
-        # frontend writes them. That is the whole reason frames come back on this connection.
-        "tty": None,
+        # Sent, not omitted. It is diagnostics only — the daemon does not write pane ttys, it
+        # returns the bytes and the frontend writes them — but "the engine must not use this" is
+        # exactly the kind of claim a harness has to exercise. Passing `None` here for months is
+        # what let the engine treat the PATH as a file descriptor: `writeSync` rejected every frame
+        # for every hosted pane, and the null branch this took hid it completely.
+        "tty": tty,
         "engine_executable": electron,
         "engine_app_dir": app_dir,
         "url": url,
@@ -198,6 +201,9 @@ def main():
     # — the registry keys on both halves, so this cannot collide with the user's own panes.
     panes = [(f"%{500 + i}", IMAGE_ID_BASE + i * IMAGE_ID_STRIDE, urls[i % len(urls)], i * 810)
              for i in range(count)]
+    # A plausible tty path per pane. It is never opened by anything here — that is the point: the
+    # engine must not open it either, and a harness that omits the field cannot say so.
+    ttys_of = {pane: f"/dev/ttys{700 + i}" for i, (pane, _, _, _) in enumerate(panes)}
 
     runtime = os.environ.get("TWEB_E2E_RUNTIME_DIR", "/tmp/tweb-daemon-e2e")
     os.makedirs(runtime, exist_ok=True)
@@ -237,7 +243,7 @@ def main():
         others = [(image_id, pane) for pane, image_id, _, _ in panes]
         for pane, image_id, url, left in panes:
             conn = PaneConn(socket_path, pane, image_id)
-            conn.send(host_request(pane, image_id, url, left, None, electron, app_dir))
+            conn.send(host_request(pane, image_id, url, left, ttys_of[pane], electron, app_dir))
             conns.append(conn)
             # The engine is spawned on the first host request and the READY handshake has a 10s
             # budget, so the first response can take seconds. Reading here rather than after the
