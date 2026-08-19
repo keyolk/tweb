@@ -1204,3 +1204,46 @@ test("the composition surface stays faint enough to be furniture", () => {
   assert.match(surface, /rgba\(24,24,27,\.42\)/);
   assert.match(surface, /rgba\(255,255,255,\.42\)/);
 });
+
+// A renderer crash reloads the page and it paints again — but the reload's preload sometimes
+// never registers, and then every key is dropped while the page looks fine. Observed on a real
+// pane: `shortcut frames=0 ready=0` for minutes after `loaded`, with no way out but a manual
+// reload. Nothing noticed, because a dropped key is silent.
+test("undeliverable shortcuts repair themselves", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // The drop is what starts the repair: it is the only evidence delivery is broken.
+  const send = main.slice(main.indexOf("function sendToFocusedTabFrame(tab, channel"),
+    main.indexOf("// The preload receives the two flags separately"));
+  assert.match(send, /repairShortcutDelivery\(tab\);/);
+
+  const repair = main.slice(main.indexOf("function repairShortcutDelivery(tab)"),
+    main.indexOf("function sendToFocusedTabFrame(tab, channel"));
+  // A ping first. Ready-gating is this file's bookkeeping, not an Electron rule — send always
+  // works, and a live preload answering re-registers itself.
+  assert.match(repair, /frame\.send\("tweb-are-you-there"\)/);
+  // A page mid-load has not had its chance to register yet; reloading would cancel the very
+  // navigation about to fix things.
+  assert.match(repair, /contents\.isLoading\(\)/);
+  // Silence means no preload is there, so the page needs reloading to get one...
+  assert.match(repair, /tab\.webContents\.reload\(\)/);
+  // ...but not forever: a page that crashes on load would otherwise reload in a loop.
+  assert.match(repair, /state\.reloads >= MAX_SHORTCUT_RELOADS/);
+  // And an answered ping must not also reload.
+  assert.match(repair, /if \(readyFrameKeys\(tab\)\.has\(frameKey\(tab\.webContents\.mainFrame\)\)\)/);
+
+  // The preload's half: the same registration it sends at startup, which is idempotent.
+  assert.match(electron, /ipcRenderer\.on\("tweb-are-you-there", \(\) => \{/);
+  const answer = electron.slice(electron.indexOf('ipcRenderer.on("tweb-are-you-there"'));
+  assert.match(answer.slice(0, 200), /ipcRenderer\.send\("tweb-preload-ready", \{ shortcutFrame \}\)/);
+});
+
+// Both sets are keyed by frame and go stale together, but only one was pruned on navigation.
+// A leftover shortcut key makes the sender believe a dead frame can take shortcuts, so it
+// skips the fall-back to the main frame and drops the key instead.
+test("navigation prunes both frame sets, not just the ready one", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const navigation = main.slice(main.indexOf('onContents("did-start-navigation"'));
+  const body = navigation.slice(0, navigation.indexOf("onContents(\"context-menu\""));
+  assert.match(body, /readyFrameKeys\(tab\)\.delete\(key\);/);
+  assert.match(body, /shortcutFrameKeys\(tab\)\.delete\(key\);/);
+});

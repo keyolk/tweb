@@ -4052,6 +4052,20 @@ installPrintShim();
   if (document.documentElement) initializeDocument();
   else addEventListener("DOMContentLoaded", initializeDocument, { once: true });
 
+  // How a preload that is alive but unregistered gets itself back on the books.
+  //
+  // The engine drops a key when the frame it would go to is not in its ready set, and after
+  // a renderer crash and reload that set can end up empty while this preload is running
+  // perfectly well — the page paints, the mode badge is there, and every shortcut is
+  // silently discarded. The engine pings on a dropped key; answering with the same
+  // registration it would have sent at startup is the whole repair.
+  //
+  // Safe to answer more than once: `tweb-preload-ready` is idempotent on the engine side —
+  // it sets membership in two sets by frame key rather than accumulating anything.
+  ipcRenderer.on("tweb-are-you-there", () => {
+    ipcRenderer.send("tweb-preload-ready", { shortcutFrame });
+  });
+
   // Register only after every listener above is installed. Main then targets
   // this frame for IPC broadcasts without racing preload initialization.
   // Report whether this frame can run TWeb shortcuts. A cross-origin subframe

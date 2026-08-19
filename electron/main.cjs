@@ -2522,6 +2522,70 @@ function sendToMainTabFrame(tab, channel, ...args) {
   }
 }
 
+// Bringing a tab's main frame back into the ready set after it fell out of it.
+//
+// A renderer crash is recoverable — `render-process-gone` reloads the page and it paints
+// again — but the reload's preload sometimes never registers, and then every key is dropped
+// while the page looks perfectly fine. Observed on a real pane: `shortcut frames=0 ready=0`
+// for minutes after `loaded`, with the user's only recourse being to reload by hand.
+//
+// The ready set is this file's own bookkeeping, not an Electron restriction: `frame.send()`
+// is always allowed and a send with no listener on the other end is harmless. So the repair
+// is a ping. A preload that is alive answers it and re-registers itself, which fixes the case
+// where only the bookkeeping was lost. Silence past the deadline means there is no preload
+// there at all, and the page has to be reloaded to get one.
+const RECOVERY_PING_MS = 1200;
+// Reloading in a loop would be worse than the defect it repairs: a page that crashes its
+// renderer on load would reload forever. `render-process-gone` already has a limiter for
+// exactly this; this is the same idea for the path that never raised an event.
+const MAX_SHORTCUT_RELOADS = 2;
+const shortcutRecoveryByTab = new WeakMap();
+
+function shortcutRecoveryState(tab) {
+  let state = shortcutRecoveryByTab.get(tab);
+  if (!state) {
+    state = { pinging: false, reloads: 0 };
+    shortcutRecoveryByTab.set(tab, state);
+  }
+  return state;
+}
+
+// Called from the drop path, so a dropped key is what starts the repair.
+function repairShortcutDelivery(tab) {
+  const state = shortcutRecoveryState(tab);
+  if (state.pinging) return;
+  const contents = tab.webContents;
+  // A page that is still loading has not had the chance to register yet, and its
+  // `tweb-preload-ready` is on the way. Reloading it here would cancel the very navigation
+  // that is about to fix things.
+  if (contents.isLoading()) return;
+  const frame = contents.mainFrame;
+  if (!frame || frame.isDestroyed() || frame.detached) return;
+  state.pinging = true;
+  try {
+    frame.send("tweb-are-you-there");
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: shortcut ping failed: ${error.message}`);
+  }
+  setTimeout(() => {
+    state.pinging = false;
+    if (tab.isDestroyed()) return;
+    // Answered, and the reply path re-registered the frame. Nothing more to do.
+    if (readyFrameKeys(tab).has(frameKey(tab.webContents.mainFrame))) {
+      state.reloads = 0;
+      return;
+    }
+    if (state.reloads >= MAX_SHORTCUT_RELOADS) {
+      console.error("tweb: shortcuts still undeliverable after"
+        + ` ${state.reloads} reload(s); not reloading again`);
+      return;
+    }
+    state.reloads += 1;
+    console.error(`tweb: no preload answered; reloading to restore shortcuts (${state.reloads})`);
+    tab.webContents.reload();
+  }, RECOVERY_PING_MS);
+}
+
 function sendToFocusedTabFrame(tab, channel, ...args) {
   if (!tab || tab.isDestroyed()) return;
   try {
@@ -2535,11 +2599,17 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
     // simply stop working until focus happened to return to the main frame.
     if (frame && !shortcutFrameKeys(tab).has(frameKey(frame))) frame = contents.mainFrame;
     const deliverable = frame && readyFrameKeys(tab).has(frameKey(frame));
-    if (debugLogging && !deliverable) {
-      console.error(`tweb: dropped ${channel}; shortcut frames=${shortcutFrameKeys(tab).size}`
-        + ` ready=${readyFrameKeys(tab).size}`);
+    if (!deliverable) {
+      if (debugLogging) {
+        console.error(`tweb: dropped ${channel}; shortcut frames=${shortcutFrameKeys(tab).size}`
+          + ` ready=${readyFrameKeys(tab).size}`);
+      }
+      // A dropped key is the signal that delivery is broken — nothing else notices, which
+      // is why this went unrepaired until a user reported it.
+      repairShortcutDelivery(tab);
+      return;
     }
-    if (deliverable) frame.send(channel, ...args);
+    frame.send(channel, ...args);
   } catch (error) {
     if (debugLogging) console.error(`tweb: focused frame send failed: ${error.message}`);
   }
@@ -4287,7 +4357,12 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 
   onContents("did-start-navigation", (details) => {
     if (details.isSameDocument || !details.frame) return;
-    readyFrameKeys(tab).delete(frameKey(details.frame));
+    const key = frameKey(details.frame);
+    readyFrameKeys(tab).delete(key);
+    // Both sets are keyed the same way and go stale the same way, but only the ready set was
+    // pruned here. A leftover shortcut key makes `sendToFocusedTabFrame` believe a dead frame
+    // can take shortcuts, so it skips the fall-back to the main frame and drops the key.
+    shortcutFrameKeys(tab).delete(key);
     // A new document has no find session behind it. Carrying the old flag over would send
     // the next query as a follow-up to a session that no longer exists, and Chromium
     // answers that with silence — the exact failure this state exists to prevent.
