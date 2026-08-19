@@ -72,8 +72,54 @@ const PATCH_ID_COUNT: u32 = 8;
 /// (SIGHUP) and a plain `kill`; they were just never the answer to this.
 const CTRL_C: u8 = 0x03;
 
+/// Ctrl-C as a MODIFIED-KEY sequence, which is how it actually arrives here.
+///
+/// `terminal_setup` asks the terminal for modified keys — `CSI > 4 ; 2 m` inside tmux, Kitty
+/// flags outside it — because the page needs to tell `Ctrl-[` from `Escape` and friends. The
+/// consequence is that the interrupt character stops arriving as `0x03`: the terminal encodes it
+/// as `CSI 99 ; 5 u`, unicode 99 (`c`) with modifier 5 (control).
+///
+/// Measured on the real thing, which is the only reason this is here: a pane logged
+/// `input 1b5b39393b3575` for a keypress a byte-only check ignored, so Ctrl-C did nothing until
+/// the user pressed it enough times to hit something else. A harness that types `0x03` into a
+/// PTY never sees this, because nothing there turned modified keys on.
+const CTRL_C_MODIFIED: &[u8] = b"\x1b[99;5u";
+
+/// The same key with other modifiers alongside control — Ctrl-Shift-C, Ctrl-Alt-C and so on.
+///
+/// The modifier is a bitfield plus one: 5 is control, 6 adds shift, 7 adds alt. Only the control
+/// bit is required, so this matches the prefix and checks the bit rather than listing the
+/// combinations. Ctrl-Shift-C is a copy shortcut in many terminals and never reaches us, but a
+/// pane must not depend on which combinations a terminal happens to intercept.
+const CTRL_C_MODIFIED_PREFIX: &[u8] = b"\x1b[99;";
+
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Whether `chunk` at `index` begins a modified-key Ctrl-C, and how many bytes it spans.
+///
+/// `CSI 99 ; <modifier> u`, accepted for any modifier whose control bit is set. Returns `None`
+/// when this is not that sequence, so the caller can carry on scanning byte by byte.
+fn modified_ctrl_c_at(chunk: &[u8], index: usize) -> Option<usize> {
+    let rest = &chunk[index..];
+    if !rest.starts_with(CTRL_C_MODIFIED_PREFIX) {
+        return None;
+    }
+    let after = &rest[CTRL_C_MODIFIED_PREFIX.len()..];
+    let digits = after
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 || after.get(digits) != Some(&b'u') {
+        return None;
+    }
+    let modifier: u32 = std::str::from_utf8(&after[..digits]).ok()?.parse().ok()?;
+    // The wire value is the bitfield plus one; bit 0 of the bitfield is control.
+    if modifier == 0 || (modifier - 1) & 0b100 == 0 {
+        return None;
+    }
+    Some(CTRL_C_MODIFIED_PREFIX.len() + digits + 1)
+}
 
 /// Tracks whether the bytes arriving are the user typing or a paste being delivered.
 ///
@@ -106,8 +152,17 @@ impl PasteTracker {
                 index += PASTE_END.len();
                 continue;
             }
-            if !self.inside && chunk[index] == CTRL_C {
-                return true;
+            if !self.inside {
+                if chunk[index] == CTRL_C {
+                    return true;
+                }
+                if modified_ctrl_c_at(chunk, index).is_some() {
+                    return true;
+                }
+            }
+            if let Some(span) = modified_ctrl_c_at(chunk, index) {
+                index += span;
+                continue;
             }
             index += 1;
         }
@@ -1188,6 +1243,43 @@ mod tests {
         let mut paste = PasteTracker::default();
         assert!(paste.typed_interrupt(b"\x03"));
         assert!(paste.typed_interrupt(b"ab\x03cd"), "mid-chunk counts too");
+    }
+
+    // THE BYTES A REAL PANE ACTUALLY SENDS. `terminal_setup` turns modified keys on, so the
+    // terminal encodes the interrupt character rather than sending 0x03 — and a byte-only check
+    // ignored it completely. Taken verbatim from a pane's log: `input 1b5b39393b3575`.
+    #[test]
+    fn a_modified_key_ctrl_c_is_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        assert!(paste.typed_interrupt(b"\x1b[99;5u"), "CSI 99;5u is Ctrl-C");
+        assert!(
+            paste.typed_interrupt(b"\x1b[99;6u"),
+            "Ctrl-Shift-C still has the control bit"
+        );
+        assert!(paste.typed_interrupt(b"\x1b[99;7u"), "Ctrl-Alt-C too");
+    }
+
+    #[test]
+    fn the_same_key_without_control_is_not_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        // Modifier 1 is no modifiers, 2 is shift — a plain `c` or `C` must reach the page.
+        assert!(!paste.typed_interrupt(b"\x1b[99;1u"));
+        assert!(!paste.typed_interrupt(b"\x1b[99;2u"));
+        // And a different key with control is not this one.
+        assert!(
+            !paste.typed_interrupt(b"\x1b[100;5u"),
+            "Ctrl-D is not Ctrl-C"
+        );
+    }
+
+    #[test]
+    fn a_pasted_modified_ctrl_c_is_not_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        assert!(!paste.typed_interrupt(b"\x1b[200~\x1b[99;5u\x1b[201~"));
+        assert!(
+            paste.typed_interrupt(b"\x1b[99;5u"),
+            "and a real one after it counts"
+        );
     }
 
     #[test]

@@ -39,6 +39,10 @@ import sys
 import time
 
 FAKE_TMUX = "/tmp/tweb-interrupt-probe,999999,0"
+# Which encoding of Ctrl-C to type. `raw` is the 0x03 byte; `modified` is what a terminal with
+# modified keys enabled sends, which is what a real pane sees — `TWEB_CTRL_C_FORM` picks.
+CTRL_C_FORM = (b"\x1b[99;5u" if os.environ.get("TWEB_CTRL_C_FORM", "modified") == "modified"
+               else b"\x03")
 PANE = "%901"
 
 
@@ -105,9 +109,12 @@ def main():
             except (BlockingIOError, OSError):
                 break
 
-        # The real event: the byte a raw-mode terminal delivers for Ctrl-C. Written to the PTY
-        # master, which is where a keypress enters.
-        os.write(primary, b"\x03")
+        # The real event. Note there are TWO of them, and only sending the first is how this
+        # harness passed while the key did nothing in a real pane: `terminal_setup` asks the
+        # terminal for modified keys, after which Ctrl-C arrives as `CSI 99;5u` rather than as
+        # `0x03`. Nothing in a bare PTY turns that on, so the harness has to send both forms —
+        # the byte for the plain case, and the sequence for the one users actually get.
+        os.write(primary, CTRL_C_FORM)
         exited = None
         try:
             exited = pane.wait(timeout=15)
