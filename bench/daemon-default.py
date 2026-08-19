@@ -58,6 +58,7 @@ def hosted_count(twebd, runtime):
 
 
 def start_pane(tweb, runtime, pane_id, url, flag=None):
+    """`url=None` runs a bare `tweb open`, which asks for the tmux window session back."""
     """`tweb __pane` on a real PTY, as a tmux pane would run it.
 
     A PTY and not a pipe: the frontend probes for graphics support by reading the terminal, enters
@@ -77,9 +78,10 @@ def start_pane(tweb, runtime, pane_id, url, flag=None):
     else:
         env["TWEB_DAEMON"] = flag
 
+    argv = [tweb, "__pane"] + ([url] if url is not None else [])
     primary, secondary = pty.openpty()
     process = subprocess.Popen(
-        [tweb, "__pane", url], env=env,
+        argv, env=env,
         stdin=secondary, stdout=secondary, stderr=open(os.path.join(runtime, f"pane{pane_id[1:]}.err"), "wb"),
         start_new_session=True,
     )
@@ -198,9 +200,23 @@ def main():
         results.append(("a stale socket does not stop a pane starting a daemon",
                         revived is not None and revived != killed))
 
-        print("\n=== 5. the daemon outlives the pane that started it ===")
-        stop(*panes[-1])
-        panes[-1] = (None, None)
+        print("\n=== 5. a bare `tweb open` is NOT hosted ===")
+        # It asks for the tmux window session back, which a host cannot give: the session is keyed
+        # on the tmux identity of the process owning the pane, and a host has N panes and one
+        # identity. Hosting it opened `about:blank` and sat there — no error, no page, and a user
+        # reported it as a hang. Falling back is the honest answer while that is true.
+        before_bare = hosted_count(twebd, runtime)
+        bare, bare_pty = start_pane(tweb, runtime, "%606", None)
+        panes.append((bare, bare_pty))
+        time.sleep(settle)
+        after_bare = hosted_count(twebd, runtime)
+        print(f"  hosted panes {before_bare} -> {after_bare}")
+        results.append(("a session-restoring pane uses its own engine",
+                        after_bare == before_bare))
+
+        print("\n=== 6. the daemon outlives the pane that started it ===")
+        stop(*panes[-2])
+        panes[-2] = (None, None)
         time.sleep(3)
         alive = daemon_pid(twebd, runtime)
         print(f"  daemon pid   {alive} after the starting pane exited")
