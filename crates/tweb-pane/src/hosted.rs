@@ -39,6 +39,9 @@ pub struct HostRequest<'a> {
     pub frame_rate: u16,
     pub adaptive_frame_rate: bool,
     pub restore_session: bool,
+    /// The pane's tmux window identity, for the hosted engine's window-session slot. Probed by this
+    /// process because the query needs a pane id, and the only one a host has is the daemon's.
+    pub session_identity: Option<Box<twebd::protocol::TmuxWindowIdentity>>,
     /// Measured here because a hosted engine cannot measure it: measurement reads `$TMUX_PANE`,
     /// and a hosted engine's own is the daemon's pane, not any of the N it serves.
     pub geometry: twebd::protocol::PaneGeometry,
@@ -78,6 +81,7 @@ pub fn connect_and_host(
         frame_rate: request.frame_rate,
         adaptive_frame_rate: request.adaptive_frame_rate,
         restore_session: request.restore_session,
+        session_identity: request.session_identity.clone(),
     });
     writer
         .write_all(line.as_bytes())

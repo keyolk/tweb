@@ -58,6 +58,11 @@ pub struct OpenRequest<'a> {
     /// *frontend* writes them, because it is already the sole writer of that pty.
     pub tty: Option<&'a str>,
     pub url: &'a str,
+    /// The pane's tmux window identity, sent on its own `SESSION` line before the `ATTACH`.
+    ///
+    /// Not another ATTACH field: that line ends in a url which takes the rest of it, so nothing can
+    /// be appended after it without making the url unparseable.
+    pub session_identity: Option<&'a crate::protocol::TmuxWindowIdentity>,
 }
 
 /// What an absent optional field looks like on the wire.
@@ -73,6 +78,35 @@ pub const ABSENT: &str = "-";
 /// placement yet must leave the anchor alone, and collapsing the two would jump it to the corner
 /// on every cold start.
 pub const ORIGIN_UNMEASURED: &str = "-1 -1";
+
+/// The `SESSION` line for a pane, or empty when it has no tmux window identity.
+///
+/// Hex-encoded and tab-separated in the field order `tmux display-message` gives them — the same
+/// order the per-pane engine reads from its own probe, so both paths build the same object. Hex
+/// because a session name or a socket path can hold anything, including the tab this splits on.
+///
+/// Written immediately before the `ATTACH` it belongs to, which is how the engine pairs them: the
+/// pane it names is not registered yet, so neither line can resolve through the registry.
+pub fn session_line(request: &OpenRequest<'_>) -> String {
+    let Some(identity) = request.session_identity else {
+        return String::new();
+    };
+    let joined = [
+        identity.socket_path.as_str(),
+        identity.server_started_at.as_str(),
+        identity.session.as_str(),
+        identity.window_id.as_str(),
+        identity.window_index.as_str(),
+        identity.pane.as_str(),
+    ]
+    .join("\t");
+    let hex = joined
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    control_line(request.pane, &format!("SESSION {hex}"))
+}
 
 pub fn open_line(request: &OpenRequest<'_>) -> String {
     let origin = request.geometry.origin.map_or_else(
@@ -221,6 +255,68 @@ pub fn decode_hex(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// An open request with no session identity. The two SESSION tests differ only in that field.
+    fn open_request() -> OpenRequest<'static> {
+        OpenRequest {
+            pane: "%3",
+            tmux_server: "/tmp/tmux-501/default,1,0",
+            generation: Generation(7),
+            image_id: 4242,
+            frame_rate: 30,
+            adaptive_frame_rate: true,
+            restore_session: false,
+            geometry: geometry(),
+            tty: Some("/dev/ttys004"),
+            url: "https://example.com",
+            session_identity: None,
+        }
+    }
+
+    // The SESSION line is what gives a hosted pane a window session at all, and it has to be paired
+    // with its ATTACH: the engine holds the identity by pane id until the attach consumes it, so an
+    // attach that arrived first would claim no slot. Hex because a session name or a socket path can
+    // hold anything, including the tab this splits on.
+    #[test]
+    fn a_session_line_carries_the_tmux_window_identity_hex_encoded() {
+        let identity = crate::protocol::TmuxWindowIdentity {
+            socket_path: "/tmp/tmux-501/default".into(),
+            server_started_at: "1787113363".into(),
+            session: "dashboard".into(),
+            window_id: "@20".into(),
+            window_index: "2".into(),
+            pane: "%3".into(),
+        };
+        let mut request = open_request();
+        request.session_identity = Some(&identity);
+        let line = session_line(&request);
+        assert!(line.starts_with("@%3 SESSION "), "{line}");
+        assert!(
+            line.ends_with('\n'),
+            "the engine reads this a line at a time"
+        );
+
+        let hex = line
+            .trim_end()
+            .strip_prefix("@%3 SESSION ")
+            .expect("the address and keyword");
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect();
+        let decoded = String::from_utf8(bytes).expect("utf8");
+        assert_eq!(
+            decoded, "/tmp/tmux-501/default\t1787113363\tdashboard\t@20\t2\t%3",
+            "field order must match what the per-pane engine reads from its own probe"
+        );
+    }
+
+    // No identity means no line at all, rather than an empty one: a pane outside tmux, or a frontend
+    // built before this, simply has no window session — which is what every hosted pane had before.
+    #[test]
+    fn a_pane_without_a_tmux_identity_sends_no_session_line() {
+        assert_eq!(session_line(&open_request()), "");
+    }
+
     #[test]
     fn a_control_line_is_the_single_pane_body_with_an_address_in_front() {
         assert_eq!(
@@ -260,6 +356,7 @@ mod tests {
             geometry: geometry(),
             tty: Some("/dev/ttys004"),
             url: "https://example.com/a b",
+            session_identity: None,
         });
         assert_eq!(
             line,
@@ -286,6 +383,7 @@ mod tests {
             },
             tty: None,
             url: "https://example.com",
+            session_identity: None,
         });
         assert_eq!(
             line,
@@ -315,6 +413,7 @@ mod tests {
             },
             tty: Some(""),
             url: "https://example.com/a b c",
+            session_identity: None,
         });
         let body = line
             .trim_end()

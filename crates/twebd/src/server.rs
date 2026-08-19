@@ -161,6 +161,7 @@ pub async fn dispatch(
             frame_rate,
             adaptive_frame_rate,
             restore_session,
+            session_identity,
         } => {
             if let Some(reason) = protocol_refusal(protocol) {
                 return refused(
@@ -205,6 +206,7 @@ pub async fn dispatch(
                         geometry,
                         tty: tty.as_deref(),
                         url: &url,
+                        session_identity: session_identity.as_deref(),
                     },
                     now_ms,
                 )
@@ -688,6 +690,7 @@ mod tests {
             frame_rate: 30,
             adaptive_frame_rate: true,
             restore_session: false,
+            session_identity: None,
         }
     }
 

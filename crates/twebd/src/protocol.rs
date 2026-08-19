@@ -26,6 +26,21 @@ use tweb_core::page::PaneId;
 /// `READY 1` is refused, and refusal means the pane spawns its own engine and works.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// The tmux window a pane's saved session belongs to.
+///
+/// Every field is load-bearing: the session key is a hash of the socket path, the session name and
+/// the window index, and the legacy key adds the server start time and the window id. A partial
+/// identity would silently disable session restore rather than fail, so the engine refuses one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxWindowIdentity {
+    pub socket_path: String,
+    pub server_started_at: String,
+    pub session: String,
+    pub window_id: String,
+    pub window_index: String,
+    pub pane: String,
+}
+
 /// A pane's viewport and where it sits in the terminal window.
 ///
 /// Carried in `host` rather than left to the engine because a hosted engine has no `$TMUX_PANE` of
@@ -169,6 +184,20 @@ pub enum Request {
         frame_rate: u16,
         adaptive_frame_rate: bool,
         restore_session: bool,
+        /// The pane's tmux window identity, for the window-session slot.
+        ///
+        /// Measured by the frontend for the same reason the geometry is: the slot is keyed on a
+        /// tmux WINDOW, and a hosted engine reads `$TMUX_PANE` to find its own — which is the
+        /// daemon's. Without this a hosted pane has no session at all, and a bare `tweb open`
+        /// (which means "restore this window's tabs") opened `about:blank` and sat there.
+        ///
+        /// `None` outside tmux, or from a frontend built before this: the pane then has no window
+        /// session, which is what every hosted pane had until now.
+        ///
+        /// Boxed because six strings inline made `Host` far larger than every other variant, and
+        /// every `Request` on this wire — a keystroke's `Control` included — would carry that size.
+        #[serde(default)]
+        session_identity: Option<Box<TmuxWindowIdentity>>,
     },
     /// One control line for an already-hosted pane — `RESIZE …`, `VIS …`, `INPUT …`, verbatim in
     /// the grammar the single-pane engine already parses.
@@ -401,6 +430,7 @@ mod tests {
                 frame_rate: 30,
                 adaptive_frame_rate: true,
                 restore_session: false,
+                session_identity: None,
             },
             Request::Control {
                 pane: pane_ref("%3", "srv"),
@@ -462,6 +492,7 @@ mod tests {
             frame_rate: 30,
             adaptive_frame_rate: false,
             restore_session: true,
+            session_identity: None,
         });
         let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(value["kind"], "host");

@@ -269,7 +269,14 @@ impl EngineHost {
         open: &engine_wire::OpenRequest<'_>,
         now_ms: u64,
     ) -> std::result::Result<(), String> {
-        let line = engine_wire::open_line(open);
+        // The session line first, and in the same write as the attach below, so the two cannot be
+        // separated by another pane's traffic: the engine holds the identity by pane id until the
+        // attach consumes it, and an attach that arrived first would claim no slot at all.
+        let line = format!(
+            "{}{}",
+            engine_wire::session_line(open),
+            engine_wire::open_line(open)
+        );
         let needs_start = {
             let mut inner = self.inner.lock();
             if let EngineState::Unavailable { reason } = &inner.state {
@@ -670,6 +677,7 @@ mod tests {
                     },
                     tty: None,
                     url: "https://example.com",
+                    session_identity: None,
                 },
                 0,
             )
@@ -785,6 +793,7 @@ mod tests {
             },
             tty: Some("/dev/ttys004"),
             url: "https://example.com",
+            session_identity: None,
         }
     }
 

@@ -37,6 +37,17 @@ import time
 # both halves, so nothing here can collide with the user's own panes.
 FAKE_TMUX = "/tmp/tweb-daemon-default-probe,999999,0"
 
+# Whether this run can exercise the window-session slot.
+#
+# The slot is keyed on a real tmux window, and the frontend refuses a partial identity rather than
+# sending one — a half identity would disable session restore silently instead of visibly. The pane
+# ids here are fabricated, so `tmux display-message -t %601` answers with empty session and window
+# fields and there is no identity to send. That is the code behaving correctly, not a defect, so the
+# slot check reports itself as not exercised rather than failing.
+#
+# Set TWEB_REAL_TMUX_PANE to a live pane id to exercise it for real.
+REAL_PANE = os.environ.get("TWEB_REAL_TMUX_PANE")
+
 
 def daemon_pid(twebd, runtime):
     """The running daemon's pid, or None. Read from `twebd status`, not from `pgrep`."""
@@ -109,13 +120,22 @@ def main():
         print(__doc__)
         return 2
     tweb, twebd = sys.argv[1], sys.argv[2]
-    settle = float(sys.argv[3]) if len(sys.argv) > 3 else 12.0
+    # A cold run pays a daemon start AND an Electron start before the first pane reports hosted, and
+    # a page has to commit before the engine registers. 10s was enough most of the time and not all
+    # of the time, which is the worst kind of harness: a real regression and a slow machine look the
+    # same. The timing checks above measure the actual cost (0.5s cold, 0.3s warm), so this only has
+    # to be comfortably above it.
+    settle = float(sys.argv[3]) if len(sys.argv) > 3 else 15.0
 
     runtime = os.environ.get("TWEB_DEFAULT_RUNTIME_DIR", "/tmp/tweb-daemon-default")
     shutil.rmtree(runtime, ignore_errors=True)
     os.makedirs(runtime, exist_ok=True)
     # `twebd` has to be findable the way a pane finds it: beside the `tweb` that is running.
     os.environ["TWEB_TWEBD"] = twebd
+    # Exported rather than set per-pane: the daemon inherits it when a pane starts one, and the
+    # engine the daemon spawns inherits it in turn. Setting it only on the pane leaves the engine
+    # writing into the user's real profile.
+    os.environ["TWEB_USER_DATA_DIR"] = os.path.join(runtime, "ud")
 
     results = []
     panes = []
@@ -200,19 +220,38 @@ def main():
         results.append(("a stale socket does not stop a pane starting a daemon",
                         revived is not None and revived != killed))
 
-        print("\n=== 5. a bare `tweb open` is NOT hosted ===")
-        # It asks for the tmux window session back, which a host cannot give: the session is keyed
-        # on the tmux identity of the process owning the pane, and a host has N panes and one
-        # identity. Hosting it opened `about:blank` and sat there — no error, no page, and a user
-        # reported it as a hang. Falling back is the honest answer while that is true.
+        print("\n=== 5. a bare `tweb open` IS hosted, and gets a session slot ===")
+        # It asks for the tmux window session back, which is the commonest way to run tweb. It was
+        # refused for a while — a host had no session to give — and that sent almost every pane back
+        # to its own engine, making the daemon a tax rather than a saving. The identity now travels
+        # on the `SESSION` line, so this pane is hosted like any other.
         before_bare = hosted_count(twebd, runtime)
         bare, bare_pty = start_pane(tweb, runtime, "%606", None)
         panes.append((bare, bare_pty))
         time.sleep(settle)
         after_bare = hosted_count(twebd, runtime)
         print(f"  hosted panes {before_bare} -> {after_bare}")
-        results.append(("a session-restoring pane uses its own engine",
-                        after_bare == before_bare))
+        results.append(("a session-restoring pane is hosted too",
+                        after_bare == before_bare + 1))
+
+        # And the slot is real: the engine claimed one for this pane, which is what makes the tabs
+        # come back rather than a blank page. A claim file per hosted pane is the evidence.
+        # The engine inherits its user-data dir from the DAEMON's environment, not the pane's — the
+        # daemon is a separate process the pane starts, and `TWEB_USER_DATA_DIR` set for the pane
+        # never reaches it. So the claims land wherever the daemon was started with, which for this
+        # harness is the same value it exports before starting anything.
+        claims = []
+        user_data = os.path.join(os.environ["TWEB_USER_DATA_DIR"], "window-sessions")
+        if os.path.isdir(user_data):
+            claims = [name for name in os.listdir(user_data) if name.endswith(".claim")]
+        if REAL_PANE:
+            print(f"  session claims {len(claims)}")
+            results.append(("a hosted pane claims a window-session slot", len(claims) >= 1))
+        else:
+            # Says so rather than passing: a check with no subject must not read as a check that
+            # passed. See REAL_PANE above for why these pane ids cannot produce an identity.
+            print(f"  session claims {len(claims)}  (fabricated pane ids — not exercised;"
+                  f" set TWEB_REAL_TMUX_PANE to run it)")
 
         print("\n=== 6. the daemon outlives the pane that started it ===")
         stop(*panes[-2])

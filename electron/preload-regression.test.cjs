@@ -171,12 +171,14 @@ test("bare open never restores or saves an internal blank page", () => {
   assert.match(main, /if \(showingLoadError \|\| !isRestorableUrl\(url\)\) return;/);
   assert.match(main, /const state = windowSessionForSave\(/);
   assert.match(main, new RegExp(
-    `if \\(!windowSessionPath \\|\\| (?:soleWindows|currentWindows\\(\\))\\.tabs\\.length === 0\\) return;`));
+    `if \\(!sess\\(\\)\\.path \\|\\| (?:soleWindows|currentWindows\\(\\))\\.tabs\\.length === 0\\) return;`));
   assert.match(main, /function writeWindowSessionState\(state\)/);
-  assert.match(main, /if \(!windowSessionPath \|\| !state\) return;/);
+  assert.match(main, /if \(!sess\(\)\.path \|\| !state\) return;/);
   assert.match(main, /claimWindowSessionSlot\(\{/);
-  assert.match(main, /for \(const candidate of \[windowSessionPath, legacyWindowSessionPath\]\)/);
-  assert.match(main, /restoreWindowSession && !isRestorableUrl\(url\)/);
+  assert.match(main, /for \(const candidate of \[sess\(\)\.path, sess\(\)\.legacyPath\]\)/);
+  // Per-pane now: `tweb open` with no url means "restore this window's tabs" and with a url means
+  // "open that", and one host serves both at once.
+  assert.match(main, /sess\(\)\.restore && !isRestorableUrl\(url\)/);
   assert.match(main, /noWindowSessionPage\(\)/);
   assert.match(main, /if \(!isRestorableUrl\(url\) \|\| url\.startsWith\("tweb-action:"\)\) return;/);
   assert.match(main, /if \(isRestorableUrl\(entry\?\.url\) && !seen\.has\(entry\.url\)\)/);
@@ -193,7 +195,11 @@ test("the window session slot is claimed exclusively and released only by its ow
   // Liveness has to be the real syscall, not a TTL — a pane sits idle for days.
   assert.match(main, /isAlive: processAlive,/);
   // Deleting a claim we do not own is what would hand a live pane's session away.
-  assert.match(main, /if \(!claimIsReleasable\(readFileSync\(claimPath, "utf8"\), process\.pid\)\) return;/);
+  // The PANE as well as the pid. One process used to mean one pane, so a matching pid was proof of
+  // ownership; a host has N panes on one pid, and releasing by pid alone would let one pane delete
+  // a sibling's claim while that sibling is still saving into the slot.
+  assert.match(main,
+    /claimIsReleasable\(readFileSync\(claimPath, "utf8"\), process\.pid, claimPane\)/);
   // The release runs on the exit path, after the final save.
   assert.match(main, /writeWindowSession\(\);\s*releaseWindowSessionClaim\(\);/);
   // A pane given a URL never restores but still saves, so it needs its own file too.
@@ -798,7 +804,9 @@ test("visibility matches the pane's live placement, not its startup identity", (
   assert.match(main, /placement = \{ \.\.\.vis\(\)\.placement, session, windowId \}/);
   // The save path stays on the startup identity; a moved pane must not silently
   // adopt another window's stored tabs. The slot claim derives from it too.
-  assert.match(main, /identity: tmuxIdentity,/);
+  // The identity lives on the pane record: a host serves panes in different tmux windows, and one
+  // module-level identity would key every pane's session slot off whichever pane probed first.
+  assert.match(main, /identity: sess\(\)\.identity,/);
   // The in-flight guard has to clear even if spawning throws, or polling stops.
   assert.match(main, /catch \(spawnError\) \{\s*vis\(\)\.checkRunning = false;/);
 });

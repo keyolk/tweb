@@ -577,6 +577,55 @@ fn host_geometry(measured: Option<terminal::WindowGeometry>) -> twebd::protocol:
 /// Deliberately *not* a write target: frames come back over the connection and are written by this
 /// process, which is already the sole writer of this pty. An engine that opened this path would be
 /// a second writing process, and no in-process writer can serialise across that.
+/// This pane's tmux window identity, for the hosted engine's window-session slot.
+///
+/// Probed here because a hosted engine cannot probe it: the query needs a pane id, and the only one
+/// a host has is the daemon's. The field order matches what the per-pane engine reads from its own
+/// `tmux display-message`, so both paths build the same identity and the same session key.
+///
+/// `None` outside tmux or when any field is missing, which costs the pane its window session and
+/// nothing else — the state every hosted pane was in before this.
+fn tmux_window_identity(pane: &str) -> Option<twebd::protocol::TmuxWindowIdentity> {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{window_index}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut fields = text.trim_end_matches('\n').split('\t');
+    let socket_path = fields.next()?.to_string();
+    let server_started_at = fields.next()?.to_string();
+    let session = fields.next()?.to_string();
+    let window_id = fields.next()?.to_string();
+    let window_index = fields.next()?.to_string();
+    // Refused rather than sent partial: the engine cannot key a slot without all of them, and a
+    // half identity would disable session restore silently instead of visibly.
+    if socket_path.is_empty()
+        || server_started_at.is_empty()
+        || session.is_empty()
+        || window_id.is_empty()
+        || window_index.is_empty()
+    {
+        return None;
+    }
+    Some(twebd::protocol::TmuxWindowIdentity {
+        socket_path,
+        server_started_at,
+        session,
+        window_id,
+        window_index,
+        pane: pane.to_string(),
+    })
+}
+
 fn pane_tty() -> Option<String> {
     // A tty this process cannot name is not a fault: it only costs the daemon a diagnostic.
     let path = unsafe { libc::ttyname(0) };
@@ -609,7 +658,7 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
     let flag = std::env::var(attach::DAEMON_FLAG).ok();
     // Decided BEFORE the daemon is started or consulted: a pane that opted out, or one asking for
     // something a host cannot do, must cost nothing — no binary lookup, no process spawn, no wait.
-    if let Err(reason) = attach::initial_route(flag.as_deref(), options.restore_session) {
+    if let Err(reason) = attach::initial_route(flag.as_deref()) {
         return HostedOutcome::Spawn(reason);
     }
     // Nothing else starts the supervisor — no service manager entry, no login hook — so a user who
@@ -648,6 +697,9 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
         frame_rate: options.frame_rate,
         adaptive_frame_rate: options.adaptive_frame_rate,
         restore_session: options.restore_session,
+        // What lets a hosted pane have a window session at all. Without it a bare `tweb open` --
+        // which means "restore this window's tabs" -- opened `about:blank` and sat there.
+        session_identity: tmux_window_identity(pane).map(Box::new),
         // Measured here, not by the engine: a hosted engine's own `$TMUX_PANE` is the daemon's
         // pane, so it cannot measure any of the N it serves. Sending it with the open is what
         // keeps the first frame from being painted at a default size and then corrected.

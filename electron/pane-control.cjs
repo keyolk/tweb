@@ -44,6 +44,12 @@ const VIS = /^VIS\s+([0-9a-f]*)$/i;
 const INPUT = /^INPUT\s+([0-9a-f]*)$/i;
 const ADDRESS = /^@(%[\w-]+)\s+(.*)$/;
 const DETACH = /^DETACH$/;
+// The pane's tmux window identity, hex-encoded, for the window-session slot.
+//
+// A separate line rather than more ATTACH fields: ATTACH ends in a url that takes the rest of the
+// line, so nothing can be appended after it. Hex because a session name and a socket path can hold
+// anything, including the tab this grammar splits on.
+const SESSION = /^SESSION\s+([0-9a-f]*)$/i;
 // Fourteen fields, the last taken verbatim. `-?\d+` on the origin because `-1 -1` is its
 // "unknown" sentinel, and the tty is any non-space run so a path is not split on.
 const ATTACH = new RegExp(
@@ -138,6 +144,13 @@ function parseControlLine(rawLine) {
 
   if (DETACH.test(rest)) return { kind: "detach", paneId };
 
+  const session = SESSION.exec(rest);
+  if (session && session[1].length % 2 === 0) {
+    const identity = parseSessionIdentity(session[1]);
+    if (identity) return { kind: "session", paneId, identity };
+    return null;
+  }
+
   return null;
 }
 
@@ -200,4 +213,34 @@ function keyboardRestoreEvent(paneId) {
   return formatOutbound("KEYBOARD", pane, "restore");
 }
 
-module.exports = { parseControlLine, splitAddress, resolveTarget, formatOutbound, keyboardRestoreEvent };
+/**
+ * The tmux identity a `SESSION` line carries, or null when it is not usable.
+ *
+ * Tab-separated in the field order `tmux display-message` gives them, which is the order the
+ * per-pane engine already reads from its own probe — so the two paths build the same object and
+ * `windowSessionKeys` cannot tell them apart. A hosted engine cannot run that probe: it reads
+ * `$TMUX_PANE`, and a host's is the daemon's.
+ */
+function parseSessionIdentity(hex) {
+  let decoded;
+  try {
+    decoded = Buffer.from(hex, "hex").toString("utf8");
+  } catch (error) {
+    void error;
+    return null;
+  }
+  const [socketPath, serverStartedAt, session, windowId, windowIndex, paneId] = decoded.split("\t");
+  // Every field is load-bearing: `windowSessionKeys` returns null without the socket path, the
+  // session or the window index, and a partial identity would silently disable session restore
+  // rather than fail.
+  if (!socketPath || !serverStartedAt || !session || !windowId || windowIndex === undefined
+    || windowIndex === "" || !paneId) {
+    return null;
+  }
+  return { socketPath, serverStartedAt, session, windowId, windowIndex, paneId };
+}
+
+module.exports = {
+  parseControlLine, splitAddress, resolveTarget, formatOutbound, keyboardRestoreEvent,
+  parseSessionIdentity,
+};
