@@ -625,7 +625,11 @@ let loggedFrameGeneration = -1;
 // Whole frames the worker deflated, against `whole` for the total. The ratio is the only outside
 // view of the sampling decision in `gfx-worker.cjs`: 0 on a text-heavy page means compression
 // silently stopped engaging, which shows up as dropped frames long before anything says why.
-let compressedWholeFrames = 0;
+//
+// Per pane, on the frame context, because a host serves N and the ratio is only meaningful against
+// THAT pane's `whole`. As a module-level counter it summed every pane's compressions and reported
+// the sum to each of them: two panes with wildly different content both read 473, which reads as
+// a working ratio for the idle pane and hides the sampling decision for the playing one.
 const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"));
 gfxWorker.unref();
 
@@ -1230,7 +1234,6 @@ gfxWorker.on("message", (message) => {
     noteRawFrameFailure();
   } else {
     rawFrameFailures = 0;
-    if (message?.compressed) compressedWholeFrames += 1;
   }
   // The completion is routed to the pane whose frame it was, by the key that travelled with the
   // request. A completion applied to the wrong pane would free that pane's image and dispatch
@@ -1243,6 +1246,9 @@ gfxWorker.on("message", (message) => {
     console.error(`tweb: graphics completion for an unknown pane: ${message?.paneKey}`);
     return;
   }
+  // Counted after the routing, not before it: the key is what says whose compression this was,
+  // and a count taken above would land on whichever pane happened to ask for its diag.
+  if (message?.type !== "error" && message?.compressed) frames.compressedWholeFrames += 1;
   // Scoped to the pane the completion belongs to: dispatching the queue reads the frame-rate state
   // and the window, and doing that against another pane's is how one pane's frame lands in
   // another's rectangle.
@@ -3222,7 +3228,7 @@ function agentDiagnostics() {
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
       wholeFormat: rawFramesEnabled ? "raw" : "png",
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
-      wholeCompressed: compressedWholeFrames,
+      wholeCompressed: currentFrames().compressedWholeFrames,
     },
     panes: {
       hosted: paneRegistry.size,

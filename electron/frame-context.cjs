@@ -62,6 +62,11 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     activeGfxGeneration: null,
     pendingGfxFrame: null,
     droppedGfxFrames: 0,
+    // Whole frames the worker deflated for THIS pane. Beside `droppedGfxFrames` because it is
+    // read the same way — against the pane's own `whole` — and belongs to the pane for the same
+    // reason: as a module-level counter it summed every pane's compressions and reported the sum
+    // to each of them.
+    compressedWholeFrames: 0,
 
     frameRate,
     framesSentCount: 0,
