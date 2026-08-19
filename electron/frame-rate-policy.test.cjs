@@ -7,6 +7,7 @@ const {
   playbackWindowMs,
   settledFrameRate,
   playbackRateForArea,
+  interactionRate,
   PLAYBACK_MIN_PAINTS,
   PLAYBACK_MIN_RATE,
   PLAYBACK_BYTE_BUDGET,
@@ -130,4 +131,39 @@ test("fixed mode ignores the budget entirely", () => {
 test("a configured maximum below the floor is still honoured", () => {
   // `--tweb-frame-rate 5` on a huge pane: the floor must not raise a rate the user capped.
   assert.equal(playbackRateForArea(8000 * 8000, 5), 5);
+});
+
+// --- the interaction cap ---
+//
+// The budget bounds what a self-painting page pushes, and interaction lifted that bound: a
+// hover or a resize raised the pane to the maximum for 700ms. Measured on a 1130x1046 pane,
+// 46 raises during one video, 38 of them from the settle's own `isLoading` branch rather than
+// from anything the user did.
+
+test("an interaction cannot lift the playback bound while the page is painting", () => {
+  const tiers = frameRateTiers(30, true, 1130 * 1046);
+  assert.ok(tiers.playback < 30, "the fixture must be a pane the budget actually bounds");
+  assert.equal(interactionRate(true, tiers), tiers.playback);
+});
+
+test("an interaction with a page that is not painting still gets the maximum", () => {
+  // A keystroke on a static page has to echo at once, and a static page pushes one frame, not
+  // a stream of them. Capping here would be a regression with nothing to show for it.
+  const tiers = frameRateTiers(30, true, 1130 * 1046);
+  assert.equal(interactionRate(false, tiers), 30);
+});
+
+test("a pane the budget does not bind is unaffected either way", () => {
+  // NEGATIVE CONTROL: on a small pane playback IS the maximum, so the cap must be invisible.
+  const tiers = frameRateTiers(30, true, 980 * 456);
+  assert.equal(tiers.playback, 30);
+  assert.equal(interactionRate(true, tiers), 30);
+  assert.equal(interactionRate(false, tiers), 30);
+});
+
+test("fixed mode is untouched by the cap", () => {
+  // `--tweb-adaptive-frame-rate 0` means "this rate, always". Every tier is the maximum there,
+  // so painting or not, the answer is the rate the user asked for.
+  const tiers = frameRateTiers(30, false, 1680 * 1026);
+  assert.equal(interactionRate(true, tiers), 30);
 });

@@ -34,6 +34,12 @@ function createPaneWindows({ maxFrameRate = 30, adaptive = true } = {}) {
     frameIntervalMs: Math.ceil(1000 / maxFrameRate),
     frameIdleTimer: null,
     paintsSinceSettle: 0,
+    // Whether the last settle judged this page to be painting on its own. It is what an
+    // interaction raise is capped against: while a video runs, a hover or a resize must not
+    // hand the pane the full rate, because the bytes that rate implies are the whole reason
+    // the playback tier is bounded. False on a page that is not painting, so an ordinary
+    // interaction still gets the maximum.
+    settledPainting: false,
 
     // The agent's surface hold. A refcount rather than a flag because agent calls overlap — `wait`
     // polls for up to ten seconds while another command runs against the same pane — and it is

@@ -37,6 +37,7 @@ const {
   frameRateTiers,
   playbackWindowMs,
   settledFrameRate,
+  interactionRate,
   PLAYBACK_BYTE_BUDGET,
 } = require("./frame-rate-policy.cjs");
 const { isOrphaned, watchedPid, abandonedFrameFiles } = require("./orphan-watch.cjs");
@@ -1415,7 +1416,12 @@ function markInteractionActivity() {
   // would otherwise leave the last idle frame on screen for a whole interval —
   // a quarter second of "nothing happened" after a keypress.
   const wasIdle = isThrottled(currentWindows());
-  applyActiveFrameRate(maxActiveFrameRate);
+  // Capped while the page is painting on its own. Without this the playback budget holds only
+  // between interactions: a hover, a resize, or the `isLoading` branch below hands the pane the
+  // full rate for the next 700ms, which on a large pane is more than twice the bytes the tier
+  // exists to bound. `invalidate()` below is what makes an interaction feel immediate, and it
+  // still runs — the rate only decides what happens after that first paint.
+  applyActiveFrameRate(interactionRate(currentWindows().settledPainting, currentPlaybackTiers()));
   if (wasIdle && currentWindows().win && !currentWindows().win.isDestroyed() && currentPane().visible) currentWindows().win.webContents.invalidate();
   if (currentWindows().frameIdleTimer) clearTimeout(currentWindows().frameIdleTimer);
   // The paints this interaction is about to cause say nothing about whether the page
@@ -1451,6 +1457,8 @@ function settleFrameRate() {
   // enough for a bound on bytes and avoids a second path that recomputes the rate mid-frame.
   const settled = settledFrameRate(currentWindows().paintsSinceSettle, currentPlaybackTiers());
   currentWindows().paintsSinceSettle = 0;
+  // Remembered for the interaction path, which has no paint count of its own to judge from.
+  currentWindows().settledPainting = settled.painting;
   applyActiveFrameRate(settled.rate);
   if (settled.painting) {
     currentWindows().frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);

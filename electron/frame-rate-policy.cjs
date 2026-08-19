@@ -111,6 +111,31 @@ function frameRateTiers(maxRate, adaptive, area) {
 }
 
 /**
+ * The rate an interaction may raise this pane to.
+ *
+ * Interaction raises the rate to the maximum so a keystroke echoes at once, and that is right
+ * for a page that is sitting still. It is wrong for one that is playing: the playback tier
+ * bounds the bytes a self-painting page pushes, and a raise to the maximum is that bound being
+ * lifted by a mouse moving over the pane.
+ *
+ * Measured on a 1130x1046 pane while a video ran: 46 raises to the full rate, 38 of them with
+ * no interaction logged at all — the settle re-arms every 1.5s, and a streaming page reports
+ * `isLoading()` while it fetches, which sends the settle down a branch that raises the rate.
+ * Each raise is 700ms of 30fps against a tier of 13, so the pane spent that window at 142MB/s
+ * rather than 61MB/s. The average barely moved, which is why the byte counters looked fine —
+ * but input latency is felt at the peak, not at the average.
+ *
+ * The cap applies only while the page is painting on its own, so an interaction with a static
+ * page is untouched, and a video that ends restores the full rate at the next settle.
+ *
+ * @param {boolean} painting whether the last settle judged the page to be painting itself
+ * @param {{max: number, playback: number}} tiers for this pane at its current size
+ */
+function interactionRate(painting, tiers) {
+  return painting ? Math.min(tiers.max, tiers.playback) : tiers.max;
+}
+
+/**
  * How long to wait before judging again.
  *
  * Long enough that a page painting at the *idle* rate still clears the threshold — at 4fps
@@ -135,6 +160,6 @@ function settledFrameRate(paints, tiers) {
 }
 
 module.exports = {
-  frameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea,
+  frameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea, interactionRate,
   PLAYBACK_MIN_PAINTS, PLAYBACK_MIN_RATE, PLAYBACK_BYTE_BUDGET,
 };
