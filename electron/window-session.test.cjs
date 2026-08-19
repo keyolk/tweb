@@ -218,13 +218,22 @@ test("a claim goes stale by its owner dying, never by age", () => {
   assert.equal(slotClaimIsStale(null, () => true), true);
 });
 
-// Release is the one path that deletes a file a live pane might be using, so it is
-// pinned to the pid in the claim: a process can only ever remove its own.
+// Release is the one path that deletes a file a live pane might be using, so it is pinned to the
+// claim's owner: the pid AND the pane. One process used to mean one pane, so the pid was the whole
+// answer; a host has N panes and one pid, and pid alone would let one pane release another's slot
+// out from under it — the live pane would then be saving into a slot anything could take.
 test("release only ever removes our own claim", () => {
-  assert.equal(claimIsReleasable(JSON.stringify({ pane: "%1", pid: 100, at: 0 }), 100), true);
-  assert.equal(claimIsReleasable(JSON.stringify({ pane: "%1", pid: 200, at: 0 }), 100), false);
-  assert.equal(claimIsReleasable(null, 100), false);
-  assert.equal(claimIsReleasable("garbage", 100), false);
+  const ours = JSON.stringify({ pane: "%1", pid: 100, at: 0 });
+  assert.equal(claimIsReleasable(ours, 100, "%1"), true);
+  // Another process: never ours, whatever pane it names.
+  assert.equal(claimIsReleasable(JSON.stringify({ pane: "%1", pid: 200, at: 0 }), 100, "%1"), false);
+  // Same process, ANOTHER PANE — the host case. Not ours to release.
+  assert.equal(claimIsReleasable(ours, 100, "%2"), false);
+  assert.equal(claimIsReleasable(null, 100, "%1"), false);
+  assert.equal(claimIsReleasable("garbage", 100, "%1"), false);
+  // A claim written before panes were recorded matches on pid alone, so an upgrade does not
+  // strand a live claim its owner can no longer release.
+  assert.equal(claimIsReleasable(JSON.stringify({ pid: 100, at: 0 }), 100, "%1"), true);
 });
 
 test("internal blank and placeholder URLs are not restorable", () => {

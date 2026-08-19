@@ -147,8 +147,8 @@ let quitting = false;
 // user's visible one. A second copy of it is therefore the one piece of state that must not exist.
 
 const passthroughClientTables = new Map();
-let tmuxIdentity = null;
-// Where this pane lives *right now* is `vis().placement`, on the pane's record. `tmuxIdentity`
+
+// Where this pane lives *right now* is `vis().placement`, on the pane's record. `sess().identity`
 // above is the startup identity and stays pinned because the window-session save path is derived
 // from it, but a pane moves: `break-pane` gives it a new window id and `join-pane` can change its
 // session too. Matching clients against the startup window then fails for every client, the pane
@@ -170,16 +170,18 @@ const tabRendererRecoveries = new Map();
 // not the pane's. See `historyLockPath`.
 const navigationHistory = [];
 let navigationSerial = 0;
-const restoreWindowSession = process.env.TWEB_RESTORE_SESSION === "1";
+// This pane's window-session state, on its record — see `createPaneRecord` for why it cannot be one
+// set of module variables once a host serves panes in different tmux windows.
+function sess() {
+  return currentPane().session;
+}
 // Deliberately not per-pane, because in a host it is never set: `resolveWindowSessionPaths` runs only
-// where `tmuxIdentity` was built from the process's own `$TMUX_PANE`, and `ownTmuxPane` is null for a
+// where `sess().identity` was built from the process's own `$TMUX_PANE`, and `ownTmuxPane` is null for a
 // hosted runtime. So `writeWindowSession` returns on its first guard and a host saves no session at
 // all. Restoring per-pane sessions in a host needs the claim to key off the ATTACH identity rather
 // than the process — a separate piece of work, and one that has to arbitrate against the per-pane
 // engines that may still hold those slots.
-let windowSessionPath = null;
-let legacyWindowSessionPath = null;
-let windowSessionClaimPath = null;
+
 let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let orphanWatchdog = null;
@@ -943,7 +945,7 @@ function initializeTmuxVisibility() {
     ).trim();
     const [socketPath, serverStartedAt, session, windowId, windowIndex, ...titleParts] = output.split("\t");
     if (socketPath && serverStartedAt && session && windowId && windowIndex !== "") {
-      tmuxIdentity = {
+      sess().identity = {
         socketPath,
         serverStartedAt,
         session,
@@ -1816,10 +1818,13 @@ function resolveWindowSessionPaths() {
     if (debugLogging) console.error(`tweb: window session dir failed: ${error.message}`);
   }
   const claim = claimWindowSessionSlot({
-    identity: tmuxIdentity,
+    identity: sess().identity,
     directory,
     pid: process.pid,
-    paneId: ownTmuxPane,
+    // THIS pane's id, not the process's. `ownTmuxPane` is null in a host, and the claim uses the
+    // pane id to tell "my own claim" from "another pane's" — so passing null would make every
+    // hosted pane in one window look like the same claimant.
+    paneId: currentPane().paneId,
     now: Date.now(),
     io: {
       readClaim: (file) => {
@@ -1846,11 +1851,11 @@ function resolveWindowSessionPaths() {
     },
   });
   if (!claim) return;
-  windowSessionPath = path.join(directory, `${claim.keys.primary}.json`);
-  legacyWindowSessionPath = claim.keys.legacy
+  sess().path = path.join(directory, `${claim.keys.primary}.json`);
+  sess().legacyPath = claim.keys.legacy
     ? path.join(directory, `${claim.keys.legacy}.json`)
     : null;
-  windowSessionClaimPath = claim.claimPath;
+  sess().claimPath = claim.claimPath;
   if (debugLogging) {
     console.error(`tweb: window session slot ${claim.slot} (claimed=${claim.claimed})`);
   }
@@ -1862,11 +1867,14 @@ function resolveWindowSessionPaths() {
 // not own is the one thing that could hand a LIVE pane's session to a second pane, so
 // the pid check is not optional.
 function releaseWindowSessionClaim() {
-  if (!windowSessionClaimPath) return;
-  const claimPath = windowSessionClaimPath;
-  windowSessionClaimPath = null;
+  if (!sess().claimPath) return;
+  const claimPath = sess().claimPath;
+  sess().claimPath = null;
   try {
-    if (!claimIsReleasable(readFileSync(claimPath, "utf8"), process.pid)) return;
+    // The pane as well as the pid: a host has N panes on one pid, and releasing by pid alone would
+    // let one pane delete a sibling's claim while that pane is still saving into the slot.
+    const claimPane = currentPane().paneId;
+    if (!claimIsReleasable(readFileSync(claimPath, "utf8"), process.pid, claimPane)) return;
     unlinkSync(claimPath);
   } catch (error) {
     if (error.code !== "ENOENT" && debugLogging) {
@@ -1876,12 +1884,12 @@ function releaseWindowSessionClaim() {
 }
 
 function writeWindowSessionState(state) {
-  if (!windowSessionPath || !state) return;
-  const temporaryPath = `${windowSessionPath}.${process.pid}.tmp`;
+  if (!sess().path || !state) return;
+  const temporaryPath = `${sess().path}.${process.pid}.tmp`;
   try {
-    mkdirSync(path.dirname(windowSessionPath), { recursive: true });
+    mkdirSync(path.dirname(sess().path), { recursive: true });
     writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, windowSessionPath);
+    renameSync(temporaryPath, sess().path);
   } catch (error) {
     try { unlinkSync(temporaryPath); } catch {}
     if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
@@ -1889,8 +1897,8 @@ function writeWindowSessionState(state) {
 }
 
 function readWindowSession() {
-  if (!restoreWindowSession || !windowSessionPath) return null;
-  for (const candidate of [windowSessionPath, legacyWindowSessionPath]) {
+  if (!sess().restore || !sess().path) return null;
+  for (const candidate of [sess().path, sess().legacyPath]) {
     if (!candidate) continue;
     try {
       const session = normalizeWindowSession(
@@ -1898,7 +1906,7 @@ function readWindowSession() {
         defaultZoomFactor
       );
       if (!session) continue;
-      if (candidate !== windowSessionPath) {
+      if (candidate !== sess().path) {
         writeWindowSessionState({ version: 1, ...session });
         if (debugLogging) console.error("tweb: migrated legacy window session");
       }
@@ -1913,7 +1921,7 @@ function readWindowSession() {
 }
 
 function writeWindowSession() {
-  if (!windowSessionPath || currentWindows().tabs.length === 0) return;
+  if (!sess().path || currentWindows().tabs.length === 0) return;
   const state = windowSessionForSave(currentWindows().tabs.flatMap((tab) => {
     if (tab.isDestroyed()) return [];
     return [{
@@ -1927,7 +1935,7 @@ function writeWindowSession() {
 }
 
 function scheduleWindowSessionSave() {
-  if (!windowSessionPath || quitting) return;
+  if (!sess().path || quitting) return;
   if (windowSessionSaveTimer) clearTimeout(windowSessionSaveTimer);
   windowSessionSaveTimer = setTimeout(() => {
     windowSessionSaveTimer = null;
@@ -4521,7 +4529,7 @@ function createWindow(url, frames = currentFrames()) {
 
   const session = readWindowSession();
   if (!session) {
-    const initialUrl = restoreWindowSession && !isRestorableUrl(url)
+    const initialUrl = sess().restore && !isRestorableUrl(url)
       ? noWindowSessionPage()
       : url;
     return createTab(initialUrl, true);
@@ -4552,6 +4560,11 @@ function createWindow(url, frames = currentFrames()) {
 // same input stream and cross the same way — a paste in one pane swallowing another's typing, a
 // multi-byte character split across panes, a double-click assembled from two panes' clicks.
 const paneInputStates = new Map();
+
+// A pane's tmux identity between its `SESSION` line and the `ATTACH` that follows. Keyed by pane id
+// rather than pane key because the key includes a generation the SESSION line does not carry — it
+// is written immediately before the attach it belongs to and consumed by it.
+const pendingSessionIdentities = new Map();
 
 function inputState() {
   const record = currentPane();
@@ -5270,6 +5283,16 @@ function handleAttach(command) {
   const { superseded } = paneRegistry.attach(record);
   if (superseded) closePane(superseded, "superseded");
 
+  // The identity its `SESSION` line carried, if it sent one. A frontend that did not — an older
+  // build, or a pane outside tmux — leaves this null, and the pane simply has no window session,
+  // which is what a host did for every pane until now.
+  const sessionIdentity = pendingSessionIdentities.get(command.paneId) || null;
+  pendingSessionIdentities.delete(command.paneId);
+  if (sessionIdentity) {
+    record.session.identity = sessionIdentity;
+    withPaneScope(record, () => resolveWindowSessionPaths());
+  }
+
   const frames = createFrameContext(record, { frameRate: command.frameRate });
   frameContexts.set(record.key, frames);
   if (command.viewport) applyFrameViewport(frames, command.viewport, command.origin);
@@ -5288,6 +5311,11 @@ function handleAttach(command) {
   record.agentSocketPath = server.path;
   paneAgentServers.set(record.key, server);
   writeProtocolLine(formatOutbound("AGENT", record.paneId, server.path));
+
+  // The ATTACH has carried this since the wire was written and nothing read it, because a host had
+  // no session to restore. It does now: the `SESSION` line before this one gave the pane its tmux
+  // window identity, and `resolveWindowSessionPaths` keyed a slot off it.
+  record.session.restore = Boolean(command.restoreSession);
 
   const url = normalizeUrl(command.url || "https://example.com");
   // Everything below this line is the shipping path, run for the attached pane: the same
@@ -5405,6 +5433,14 @@ process.stdin.on("data", (chunk) => {
     // always meant by it — so a frontend that never learns the `@%N` prefix keeps working.
     const command = parseControlLine(line);
     if (!command) continue;
+
+    // SESSION carries the pane's tmux window identity and arrives immediately before its ATTACH,
+    // so like ATTACH it cannot resolve through the registry — the pane it names is not registered
+    // yet. It is held until the attach claims a slot with it.
+    if (command.kind === "session") {
+      pendingSessionIdentities.set(command.paneId, command.identity);
+      continue;
+    }
 
     // ATTACH is dispatched before resolution, because resolution is what it *creates*: the pane
     // it names is by definition not registered yet, so `resolveTarget` answers null for it and
@@ -5573,7 +5609,7 @@ app.whenReady().then(async () => {
   // `whenReady` is async — a few tens of milliseconds of startup buys a session whose rules
   // are armed for request one.
   await setUpExtensions();
-  if (restoreWindowSession) {
+  if (sess().restore) {
     initializeTmuxVisibility();
     createWindow(currentUrl);
   } else {

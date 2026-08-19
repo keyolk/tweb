@@ -163,6 +163,24 @@ function createPaneRecord({
     // Whole/patch counters are per-pane because `tweb diag` reports them per-pane, and a shared
     // counter would attribute one pane's frames to another.
     frames: { whole: 0, patches: 0 },
+    // The tmux window session this pane restores from and saves to.
+    //
+    // Per-pane because the slot is keyed on a tmux WINDOW: a host serves panes in different
+    // windows, and one path would give them all the same tabs — or, with the claim file in play,
+    // give the first pane the slot and every other one nothing. A per-pane engine fills this from
+    // its own `tmux display-message`; a hosted one is sent it on the `SESSION` line, because the
+    // probe reads `$TMUX_PANE` and a host's is the daemon's.
+    //
+    // `restore` is per-pane for the same reason it is a per-pane question: `tweb open` with no url
+    // means "restore this window's tabs" and with a url means "open that", and one host serves both
+    // at once.
+    session: {
+      identity: null,
+      restore: false,
+      path: null,
+      legacyPath: null,
+      claimPath: null,
+    },
     // Where this pane lives right now, who is looking at it, and how we know.
     //
     // Per-pane because panes in one engine sit in DIFFERENT tmux windows watched by DIFFERENT

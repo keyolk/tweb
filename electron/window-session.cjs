@@ -111,8 +111,21 @@ function slotClaimIsStale(claim, isAlive) {
   return !isAlive(claim.pid);
 }
 
-function claimOwnedBy(claim, pid) {
-  return Boolean(claim) && claim.pid === pid;
+/**
+ * Whether `claim` belongs to the caller.
+ *
+ * The PANE as well as the pid, and the pane is the half that matters now. One process used to mean
+ * one pane, so a matching pid was proof; a host has N panes and one pid, and pid alone would let
+ * pane B read pane A's claim as its own — taking the same slot and, with it, the same tabs. Two
+ * panes in one tmux window would show the same page.
+ *
+ * A claim with no pane recorded (written by an engine from before this) matches on pid alone, so an
+ * upgrade does not orphan a live claim and hand its slot away.
+ */
+function claimOwnedBy(claim, pid, paneId = null) {
+  if (!claim || claim.pid !== pid) return false;
+  if (claim.pane === null || claim.pane === undefined) return true;
+  return claim.pane === paneId;
 }
 
 /**
@@ -149,7 +162,7 @@ function claimWindowSessionSlot({
   for (let slot = 0; slot < maxSlots; slot += 1) {
     const keys = slot === 0 ? zeroKeys : windowSessionKeys(identity, slot);
     const claimPath = slotClaimPath(directory, keys.primary);
-    if (takeSlot(claimPath, mine, pid, io)) {
+    if (takeSlot(claimPath, mine, pid, io, paneId)) {
       return { slot, claimed: true, keys, claimPath };
     }
   }
@@ -160,22 +173,24 @@ function claimWindowSessionSlot({
   return { slot: 0, claimed: false, keys: zeroKeys, claimPath: null };
 }
 
-function takeSlot(claimPath, mine, pid, io) {
+function takeSlot(claimPath, mine, pid, io, paneId = null) {
   if (io.createClaim(claimPath, mine)) {
-    return claimOwnedBy(parseSlotClaim(io.readClaim(claimPath)), pid);
+    return claimOwnedBy(parseSlotClaim(io.readClaim(claimPath)), pid, paneId);
   }
   const existing = parseSlotClaim(io.readClaim(claimPath));
-  // Re-running the walk inside one process must be idempotent, not a slot leak.
-  if (claimOwnedBy(existing, pid)) return true;
+  // Re-running the walk for the SAME pane inside one process must be idempotent, not a slot leak.
+  // For a different pane of the same process it must not: that is the host case, and treating it as
+  // idempotent would give both panes one slot.
+  if (claimOwnedBy(existing, pid, paneId)) return true;
   if (!slotClaimIsStale(existing, io.isAlive)) return false;
   io.removeClaim(claimPath);
   if (!io.createClaim(claimPath, mine)) return false;
-  return claimOwnedBy(parseSlotClaim(io.readClaim(claimPath)), pid);
+  return claimOwnedBy(parseSlotClaim(io.readClaim(claimPath)), pid, paneId);
 }
 
 /** Whether an exiting process may delete a claim file — only ever its own. */
-function claimIsReleasable(text, pid) {
-  return claimOwnedBy(parseSlotClaim(text), pid);
+function claimIsReleasable(text, pid, paneId = null) {
+  return claimOwnedBy(parseSlotClaim(text), pid, paneId);
 }
 
 function isRestorableUrl(url) {
