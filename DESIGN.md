@@ -347,36 +347,43 @@ now built as well, and **is not reachable from any shipping path** — the parag
 exactly where the line is, because "built" and "on" are different claims and conflating them is how
 a blank pane ships.
 
-`crates/tweb-pane` does reference `twebd` now (`hosted.rs`, `attach.rs`, and the `twebd` crate
-dependency): with `TWEB_DAEMON=1` the frontend asks the daemon to host its pane before spawning an
-engine of its own. What it gets today is a **refusal**, and the refusal is the design rather than a
-failure — see the gate below.
+**A pane asks the daemon by default now, and starts one if none is running.** `crates/tweb-pane`
+resolves the route in `attach.rs` and takes it in `hosted.rs`; `daemon_autostart.rs` is what makes
+the default mean anything, because nothing else launches the supervisor — there is no service
+manager entry and no login hook, so a user who never ran `twebd serve` by hand would find no socket
+and every pane would fall back while looking like the daemon was simply not wanted.
 
-**The gate.** A hosted engine declares what it can do by printing `READY <protocol>` on its stdout,
-and `electron/hosted-runtime.cjs` `hostProtocolVersion()` returns `null`, so no engine in the tree
-prints it. `twebd` kills an engine that has not declared itself within `READY_TIMEOUT` (10s) and
-answers `EngineUnavailable`; the frontend logs the reason and spawns its own engine. Two tests hold
-the gate shut: one asserts the null, one greps every non-test `.cjs` for a `READY` literal.
-
-The order is deliberate and is the lesson of the previous attempt. File presence is not evidence of
-behaviour — the modules a host needs shipped in a release *before* the host that used them, and a
-daemon that checked for files started a healthy single-pane engine which opened its own default
-page, painted it into the control pipe, and left the requesting pane blank forever with no failure
-anywhere to trigger a fallback. **A records-only accept is worse than a refusal**, because a refusal
-falls back to a browser that works.
-
-Measured on this tree, `TWEB_DAEMON=1` with a live daemon, a real pane in a `tmux split-window`:
+`bench/daemon-default.py` drives `tweb __pane` on a real PTY and reads the answer from `twebd
+status`, which is the only side that knows — a pane that fell back renders exactly the same page:
 
 ```text
-pane stderr   spawning this pane's own engine reason=twebd declined (EngineUnavailable):
-              engine did not declare itself a pane host within 10000ms
-twebd status  panes 0 · generations 1 · protocol 2 · engine unavailable
-parentage     pane_pid -> tweb -> Electron;  the daemon has no children at all
+1. no flag, no daemon        daemon pid 1512 · hosted panes 1
+2. a second pane             daemon pid 1512 (unchanged) · hosted panes 2
+3. TWEB_DAEMON=0             hosted panes 2 -> 2
+4. after SIGKILLing it       socket file left behind: True · a fresh daemon starts (20364)
+5. the starting pane exits   daemon 20364 still running
 ```
 
-The first pane pays the 10s handshake; the daemon then remembers the engine is unavailable and
-every later pane falls back in **24 ms**. The daemon does not respawn the engine per attempt —
-sampled over 60s, `twebd` held 0 children and 0.0% CPU.
+Verified as negative controls, separately: putting the opt-in default back fails 1 and 2, and
+leaving the default on while removing the autostart fails the same two. Both halves are load-bearing.
+
+**The escape hatch matters more than the opt-in it replaced.** `TWEB_DAEMON=0` (or `false`, or
+empty) puts a pane back on the path that has always worked, without a rebuild, and nothing about the
+daemon is consulted on that path — no binary lookup, no spawn, no wait. Unset means on.
+
+**Everything still resolves towards the pane spawning its own engine.** No daemon, an unreachable
+daemon, a daemon from another build, a daemon whose engine cannot host, a daemon that answered
+something unexpected — every one of those is `Route::Spawn`. There is deliberately no condition
+under which the frontend guesses that hosting will work. The order is the lesson of the previous
+attempt: file presence is not evidence of behaviour, and a daemon that checked for files once
+started a healthy single-pane engine which painted its own default page into the control pipe and
+left the requesting pane blank forever with nothing failing anywhere. **A records-only accept is
+worse than a refusal**, because a refusal falls back to a browser that works.
+
+One subtlety the autostart had to get right: liveness is a `connect()`, never a `stat()`. A
+`SIGKILL`ed daemon leaves its socket file behind, so a check for the file sees a daemon that is not
+there — and every pane afterwards would skip the start and fail at connect, falling back forever
+while a daemon was one spawn away. Check 4 above is that case, produced by killing a real daemon.
 
 `bench/t1-host-harness.py` speaks the supervisor's side of the protocol to an engine started with
 `TWEB_MULTIPANE=1` and every pane identity variable removed, and reads back the declaration, an agent
@@ -460,9 +467,8 @@ The e2e's own first verdict was a false PASS, which is worth recording: it count
 and each pane's one event was an 11-byte cursor-hide sequence. It now requires a frame carrying that
 pane's own image id, which made the broken state fail without any negative control being staged.
 
-**What is still not on by default:** a frontend only asks the daemon when `TWEB_DAEMON=1` is set, so
-a default install still spawns one engine per pane. That is the last switch, and it is a
-user-visible behaviour change rather than a capability question.
+**The default is the daemon now.** A pane asks it, starts one if none is running, and falls back to
+its own engine on any doubt — see the top of this section for the measurements and the escape hatch.
 
 #### What survives the collapse from N processes to one
 

@@ -13,19 +13,18 @@ Research date: 2026-07-31.
 > written before implementation and are in the present indicative throughout; several of their
 > central claims are the opposite of what ships. Specifically:
 >
-> - **One Electron process still runs per tmux pane unless `TWEB_DAEMON=1`.**
->   `crates/tweb-pane/src/lib.rs` spawns one from every `tweb __pane`, and the `BrowserWindow`s
->   inside it are *tabs of that pane*, never other panes. §4.2's "add a BrowserWindow per pane, not
->   a new Electron process" is **built and declared** now — the engine answers `READY 2`, five panes
->   render in one engine (§8.7), and `bench/daemon-e2e.py` shows a real `twebd` hosting them — but a
->   frontend only asks the daemon when `TWEB_DAEMON=1` is set, so §4.1's topology is what a default
->   install still runs.
-> - **`twebd` routes a hosted pane's frames when it is asked to.** `hosted.rs` attaches to a
->   daemon-held page and writes the frames it gets back, and the attach is no longer refused: the
->   engine declares host capability and the daemon accepts it. On the default path — no
->   `TWEB_DAEMON=1` — what carries `RESIZE` / `VIS` / `INPUT` is still newline-framed lines on the
->   engine's **stdin**, written directly by the Rust frontend. The arrows through `twebd` in §4.3,
->   §4.4, §5.3, §6.1 and §6.3 describe the hosted path rather than the default one.
+> - **§4.2's "add a BrowserWindow per pane, not a new Electron process" is what ships now.**
+>   A pane asks `twebd` by default and starts one if none is running; five panes render in one
+>   engine (§8.7), and `bench/daemon-default.py` drives the real frontend to show the decision being
+>   taken rather than the pieces working. §4.1's one-process-per-pane topology is the **fallback** —
+>   reached by `TWEB_DAEMON=0`, by no `twebd` binary, or by any doubt about hosting — not the
+>   default. The `BrowserWindow`s inside a hosted engine are tabs of a *particular* pane, keyed by
+>   the ambient pane scope (§8.7).
+> - **`twebd` routes a hosted pane's frames.** `hosted.rs` attaches to a daemon-held page and writes
+>   the frames it gets back — the frontend stays the sole writer of its own pty, which is why frames
+>   travel back rather than being written by the daemon. So the arrows through `twebd` in §4.3,
+>   §4.4, §5.3, §6.1 and §6.3 describe the ordinary path now. Newline-framed lines on the engine's
+>   **stdin** are what the fallback path uses.
 > - **The Rust native module / SHM transport named in §4.3 was deleted** — see §8.4, which records
 >   the deletion but does not go back and correct §4.3. Frames go `paint` → `gfx-worker.cjs` → file →
 >   Kitty `t=f` on the inherited stdout.

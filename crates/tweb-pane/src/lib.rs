@@ -11,6 +11,7 @@
 //! - pane kill → Electron shutdown, image delete
 
 pub mod attach;
+pub mod daemon_autostart;
 pub mod display;
 mod engine_app;
 pub mod graphics;
@@ -606,6 +607,19 @@ enum HostedOutcome {
 async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
     let socket = twebd::paths::socket_path_in(&twebd::paths::runtime_dir());
     let flag = std::env::var(attach::DAEMON_FLAG).ok();
+    // The flag is checked before anything else is done, so a pane that opted out costs nothing:
+    // no binary lookup, no process spawn, no wait.
+    if !attach::flag_enabled(flag.as_deref()) {
+        return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
+    }
+    // Nothing else starts the supervisor — no service manager entry, no login hook — so a user who
+    // has never run `twebd serve` would otherwise never have one, and every pane would fall back
+    // while looking like the daemon was simply not wanted. N panes starting at once all try; the
+    // `flock` in `twebd serve` decides, and the losers exit 0. See `daemon_autostart`.
+    if let Err(err) = daemon_autostart::ensure_running(&socket) {
+        tracing::debug!(%err, "no twebd for this pane");
+        return HostedOutcome::Spawn(attach::SpawnReason::DaemonStartFailed(err));
+    }
     if let Err(reason) = attach::initial_route(flag.as_deref(), socket.exists()) {
         return HostedOutcome::Spawn(reason);
     }
