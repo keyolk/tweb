@@ -1395,6 +1395,15 @@ installPrintShim();
     const box = document.createElement("div");
     // No border or shadow: this should read as a little clearing in the input's
     // own surface, not as a second UI component sitting on top of it.
+    //
+    // The blur stays, and the alpha is what came down instead. Composition is not
+    // signalled to this preload at all — preedit happens in the terminal and only
+    // committed text reaches the page — so the slot is painted for as long as a field has
+    // focus, not while something is being composed. At `.76` that read as an opaque block
+    // sitting in a search box nobody had typed in yet. But the blur is doing the job the
+    // alpha cannot: it is what keeps page glyphs from being legible UNDER the preedit, and
+    // a lower alpha needs it more, not less. Removing it was tried and the regression test
+    // for this surface caught it.
     box.style.cssText = ["position:fixed", "box-sizing:border-box", "border-radius:2px",
       "background:transparent", "backdrop-filter:blur(1.5px)"].join(";");
     shadow.append(box);
@@ -1415,16 +1424,19 @@ installPrintShim();
       const values = getComputedStyle(element).backgroundColor.match(/[\d.]+/g)?.map(Number) || [];
       const alpha = values.length > 3 ? values[3] : 1;
       if (values.length >= 3 && alpha > 0.05) {
-        // Reuse the input surface's hue but leave enough transparency that gradients
-        // and subtle texture still continue through the composition clearing.
-        return `rgba(${Math.round(values[0])},${Math.round(values[1])},${Math.round(values[2])},.76)`;
+        // Reuse the input surface's hue, at an alpha that hides the page glyphs a
+        // composition would otherwise be read against WITHOUT announcing itself. It was
+        // `.76`, chosen against the composition case alone — but the slot is up whenever a
+        // field has focus, so that value spent its budget on the case that is rare and paid
+        // for it in the case that is constant.
+        return `rgba(${Math.round(values[0])},${Math.round(values[1])},${Math.round(values[2])},.42)`;
       }
       const root = element.getRootNode();
       element = element.parentElement || (root instanceof ShadowRoot ? root.host : null);
     }
     return matchMedia("(prefers-color-scheme: dark)").matches
-      ? "rgba(24,24,27,.72)"
-      : "rgba(255,255,255,.72)";
+      ? "rgba(24,24,27,.42)"
+      : "rgba(255,255,255,.42)";
   }
 
   // Where composition should appear, in cell-grid coordinates: the page image fills
@@ -1459,6 +1471,39 @@ installPrintShim();
     return { left, top, width, height: cell.height, lineTop, lineBottom };
   }
 
+  // While the terminal draws a cursor for this pane, the page must not draw one too.
+  //
+  // Both are honest: the page paints its own caret because a field has focus, and the
+  // terminal paints one because that is where composition will land. Together they are two
+  // bars a few pixels apart, which reads as a rendering fault rather than as two systems
+  // agreeing. The terminal's is the one to keep — it is the anchor the terminal composes
+  // against, and it blinks with the rest of the terminal.
+  //
+  // An inline style on the focused element, restored when focus leaves, rather than a
+  // stylesheet: `caret-color` inherits, and a page-wide rule would hide the caret in every
+  // field including ones this pane is not driving.
+  let caretHiddenElement = null;
+  let caretColorBefore = "";
+
+  function hidePageCaret(element) {
+    if (caretHiddenElement === element) return;
+    restorePageCaret();
+    if (!isElement(element) || !element.style) return;
+    caretHiddenElement = element;
+    caretColorBefore = element.style.caretColor || "";
+    element.style.caretColor = "transparent";
+  }
+
+  function restorePageCaret() {
+    if (!caretHiddenElement) return;
+    try {
+      if (caretColorBefore) caretHiddenElement.style.caretColor = caretColorBefore;
+      else caretHiddenElement.style.removeProperty("caret-color");
+    } catch (_) { /* the element may be gone with its document */ }
+    caretHiddenElement = null;
+    caretColorBefore = "";
+  }
+
   function updateImeSlot(rect) {
     const surface = rect ? imeSurfaceColor() : "";
     const key = rect ? `${rect.left},${rect.lineTop},${rect.width},${rect.lineBottom},${surface}` : "";
@@ -1466,7 +1511,11 @@ installPrintShim();
     imeSlotKey = key;
     if (!rect) {
       removeImeSlot();
+      restorePageCaret();
     } else {
+      // The slot is up, so the terminal cursor is on this spot — the page's own caret
+      // would be the second bar beside it.
+      hidePageCaret(activeElement());
       ensureImeSlot();
       // Match the reserved cells exactly. Extra padding would turn the translucent
       // clearing back into a visible surface and could cover the preceding page glyph.
@@ -1543,7 +1592,22 @@ installPrintShim();
     const element = activeElement();
     if (!isEditable(element) || isTag(element, "select")) return null;
     const box = element.getBoundingClientRect();
-    if (!box.width || !box.height || box.bottom <= 0 || box.top >= innerHeight) return null;
+    // Offscreen in EITHER axis, not just vertically. A hidden field parked at
+    // `left:-9999px` is one of the commonest ways a page holds focus for a search overlay
+    // or a paste target, and reporting its caret put the terminal cursor at the pane's
+    // edge — sitting in the middle of a heading, where nothing can be typed.
+    if (!box.width || !box.height) return null;
+    if (box.bottom <= 0 || box.top >= innerHeight) return null;
+    if (box.right <= 0 || box.left >= innerWidth) return null;
+    // A field can also be present and laid out while being invisible — `opacity:0` over a
+    // real position, `visibility:hidden` on an ancestor. `checkVisibility` answers both,
+    // and is guarded because it is newer than the oldest engine this preload runs in.
+    if (typeof element.checkVisibility === "function"
+      && !element.checkVisibility({ visibilityProperty: true, opacityProperty: true })) {
+      return null;
+    }
+    // A 1x1 field is a focus trap, not somewhere a person types.
+    if (box.width < 2 || box.height < 2) return null;
 
     const computed = getComputedStyle(element);
     let x = box.left + (parseFloat(computed.paddingLeft) || 0) + 1;

@@ -1159,3 +1159,48 @@ test("paper printing is opt-in and never remaps Ctrl-P", () => {
   assert.match(main, /else if \(print\) void printPageToPdf\(\);/);
   assert.match(electron, /else if \(key === "p"\) send\("print-paper"\);/);
 });
+
+// A focused field the user cannot see is not a place to put a cursor. Pages hold focus in
+// hidden inputs constantly — search overlays, paste targets, focus traps — and reporting
+// those put the terminal cursor in the middle of a heading, which is what the user saw.
+test("an invisible or offscreen field reports no caret", () => {
+  const gate = electron.slice(electron.indexOf("function caretPoint()"),
+    electron.indexOf("const computed = getComputedStyle(element)"));
+  // Both axes. Only the vertical pair was checked, so `left:-9999px` — the commonest way
+  // to park a hidden field — sailed through.
+  assert.match(gate, /box\.bottom <= 0 \|\| box\.top >= innerHeight/);
+  assert.match(gate, /box\.right <= 0 \|\| box\.left >= innerWidth/);
+  // Laid out but invisible: opacity:0 over a real position, or a hidden ancestor.
+  assert.match(gate, /checkVisibility\(\{ visibilityProperty: true, opacityProperty: true \}\)/);
+  // And a 1x1 focus trap is not somewhere a person types.
+  assert.match(gate, /box\.width < 2 \|\| box\.height < 2/);
+});
+
+// Two carets a few pixels apart read as a rendering fault, not as two systems agreeing.
+// The terminal's is the one that matters: it is the anchor composition lands on.
+test("the page caret is hidden while the terminal draws one", () => {
+  assert.match(electron, /function hidePageCaret\(element\)/);
+  assert.match(electron, /element\.style\.caretColor = "transparent"/);
+  // Restored when the slot goes away, or a field keeps an invisible caret after this pane
+  // stops driving it.
+  assert.match(electron, /function restorePageCaret\(\)/);
+  const update = electron.slice(electron.indexOf("function updateImeSlot(rect)"),
+    electron.indexOf("// The frame clock may have dropped"));
+  assert.match(update, /removeImeSlot\(\);\s*restorePageCaret\(\);/);
+  assert.match(update, /hidePageCaret\(activeElement\(\)\)/);
+  // An inline style rather than a stylesheet: caret-color inherits, and a page-wide rule
+  // would blank the caret in fields this pane is not driving.
+  assert.match(electron, /caretColorBefore = element\.style\.caretColor \|\| ""/);
+});
+
+// The slot is up whenever a field has focus — composition is never signalled to the
+// preload — so its alpha is paid every time someone clicks a search box, not only while
+// something is being composed.
+test("the composition surface stays faint enough to be furniture", () => {
+  const surface = electron.slice(electron.indexOf("function imeSurfaceColor()"),
+    electron.indexOf("function imeSlotRect(caret)"));
+  assert.doesNotMatch(surface, /,\.7[0-9]\)/, "the .76 that read as an opaque block");
+  assert.match(surface, /,\.42\)`/);
+  assert.match(surface, /rgba\(24,24,27,\.42\)/);
+  assert.match(surface, /rgba\(255,255,255,\.42\)/);
+});
