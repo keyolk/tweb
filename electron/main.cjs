@@ -484,9 +484,25 @@ let hostReady = false;
  * for stays blank. So a hosted pane with no tty of its own writes nowhere rather than somewhere
  * wrong — measured, this is what stops even the exit-path image delete from reaching the pipe.
  */
+/**
+ * The file descriptor this pane's bytes go to, or null when they travel over the host channel.
+ *
+ * A HOSTED pane always answers null, whatever `record.tty` says. That field carries the pane's tty
+ * PATH — `/dev/ttys013` — and it is diagnostics only: the protocol says so, and the reason is the
+ * one `hostedFrameSink` records below. An engine that wrote there would be a second writing
+ * *process* on that pty, racing the frontend's own caret, alternate-screen and keyboard writes,
+ * and `createPaneWriter` serialises within one process only.
+ *
+ * It used to be returned as if it were a descriptor, and `writeSync` rejected it every time:
+ * `The "fd" argument must be of type number. Received type string ('/dev/ttys013')`. Every frame
+ * for every hosted pane failed, the engine exited, and the pane fell back to spawning its own —
+ * so the daemon path cost a full engine startup and then did what it had always done. It survived
+ * because no harness sent a tty: they all pass `None`, which took the null branch, and only the
+ * real frontend fills the field in.
+ */
 function paneOutputFd(record) {
-  if (record.tty !== null && record.tty !== undefined) return record.tty;
-  return hostedRuntime ? null : 1;
+  if (hostedRuntime) return null;
+  return typeof record.tty === "number" ? record.tty : 1;
 }
 
 // One addressed line on the supervisor's stdout, carrying a pane's bytes to the frontend that
