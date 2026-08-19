@@ -3256,6 +3256,15 @@ function agentDiagnostics() {
       // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
       wholeFormat: rawFramesEnabled ? "raw" : "png",
+      // How whole frames reach the terminal, and where the setting came from.
+      //
+      // Reported because setting it is silently a no-op on the hosted path, which is the
+      // default: the engine is spawned by the DAEMON, so `TWEB_FRAME_TRANSPORT` on a pane never
+      // reaches `process.env` here — it is the daemon's value, from whenever the daemon started.
+      // Measured the hard way: an experiment run with the variable set on the pane produced a
+      // fresh engine that still wrote frame files, and nothing anywhere said so.
+      transport: frameTransport,
+      transportFromDaemonEnv: hostedRuntime,
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
       wholeCompressed: currentFrames().compressedWholeFrames,
     },
