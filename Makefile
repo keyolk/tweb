@@ -87,15 +87,22 @@ install: release ## Install tweb into PREFIX (default ~/.local)
 	install -m 0755 target/release/tweb "$(DESTDIR)$(PREFIX)/bin/tweb"
 	@test ! -f target/release/tweb-tauri \
 		|| install -m 0755 target/release/tweb-tauri "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
+	@# The supervisor. `tweb __pane` starts it on demand and finds it beside itself, so an install
+	@# without it is an install where every pane silently spawns its own engine.
+	@test ! -f target/release/twebd \
+		|| install -m 0755 target/release/twebd "$(DESTDIR)$(PREFIX)/bin/twebd"
 	@# 기존 binary 위에 덮어쓰면 macOS 서명이 깨지고 kernel이 exec 시 SIGKILL한다.
 	@# 조용한 no-op처럼 보여서 원인을 찾기 어렵다.
 	@test "$$(uname)" != Darwin || codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb"
 	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
 		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
+	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/twebd" \
+		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/twebd"
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb"
 
 uninstall: ## Remove what install placed (the cache is left alone)
-	rm -f "$(DESTDIR)$(PREFIX)/bin/tweb" "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
+	rm -f "$(DESTDIR)$(PREFIX)/bin/tweb" "$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
+		"$(DESTDIR)$(PREFIX)/bin/twebd"
 
 clean: ## Remove the Rust build output
 	$(CARGO) clean

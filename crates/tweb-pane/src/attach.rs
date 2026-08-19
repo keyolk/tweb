@@ -9,10 +9,17 @@
 
 use twebd::protocol::{RefusalReason, Response};
 
-/// The environment variable that opts a pane into the daemon.
+/// The environment variable that decides whether a pane uses the daemon.
 ///
-/// Off by default, and it stays that way until the hosted path is the better one for a real case.
-/// A flag that defaults on is the same thing as no flag when the fallback is what actually ships.
+/// **On by default now.** It was an opt-in while the hosted path could not render N panes; it can,
+/// measured — five panes in one engine at 267MB and 1.6 processes each, against 501MB and 5.0 as
+/// separate engines (DESIGN.md 6.5, DETAIL.md 8.7). Keeping it opt-in past that point would mean
+/// shipping the measurement and not the saving.
+///
+/// Setting it to `0`, `false` or an empty string turns the daemon off for that pane, which is the
+/// escape hatch: a user whose panes misbehave has a one-variable way back to the path that has
+/// always worked, without a rebuild. That matters more now than the opt-in did, because the
+/// fallback is no longer what runs by default.
 pub const DAEMON_FLAG: &str = "TWEB_DAEMON";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +36,8 @@ pub enum Route {
 pub enum SpawnReason {
     FlagOff,
     NoSocket,
+    /// The daemon was not running and this process could not start one.
+    DaemonStartFailed(String),
     ConnectFailed(String),
     Refused(RefusalReason, String),
     /// The daemon answered something this build does not understand — which is what an older
@@ -41,8 +50,9 @@ pub enum SpawnReason {
 impl std::fmt::Display for SpawnReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FlagOff => write!(f, "{DAEMON_FLAG} is not set"),
+            Self::FlagOff => write!(f, "{DAEMON_FLAG} is off"),
             Self::NoSocket => write!(f, "no twebd socket"),
+            Self::DaemonStartFailed(err) => write!(f, "cannot start twebd: {err}"),
             Self::ConnectFailed(err) => write!(f, "cannot reach twebd: {err}"),
             Self::Refused(reason, detail) => write!(f, "twebd declined ({reason:?}): {detail}"),
             Self::UnexpectedAnswer(answer) => write!(f, "twebd answered {answer}"),
@@ -51,12 +61,13 @@ impl std::fmt::Display for SpawnReason {
     }
 }
 
-/// Whether the flag opts this pane in.
+/// Whether the flag leaves this pane on the daemon.
 ///
-/// Anything other than an explicit off is on, because the operator typed the variable for a
-/// reason; but the *unset* case has to be off, which is the case that matters for shipping.
+/// Unset means on. Only an explicit off — `0`, `false`, or an empty value — turns it off, and an
+/// empty value counts because `TWEB_DAEMON=` in a shell profile reads as "I turned this off" to
+/// everyone who writes it.
 pub fn flag_enabled(value: Option<&str>) -> bool {
-    !matches!(value, None | Some("") | Some("0") | Some("false"))
+    !matches!(value, Some("") | Some("0") | Some("false"))
 }
 
 /// The route to take before anything has been sent.
@@ -102,25 +113,38 @@ mod tests {
     use super::*;
     use twebd::protocol::Generation;
 
+    // Unset is ON. The daemon was opt-in while the hosted path could not render N panes; it can,
+    // measured, so the default follows the measurement.
     #[test]
-    fn the_flag_is_off_unless_it_is_explicitly_on() {
-        assert!(!flag_enabled(None));
-        assert!(!flag_enabled(Some("")));
-        assert!(!flag_enabled(Some("0")));
-        assert!(!flag_enabled(Some("false")));
+    fn the_flag_is_on_unless_it_is_explicitly_off() {
+        assert!(flag_enabled(None));
         assert!(flag_enabled(Some("1")));
         assert!(flag_enabled(Some("yes")));
+        assert!(!flag_enabled(Some("0")));
+        assert!(!flag_enabled(Some("false")));
+        // An empty value counts as off: `TWEB_DAEMON=` in a shell profile reads as "I turned this
+        // off" to everyone who writes it, and reading it as on would be a trap.
+        assert!(!flag_enabled(Some("")));
     }
 
-    // The shipping default. Nothing about the daemon is consulted, so a broken or hostile daemon
-    // cannot affect a pane that did not ask for it.
+    // THE ESCAPE HATCH, and it matters more than the opt-in it replaced: the fallback is no longer
+    // what runs by default, so a user whose panes misbehave needs a one-variable way back to the
+    // path that has always worked — without a rebuild, and without the daemon being consulted at
+    // all. Nothing about it is touched on this path: no binary lookup, no spawn, no wait.
     #[test]
-    fn without_the_flag_a_pane_spawns_its_own_engine_even_with_a_daemon_running() {
-        assert_eq!(initial_route(None, true), Err(SpawnReason::FlagOff));
+    fn an_explicit_off_spawns_an_engine_even_with_a_daemon_running() {
+        assert_eq!(initial_route(Some("0"), true), Err(SpawnReason::FlagOff));
+        assert_eq!(
+            initial_route(Some("false"), true),
+            Err(SpawnReason::FlagOff)
+        );
+        assert_eq!(initial_route(Some(""), true), Err(SpawnReason::FlagOff));
     }
 
     #[test]
-    fn the_flag_without_a_daemon_falls_back_rather_than_failing() {
+    fn no_daemon_falls_back_rather_than_failing() {
+        assert_eq!(initial_route(None, false), Err(SpawnReason::NoSocket));
+        assert_eq!(initial_route(None, true), Ok(Route::Daemon));
         assert_eq!(initial_route(Some("1"), false), Err(SpawnReason::NoSocket));
         assert_eq!(initial_route(Some("1"), true), Ok(Route::Daemon));
     }
