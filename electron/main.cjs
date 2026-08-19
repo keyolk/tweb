@@ -37,6 +37,7 @@ const {
   frameRateTiers,
   playbackWindowMs,
   settledFrameRate,
+  PLAYBACK_BYTE_BUDGET,
 } = require("./frame-rate-policy.cjs");
 const { isOrphaned, watchedPid, abandonedFrameFiles } = require("./orphan-watch.cjs");
 const {
@@ -232,7 +233,6 @@ const adaptiveFrameRate = configuredAdaptiveFrameRate !== undefined
 const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxActiveFrameRate;
 // See frame-rate-policy.cjs for why playback is its own tier and how it is detected.
 const frameRates = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
-const playbackFrameRate = frameRates.playback;
 const playbackWindow = playbackWindowMs(idleFrameRate);
 // The window/tab and frame-rate state for this pane. Like the frame context, the shipping path
 // has exactly one and runs through it — the ceiling is per-pane because a host serves panes
@@ -1444,12 +1444,29 @@ function settleFrameRate() {
   // Judge against the paints that arrived over the window just ended, then reset the
   // count. Reading a timestamp instead would count the paint that changing the rate
   // itself provokes, and a static page would hold the playback rate forever.
-  const settled = settledFrameRate(currentWindows().paintsSinceSettle, frameRates);
+  //
+  // The tiers are resolved here rather than at startup because the playback rate depends on
+  // how large this pane is right now, and a pane is resized freely while it runs. A resize
+  // during playback is picked up at the next settle — within the 1.5s window — which is soon
+  // enough for a bound on bytes and avoids a second path that recomputes the rate mid-frame.
+  const settled = settledFrameRate(currentWindows().paintsSinceSettle, currentPlaybackTiers());
   currentWindows().paintsSinceSettle = 0;
   applyActiveFrameRate(settled.rate);
   if (settled.painting) {
     currentWindows().frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
   }
+}
+
+// The tiers for THIS pane at its current size.
+//
+// `frameRates` is the startup shape, computed before any viewport exists; this is the one that
+// bounds the bytes. Per pane because a host serves panes of different sizes, and a rate derived
+// from another pane's area is exactly the crossing this engine is careful about elsewhere.
+function currentPlaybackTiers() {
+  const viewport = currentFrames().viewport;
+  if (!viewport) return frameRates;
+  const size = renderedFrameSize(viewport);
+  return frameRateTiers(maxActiveFrameRate, adaptiveFrameRate, size.width * size.height);
 }
 
 // A page can start painting long after the last keystroke — a video begins, an animation
@@ -1458,7 +1475,7 @@ function settleFrameRate() {
 function notePaintActivity() {
   currentWindows().paintsSinceSettle += 1;
   if (!adaptiveFrameRate || currentWindows().frameIdleTimer) return;
-  if (currentWindows().activeFrameRate >= playbackFrameRate) return;
+  if (currentWindows().activeFrameRate >= currentPlaybackTiers().playback) return;
   currentWindows().frameIdleTimer = setTimeout(settleFrameRate, playbackWindow);
 }
 
@@ -3209,13 +3226,17 @@ function agentDiagnostics() {
       adaptive: adaptiveFrameRate,
       // All three resolved rates, not just the one in force. The startup banner was the
       // only place they were stated together, and it wrote into tmux's shared status line.
-      tiers: { idle: idleFrameRate, playback: playbackFrameRate, max: maxActiveFrameRate },
+      tiers: {
+        idle: idleFrameRate,
+        playback: currentPlaybackTiers().playback,
+        max: maxActiveFrameRate,
+      },
       // Which of the three adaptive rates is in force. `playback` means the page is
       // painting on its own — a video, an animation — which is what separates "the pane
       // is throttled" from "the page has nothing new to show".
       rateKind: !adaptiveFrameRate ? "fixed"
         : currentWindows().activeFrameRate >= maxActiveFrameRate ? "active"
-          : currentWindows().activeFrameRate >= playbackFrameRate ? "playback" : "idle",
+          : currentWindows().activeFrameRate >= currentPlaybackTiers().playback ? "playback" : "idle",
       droppedByBackpressure: currentFrames().droppedGfxFrames,
       imageId: currentFrames().imageIds.base,
       // How the damage split between the two paths. A pane that feels slow while typing
@@ -5646,7 +5667,8 @@ app.whenReady().then(async () => {
   // asked for instead: `tweb diag` reports `frames.tiers` and the zoom, and the line
   // below goes to the engine log.
   console.error(`tweb: started ${modeLabel()} — toggle Ctrl-; · frame ${adaptiveFrameRate
-    ? `adaptive ${idleFrameRate}/${playbackFrameRate}/${maxActiveFrameRate}`
+    ? `adaptive ${idleFrameRate}/≤${maxActiveFrameRate} (playback ≤${
+      Math.round(PLAYBACK_BYTE_BUDGET / 1e6)}MB/s)`
     : `fixed ${maxActiveFrameRate}`}fps`
     + ` · zoom ${Math.round(defaultZoomFactor * 100)}%`);
 });
