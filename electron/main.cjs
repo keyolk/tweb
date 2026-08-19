@@ -2586,6 +2586,52 @@ function repairShortcutDelivery(tab) {
   }, RECOVERY_PING_MS);
 }
 
+// Telling the pane that a page is on its way.
+//
+// Three things shape this, and together they rule out the ordinary answer of an indeterminate
+// animated bar:
+//
+//   1. Every pixel change here is a frame to the terminal — megabytes of it. A bar that
+//      animates would push whole frames continuously for the length of every page load, which
+//      is precisely the cost the playback budget exists to bound.
+//   2. Continuous painting is also how `settleFrameRate` decides a page is playing video, so
+//      an animated indicator would hold the pane at its playback rate while nothing plays.
+//   3. A load that finishes in under a second does not need announcing. An indicator that
+//      appears and vanishes is noise, and it costs two frames to say nothing.
+//
+// So: nothing is drawn for the first `LOADING_INDICATOR_DELAY_MS`, and after that the state
+// changes only on lifecycle events — two or three paints for a whole load, and a bar that
+// grows in steps a person can read as progress.
+const LOADING_INDICATOR_DELAY_MS = 250;
+const loadingTimersByTab = new WeakMap();
+
+function clearLoadingTimer(tab) {
+  const timer = loadingTimersByTab.get(tab);
+  if (timer) clearTimeout(timer);
+  loadingTimersByTab.delete(tab);
+}
+
+// `progress` is 0..1, or null to take the indicator away.
+function sendLoadingProgress(tab, progress) {
+  clearLoadingTimer(tab);
+  if (progress === null) {
+    sendToMainTabFrame(tab, "tweb-loading", null);
+    return;
+  }
+  sendToMainTabFrame(tab, "tweb-loading", { progress });
+}
+
+// The first step waits, so a fast page never shows anything at all.
+function scheduleLoadingProgress(tab, progress) {
+  clearLoadingTimer(tab);
+  const timer = setTimeout(() => {
+    loadingTimersByTab.delete(tab);
+    if (tab.isDestroyed()) return;
+    sendToMainTabFrame(tab, "tweb-loading", { progress });
+  }, LOADING_INDICATOR_DELAY_MS);
+  loadingTimersByTab.set(tab, timer);
+}
+
 function sendToFocusedTabFrame(tab, channel, ...args) {
   if (!tab || tab.isDestroyed()) return;
   try {
@@ -4357,6 +4403,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 
   onContents("did-start-navigation", (details) => {
     if (details.isSameDocument || !details.frame) return;
+    if (details.isMainFrame) scheduleLoadingProgress(tab, 0.3);
     const key = frameKey(details.frame);
     readyFrameKeys(tab).delete(key);
     // Both sets are keyed the same way and go stale the same way, but only the ready set was
@@ -4394,6 +4441,17 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   onContents("found-in-page", (_event, result) => {
     sendToTabFrames(tab, "tweb-find-result", result);
   });
+  // The document exists and the page is now fetching what it references. Nothing is scheduled
+  // here: if the delay has not elapsed the pending first step just carries the higher value,
+  // and a page that reached this within the delay still shows nothing.
+  onContents("dom-ready", () => {
+    if (loadingTimersByTab.has(tab)) scheduleLoadingProgress(tab, 0.7);
+    else sendLoadingProgress(tab, 0.7);
+  });
+  // Gone on the way out, whether the load worked or not. `did-stop-loading` covers the
+  // ordinary end, a stop, and a failure alike — a bar left behind by an error page would be
+  // the most annoying form of this feature.
+  onContents("did-stop-loading", () => sendLoadingProgress(tab, null));
 
   let showingLoadError = false;
   const recordNavigation = (url) => {

@@ -480,6 +480,62 @@ installPrintShim();
     tabPopover = popover;
   }
 
+  // A two-pixel bar across the top of the pane while a page loads.
+  //
+  // It grows in steps rather than animating, and the reason is not taste: in this browser a
+  // pixel change is a frame to the terminal, and a continuously animating bar would push whole
+  // frames for the length of every load — the cost the playback budget exists to bound. It
+  // would also read as video to `settleFrameRate`, which decides a page is playing by counting
+  // paints, and hold the pane at its playback rate while nothing plays.
+  //
+  // So the engine sends a value on lifecycle events only, and waits 250ms before the first
+  // one, so a page that loads quickly never draws anything at all. Two or three paints for a
+  // whole load, against a bar a person can still read as progress.
+  //
+  // DO NOT add a transition here. It would restore exactly the cost this shape avoids.
+  let loadingHost = null;
+  let loadingBar = null;
+
+  function ensureLoadingBar() {
+    if (!topFrame || !document.documentElement || loadingHost?.isConnected) return;
+    const host = document.createElement("div");
+    host.id = "__tweb_loading__";
+    host.style.cssText = "position:fixed;left:0;top:0;right:0;height:2px;"
+      + "z-index:2147483646;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "closed" });
+    const bar = document.createElement("div");
+    // The same blue the tab badge uses, so the pane's own chrome stays one palette.
+    bar.style.cssText = "height:2px;width:0;background:#8ab4f8;box-shadow:0 0 4px #8ab4f899";
+    shadow.append(bar);
+    document.documentElement.append(host);
+    loadingHost = host;
+    loadingBar = bar;
+  }
+
+  function removeLoadingBar() {
+    loadingHost?.remove();
+    loadingHost = null;
+    loadingBar = null;
+  }
+
+  function updateLoadingBar(state) {
+    if (!topFrame) return;
+    if (!state) {
+      if (!loadingHost) return;
+      removeLoadingBar();
+      paintNow();
+      return;
+    }
+    ensureLoadingBar();
+    if (!loadingBar) return;
+    loadingBar.style.width = `${Math.round(Math.max(0, Math.min(1, state.progress)) * 100)}%`;
+    // The frame clock may be at its idle rate, and an indicator that appears a quarter second
+    // after the page started loading is worse than none.
+    paintNow();
+  }
+
+  ipcRenderer.on("tweb-loading", (_event, state) => updateLoadingBar(state));
+
   // What the input badge says, or "" for nothing to say.
   //
   // Two independent toggles: whether TWeb's shortcuts are on (Ctrl-/), and whether Cmd

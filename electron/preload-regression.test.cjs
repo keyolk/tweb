@@ -1247,3 +1247,32 @@ test("navigation prunes both frame sets, not just the ready one", () => {
   assert.match(body, /readyFrameKeys\(tab\)\.delete\(key\);/);
   assert.match(body, /shortcutFrameKeys\(tab\)\.delete\(key\);/);
 });
+
+// The ordinary answer to "show me it is loading" is an animated indeterminate bar. It is the
+// wrong answer here, and these pin why so the next person does not helpfully add one.
+test("the loading bar steps rather than animates", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // A page that loads quickly shows nothing: the first step is scheduled, not sent.
+  assert.match(main, /const LOADING_INDICATOR_DELAY_MS = \d+;/);
+  assert.match(main, /function scheduleLoadingProgress\(tab, progress\)/);
+  // Main-frame navigation only. `did-start-loading` also fires for subframes, so a video page
+  // fetching ads would flicker the bar — and every flicker is a whole frame to the terminal.
+  const navigation = main.slice(main.indexOf('onContents("did-start-navigation"'));
+  assert.match(navigation.slice(0, 400), /if \(details\.isMainFrame\) scheduleLoadingProgress\(tab, 0\.3\);/);
+  assert.match(main, /onContents\("dom-ready", \(\) => \{/);
+  // Removed at the end of the load however it ended — an error page must not keep a bar.
+  assert.match(main, /onContents\("did-stop-loading", \(\) => sendLoadingProgress\(tab, null\)\);/);
+
+  const bar = electron.slice(electron.indexOf("function ensureLoadingBar()"),
+    electron.indexOf("function removeLoadingBar()"));
+  // NO ANIMATION. A transition or keyframes here would push whole frames continuously for the
+  // length of every page load, and would read as video to the playback detector, which decides
+  // a page is playing by counting paints.
+  assert.doesNotMatch(bar, /transition/);
+  assert.doesNotMatch(bar, /animation/);
+  assert.doesNotMatch(bar, /@keyframes/);
+  // Thin, at the top, and never in the way of a click.
+  assert.match(bar, /height:2px/);
+  assert.match(bar, /pointer-events:none/);
+  assert.match(electron, /ipcRenderer\.on\("tweb-loading"/);
+});
