@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Does a hosted pane clean up after itself when it is interrupted?
 
-The defect this checks for is invisible from inside tweb: a hosted pane that dies by SIGINT's
-default action leaves the kitty image on the terminal and never leaves the alternate screen,
-because both cleanups are code in the pane process that a default-action death never runs. The
-page vanishes, a black screen stays, and the pane is stuck. It only happens with the daemon —
-on the spawn path the engine is the pane's own child and its exit path covers for this.
+**Ctrl-C is not SIGINT here.** tweb enters raw mode with `cfmakeraw`, which clears `ISIG`, so
+the terminal never translates the interrupt character into a signal — it arrives as a `0x03`
+BYTE on stdin. An earlier version of this harness called `send_signal(SIGINT)` and passed while
+the real key did nothing, because it was testing an event a user in raw mode cannot produce.
+So this writes the byte to the PTY, the way a keypress does.
+
+What goes wrong without the fix: nothing treats `0x03` as an exit, so the pane keeps running,
+its engine keeps running, and the page's image stays on the terminal. Measured on a wedged
+pane: both processes still alive minutes later, and the engine ignoring SIGTERM on top of that.
 
     python3 bench/hosted-interrupt.py <tweb-binary> <twebd-binary> [seconds]
 
@@ -13,20 +17,16 @@ What it checks, on a real PTY with a real daemon:
 
     1. the pane is hosted           otherwise this measures the spawn path, which never had
                                     the bug
-    2. SIGINT ends the process      a handler that swallows the signal is a worse bug than
-                                    the one being fixed
-    3. it exits 0, not -2           the difference between dying where the cleanup is and
-                                    dying before it
+    2. a typed 0x03 ends it         the pane exits rather than sitting there
+    3. its engine goes with it      a hosted pane's engine belongs to the daemon, but a spawned
+                                    one is the pane's own child and must not outlive it
 
-Check 3 is the one that separates the defect from the fix, and it was verified in both
-directions: the pre-fix binary exits -2 here, the fixed one exits 0.
+Verified in both directions: before the fix the pane survives the byte entirely.
 
-It asserts the exit path rather than the cleanup BYTES, which is a limitation worth stating.
+It asserts the exit rather than the cleanup BYTES, which is a limitation worth stating.
 `write_kitty_delete` wraps its output in tmux passthrough whenever $TMUX is set, and a harness
 needs a fabricated $TMUX to reach the hosted path at all — so the wrapped sequence has no live
-server to travel through and never lands on this PTY. Checked separately without $TMUX, where
-the raw `a=d,d=I` does appear on the tty; that run takes the spawn path, so it says the delete
-works but not that an interrupt reaches it.
+server to travel through and never lands on this PTY.
 """
 
 import os
@@ -39,6 +39,10 @@ import sys
 import time
 
 FAKE_TMUX = "/tmp/tweb-interrupt-probe,999999,0"
+# Which encoding of Ctrl-C to type. `raw` is the 0x03 byte; `modified` is what a terminal with
+# modified keys enabled sends, which is what a real pane sees — `TWEB_CTRL_C_FORM` picks.
+CTRL_C_FORM = (b"\x1b[99;5u" if os.environ.get("TWEB_CTRL_C_FORM", "modified") == "modified"
+               else b"\x03")
 PANE = "%901"
 
 
@@ -105,14 +109,19 @@ def main():
             except (BlockingIOError, OSError):
                 break
 
-        pane.send_signal(signal.SIGINT)
+        # The real event. Note there are TWO of them, and only sending the first is how this
+        # harness passed while the key did nothing in a real pane: `terminal_setup` asks the
+        # terminal for modified keys, after which Ctrl-C arrives as `CSI 99;5u` rather than as
+        # `0x03`. Nothing in a bare PTY turns that on, so the harness has to send both forms —
+        # the byte for the plain case, and the sequence for the one users actually get.
+        os.write(primary, CTRL_C_FORM)
         exited = None
         try:
-            exited = pane.wait(timeout=10)
+            exited = pane.wait(timeout=15)
         except subprocess.TimeoutExpired:
             pass
-        print(f"  exit status after SIGINT: {exited}")
-        results.append(("SIGINT ends the pane", exited is not None))
+        print(f"  exit status after a typed Ctrl-C: {exited}")
+        results.append(("a typed Ctrl-C ends the pane", exited is not None))
 
         # Read whatever the pane wrote on its way out.
         end = time.time() + 3
@@ -126,15 +135,10 @@ def main():
                 break
             captured += chunk
 
-        # THE CHECK THAT SEPARATES THE DEFECT FROM THE FIX.
-        #
-        # `-2` is death by SIGINT's default action: no handler ran, so no cleanup ran either —
-        # the image stays on the terminal and the alternate screen is never left. `0` means the
-        # session ended through its own exit path, which is the path the cleanup lives on.
-        # Measured both ways on this harness: the pre-fix binary gives -2, the fixed one 0.
+        # Ending through the exit path, not by a signal — that is where the cleanup lives.
         clean = exited == 0
-        print(f"  exited cleanly (0) rather than by signal (-2): {clean}")
-        results.append(("SIGINT ends the session through its exit path", clean))
+        print(f"  exited through its own exit path (0): {clean}")
+        results.append(("the pane ends through its exit path", clean))
 
         # The cleanup bytes themselves are NOT asserted here, and that is a limitation of the
         # harness rather than a gap in the fix. `write_kitty_delete` wraps its output in tmux

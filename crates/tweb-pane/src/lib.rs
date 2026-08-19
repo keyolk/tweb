@@ -61,6 +61,136 @@ impl Default for PaneOptions {
 /// screen — small strips of a page that is no longer there.
 const PATCH_ID_COUNT: u32 = 8;
 
+/// The byte a terminal in raw mode delivers when the user presses Ctrl-C.
+///
+/// It is a BYTE and not a signal, and that distinction is the whole of a defect this cost real
+/// time to find. `RawModeGuard` enters raw mode with `cfmakeraw`, which clears `ISIG` — so the
+/// terminal stops translating the interrupt character into SIGINT and hands it over as data.
+/// Every signal handler in this file is therefore irrelevant to the key the user actually
+/// presses: a pane with handlers installed for SIGINT still sat there when Ctrl-C arrived,
+/// because no SIGINT was ever generated. The signal arms still matter for `tmux kill-pane`
+/// (SIGHUP) and a plain `kill`; they were just never the answer to this.
+const CTRL_C: u8 = 0x03;
+
+/// Ctrl-C as a MODIFIED-KEY sequence, which is how it actually arrives here.
+///
+/// `terminal_setup` asks the terminal for modified keys — `CSI > 4 ; 2 m` inside tmux, Kitty
+/// flags outside it — because the page needs to tell `Ctrl-[` from `Escape` and friends. The
+/// consequence is that the interrupt character stops arriving as `0x03`: the terminal encodes it
+/// as `CSI 99 ; 5 u`, unicode 99 (`c`) with modifier 5 (control).
+///
+/// Measured on the real thing, which is the only reason this is here: a pane logged
+/// `input 1b5b39393b3575` for a keypress a byte-only check ignored, so Ctrl-C did nothing until
+/// the user pressed it enough times to hit something else. A harness that types `0x03` into a
+/// PTY never sees this, because nothing there turned modified keys on.
+const CTRL_C_MODIFIED: &[u8] = b"\x1b[99;5u";
+
+/// The same key with other modifiers alongside control — Ctrl-Shift-C, Ctrl-Alt-C and so on.
+///
+/// The modifier is a bitfield plus one: 5 is control, 6 adds shift, 7 adds alt. Only the control
+/// bit is required, so this matches the prefix and checks the bit rather than listing the
+/// combinations. Ctrl-Shift-C is a copy shortcut in many terminals and never reaches us, but a
+/// pane must not depend on which combinations a terminal happens to intercept.
+const CTRL_C_MODIFIED_PREFIX: &[u8] = b"\x1b[99;";
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Whether `chunk` at `index` begins a modified-key Ctrl-C, and how many bytes it spans.
+///
+/// `CSI 99 ; <modifier> u`, accepted for any modifier whose control bit is set. Returns `None`
+/// when this is not that sequence, so the caller can carry on scanning byte by byte.
+fn modified_ctrl_c_at(chunk: &[u8], index: usize) -> Option<usize> {
+    let rest = &chunk[index..];
+    if !rest.starts_with(CTRL_C_MODIFIED_PREFIX) {
+        return None;
+    }
+    let after = &rest[CTRL_C_MODIFIED_PREFIX.len()..];
+    let digits = after
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 || after.get(digits) != Some(&b'u') {
+        return None;
+    }
+    let modifier: u32 = std::str::from_utf8(&after[..digits]).ok()?.parse().ok()?;
+    // The wire value is the bitfield plus one; bit 0 of the bitfield is control.
+    if modifier == 0 || (modifier - 1) & 0b100 == 0 {
+        return None;
+    }
+    Some(CTRL_C_MODIFIED_PREFIX.len() + digits + 1)
+}
+
+/// Tracks whether the bytes arriving are the user typing or a paste being delivered.
+///
+/// A paste can carry any byte, `0x03` included — clipboard content is not keystrokes, and
+/// quitting the browser because someone pasted a control character would be worse than the bug
+/// this exists for. tmux and modern terminals bracket a paste with `ESC[200~` and `ESC[201~`,
+/// and both markers can land in the same read as the payload.
+#[derive(Default)]
+struct PasteTracker {
+    inside: bool,
+}
+
+impl PasteTracker {
+    /// Whether this chunk holds a Ctrl-C the user typed, and updates the paste state.
+    ///
+    /// Walks the chunk rather than testing `contains`, because the answer depends on WHERE the
+    /// byte sits relative to the markers: a `0x03` after `ESC[200~` in the same read is pasted
+    /// data, and one after `ESC[201~` is a keypress.
+    fn typed_interrupt(&mut self, chunk: &[u8]) -> bool {
+        let mut index = 0;
+        while index < chunk.len() {
+            let rest = &chunk[index..];
+            if rest.starts_with(PASTE_START) {
+                self.inside = true;
+                index += PASTE_START.len();
+                continue;
+            }
+            if rest.starts_with(PASTE_END) {
+                self.inside = false;
+                index += PASTE_END.len();
+                continue;
+            }
+            if !self.inside {
+                if chunk[index] == CTRL_C {
+                    return true;
+                }
+                if modified_ctrl_c_at(chunk, index).is_some() {
+                    return true;
+                }
+            }
+            if let Some(span) = modified_ctrl_c_at(chunk, index) {
+                index += span;
+                continue;
+            }
+            index += 1;
+        }
+        false
+    }
+}
+
+/// Ends the engine process, and does not wait forever for it to agree.
+///
+/// SIGTERM first, because a clean exit lets the engine drop its own placements and save its
+/// session. Then SIGKILL, because a SIGTERM the engine ignores is not hypothetical — measured
+/// on a wedged pane, the engine sat through it and both processes had to be killed by hand.
+/// An unbounded wait here reproduces exactly the defect this is fixing.
+async fn end_engine(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    let pid = pid as i32;
+    // SAFETY: `kill` on a pid this process spawned; a reaped pid yields ESRCH, which is ignored.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // SAFETY: signal 0 tests for existence without delivering anything.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+    }
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
 fn raw_kitty_delete(image_id: u32) -> String {
     let mut sequence = format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\");
     for slot in 0..PATCH_ID_COUNT {
@@ -444,11 +574,19 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         async move {
             let mut tty = tokio::io::stdin();
             let mut buf = [0u8; 256];
+            let mut paste = PasteTracker::default();
 
             loop {
                 match tty.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // Ctrl-C ends the pane, and is NOT forwarded — see `CTRL_C` for why this
+                        // is the only place that can see it. Ending the engine is what unblocks
+                        // the `child.wait()` below, and the image delete after it then runs.
+                        if paste.typed_interrupt(&buf[..n]) {
+                            end_engine(child_id).await;
+                            break;
+                        }
                         let mut hex = String::with_capacity(n * 2 + 7);
                         hex.push_str("INPUT ");
                         for byte in &buf[..n] {
@@ -496,16 +634,10 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             let mut previous_visibility = None;
             loop {
                 tokio::select! {
-                    _ = sighup.recv() => {
-                        if let Some(pid) = child_id {
-                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-                        }
-                    }
-                    _ = sigterm.recv() => {
-                        if let Some(pid) = child_id {
-                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-                        }
-                    }
+                    // Bounded, for the same reason the typed-interrupt path is: a SIGTERM the
+                    // engine ignores used to leave this pane waiting on it forever.
+                    _ = sighup.recv() => end_engine(child_id).await,
+                    _ = sigterm.recv() => end_engine(child_id).await,
                     _ = sigwinch.recv() => {
                         forward_pane_state(
                             &control_tx,
@@ -762,15 +894,29 @@ async fn run_hosted_session(
         }
     });
 
+    // A typed Ctrl-C reaches the session through this rather than through a signal, and ends it
+    // the same way a signal does — so the teardown has exactly one shape.
+    let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
     let input_handle = tokio::spawn({
         let control_tx = control_tx.clone();
+        let interrupt_tx = interrupt_tx.clone();
         async move {
             let mut tty = tokio::io::stdin();
             let mut buf = [0u8; 256];
+            let mut paste = PasteTracker::default();
             loop {
                 match tty.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // Ctrl-C ends the pane, and is NOT forwarded. Raw mode means it arrives
+                        // as a byte rather than a signal (see `CTRL_C`), so this is the only
+                        // place that can act on it. Swallowing it costs the page a literal
+                        // Ctrl-C — worth it while the alternative is a pane the key does
+                        // nothing to.
+                        if paste.typed_interrupt(&buf[..n]) {
+                            let _ = interrupt_tx.send(()).await;
+                            break;
+                        }
                         let mut hex = String::with_capacity(n * 2 + 7);
                         hex.push_str("INPUT ");
                         for byte in &buf[..n] {
@@ -846,6 +992,7 @@ async fn run_hosted_session(
         _ = recv_any(&mut sigint) => None,
         _ = recv_any(&mut sigterm) => None,
         _ = recv_any(&mut sighup) => None,
+        _ = interrupt_rx.recv() => None,
     };
 
     input_handle.abort();
@@ -1040,7 +1187,7 @@ fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
 mod tests {
     use super::{
         changed_geometry_message, host_geometry, matching_client_ttys, raw_kitty_delete,
-        resolve_electron_paths, tmux_passthrough, PATCH_ID_COUNT,
+        resolve_electron_paths, tmux_passthrough, PasteTracker, PATCH_ID_COUNT,
     };
     use crate::terminal::{WindowGeometry, WindowSize};
 
@@ -1089,6 +1236,86 @@ mod tests {
     // frontend deletes on paths the engine cannot reach, so it has to know about them too —
     // and the two constants live in different languages, where a drift is silent and shows
     // up only as strips of a dead page left on screen.
+    // Ctrl-C in raw mode is a BYTE, not a signal — the defect these guard was a pane that sat
+    // there while every signal handler waited for a SIGINT the terminal never generated.
+    #[test]
+    fn a_typed_ctrl_c_is_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        assert!(paste.typed_interrupt(b"\x03"));
+        assert!(paste.typed_interrupt(b"ab\x03cd"), "mid-chunk counts too");
+    }
+
+    // THE BYTES A REAL PANE ACTUALLY SENDS. `terminal_setup` turns modified keys on, so the
+    // terminal encodes the interrupt character rather than sending 0x03 — and a byte-only check
+    // ignored it completely. Taken verbatim from a pane's log: `input 1b5b39393b3575`.
+    #[test]
+    fn a_modified_key_ctrl_c_is_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        assert!(paste.typed_interrupt(b"\x1b[99;5u"), "CSI 99;5u is Ctrl-C");
+        assert!(
+            paste.typed_interrupt(b"\x1b[99;6u"),
+            "Ctrl-Shift-C still has the control bit"
+        );
+        assert!(paste.typed_interrupt(b"\x1b[99;7u"), "Ctrl-Alt-C too");
+    }
+
+    #[test]
+    fn the_same_key_without_control_is_not_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        // Modifier 1 is no modifiers, 2 is shift — a plain `c` or `C` must reach the page.
+        assert!(!paste.typed_interrupt(b"\x1b[99;1u"));
+        assert!(!paste.typed_interrupt(b"\x1b[99;2u"));
+        // And a different key with control is not this one.
+        assert!(
+            !paste.typed_interrupt(b"\x1b[100;5u"),
+            "Ctrl-D is not Ctrl-C"
+        );
+    }
+
+    #[test]
+    fn a_pasted_modified_ctrl_c_is_not_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        assert!(!paste.typed_interrupt(b"\x1b[200~\x1b[99;5u\x1b[201~"));
+        assert!(
+            paste.typed_interrupt(b"\x1b[99;5u"),
+            "and a real one after it counts"
+        );
+    }
+
+    #[test]
+    fn ordinary_input_is_not_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        assert!(!paste.typed_interrupt(b"hello"));
+        assert!(
+            !paste.typed_interrupt(b"\x1b[A"),
+            "an arrow key is not a quit"
+        );
+    }
+
+    // Clipboard content is not keystrokes. Quitting because someone pasted a control byte would
+    // be a worse bug than the one this fixes, and a paste can carry any byte at all.
+    #[test]
+    fn a_pasted_ctrl_c_is_not_an_interrupt() {
+        let mut paste = PasteTracker::default();
+        assert!(!paste.typed_interrupt(b"\x1b[200~ab\x03cd\x1b[201~"));
+        // ...and the tracker is back to normal afterwards.
+        assert!(paste.typed_interrupt(b"\x03"));
+    }
+
+    #[test]
+    fn a_paste_split_across_reads_still_shields_its_payload() {
+        // The markers and the payload need not arrive in one read, which is what makes this
+        // stateful rather than a `contains` check.
+        let mut paste = PasteTracker::default();
+        assert!(!paste.typed_interrupt(b"\x1b[200~begin"));
+        assert!(!paste.typed_interrupt(b"middle\x03still-pasted"));
+        assert!(!paste.typed_interrupt(b"end\x1b[201~"));
+        assert!(
+            paste.typed_interrupt(b"\x03"),
+            "and a real one after it still counts"
+        );
+    }
+
     #[test]
     fn deleting_covers_the_base_image_and_every_patch_slot() {
         let sequence = raw_kitty_delete(4242);
