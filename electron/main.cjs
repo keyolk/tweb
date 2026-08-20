@@ -76,6 +76,7 @@ const {
   loadExtensions,
   watchServiceWorkers,
 } = require("./extensions.cjs");
+const { extensionReport } = require("./extension-report.cjs");
 const { createPaneWriter, fdSink, channelSink } = require("./frame-writer.cjs");
 const { serverIdentityFrom, paneKey } = require("./pane-identity.cjs");
 const {
@@ -3538,6 +3539,10 @@ async function dispatchAgentCommand(method, params) {
       }
       return { ...engine, page };
     }
+    // Reporting only, like `diag`. The loader keeps its results precisely so this can answer
+    // without re-reading the profile directory.
+    case "extensions":
+      return extensionReport(extensionResults, extensionsDirectory);
     case "engine-log": {
       const limit = Number.isInteger(params?.limit) ? Math.max(1, Math.min(400, params.limit)) : 60;
       return { lines: engineLog.slice(-limit) };
@@ -3892,11 +3897,15 @@ function cancelTransfer(id) {
 // partition, so every tab in this engine already runs in the default session, and loading an
 // extension anywhere else would arm rules for a session no page uses.
 //
+let extensionResults = [];
+let extensionsDirectory = null;
+
 // What is NOT here is any attempt to install, download or update anything. The directory is
 // the interface — see `extension-policy.cjs` for which manifests are accepted and why an
 // unsupported one is refused with a reason rather than loaded and left inert.
 async function setUpExtensions() {
   const dir = extensionsDir(process.env, app.getPath("userData"));
+  extensionsDirectory = dir;
   watchServiceWorkers(session.defaultSession, {
     log: (message) => console.error(`tweb: ${message}`),
   });
@@ -3908,6 +3917,10 @@ async function setUpExtensions() {
       // profile state rather than under the source directory.
       runtimeRoot: path.join(app.getPath("userData"), "extension-runtime"),
     });
+    // Kept rather than counted. Everything `tweb extensions` reports is already in here —
+    // the refusal reason, the worker's fate, the ruleset count — and reducing it to two
+    // numbers is what made the state unaskable.
+    extensionResults = results;
     if (results.length > 0) {
       const loaded = results.filter((result) => result.loaded).length;
       console.error(`tweb: extensions ${loaded} loaded, ${results.length - loaded} refused`);
