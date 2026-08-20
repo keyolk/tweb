@@ -91,11 +91,29 @@ set-option -s extended-keys-format csi-u
 /// less at the root than it first appears, and a page cannot copy at all
 /// without it while typing. Both are taken, and doctor warns when a user has
 /// turned `copy-on-select` off — that is the one setup where this trade is bad.
+/// The caret motions below are a different trade from the four above. Cmd-arrow
+/// has no terminal meaning at all to spend — Ghostty leaves the combination
+/// unbound — so claiming it costs nothing. What it buys is the one set of
+/// motions a text field cannot get any other way: sending a synthetic Cmd-arrow
+/// to the engine does nothing, because on macOS the real key is translated by
+/// AppKit into an editing selector (`moveToBeginningOfLine:` and friends)
+/// before the web content ever sees it, and a synthetic key skips that
+/// translation. Measured — a plain arrow down the same path moves the caret and
+/// a Cmd-arrow does not — so the engine drives these through the renderer
+/// instead, and needs the bytes to arrive to know when.
 const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[
     ("super+k", 5020, 120),
     ("super+a", 5021, 121),
     ("super+c", 5022, 122),
     ("super+x", 5023, 123),
+    ("super+left", 5024, 124),
+    ("super+right", 5025, 125),
+    ("super+up", 5026, 126),
+    ("super+down", 5027, 127),
+    ("super+shift+left", 5028, 128),
+    ("super+shift+right", 5029, 129),
+    ("super+shift+up", 5030, 130),
+    ("super+shift+down", 5031, 131),
 ];
 
 fn cmd_passthrough_ghostty_bindings() -> String {
