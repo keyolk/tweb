@@ -5325,9 +5325,25 @@ function consumeRawInput() {
 
     match = /^\x1b\[([0-9]+)(?::[0-9]+)*(?:;([0-9]+)(?::([123]))?)?(?:;([0-9:]+))?u/.exec(decoded);
     if (match) {
+      // A CSI sequence written as literal text — a `keybind = home=text:\x1b[1~`, or this
+      // engine's own `ESC[5008~` Cmd codes coming back through the terminal — has its
+      // leading ESC encoded as a key in its own right once modified keys are on. What
+      // arrives is `ESC[91;3u` (Alt-`[`) with the rest of the sequence trailing behind it,
+      // so Home read as Alt-`[` and the `1~` after it was dropped.
+      //
+      // Unfolding it here rather than at the source covers every leg: whatever did the
+      // folding, the bytes are put back and the matchers below handle Home, End and the
+      // private shortcuts as they always did. A real Alt-`[` with nothing after it still
+      // dispatches — what is given up is a real Alt-`[` arriving in the same read as a
+      // trailing CSI, which no keyboard produces.
+      const folded = Buffer.byteLength(match[0]);
+      if (Number(match[1]) === 91 && (Number(match[2] || 1) - 1) & 0b10 && input.raw.length > folded) {
+        input.raw = Buffer.concat([Buffer.from("\x1b["), input.raw.subarray(folded)]);
+        continue;
+      }
       const text = match[4] ? match[4].split(":").map(Number).filter(Number.isFinite) : [];
       dispatchKey(Number(match[1]), Number(match[2] || 1), Number(match[3] || 1), text);
-      input.raw = input.raw.subarray(Buffer.byteLength(match[0]));
+      input.raw = input.raw.subarray(folded);
       continue;
     }
 
