@@ -1493,6 +1493,19 @@ function notePaintActivity() {
 // The terminal holds the last image we transferred under `imageId`, which lets a
 // resize re-place it without sending the pixels again.
 
+// Every placement this pane makes carries this id. A put with no `p=` is an *anonymous*
+// placement, and the protocol adds one each time rather than replacing the last: "Not
+// specifying a placement id or using p=0 for multiple put commands (a=p) with the same
+// non-zero image id results in multiple placements of the image." A resize re-places the
+// base image, so each one stacked another copy at a different cell box, and the taller
+// ones kept showing below the pane. Placements are keyed by (image id, placement id), so
+// one fixed id per pane makes every re-place replace rather than accumulate.
+//
+// It goes on the transmits too, not just the put. An anonymous placement and `p=1` are
+// different keys and would coexist: fixing only the put would leave the last whole
+// frame's anonymous placement underneath the one the resize just made.
+const PLACEMENT_ID = 1;
+
 // `d=i` drops the placements but keeps the image data, so it can be re-placed.
 function deletePlacement(frames = currentFrames()) {
   frames.pendingImageDelete = false;
@@ -1507,7 +1520,7 @@ function deletePlacement(frames = currentFrames()) {
 function replacePlacement(frames = currentFrames()) {
   if (!frames.imageTransferred) return;
   if (frames.pendingImageDelete) deletePlacement(frames);
-  writeGfx(`a=p,i=${frames.imageIds.base},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
+  writeGfx(`a=p,i=${frames.imageIds.base},p=${PLACEMENT_ID},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2", "");
 }
 
@@ -1543,7 +1556,7 @@ function deletePatches(frames = currentFrames()) {
 // Kitty places an image at the cursor. Patches address their cell against the pane's own
 // origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
 function patchPlacementSequence(id, place, frames = currentFrames()) {
-  const header = `a=T,f=100,i=${id},C=1,c=${place.cols},r=${place.rows}`
+  const header = `a=T,f=100,i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
@@ -1604,7 +1617,7 @@ function transferFrame(pixels, generation, format = "png", size = null) {
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
   // whose pixel size no longer matches still covers exactly the pane. `f=` is left to the
   // worker, which knows whether it is writing a PNG or raw pixels.
-  const header = `a=T,i=${currentFrames().imageIds.base},C=1,`
+  const header = `a=T,i=${currentFrames().imageIds.base},p=${PLACEMENT_ID},C=1,`
     + `c=${currentFrames().cells.cols},r=${currentFrames().cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
@@ -2522,6 +2535,116 @@ function sendToMainTabFrame(tab, channel, ...args) {
   }
 }
 
+// Bringing a tab's main frame back into the ready set after it fell out of it.
+//
+// A renderer crash is recoverable — `render-process-gone` reloads the page and it paints
+// again — but the reload's preload sometimes never registers, and then every key is dropped
+// while the page looks perfectly fine. Observed on a real pane: `shortcut frames=0 ready=0`
+// for minutes after `loaded`, with the user's only recourse being to reload by hand.
+//
+// The ready set is this file's own bookkeeping, not an Electron restriction: `frame.send()`
+// is always allowed and a send with no listener on the other end is harmless. So the repair
+// is a ping. A preload that is alive answers it and re-registers itself, which fixes the case
+// where only the bookkeeping was lost. Silence past the deadline means there is no preload
+// there at all, and the page has to be reloaded to get one.
+const RECOVERY_PING_MS = 1200;
+// Reloading in a loop would be worse than the defect it repairs: a page that crashes its
+// renderer on load would reload forever. `render-process-gone` already has a limiter for
+// exactly this; this is the same idea for the path that never raised an event.
+const MAX_SHORTCUT_RELOADS = 2;
+const shortcutRecoveryByTab = new WeakMap();
+
+function shortcutRecoveryState(tab) {
+  let state = shortcutRecoveryByTab.get(tab);
+  if (!state) {
+    state = { pinging: false, reloads: 0 };
+    shortcutRecoveryByTab.set(tab, state);
+  }
+  return state;
+}
+
+// Called from the drop path, so a dropped key is what starts the repair.
+function repairShortcutDelivery(tab) {
+  const state = shortcutRecoveryState(tab);
+  if (state.pinging) return;
+  const contents = tab.webContents;
+  // A page that is still loading has not had the chance to register yet, and its
+  // `tweb-preload-ready` is on the way. Reloading it here would cancel the very navigation
+  // that is about to fix things.
+  if (contents.isLoading()) return;
+  const frame = contents.mainFrame;
+  if (!frame || frame.isDestroyed() || frame.detached) return;
+  state.pinging = true;
+  try {
+    frame.send("tweb-are-you-there");
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: shortcut ping failed: ${error.message}`);
+  }
+  setTimeout(() => {
+    state.pinging = false;
+    if (tab.isDestroyed()) return;
+    // Answered, and the reply path re-registered the frame. Nothing more to do.
+    if (readyFrameKeys(tab).has(frameKey(tab.webContents.mainFrame))) {
+      state.reloads = 0;
+      return;
+    }
+    if (state.reloads >= MAX_SHORTCUT_RELOADS) {
+      console.error("tweb: shortcuts still undeliverable after"
+        + ` ${state.reloads} reload(s); not reloading again`);
+      return;
+    }
+    state.reloads += 1;
+    console.error(`tweb: no preload answered; reloading to restore shortcuts (${state.reloads})`);
+    tab.webContents.reload();
+  }, RECOVERY_PING_MS);
+}
+
+// Telling the pane that a page is on its way.
+//
+// Three things shape this, and together they rule out the ordinary answer of an indeterminate
+// animated bar:
+//
+//   1. Every pixel change here is a frame to the terminal — megabytes of it. A bar that
+//      animates would push whole frames continuously for the length of every page load, which
+//      is precisely the cost the playback budget exists to bound.
+//   2. Continuous painting is also how `settleFrameRate` decides a page is playing video, so
+//      an animated indicator would hold the pane at its playback rate while nothing plays.
+//   3. A load that finishes in under a second does not need announcing. An indicator that
+//      appears and vanishes is noise, and it costs two frames to say nothing.
+//
+// So: nothing is drawn for the first `LOADING_INDICATOR_DELAY_MS`, and after that the state
+// changes only on lifecycle events — two or three paints for a whole load, and a bar that
+// grows in steps a person can read as progress.
+const LOADING_INDICATOR_DELAY_MS = 250;
+const loadingTimersByTab = new WeakMap();
+
+function clearLoadingTimer(tab) {
+  const timer = loadingTimersByTab.get(tab);
+  if (timer) clearTimeout(timer);
+  loadingTimersByTab.delete(tab);
+}
+
+// `progress` is 0..1, or null to take the indicator away.
+function sendLoadingProgress(tab, progress) {
+  clearLoadingTimer(tab);
+  if (progress === null) {
+    sendToMainTabFrame(tab, "tweb-loading", null);
+    return;
+  }
+  sendToMainTabFrame(tab, "tweb-loading", { progress });
+}
+
+// The first step waits, so a fast page never shows anything at all.
+function scheduleLoadingProgress(tab, progress) {
+  clearLoadingTimer(tab);
+  const timer = setTimeout(() => {
+    loadingTimersByTab.delete(tab);
+    if (tab.isDestroyed()) return;
+    sendToMainTabFrame(tab, "tweb-loading", { progress });
+  }, LOADING_INDICATOR_DELAY_MS);
+  loadingTimersByTab.set(tab, timer);
+}
+
 function sendToFocusedTabFrame(tab, channel, ...args) {
   if (!tab || tab.isDestroyed()) return;
   try {
@@ -2535,11 +2658,17 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
     // simply stop working until focus happened to return to the main frame.
     if (frame && !shortcutFrameKeys(tab).has(frameKey(frame))) frame = contents.mainFrame;
     const deliverable = frame && readyFrameKeys(tab).has(frameKey(frame));
-    if (debugLogging && !deliverable) {
-      console.error(`tweb: dropped ${channel}; shortcut frames=${shortcutFrameKeys(tab).size}`
-        + ` ready=${readyFrameKeys(tab).size}`);
+    if (!deliverable) {
+      if (debugLogging) {
+        console.error(`tweb: dropped ${channel}; shortcut frames=${shortcutFrameKeys(tab).size}`
+          + ` ready=${readyFrameKeys(tab).size}`);
+      }
+      // A dropped key is the signal that delivery is broken — nothing else notices, which
+      // is why this went unrepaired until a user reported it.
+      repairShortcutDelivery(tab);
+      return;
     }
-    if (deliverable) frame.send(channel, ...args);
+    frame.send(channel, ...args);
   } catch (error) {
     if (debugLogging) console.error(`tweb: focused frame send failed: ${error.message}`);
   }
@@ -4287,7 +4416,13 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
 
   onContents("did-start-navigation", (details) => {
     if (details.isSameDocument || !details.frame) return;
-    readyFrameKeys(tab).delete(frameKey(details.frame));
+    if (details.isMainFrame) scheduleLoadingProgress(tab, 0.3);
+    const key = frameKey(details.frame);
+    readyFrameKeys(tab).delete(key);
+    // Both sets are keyed the same way and go stale the same way, but only the ready set was
+    // pruned here. A leftover shortcut key makes `sendToFocusedTabFrame` believe a dead frame
+    // can take shortcuts, so it skips the fall-back to the main frame and drops the key.
+    shortcutFrameKeys(tab).delete(key);
     // A new document has no find session behind it. Carrying the old flag over would send
     // the next query as a follow-up to a session that no longer exists, and Chromium
     // answers that with silence — the exact failure this state exists to prevent.
@@ -4319,6 +4454,17 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   onContents("found-in-page", (_event, result) => {
     sendToTabFrames(tab, "tweb-find-result", result);
   });
+  // The document exists and the page is now fetching what it references. Nothing is scheduled
+  // here: if the delay has not elapsed the pending first step just carries the higher value,
+  // and a page that reached this within the delay still shows nothing.
+  onContents("dom-ready", () => {
+    if (loadingTimersByTab.has(tab)) scheduleLoadingProgress(tab, 0.7);
+    else sendLoadingProgress(tab, 0.7);
+  });
+  // Gone on the way out, whether the load worked or not. `did-stop-loading` covers the
+  // ordinary end, a stop, and a failure alike — a bar left behind by an error page would be
+  // the most annoying form of this feature.
+  onContents("did-stop-loading", () => sendLoadingProgress(tab, null));
 
   let showingLoadError = false;
   const recordNavigation = (url) => {

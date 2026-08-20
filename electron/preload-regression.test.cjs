@@ -82,6 +82,92 @@ test("Tauri preload maps Korean normal keys and uses trusted hint clicks", () =>
   assertPreload(tauri);
 });
 
+// `cursor` inherits, so a pointer-styled ad card makes every descendant compute
+// as `pointer` and the parent check suppresses them — including the dismiss "x"
+// the card puts in its own corner. Reproduced with two identical `x` elements
+// differing only in whether the card above them was pointer-styled: only the one
+// under a pointer parent lost its hint.
+test("an element that declares its own pointer cursor keeps its hint", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const intent = source.slice(source.indexOf("function hasPointerIntent(element)"),
+    source.indexOf("function clickableAncestor(element)"));
+  assert.match(intent, /return ownsPointerIntent\(element\)/,
+    "the parent-cursor suppression must consult the element's own declaration");
+
+  const owns = source.slice(source.indexOf("function ownsPointerIntent(element)"),
+    source.indexOf("function hasPointerIntent(element)"));
+  assert.match(owns, /element\.style\?\.cursor === "pointer"/);
+  assert.match(owns, /aria-label/);
+
+  // Computed style reports the inherited value, so it cannot answer "did this
+  // element declare a cursor itself" — only the sheets can.
+  const matcher = source.slice(source.indexOf("function declaredCursorMatcher()"),
+    source.indexOf("function forgetDeclaredCursors()"));
+  assert.match(matcher, /adoptedStyleSheets/);
+  assert.match(matcher, /if \(rule\.cssRules\) walk\(rule\.cssRules\)/,
+    "cursor rules nested under @media would otherwise be invisible");
+  assert.match(matcher, /:is\(\$\{selectors\.join\(","\)\}\)/,
+    ":is() is forgiving, so one unparsable selector cannot poison the match");
+  assert.match(matcher, /catch \(_\) \{\}/,
+    "a cross-origin sheet must degrade to the old behaviour, not throw");
+
+  // A page can load or adopt a sheet between passes.
+  const targets = source.slice(source.indexOf("function interactiveTargets()"),
+    source.indexOf("function resourceUrl(value, element)"));
+  assert.match(targets, /forgetDeclaredCursors\(\)/);
+});
+
+// The reported ad's close button was a bare `<div class="Sticky__cancel">` —
+// no cursor, no label, no attribute, its click added with `addEventListener`.
+// Listener inspection would not have found it either: such a click is often
+// delegated from `document`, so the element holds no listener at all. The name
+// is the only signal it emits.
+test("a dismiss button is found by its name when nothing else marks it", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const dismiss = source.slice(source.indexOf("function dismissNameTargets(roots)"),
+    source.indexOf("function interactiveTargets()"));
+
+  // `Sticky__cancel` and `closableContainer` both have to yield their word.
+  assert.match(dismiss, /replace\(\/\(\[a-z0-9\]\)\(\[A-Z\]\)\/g, "\$1 \$2"\)/,
+    "camelCase names must be split or closableContainer never matches");
+  assert.match(dismiss, /split\(\/\[\^a-z0-9\]\+\//);
+  assert.match(dismiss, /dismissNames\.has\(word\)/,
+    "matching by substring would take `disclosure` for a close button");
+  assert.doesNotMatch(dismiss, /\.includes\(name\)|indexOf\(name\)/);
+
+  // A dismiss button is small; the bound keeps a page-covering close overlay out.
+  assert.match(dismiss, /box\.width > 48 \|\| box\.height > 48/);
+  assert.match(dismiss, /pointerEvents === "none"/);
+
+  for (const name of ["close", "cancel", "dismiss", "closable"]) {
+    assert.match(dismiss.slice(0, 0) + source, new RegExp(`"${name}"`),
+      `dismissNames is missing ${name}`);
+  }
+
+  const targets = source.slice(source.indexOf("function interactiveTargets()"),
+    source.indexOf("function resourceUrl(value, element)"));
+  assert.match(targets, /dismissNameTargets\(roots\)/,
+    "the source has to be collected, not just defined");
+});
+
+// A put with no `p=` is an anonymous placement, and the protocol adds one each time
+// rather than replacing the last. A resize re-places the base image, so each one stacked
+// another copy at a different cell box and the taller ones kept showing below the pane.
+test("every placement carries a fixed placement id", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+
+  // `a=d` deletes and `a=q` queries make no placement; `a=T` and `a=p` do, and an
+  // anonymous one coexists with `p=1` rather than replacing it — so all of them need it.
+  const placements = main.match(/`a=[Tp][^`]*`/g) || [];
+  assert.ok(placements.length >= 3, `expected placement headers, found ${placements.length}`);
+  for (const header of placements) {
+    assert.match(header, /p=\$\{PLACEMENT_ID\}/,
+      `placement header without a placement id accumulates: ${header}`);
+  }
+
+  assert.match(main, /const PLACEMENT_ID = 1;/);
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);
@@ -1158,4 +1244,121 @@ test("paper printing is opt-in and never remaps Ctrl-P", () => {
   assert.match(main, /const print = control && key\.toLowerCase\(\) === "p"/);
   assert.match(main, /else if \(print\) void printPageToPdf\(\);/);
   assert.match(electron, /else if \(key === "p"\) send\("print-paper"\);/);
+});
+
+// A focused field the user cannot see is not a place to put a cursor. Pages hold focus in
+// hidden inputs constantly — search overlays, paste targets, focus traps — and reporting
+// those put the terminal cursor in the middle of a heading, which is what the user saw.
+test("an invisible or offscreen field reports no caret", () => {
+  const gate = electron.slice(electron.indexOf("function caretPoint()"),
+    electron.indexOf("const computed = getComputedStyle(element)"));
+  // Both axes. Only the vertical pair was checked, so `left:-9999px` — the commonest way
+  // to park a hidden field — sailed through.
+  assert.match(gate, /box\.bottom <= 0 \|\| box\.top >= innerHeight/);
+  assert.match(gate, /box\.right <= 0 \|\| box\.left >= innerWidth/);
+  // Laid out but invisible: opacity:0 over a real position, or a hidden ancestor.
+  assert.match(gate, /checkVisibility\(\{ visibilityProperty: true, opacityProperty: true \}\)/);
+  // And a 1x1 focus trap is not somewhere a person types.
+  assert.match(gate, /box\.width < 2 \|\| box\.height < 2/);
+});
+
+// Two carets a few pixels apart read as a rendering fault, not as two systems agreeing.
+// The terminal's is the one that matters: it is the anchor composition lands on.
+test("the page caret is hidden while the terminal draws one", () => {
+  assert.match(electron, /function hidePageCaret\(element\)/);
+  assert.match(electron, /element\.style\.caretColor = "transparent"/);
+  // Restored when the slot goes away, or a field keeps an invisible caret after this pane
+  // stops driving it.
+  assert.match(electron, /function restorePageCaret\(\)/);
+  const update = electron.slice(electron.indexOf("function updateImeSlot(rect)"),
+    electron.indexOf("// The frame clock may have dropped"));
+  assert.match(update, /removeImeSlot\(\);\s*restorePageCaret\(\);/);
+  assert.match(update, /hidePageCaret\(activeElement\(\)\)/);
+  // An inline style rather than a stylesheet: caret-color inherits, and a page-wide rule
+  // would blank the caret in fields this pane is not driving.
+  assert.match(electron, /caretColorBefore = element\.style\.caretColor \|\| ""/);
+});
+
+// The slot is up whenever a field has focus — composition is never signalled to the
+// preload — so its alpha is paid every time someone clicks a search box, not only while
+// something is being composed.
+test("the composition surface stays faint enough to be furniture", () => {
+  const surface = electron.slice(electron.indexOf("function imeSurfaceColor()"),
+    electron.indexOf("function imeSlotRect(caret)"));
+  assert.doesNotMatch(surface, /,\.7[0-9]\)/, "the .76 that read as an opaque block");
+  assert.match(surface, /,\.42\)`/);
+  assert.match(surface, /rgba\(24,24,27,\.42\)/);
+  assert.match(surface, /rgba\(255,255,255,\.42\)/);
+});
+
+// A renderer crash reloads the page and it paints again — but the reload's preload sometimes
+// never registers, and then every key is dropped while the page looks fine. Observed on a real
+// pane: `shortcut frames=0 ready=0` for minutes after `loaded`, with no way out but a manual
+// reload. Nothing noticed, because a dropped key is silent.
+test("undeliverable shortcuts repair themselves", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // The drop is what starts the repair: it is the only evidence delivery is broken.
+  const send = main.slice(main.indexOf("function sendToFocusedTabFrame(tab, channel"),
+    main.indexOf("// The preload receives the two flags separately"));
+  assert.match(send, /repairShortcutDelivery\(tab\);/);
+
+  const repair = main.slice(main.indexOf("function repairShortcutDelivery(tab)"),
+    main.indexOf("function sendToFocusedTabFrame(tab, channel"));
+  // A ping first. Ready-gating is this file's bookkeeping, not an Electron rule — send always
+  // works, and a live preload answering re-registers itself.
+  assert.match(repair, /frame\.send\("tweb-are-you-there"\)/);
+  // A page mid-load has not had its chance to register yet; reloading would cancel the very
+  // navigation about to fix things.
+  assert.match(repair, /contents\.isLoading\(\)/);
+  // Silence means no preload is there, so the page needs reloading to get one...
+  assert.match(repair, /tab\.webContents\.reload\(\)/);
+  // ...but not forever: a page that crashes on load would otherwise reload in a loop.
+  assert.match(repair, /state\.reloads >= MAX_SHORTCUT_RELOADS/);
+  // And an answered ping must not also reload.
+  assert.match(repair, /if \(readyFrameKeys\(tab\)\.has\(frameKey\(tab\.webContents\.mainFrame\)\)\)/);
+
+  // The preload's half: the same registration it sends at startup, which is idempotent.
+  assert.match(electron, /ipcRenderer\.on\("tweb-are-you-there", \(\) => \{/);
+  const answer = electron.slice(electron.indexOf('ipcRenderer.on("tweb-are-you-there"'));
+  assert.match(answer.slice(0, 200), /ipcRenderer\.send\("tweb-preload-ready", \{ shortcutFrame \}\)/);
+});
+
+// Both sets are keyed by frame and go stale together, but only one was pruned on navigation.
+// A leftover shortcut key makes the sender believe a dead frame can take shortcuts, so it
+// skips the fall-back to the main frame and drops the key instead.
+test("navigation prunes both frame sets, not just the ready one", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const navigation = main.slice(main.indexOf('onContents("did-start-navigation"'));
+  const body = navigation.slice(0, navigation.indexOf("onContents(\"context-menu\""));
+  assert.match(body, /readyFrameKeys\(tab\)\.delete\(key\);/);
+  assert.match(body, /shortcutFrameKeys\(tab\)\.delete\(key\);/);
+});
+
+// The ordinary answer to "show me it is loading" is an animated indeterminate bar. It is the
+// wrong answer here, and these pin why so the next person does not helpfully add one.
+test("the loading bar steps rather than animates", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // A page that loads quickly shows nothing: the first step is scheduled, not sent.
+  assert.match(main, /const LOADING_INDICATOR_DELAY_MS = \d+;/);
+  assert.match(main, /function scheduleLoadingProgress\(tab, progress\)/);
+  // Main-frame navigation only. `did-start-loading` also fires for subframes, so a video page
+  // fetching ads would flicker the bar — and every flicker is a whole frame to the terminal.
+  const navigation = main.slice(main.indexOf('onContents("did-start-navigation"'));
+  assert.match(navigation.slice(0, 400), /if \(details\.isMainFrame\) scheduleLoadingProgress\(tab, 0\.3\);/);
+  assert.match(main, /onContents\("dom-ready", \(\) => \{/);
+  // Removed at the end of the load however it ended — an error page must not keep a bar.
+  assert.match(main, /onContents\("did-stop-loading", \(\) => sendLoadingProgress\(tab, null\)\);/);
+
+  const bar = electron.slice(electron.indexOf("function ensureLoadingBar()"),
+    electron.indexOf("function removeLoadingBar()"));
+  // NO ANIMATION. A transition or keyframes here would push whole frames continuously for the
+  // length of every page load, and would read as video to the playback detector, which decides
+  // a page is playing by counting paints.
+  assert.doesNotMatch(bar, /transition/);
+  assert.doesNotMatch(bar, /animation/);
+  assert.doesNotMatch(bar, /@keyframes/);
+  // Thin, at the top, and never in the way of a click.
+  assert.match(bar, /height:2px/);
+  assert.match(bar, /pointer-events:none/);
+  assert.match(electron, /ipcRenderer\.on\("tweb-loading"/);
 });

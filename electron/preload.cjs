@@ -480,6 +480,62 @@ installPrintShim();
     tabPopover = popover;
   }
 
+  // A two-pixel bar across the top of the pane while a page loads.
+  //
+  // It grows in steps rather than animating, and the reason is not taste: in this browser a
+  // pixel change is a frame to the terminal, and a continuously animating bar would push whole
+  // frames for the length of every load — the cost the playback budget exists to bound. It
+  // would also read as video to `settleFrameRate`, which decides a page is playing by counting
+  // paints, and hold the pane at its playback rate while nothing plays.
+  //
+  // So the engine sends a value on lifecycle events only, and waits 250ms before the first
+  // one, so a page that loads quickly never draws anything at all. Two or three paints for a
+  // whole load, against a bar a person can still read as progress.
+  //
+  // DO NOT add a transition here. It would restore exactly the cost this shape avoids.
+  let loadingHost = null;
+  let loadingBar = null;
+
+  function ensureLoadingBar() {
+    if (!topFrame || !document.documentElement || loadingHost?.isConnected) return;
+    const host = document.createElement("div");
+    host.id = "__tweb_loading__";
+    host.style.cssText = "position:fixed;left:0;top:0;right:0;height:2px;"
+      + "z-index:2147483646;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "closed" });
+    const bar = document.createElement("div");
+    // The same blue the tab badge uses, so the pane's own chrome stays one palette.
+    bar.style.cssText = "height:2px;width:0;background:#8ab4f8;box-shadow:0 0 4px #8ab4f899";
+    shadow.append(bar);
+    document.documentElement.append(host);
+    loadingHost = host;
+    loadingBar = bar;
+  }
+
+  function removeLoadingBar() {
+    loadingHost?.remove();
+    loadingHost = null;
+    loadingBar = null;
+  }
+
+  function updateLoadingBar(state) {
+    if (!topFrame) return;
+    if (!state) {
+      if (!loadingHost) return;
+      removeLoadingBar();
+      paintNow();
+      return;
+    }
+    ensureLoadingBar();
+    if (!loadingBar) return;
+    loadingBar.style.width = `${Math.round(Math.max(0, Math.min(1, state.progress)) * 100)}%`;
+    // The frame clock may be at its idle rate, and an indicator that appears a quarter second
+    // after the page started loading is worse than none.
+    paintNow();
+  }
+
+  ipcRenderer.on("tweb-loading", (_event, state) => updateLoadingBar(state));
+
   // What the input badge says, or "" for nothing to say.
   //
   // Two independent toggles: whether TWeb's shortcuts are on (Ctrl-/), and whether Cmd
@@ -781,6 +837,55 @@ installPrintShim();
     return typeof element?.id === "string" ? element.id : "";
   }
 
+  // `cursor` inherits, so every descendant of a pointer-styled card computes as
+  // `pointer` too and the suppression below is what keeps one card from emitting
+  // a hint per descendant. Telling the two apart needs the *declared* cursor,
+  // which no computed style reports — so the stylesheets are read for the
+  // selectors that set one. Recomputed once per hint pass because a page can
+  // load or adopt a sheet between passes.
+  let declaredCursorSelector;
+
+  function declaredCursorMatcher() {
+    if (declaredCursorSelector !== undefined) return declaredCursorSelector;
+    const selectors = [];
+    const walk = (rules) => {
+      for (const rule of rules || []) {
+        // `@media`/`@supports`/nesting hold their own lists, and real sites put
+        // plenty of cursor rules under a media query.
+        if (rule.cssRules) walk(rule.cssRules);
+        if (rule.style?.cursor && rule.selectorText) selectors.push(rule.selectorText);
+      }
+    };
+    for (const root of collectRoots()) {
+      const document_ = root.ownerDocument || root;
+      // Cross-origin sheets throw on `cssRules`; their declarations are simply
+      // invisible and such elements keep the old behaviour.
+      try { for (const sheet of document_.styleSheets || []) walk(sheet.cssRules); } catch (_) {}
+      try { for (const sheet of root.adoptedStyleSheets || []) walk(sheet.cssRules); } catch (_) {}
+    }
+    // `:is()` is forgiving, so one selector this engine cannot parse does not
+    // poison the whole match.
+    declaredCursorSelector = selectors.length ? `:is(${selectors.join(",")})` : "";
+    return declaredCursorSelector;
+  }
+
+  function forgetDeclaredCursors() {
+    declaredCursorSelector = undefined;
+  }
+
+  // An element that declares its own pointer cursor, or names itself for a
+  // screen reader, is asking to be clicked in its own right — a dismiss "x" in
+  // the corner of a pointer-styled ad is exactly this. Only consulted on the
+  // branch that would otherwise suppress it, so the `*` sweep does not pay for
+  // it.
+  function ownsPointerIntent(element) {
+    if (element.style?.cursor === "pointer") return true;
+    if (element.matches("[aria-label],[aria-labelledby],[title]")) return true;
+    const selector = declaredCursorMatcher();
+    if (!selector) return false;
+    try { return element.matches(selector); } catch (_) { return false; }
+  }
+
   function hasPointerIntent(element) {
     if (!(isElement(element)) || ownId(element).startsWith("__tweb_")) return false;
     const style = getComputedStyle(element);
@@ -790,7 +895,8 @@ installPrintShim();
     if (style.cursor !== "pointer") return false;
     const root = element.getRootNode();
     const parent = element.parentElement || root instanceof ShadowRoot && root.host || null;
-    return !(isElement(parent)) || getComputedStyle(parent).cursor !== "pointer";
+    if (!(isElement(parent)) || getComputedStyle(parent).cursor !== "pointer") return true;
+    return ownsPointerIntent(element);
   }
 
   function clickableAncestor(element) {
@@ -905,13 +1011,48 @@ installPrintShim();
       .filter((element) => !ownId(element).startsWith("__tweb_") && hasPointerIntent(element));
   }
 
+  const dismissNames = new Set(["close", "closable", "cancel", "dismiss", "xbutton", "closebtn", "closebutton"]);
+
+  // Ad dismiss buttons are the one control a person actually wants and the one
+  // this file cannot see: the real ones are bare `<div class="Sticky__cancel">`
+  // with no cursor, no label, no attribute, and their click wired by
+  // `addEventListener` — often delegated from `document`, so the element itself
+  // never holds a listener at all and no amount of listener inspection would
+  // find it. What it does carry is a name. Matching that name is a guess, but it
+  // is the only signal such a button emits, and clicking one that turns out to
+  // be inert costs nothing.
+  function dismissNameTargets(roots) {
+    const named = [];
+    for (const root of roots) {
+      for (const element of root.querySelectorAll("[class],[id]")) {
+        if (ownId(element).startsWith("__tweb_")) continue;
+        const box = element.getBoundingClientRect();
+        // A dismiss button is small. The size bound is what keeps a
+        // `.modal-close-overlay` covering the page out of the hints.
+        if (box.width < 4 || box.height < 4 || box.width > 48 || box.height > 48) continue;
+        // `Sticky__cancel` and `closableContainer` both have to yield their word,
+        // and matching by substring would take `disclosure` for a close button.
+        const words = `${element.className?.baseVal ?? (typeof element.className === "string" ? element.className : "")} ${ownId(element)}`
+          .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+          .toLowerCase()
+          .split(/[^a-z0-9]+/);
+        if (!words.some((word) => dismissNames.has(word))) continue;
+        if (getComputedStyle(element).pointerEvents === "none") continue;
+        named.push(element);
+      }
+    }
+    return named;
+  }
+
   function interactiveTargets() {
+    forgetDeclaredCursors();
     const roots = collectRoots();
     const semantic = roots.flatMap((root) => [...root.querySelectorAll(interactiveSelector)]);
     const media = semantic.filter((element) => element.matches("video,audio"));
     const elements = [
       ...semantic.filter((element) => !element.matches("video,audio")),
       ...pointerIntentTargets(roots),
+      ...dismissNameTargets(roots),
     ];
     const targets = uniqueVisibleTargets(hitTestTargets(elements), (element) => ({
       nativeSurface: isTag(element, "canvas"),
@@ -1395,6 +1536,15 @@ installPrintShim();
     const box = document.createElement("div");
     // No border or shadow: this should read as a little clearing in the input's
     // own surface, not as a second UI component sitting on top of it.
+    //
+    // The blur stays, and the alpha is what came down instead. Composition is not
+    // signalled to this preload at all — preedit happens in the terminal and only
+    // committed text reaches the page — so the slot is painted for as long as a field has
+    // focus, not while something is being composed. At `.76` that read as an opaque block
+    // sitting in a search box nobody had typed in yet. But the blur is doing the job the
+    // alpha cannot: it is what keeps page glyphs from being legible UNDER the preedit, and
+    // a lower alpha needs it more, not less. Removing it was tried and the regression test
+    // for this surface caught it.
     box.style.cssText = ["position:fixed", "box-sizing:border-box", "border-radius:2px",
       "background:transparent", "backdrop-filter:blur(1.5px)"].join(";");
     shadow.append(box);
@@ -1415,16 +1565,19 @@ installPrintShim();
       const values = getComputedStyle(element).backgroundColor.match(/[\d.]+/g)?.map(Number) || [];
       const alpha = values.length > 3 ? values[3] : 1;
       if (values.length >= 3 && alpha > 0.05) {
-        // Reuse the input surface's hue but leave enough transparency that gradients
-        // and subtle texture still continue through the composition clearing.
-        return `rgba(${Math.round(values[0])},${Math.round(values[1])},${Math.round(values[2])},.76)`;
+        // Reuse the input surface's hue, at an alpha that hides the page glyphs a
+        // composition would otherwise be read against WITHOUT announcing itself. It was
+        // `.76`, chosen against the composition case alone — but the slot is up whenever a
+        // field has focus, so that value spent its budget on the case that is rare and paid
+        // for it in the case that is constant.
+        return `rgba(${Math.round(values[0])},${Math.round(values[1])},${Math.round(values[2])},.42)`;
       }
       const root = element.getRootNode();
       element = element.parentElement || (root instanceof ShadowRoot ? root.host : null);
     }
     return matchMedia("(prefers-color-scheme: dark)").matches
-      ? "rgba(24,24,27,.72)"
-      : "rgba(255,255,255,.72)";
+      ? "rgba(24,24,27,.42)"
+      : "rgba(255,255,255,.42)";
   }
 
   // Where composition should appear, in cell-grid coordinates: the page image fills
@@ -1459,6 +1612,39 @@ installPrintShim();
     return { left, top, width, height: cell.height, lineTop, lineBottom };
   }
 
+  // While the terminal draws a cursor for this pane, the page must not draw one too.
+  //
+  // Both are honest: the page paints its own caret because a field has focus, and the
+  // terminal paints one because that is where composition will land. Together they are two
+  // bars a few pixels apart, which reads as a rendering fault rather than as two systems
+  // agreeing. The terminal's is the one to keep — it is the anchor the terminal composes
+  // against, and it blinks with the rest of the terminal.
+  //
+  // An inline style on the focused element, restored when focus leaves, rather than a
+  // stylesheet: `caret-color` inherits, and a page-wide rule would hide the caret in every
+  // field including ones this pane is not driving.
+  let caretHiddenElement = null;
+  let caretColorBefore = "";
+
+  function hidePageCaret(element) {
+    if (caretHiddenElement === element) return;
+    restorePageCaret();
+    if (!isElement(element) || !element.style) return;
+    caretHiddenElement = element;
+    caretColorBefore = element.style.caretColor || "";
+    element.style.caretColor = "transparent";
+  }
+
+  function restorePageCaret() {
+    if (!caretHiddenElement) return;
+    try {
+      if (caretColorBefore) caretHiddenElement.style.caretColor = caretColorBefore;
+      else caretHiddenElement.style.removeProperty("caret-color");
+    } catch (_) { /* the element may be gone with its document */ }
+    caretHiddenElement = null;
+    caretColorBefore = "";
+  }
+
   function updateImeSlot(rect) {
     const surface = rect ? imeSurfaceColor() : "";
     const key = rect ? `${rect.left},${rect.lineTop},${rect.width},${rect.lineBottom},${surface}` : "";
@@ -1466,7 +1652,11 @@ installPrintShim();
     imeSlotKey = key;
     if (!rect) {
       removeImeSlot();
+      restorePageCaret();
     } else {
+      // The slot is up, so the terminal cursor is on this spot — the page's own caret
+      // would be the second bar beside it.
+      hidePageCaret(activeElement());
       ensureImeSlot();
       // Match the reserved cells exactly. Extra padding would turn the translucent
       // clearing back into a visible surface and could cover the preceding page glyph.
@@ -1543,7 +1733,22 @@ installPrintShim();
     const element = activeElement();
     if (!isEditable(element) || isTag(element, "select")) return null;
     const box = element.getBoundingClientRect();
-    if (!box.width || !box.height || box.bottom <= 0 || box.top >= innerHeight) return null;
+    // Offscreen in EITHER axis, not just vertically. A hidden field parked at
+    // `left:-9999px` is one of the commonest ways a page holds focus for a search overlay
+    // or a paste target, and reporting its caret put the terminal cursor at the pane's
+    // edge — sitting in the middle of a heading, where nothing can be typed.
+    if (!box.width || !box.height) return null;
+    if (box.bottom <= 0 || box.top >= innerHeight) return null;
+    if (box.right <= 0 || box.left >= innerWidth) return null;
+    // A field can also be present and laid out while being invisible — `opacity:0` over a
+    // real position, `visibility:hidden` on an ancestor. `checkVisibility` answers both,
+    // and is guarded because it is newer than the oldest engine this preload runs in.
+    if (typeof element.checkVisibility === "function"
+      && !element.checkVisibility({ visibilityProperty: true, opacityProperty: true })) {
+      return null;
+    }
+    // A 1x1 field is a focus trap, not somewhere a person types.
+    if (box.width < 2 || box.height < 2) return null;
 
     const computed = getComputedStyle(element);
     let x = box.left + (parseFloat(computed.paddingLeft) || 0) + 1;
@@ -3987,6 +4192,20 @@ installPrintShim();
   };
   if (document.documentElement) initializeDocument();
   else addEventListener("DOMContentLoaded", initializeDocument, { once: true });
+
+  // How a preload that is alive but unregistered gets itself back on the books.
+  //
+  // The engine drops a key when the frame it would go to is not in its ready set, and after
+  // a renderer crash and reload that set can end up empty while this preload is running
+  // perfectly well — the page paints, the mode badge is there, and every shortcut is
+  // silently discarded. The engine pings on a dropped key; answering with the same
+  // registration it would have sent at startup is the whole repair.
+  //
+  // Safe to answer more than once: `tweb-preload-ready` is idempotent on the engine side —
+  // it sets membership in two sets by frame key rather than accumulating anything.
+  ipcRenderer.on("tweb-are-you-there", () => {
+    ipcRenderer.send("tweb-preload-ready", { shortcutFrame });
+  });
 
   // Register only after every listener above is installed. Main then targets
   // this frame for IPC broadcasts without racing preload initialization.
