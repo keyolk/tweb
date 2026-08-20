@@ -1579,3 +1579,22 @@ test("Option-arrow is driven through the renderer, like the Cmd motions", () => 
   assert.match(editable, /PageUp: \["backward", "line"\], PageDown: \["forward", "line"\]/);
   assert.match(editable, /textControlPageLines\(contentEditableHost\(\)/);
 });
+
+// A pane that goes hidden and does not come back is invisible from the outside: no frames
+// arrive, and every other symptom — a strip of stale image, a page that looks dead — is
+// downstream of this one transition. Observed once during a resize and never pinned,
+// because the line that would have said so was behind `debugLogging`.
+test("a visibility transition is logged whether or not debug logging is on", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const listing = main.slice(main.indexOf("function applyClientListing(clients, placement)"),
+    main.indexOf("function applyVisibilityPush(hex)"));
+  const transition = listing.slice(listing.indexOf("const changed = recordVisibility("));
+  assert.match(transition, /console\.error\(`tweb: visibility \$\{changed\.visible \? "visible" : "hidden"\}`/);
+  // Not gated. The eviction log above it still is, because that one fires per client per
+  // poll; this one fires only on a change.
+  assert.doesNotMatch(transition, /if \(debugLogging\)/);
+  // "Hidden" has two very different causes — no client is watching, or this pane resolved
+  // to the wrong window — and the line has to tell them apart on its own.
+  assert.match(transition, /ttys=\$\{\[\.\.\.next\]\.join\(","\) \|\| "none"\}/);
+  assert.match(transition, /placement=\$\{vis\(\)\.placement\?\.session\}/);
+});
