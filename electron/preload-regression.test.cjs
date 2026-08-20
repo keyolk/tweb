@@ -1366,8 +1366,10 @@ test("paper printing is opt-in and never remaps Ctrl-P", () => {
 // hidden inputs constantly — search overlays, paste targets, focus traps — and reporting
 // those put the terminal cursor in the middle of a heading, which is what the user saw.
 test("an invisible or offscreen field reports no caret", () => {
+  // Bounded by a string unique to caretPoint: `const computed = getComputedStyle(element)`
+  // also appears in `textControlPageLines`, which is defined earlier in the file.
   const gate = electron.slice(electron.indexOf("function caretPoint()"),
-    electron.indexOf("const computed = getComputedStyle(element)"));
+    electron.indexOf("let x = box.left +"));
   // Both axes. Only the vertical pair was checked, so `left:-9999px` — the commonest way
   // to park a hidden field — sailed through.
   assert.match(gate, /box\.bottom <= 0 \|\| box\.top >= innerHeight/);
@@ -1523,4 +1525,57 @@ test("the IME slot is withheld when the caret is not at the end", () => {
     electron.indexOf("  function ensureImeSlot()"));
   assert.doesNotMatch(slot, /hidePageCaret/);
   assert.doesNotMatch(slot, /restorePageCaret/);
+});
+
+// The page keys scrolled the document from inside a focused textarea, because they skipped
+// the caret step the arrows right next to them take. No other editor does that with them.
+test("the page keys move the caret in a field before they scroll", () => {
+  const perform = electron.slice(electron.indexOf("function performKeyDefault(active, payload, editable)"));
+  const page = perform.slice(perform.indexOf('if (key === "PageUp" || key === "PageDown")'));
+  // Same two calls, in the same order, as the arrow branch above it.
+  assert.match(page, /if \(moveTextControlCaret\(active, key, Boolean\(payload\.shiftKey\)\)\) return;/);
+  assert.match(page, /if \(active\?\.isContentEditable && moveContentEditableCaret\(key, Boolean\(payload\.shiftKey\)\)\) return;/);
+  // And only then the surface, which is what it always did.
+  assert.match(page, /scrollSurfaceBy\(0, \(key === "PageUp" \? -0\.9 : 0\.9\) \* scrollSurfaceHeight\(\)\)/);
+
+  const destination = electron.slice(electron.indexOf("function textControlDestination(element, key, position)"),
+    electron.indexOf("function moveTextControlCaret("));
+  // A page of the FIELD. A textarea is routinely much shorter than the viewport, and the
+  // caret is moving inside its box.
+  assert.match(destination, /textControlPageLines\(element\)/);
+  assert.match(electron, /element\.clientHeight \* 0\.9 \/ lineHeight/);
+  // A single-line input has no page to move through, so it answers with the ends — which
+  // is what a browser does there too.
+  assert.match(destination, /if \(!\(isTag\(element, "textarea"\)\)\) return key === "PageUp" \? 0 : value\.length;/);
+});
+
+// Option-arrow is word motion in every macOS text field, and it was the one motion a field
+// here could not get at all.
+test("Option-arrow is driven through the renderer, like the Cmd motions", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const named = main.slice(main.indexOf("function dispatchNamedKey(key, modifierMask"));
+  const alt = named.slice(named.indexOf('modifiers.includes("alt")'));
+  // Not dispatched natively: AppKit translates the real key into an editing selector before
+  // the web content sees it, and a synthesised key skips that translation — the same reason
+  // the Cmd motions are routed this way, measured when they were added.
+  assert.match(alt.slice(0, 400), /sendToFocusedTabFrame\(currentWindows\(\)\.win, "tweb-caret-motion"/);
+  assert.match(alt.slice(0, 400), /key === "ArrowLeft" \? "WordLeft" : "WordRight"/);
+  assert.match(alt.slice(0, 400), /extend: shift/);
+  // Up/Down stay native: Option-Up/Down is paragraph motion, which no field here has.
+  assert.match(named, /\(key === "ArrowLeft" \|\| key === "ArrowRight"\)/);
+
+  // The preload's half: both paths answer the new keys.
+  const destination = electron.slice(electron.indexOf("function textControlDestination(element, key, position)"),
+    electron.indexOf("function moveTextControlCaret("));
+  assert.match(destination, /if \(key === "WordLeft" \|\| key === "WordRight"\)/);
+  // Whitespace first, then the word — so Option-Left from mid-word lands on that word's
+  // start rather than skipping past it.
+  assert.match(destination, /while \(index > 0 && !wordAt\(index - 1\)\) index -= 1;/);
+  assert.match(destination, /while \(index > 0 && wordAt\(index - 1\)\) index -= 1;/);
+  const editable = electron.slice(electron.indexOf("function moveContentEditableCaret(key, extend)"),
+    electron.indexOf("function performKeyDefault("));
+  assert.match(editable, /WordLeft: \["backward", "word"\], WordRight: \["forward", "word"\]/);
+  // `selection.modify` has no page granularity, so a page is a run of line steps.
+  assert.match(editable, /PageUp: \["backward", "line"\], PageDown: \["forward", "line"\]/);
+  assert.match(editable, /textControlPageLines\(contentEditableHost\(\)/);
 });
