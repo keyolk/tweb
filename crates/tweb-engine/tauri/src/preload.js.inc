@@ -230,10 +230,17 @@
     if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(key)) {
       if (moveTextControlCaret(active, key, Boolean(payload.shiftKey))) return;
       if (active?.isContentEditable && moveContentEditableCaret(key, Boolean(payload.shiftKey))) return;
-      if (!editable && key === "Home") scrollTo({ top: 0, behavior: "instant" });
-      else if (!editable && key === "End") scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
-      else if (!editable && key === "ArrowUp") scrollBy({ top: -40, behavior: "instant" });
-      else if (!editable && key === "ArrowDown") scrollBy({ top: 40, behavior: "instant" });
+      // Through the picked surface, the way `gg`/`G` and `j`/`k` already go. These four
+      // called the window directly, so picking an inner pane with `s` moved the page
+      // behind it instead — the one thing picking a surface exists to prevent.
+      //
+      // On a panned surface Home/End now do nothing, because `scrollSurfaceTo` refuses a
+      // pan target: there is no "top" of a drag-panned canvas to go to. That matches
+      // `gg`/`G`, which have always behaved this way.
+      if (!editable && key === "Home") scrollSurfaceTo(0);
+      else if (!editable && key === "End") scrollSurfaceTo(scrollSurfaceEnd());
+      else if (!editable && key === "ArrowUp") scrollSurfaceBy(0, -40);
+      else if (!editable && key === "ArrowDown") scrollSurfaceBy(0, 40);
       return;
     }
     if (key === "PageUp" || key === "PageDown") {

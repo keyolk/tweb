@@ -200,6 +200,26 @@ test("visibleRect survives a null element", () => {
   }
 });
 
+// Picking an inner surface with `s` was defeated by the very keys a reader reaches for:
+// Home/End/arrows called the window directly, so the page behind the panel moved instead.
+test("Home, End and the arrows scroll the picked surface", () => {
+  for (const source of [electron, tauri]) {
+    const start = source.indexOf('if (!editable && key === "Home")');
+    assert.ok(start > 0, "the non-editable scroll branch is missing");
+    const block = source.slice(start, start + 400)
+      .split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+
+    assert.match(block, /key === "Home"\) scrollSurfaceTo\(0\)/);
+    assert.match(block, /key === "End"\) scrollSurfaceTo\(scrollSurfaceEnd\(\)\)/);
+    assert.match(block, /key === "ArrowUp"\) scrollSurfaceBy\(0, -40\)/);
+    assert.match(block, /key === "ArrowDown"\) scrollSurfaceBy\(0, 40\)/);
+
+    // The window calls are what picking a surface exists to avoid.
+    assert.doesNotMatch(block, /[^e]scrollTo\(\{/);
+    assert.doesNotMatch(block, /[^e]scrollBy\(\{/);
+  }
+});
+
 // A CSI sequence sent as literal text has its leading ESC encoded as a key of its own
 // once modified keys are on, so Home arrived as `ESC[91;3u` + `1~` — read as Alt-`[` with
 // the rest thrown away. Captured from a real pane:
