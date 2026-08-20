@@ -756,6 +756,10 @@ installPrintShim();
   }
 
   function visibleRect(element) {
+    // Callers reach here from optional chains — `visibleRect(panSurface())?.height` reads
+    // as guarded, but `?.` protects the result and not the argument, so a null surface
+    // threw out of `getComputedStyle` and took the whole key handler with it.
+    if (!isElement(element)) return null;
     const style = ownerView(element).getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return null;
     const offset = frameOffset(element);
