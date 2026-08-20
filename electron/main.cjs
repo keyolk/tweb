@@ -5188,6 +5188,21 @@ const CMD_PRIVATE_KEYS = new Map([
   [5023, "x"],
 ]);
 
+// Cmd motions inside a text field. macOS semantics: Cmd-Left/Right travel to the ends of
+// the line, Cmd-Up/Down to the ends of the field, and Shift extends the selection to the
+// same place. `Home`/`End` are reused for the line pair because the preload's movers
+// already know what those mean in an input and a textarea.
+const CMD_CARET_MOTIONS = new Map([
+  [5024, { key: "Home", extend: false }],
+  [5025, { key: "End", extend: false }],
+  [5026, { key: "DocumentStart", extend: false }],
+  [5027, { key: "DocumentEnd", extend: false }],
+  [5028, { key: "Home", extend: true }],
+  [5029, { key: "End", extend: true }],
+  [5030, { key: "DocumentStart", extend: true }],
+  [5031, { key: "DocumentEnd", extend: true }],
+]);
+
 function dispatchPrivateShortcut(code) {
   if (debugLogging) console.error(`tweb: private key ${code}`);
   // Ctrl-; — bypass toggle. Leaves vimium alone.
@@ -5203,6 +5218,27 @@ function dispatchPrivateShortcut(code) {
   // The legacy forced ON/OFF sequences — under the new flags they force bypass.
   if (code === 5011 || code === 5012) {
     setCmdBypassEnabled(code === 5012);
+    return;
+  }
+  // Driven through the renderer rather than as a key event, and this was measured rather
+  // than assumed. Sending the combination straight to Electron does nothing at all — same
+  // field, caret at offset 12, each key delivered by `sendInputEvent`:
+  //
+  //     Left               12 -> 11        moved
+  //     Shift-Left         12 -> [11,12]   selected
+  //     Cmd-Left           12 -> 12        nothing
+  //     Cmd-Shift-Right    12 -> 12        nothing
+  //     Cmd-Up (textarea)  20 -> 20        nothing
+  //     Cmd-Left (in a contenteditable)    nothing
+  //
+  // The plain arrows work because Blink moves the caret itself. Cmd-arrow is not web
+  // behaviour at all: on macOS, AppKit translates the key into an editing selector like
+  // `moveToBeginningOfLine:` before the web content ever sees it, and a synthetic key
+  // skips that translation entirely. Nothing downstream gives it meaning, which is the
+  // same reason Cmd-C/V/X and Cmd-A are driven directly a few lines above.
+  const motion = CMD_CARET_MOTIONS.get(code);
+  if (motion) {
+    sendToFocusedTabFrame(currentWindows().win, "tweb-caret-motion", motion);
     return;
   }
   const cmdKey = CMD_PRIVATE_KEYS.get(code);
