@@ -82,6 +82,41 @@ test("Tauri preload maps Korean normal keys and uses trusted hint clicks", () =>
   assertPreload(tauri);
 });
 
+// `cursor` inherits, so a pointer-styled ad card makes every descendant compute
+// as `pointer` and the parent check suppresses them — including the dismiss "x"
+// the card puts in its own corner. Reproduced with two identical `x` elements
+// differing only in whether the card above them was pointer-styled: only the one
+// under a pointer parent lost its hint.
+test("an element that declares its own pointer cursor keeps its hint", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const intent = source.slice(source.indexOf("function hasPointerIntent(element)"),
+    source.indexOf("function clickableAncestor(element)"));
+  assert.match(intent, /return ownsPointerIntent\(element\)/,
+    "the parent-cursor suppression must consult the element's own declaration");
+
+  const owns = source.slice(source.indexOf("function ownsPointerIntent(element)"),
+    source.indexOf("function hasPointerIntent(element)"));
+  assert.match(owns, /element\.style\?\.cursor === "pointer"/);
+  assert.match(owns, /aria-label/);
+
+  // Computed style reports the inherited value, so it cannot answer "did this
+  // element declare a cursor itself" — only the sheets can.
+  const matcher = source.slice(source.indexOf("function declaredCursorMatcher()"),
+    source.indexOf("function forgetDeclaredCursors()"));
+  assert.match(matcher, /adoptedStyleSheets/);
+  assert.match(matcher, /if \(rule\.cssRules\) walk\(rule\.cssRules\)/,
+    "cursor rules nested under @media would otherwise be invisible");
+  assert.match(matcher, /:is\(\$\{selectors\.join\(","\)\}\)/,
+    ":is() is forgiving, so one unparsable selector cannot poison the match");
+  assert.match(matcher, /catch \(_\) \{\}/,
+    "a cross-origin sheet must degrade to the old behaviour, not throw");
+
+  // A page can load or adopt a sheet between passes.
+  const targets = source.slice(source.indexOf("function interactiveTargets()"),
+    source.indexOf("function resourceUrl(value, element)"));
+  assert.match(targets, /forgetDeclaredCursors\(\)/);
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);

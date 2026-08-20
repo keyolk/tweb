@@ -837,6 +837,55 @@ installPrintShim();
     return typeof element?.id === "string" ? element.id : "";
   }
 
+  // `cursor` inherits, so every descendant of a pointer-styled card computes as
+  // `pointer` too and the suppression below is what keeps one card from emitting
+  // a hint per descendant. Telling the two apart needs the *declared* cursor,
+  // which no computed style reports — so the stylesheets are read for the
+  // selectors that set one. Recomputed once per hint pass because a page can
+  // load or adopt a sheet between passes.
+  let declaredCursorSelector;
+
+  function declaredCursorMatcher() {
+    if (declaredCursorSelector !== undefined) return declaredCursorSelector;
+    const selectors = [];
+    const walk = (rules) => {
+      for (const rule of rules || []) {
+        // `@media`/`@supports`/nesting hold their own lists, and real sites put
+        // plenty of cursor rules under a media query.
+        if (rule.cssRules) walk(rule.cssRules);
+        if (rule.style?.cursor && rule.selectorText) selectors.push(rule.selectorText);
+      }
+    };
+    for (const root of collectRoots()) {
+      const document_ = root.ownerDocument || root;
+      // Cross-origin sheets throw on `cssRules`; their declarations are simply
+      // invisible and such elements keep the old behaviour.
+      try { for (const sheet of document_.styleSheets || []) walk(sheet.cssRules); } catch (_) {}
+      try { for (const sheet of root.adoptedStyleSheets || []) walk(sheet.cssRules); } catch (_) {}
+    }
+    // `:is()` is forgiving, so one selector this engine cannot parse does not
+    // poison the whole match.
+    declaredCursorSelector = selectors.length ? `:is(${selectors.join(",")})` : "";
+    return declaredCursorSelector;
+  }
+
+  function forgetDeclaredCursors() {
+    declaredCursorSelector = undefined;
+  }
+
+  // An element that declares its own pointer cursor, or names itself for a
+  // screen reader, is asking to be clicked in its own right — a dismiss "x" in
+  // the corner of a pointer-styled ad is exactly this. Only consulted on the
+  // branch that would otherwise suppress it, so the `*` sweep does not pay for
+  // it.
+  function ownsPointerIntent(element) {
+    if (element.style?.cursor === "pointer") return true;
+    if (element.matches("[aria-label],[aria-labelledby],[title]")) return true;
+    const selector = declaredCursorMatcher();
+    if (!selector) return false;
+    try { return element.matches(selector); } catch (_) { return false; }
+  }
+
   function hasPointerIntent(element) {
     if (!(isElement(element)) || ownId(element).startsWith("__tweb_")) return false;
     const style = getComputedStyle(element);
@@ -846,7 +895,8 @@ installPrintShim();
     if (style.cursor !== "pointer") return false;
     const root = element.getRootNode();
     const parent = element.parentElement || root instanceof ShadowRoot && root.host || null;
-    return !(isElement(parent)) || getComputedStyle(parent).cursor !== "pointer";
+    if (!(isElement(parent)) || getComputedStyle(parent).cursor !== "pointer") return true;
+    return ownsPointerIntent(element);
   }
 
   function clickableAncestor(element) {
@@ -962,6 +1012,7 @@ installPrintShim();
   }
 
   function interactiveTargets() {
+    forgetDeclaredCursors();
     const roots = collectRoots();
     const semantic = roots.flatMap((root) => [...root.querySelectorAll(interactiveSelector)]);
     const media = semantic.filter((element) => element.matches("video,audio"));
