@@ -200,6 +200,29 @@ test("visibleRect survives a null element", () => {
   }
 });
 
+// A CSI sequence sent as literal text has its leading ESC encoded as a key of its own
+// once modified keys are on, so Home arrived as `ESC[91;3u` + `1~` — read as Alt-`[` with
+// the rest thrown away. Captured from a real pane:
+//   1b5b39313b3375317e  Home        1b5b39313b3375347e  End
+//   1b5b39313b3375353030387e        this engine's own ESC[5008~ Cmd code
+test("a CSI sequence folded into Alt-[ is put back together", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const start = main.indexOf('match = /^\\x1b\\[([0-9]+)(?::[0-9]+)*');
+  assert.ok(start > 0, "the CSI-u matcher is missing");
+  const block = main.slice(start, start + 1600)
+    .split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+
+  // 91 is `[`, and bit 2 of the modifier bitfield is alt.
+  assert.match(block, /Number\(match\[1\]\) === 91/);
+  assert.match(block, /& 0b10/);
+  // Only when something trails it: a real Alt-`[` alone must still dispatch.
+  assert.match(block, /input\.raw\.length > folded/);
+  assert.match(block, /Buffer\.concat\(\[Buffer\.from\("\\x1b\["\), input\.raw\.subarray\(folded\)\]\)/);
+
+  // The rewrite is 7 bytes to 2, so the buffer always shrinks and the loop terminates.
+  assert.match(block, /const folded = Buffer\.byteLength\(match\[0\]\)/);
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);
