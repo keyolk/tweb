@@ -500,7 +500,7 @@ test("the terminal cursor follows the visual caret on an ordinary page", () => {
   const report = electron.slice(electron.indexOf("function reportCaret()"),
     electron.indexOf("// Suggestion panels and popovers close on Escape"));
   assert.match(report, /const composing = !visualState\?\.caret;/);
-  assert.match(report, /point && composing \? imeSlotRect/);
+  assert.match(report, /point && composing && caretAtContentEnd\(\) \? imeSlotRect/);
 
   // Leaving visual mode has to release the cursor, since no other reporter covers a
   // plain page and it would otherwise stay parked on the last caret.
@@ -1386,10 +1386,14 @@ test("the page caret is hidden while the terminal draws one", () => {
   // Restored when the slot goes away, or a field keeps an invisible caret after this pane
   // stops driving it.
   assert.match(electron, /function restorePageCaret\(\)/);
-  const update = electron.slice(electron.indexOf("function updateImeSlot(rect)"),
-    electron.indexOf("// The frame clock may have dropped"));
-  assert.match(update, /removeImeSlot\(\);\s*restorePageCaret\(\);/);
-  assert.match(update, /hidePageCaret\(activeElement\(\)\)/);
+  // Keyed off the parked terminal cursor rather than off the IME slot, which is now
+  // withheld mid-text — see "the IME slot is withheld when the caret is not at the end".
+  // Tying it to the slot would leave the page's caret drawn beside the terminal's in
+  // exactly the case the slot is skipped.
+  const report = electron.slice(electron.indexOf("  function reportCaret()"),
+    electron.indexOf("  function dismissPageOverlay()"));
+  assert.match(report, /hidePageCaret\(activeElement\(\)\)/);
+  assert.match(report, /else restorePageCaret\(\);/);
   // An inline style rather than a stylesheet: caret-color inherits, and a page-wide rule
   // would blank the caret in fields this pane is not driving.
   assert.match(electron, /caretColorBefore = element\.style\.caretColor \|\| ""/);
@@ -1477,4 +1481,46 @@ test("the loading bar steps rather than animates", () => {
   assert.match(bar, /height:2px/);
   assert.match(bar, /pointer-events:none/);
   assert.match(electron, /ipcRenderer\.on\("tweb-loading"/);
+});
+
+// Chrome does not fire blur or focusout when the focused element is removed from the DOM,
+// which is exactly how a search overlay closes. Every other caret trigger is an event on the
+// focused field, so the terminal cursor stayed parked on a field that no longer existed —
+// visible in normal mode, on top of the page, until some unrelated key reported again.
+test("leaving a mode re-reports the caret", () => {
+  const normal = electron.slice(electron.indexOf("  function normalMode() {"),
+    electron.indexOf("  function hasTransientMode()"));
+  assert.match(normal, /reportCaret\(\);/);
+  // `""` is itself the no-caret report, so resetting the dedup key to it would swallow the
+  // one send that clears the cursor.
+  assert.match(normal, /lastCaretReport = null;/);
+});
+
+// The slot reserves cells past the caret and paints over them. At the end of a field that is
+// empty space; anywhere else it is the page's own text, three cells of it blurred out.
+test("the IME slot is withheld when the caret is not at the end", () => {
+  assert.match(electron, /const slot = point && composing && caretAtContentEnd\(\)/);
+  const helper = electron.slice(electron.indexOf("  function caretAtContentEnd()"),
+    electron.indexOf("  function reportCaret()"));
+  // Measured from `selectionStart`, which is where the caret is drawn. Shift+Home leaves
+  // `selectionEnd` at the far end of the text, so asking it said "at the end" while the
+  // caret sat in front of everything — the reported smear.
+  assert.match(helper, /const start = element\.selectionStart/);
+  assert.match(helper, /!value\.slice\(start\)\.trim\(\)/);
+  // A range selection is never a place to compose: the next character replaces it.
+  assert.match(helper, /if \(\(element\.selectionEnd \?\? start\) !== start\) return false;/);
+  assert.match(helper, /if \(!selection\.isCollapsed\) return false;/);
+  // contentEditable has no value, so the range from the caret to the end of the host is it.
+  assert.match(helper, /after\.setEndAfter\(element\)/);
+
+  // Suppressing the page caret must follow the parked terminal cursor, not the slot —
+  // otherwise withholding the slot brings back the two carets a few pixels apart.
+  const report = electron.slice(electron.indexOf("  function reportCaret()"),
+    electron.indexOf("  function dismissPageOverlay()"));
+  assert.match(report, /if \(point && isEditable\(activeElement\(\)\)\) hidePageCaret\(activeElement\(\)\);/);
+  assert.match(report, /else restorePageCaret\(\);/);
+  const slot = electron.slice(electron.indexOf("  function updateImeSlot(rect)"),
+    electron.indexOf("  function ensureImeSlot()"));
+  assert.doesNotMatch(slot, /hidePageCaret/);
+  assert.doesNotMatch(slot, /restorePageCaret/);
 });

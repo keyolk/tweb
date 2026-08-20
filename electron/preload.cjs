@@ -689,6 +689,18 @@ installPrintShim();
     else if (isEditable(activeElement())) setMode("insert");
     else if (panSurface()) setMode("normal", "↔ pan · Esc");
     else setMode("normal", scrollSurface() ? "⇅ inner · Esc" : "");
+    // Every other caret trigger is an event on the focused field, and a field can leave
+    // without firing one: Chrome does not fire blur or focusout when the focused element is
+    // removed from the DOM, which is how a search overlay closes. The terminal cursor was
+    // then stranded on the vanished field's last position, in normal mode, with nothing to
+    // clear it until some unrelated key happened to report again. Measured on Google:
+    // Escape left `caret {col:22,row:28}` with `activeElement: body`, and the next `j`
+    // cleared it. A mode change is the one moment that always happens, so it reports.
+    // `lastCaretReport` is invalidated with a sentinel rather than `""`, because `""` IS the
+    // no-caret report: resetting to it would make dedup swallow the very send that clears
+    // the cursor. `null` matches no report the function can build.
+    lastCaretReport = null;
+    reportCaret();
   }
 
   const koreanLangmap = new Map(Object.entries({
@@ -1674,11 +1686,7 @@ installPrintShim();
     imeSlotKey = key;
     if (!rect) {
       removeImeSlot();
-      restorePageCaret();
     } else {
-      // The slot is up, so the terminal cursor is on this spot — the page's own caret
-      // would be the second bar beside it.
-      hidePageCaret(activeElement());
       ensureImeSlot();
       // Match the reserved cells exactly. Extra padding would turn the translucent
       // clearing back into a visible surface and could cover the preceding page glyph.
@@ -1825,6 +1833,45 @@ installPrintShim();
     };
   }
 
+  // The slot reserves cells PAST the caret and paints over them, which is right where a
+  // preedit lands — and right on top of real text whenever the caret is not at the end.
+  // Typing at the end is the overwhelming case (and the only one an IME preedit normally
+  // happens in), so the surface is withheld rather than allowed to smear three cells of the
+  // page. Reported after Home and Cmd-Left started putting the caret in front of text a
+  // person could still read: `asdfasdf` came back with its first cells blurred out.
+  //
+  // Trailing whitespace does not count as content — a preedit over a run of spaces hides
+  // nothing worth keeping.
+  function caretAtContentEnd() {
+    const element = activeElement();
+    if (!isElement(element)) return false;
+    if (isTag(element, "input", "textarea")) {
+      const value = element.value ?? "";
+      const start = element.selectionStart ?? value.length;
+      // A range selection is never a place to compose: the next character replaces it, and
+      // the surface would sit on the highlight. `selectionEnd` is also the wrong end to ask
+      // about — Shift+Home leaves it at the far end of the text while the caret is drawn at
+      // `selectionStart`, so measuring from it said "at the end" while the caret sat in
+      // front of everything. That is the reported smear: three cells of `asdfasdf` blurred
+      // out, immediately right of a caret at position 0.
+      if ((element.selectionEnd ?? start) !== start) return false;
+      return !value.slice(start).trim();
+    }
+    if (!element.isContentEditable) return false;
+    const selection = getSelection();
+    if (!selection?.rangeCount) return true;
+    if (!selection.isCollapsed) return false;
+    try {
+      const after = selection.getRangeAt(0).cloneRange();
+      after.collapse(false);
+      after.setEndAfter(element);
+      return !after.toString().trim();
+    } catch (_) {
+      // A range that cannot be built says nothing about the text, so keep the surface.
+      return true;
+    }
+  }
+
   function reportCaret() {
     if (!topFrame && !document.hasFocus()) return;
     const caret = caretPoint();
@@ -1837,7 +1884,7 @@ installPrintShim();
     const composing = !visualState?.caret;
     // A subframe cannot draw the surface in the top document, so it reports the raw
     // caret and the top frame's own report wins as soon as focus moves there.
-    const slot = point && composing ? imeSlotRect({ ...point, height }) : null;
+    const slot = point && composing && caretAtContentEnd() ? imeSlotRect({ ...point, height }) : null;
     if (slot) {
       point = { x: slot.left, y: slot.top };
       height = slot.height;
@@ -1845,6 +1892,12 @@ installPrintShim();
     } else {
       updateImeSlot(null);
     }
+    // Tied to the parked terminal cursor rather than to the slot. The page's caret is
+    // suppressed because the terminal draws one on the same spot, and that stays true in
+    // every case the slot is withheld — otherwise withholding it above would bring back
+    // the two-carets-a-few-pixels-apart this was written to fix.
+    if (point && isEditable(activeElement())) hidePageCaret(activeElement());
+    else restorePageCaret();
     const report = point ? `${Math.round(point.x)},${Math.round(point.y)},${Math.round(height)}` : "";
     if (report === lastCaretReport) return;
     lastCaretReport = report;
