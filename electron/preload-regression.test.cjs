@@ -150,6 +150,24 @@ test("a dismiss button is found by its name when nothing else marks it", () => {
     "the source has to be collected, not just defined");
 });
 
+// A put with no `p=` is an anonymous placement, and the protocol adds one each time
+// rather than replacing the last. A resize re-places the base image, so each one stacked
+// another copy at a different cell box and the taller ones kept showing below the pane.
+test("every placement carries a fixed placement id", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+
+  // `a=d` deletes and `a=q` queries make no placement; `a=T` and `a=p` do, and an
+  // anonymous one coexists with `p=1` rather than replacing it — so all of them need it.
+  const placements = main.match(/`a=[Tp][^`]*`/g) || [];
+  assert.ok(placements.length >= 3, `expected placement headers, found ${placements.length}`);
+  for (const header of placements) {
+    assert.match(header, /p=\$\{PLACEMENT_ID\}/,
+      `placement header without a placement id accumulates: ${header}`);
+  }
+
+  assert.match(main, /const PLACEMENT_ID = 1;/);
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);

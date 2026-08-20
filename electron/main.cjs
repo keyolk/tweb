@@ -1493,6 +1493,19 @@ function notePaintActivity() {
 // The terminal holds the last image we transferred under `imageId`, which lets a
 // resize re-place it without sending the pixels again.
 
+// Every placement this pane makes carries this id. A put with no `p=` is an *anonymous*
+// placement, and the protocol adds one each time rather than replacing the last: "Not
+// specifying a placement id or using p=0 for multiple put commands (a=p) with the same
+// non-zero image id results in multiple placements of the image." A resize re-places the
+// base image, so each one stacked another copy at a different cell box, and the taller
+// ones kept showing below the pane. Placements are keyed by (image id, placement id), so
+// one fixed id per pane makes every re-place replace rather than accumulate.
+//
+// It goes on the transmits too, not just the put. An anonymous placement and `p=1` are
+// different keys and would coexist: fixing only the put would leave the last whole
+// frame's anonymous placement underneath the one the resize just made.
+const PLACEMENT_ID = 1;
+
 // `d=i` drops the placements but keeps the image data, so it can be re-placed.
 function deletePlacement(frames = currentFrames()) {
   frames.pendingImageDelete = false;
@@ -1507,7 +1520,7 @@ function deletePlacement(frames = currentFrames()) {
 function replacePlacement(frames = currentFrames()) {
   if (!frames.imageTransferred) return;
   if (frames.pendingImageDelete) deletePlacement(frames);
-  writeGfx(`a=p,i=${frames.imageIds.base},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
+  writeGfx(`a=p,i=${frames.imageIds.base},p=${PLACEMENT_ID},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2", "");
 }
 
@@ -1543,7 +1556,7 @@ function deletePatches(frames = currentFrames()) {
 // Kitty places an image at the cursor. Patches address their cell against the pane's own
 // origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
 function patchPlacementSequence(id, place, frames = currentFrames()) {
-  const header = `a=T,f=100,i=${id},C=1,c=${place.cols},r=${place.rows}`
+  const header = `a=T,f=100,i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
@@ -1604,7 +1617,7 @@ function transferFrame(pixels, generation, format = "png", size = null) {
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
   // whose pixel size no longer matches still covers exactly the pane. `f=` is left to the
   // worker, which knows whether it is writing a PNG or raw pixels.
-  const header = `a=T,i=${currentFrames().imageIds.base},C=1,`
+  const header = `a=T,i=${currentFrames().imageIds.base},p=${PLACEMENT_ID},C=1,`
     + `c=${currentFrames().cells.cols},r=${currentFrames().cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
