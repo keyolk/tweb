@@ -168,6 +168,38 @@ test("every placement carries a fixed placement id", () => {
   assert.match(main, /const PLACEMENT_ID = 1;/);
 });
 
+// PageUp/PageDown moved by 90px, which is the line step `j`/`k` use — so the two keys did
+// the same thing as the ones beside them.
+test("page keys scroll by the surface, not by a line", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const pageKeys = source.slice(source.indexOf('if (key === "PageUp" || key === "PageDown") {'),
+    source.indexOf("function hideTabPopover()"));
+  assert.match(pageKeys, /scrollSurfaceHeight\(\)/,
+    "a fixed pixel step is a line step, whatever the number");
+  assert.doesNotMatch(pageKeys, /scrollSurfaceBy\(0, key === "PageUp" \? -?\d+ : \d+\)/);
+
+  // Measured against the same surface `d`/`u` use, so an inner pane pages by its own height.
+  const halfPage = source.slice(source.indexOf('case "d": '), source.indexOf('case "G": '));
+  assert.match(halfPage, /scrollSurfaceHeight\(\)/);
+});
+
+// `visibleRect(panSurface())?.height` reads as guarded, but `?.` protects the result and
+// not the argument: with no pan surface picked, `getComputedStyle(null)` threw and took
+// the whole key handler with it, so the key did nothing at all and said nothing about it.
+test("visibleRect survives a null element", () => {
+  for (const source of [electron, tauri]) {
+    const start = source.indexOf("function visibleRect(element)");
+    const rect = source.slice(start, start + 600);
+    assert.match(rect, /if \(!isElement\(element\)\) return null;/,
+      "an optional chain on the result does not guard the argument");
+    // Compare the code, not the comment above it, which names getComputedStyle too.
+    const code = rect.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+    const guardAt = code.indexOf("isElement(element)");
+    const styleAt = code.indexOf("getComputedStyle");
+    assert.ok(guardAt >= 0 && guardAt < styleAt, "the guard must precede getComputedStyle");
+  }
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);
@@ -754,7 +786,8 @@ test("scroll keys can target a picked inner surface", () => {
       `${key} must scroll the picked surface`);
   }
   assert.doesNotMatch(electron, /case "j": scrollBy\(/);
-  assert.match(electron, /if \(key === "PageUp" \|\| key === "PageDown"\) \{\s*scrollSurfaceBy\(0, key === "PageUp" \? -90 : 90\);/);
+  // The surface, not the step: how far a page key moves is pinned by its own test.
+  assert.match(electron, /if \(key === "PageUp" \|\| key === "PageDown"\) \{[\s\S]*?scrollSurfaceBy\(0, /);
 });
 
 test("large canvas and SVG surfaces can be panned with scroll keys", () => {

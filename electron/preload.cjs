@@ -332,7 +332,12 @@ installPrintShim();
       return;
     }
     if (key === "PageUp" || key === "PageDown") {
-      scrollSurfaceBy(0, key === "PageUp" ? -90 : 90);
+      // A page, not a line. 90px is the line step `j`/`k` use, which made these two keys
+      // do the same thing as the ones right next to them. Measured against the scroll
+      // surface like `d`/`u`, so an inner pane pages by its own height rather than the
+      // window's. Nine tenths rather than the whole thing: browsers leave a few lines of
+      // the previous screen behind so the reader can pick the thread back up.
+      scrollSurfaceBy(0, (key === "PageUp" ? -0.9 : 0.9) * scrollSurfaceHeight());
       return;
     }
     if (editable && typeof payload.text === "string" && payload.text) {
@@ -751,6 +756,10 @@ installPrintShim();
   }
 
   function visibleRect(element) {
+    // Callers reach here from optional chains — `visibleRect(panSurface())?.height` reads
+    // as guarded, but `?.` protects the result and not the argument, so a null surface
+    // threw out of `getComputedStyle` and took the whole key handler with it.
+    if (!isElement(element)) return null;
     const style = ownerView(element).getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return null;
     const offset = frameOffset(element);
