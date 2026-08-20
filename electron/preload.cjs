@@ -237,6 +237,10 @@ installPrintShim();
 
   function textControlDestination(element, key, position) {
     const value = element.value;
+    // Cmd-Up/Down go to the ends of the field, not of a line — the one motion the
+    // per-line arrows below cannot express.
+    if (key === "DocumentStart") return 0;
+    if (key === "DocumentEnd") return value.length;
     if (key === "ArrowLeft") return previousCharacter(value, position);
     if (key === "ArrowRight") return nextCharacter(value, position);
     if (key === "Home") {
@@ -296,6 +300,8 @@ installPrintShim();
       ArrowLeft: ["backward", "character"], ArrowRight: ["forward", "character"],
       ArrowUp: ["backward", "line"], ArrowDown: ["forward", "line"],
       Home: ["backward", "lineboundary"], End: ["forward", "lineboundary"],
+      DocumentStart: ["backward", "documentboundary"],
+      DocumentEnd: ["forward", "documentboundary"],
     }[key];
     if (!motion) return false;
     selection.modify(extend ? "extend" : "move", motion[0], motion[1]);
@@ -4017,6 +4023,20 @@ installPrintShim();
     } else {
       document.execCommand("selectAll");
     }
+  });
+
+  // Cmd motions are driven directly rather than dispatched as key events, for the same
+  // reason `tweb-select-all` is: a `meta` modifier goes down the native path, and a
+  // synthetic native key carries no default editing behaviour with it. Here the renderer
+  // already knows the selection and the focused field, which is all these need.
+  ipcRenderer.on("tweb-caret-motion", (_event, motion) => {
+    if (topFrame && isTag(document.activeElement, "iframe", "frame")) return;
+    if (!topFrame && !document.hasFocus()) return;
+    const active = activeElement();
+    const key = motion?.key;
+    const extend = Boolean(motion?.extend);
+    if (moveTextControlCaret(active, key, extend)) return;
+    if (active?.isContentEditable) moveContentEditableCaret(key, extend);
   });
 
   ipcRenderer.on("tweb-tabs", (_event, model) => {

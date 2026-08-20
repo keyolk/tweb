@@ -243,6 +243,46 @@ test("a CSI sequence folded into Alt-[ is put back together", () => {
   assert.match(block, /const folded = Buffer\.byteLength\(match\[0\]\)/);
 });
 
+// Cmd is not a terminal modifier, so these arrive as private ESC[50XX~ codes and have to
+// be driven through the renderer: a `meta` modifier takes the native path, and a synthetic
+// native key carries no default editing behaviour with it.
+test("Cmd caret motions are driven through the renderer", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const table = main.slice(main.indexOf("const CMD_CARET_MOTIONS"),
+    main.indexOf("function dispatchPrivateShortcut"));
+
+  // Four directions, each with and without Shift.
+  for (const code of [5024, 5025, 5026, 5027, 5028, 5029, 5030, 5031]) {
+    assert.match(table, new RegExp(`\\[${code}, \\{`), `motion ${code} is missing`);
+  }
+  assert.equal((table.match(/extend: true/g) || []).length, 4);
+  assert.equal((table.match(/extend: false/g) || []).length, 4);
+  // Cmd-Up/Down are the field's ends; the line pair reuses Home/End, which the preload
+  // movers already understand.
+  assert.match(table, /DocumentStart/);
+  assert.match(table, /DocumentEnd/);
+
+  assert.match(main, /sendToFocusedTabFrame\(currentWindows\(\)\.win, "tweb-caret-motion", motion\)/);
+  // The motion branch returns before the Cmd key table below it, which legitimately does
+  // use dispatchNamedKey — so the check is on the branch, not on a span of the file.
+  const branch = main.slice(main.indexOf("const motion = CMD_CARET_MOTIONS.get(code)"),
+    main.indexOf("const cmdKey = CMD_PRIVATE_KEYS.get(code)"));
+  assert.doesNotMatch(branch, /dispatchNamedKey|dispatchNativeKey/);
+  assert.match(branch, /return;/);
+
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const handler = preload.slice(preload.indexOf('ipcRenderer.on("tweb-caret-motion"'),
+    preload.indexOf('ipcRenderer.on("tweb-tabs"'));
+  assert.match(handler, /moveTextControlCaret\(active, key, extend\)/);
+  assert.match(handler, /moveContentEditableCaret\(key, extend\)/);
+
+  // Both movers have to know the document boundary, or Cmd-Up/Down do nothing.
+  assert.match(preload, /if \(key === "DocumentStart"\) return 0;/);
+  assert.match(preload, /if \(key === "DocumentEnd"\) return value\.length;/);
+  assert.match(preload, /DocumentStart: \["backward", "documentboundary"\]/);
+  assert.match(preload, /DocumentEnd: \["forward", "documentboundary"\]/);
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);
