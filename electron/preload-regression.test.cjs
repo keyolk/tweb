@@ -168,6 +168,21 @@ test("every placement carries a fixed placement id", () => {
   assert.match(main, /const PLACEMENT_ID = 1;/);
 });
 
+// PageUp/PageDown moved by 90px, which is the line step `j`/`k` use — so the two keys did
+// the same thing as the ones beside them.
+test("page keys scroll by the surface, not by a line", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const pageKeys = source.slice(source.indexOf('if (key === "PageUp" || key === "PageDown") {'),
+    source.indexOf("function hideTabPopover()"));
+  assert.match(pageKeys, /scrollSurfaceHeight\(\)/,
+    "a fixed pixel step is a line step, whatever the number");
+  assert.doesNotMatch(pageKeys, /scrollSurfaceBy\(0, key === "PageUp" \? -?\d+ : \d+\)/);
+
+  // Measured against the same surface `d`/`u` use, so an inner pane pages by its own height.
+  const halfPage = source.slice(source.indexOf('case "d": '), source.indexOf('case "G": '));
+  assert.match(halfPage, /scrollSurfaceHeight\(\)/);
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);
@@ -754,7 +769,8 @@ test("scroll keys can target a picked inner surface", () => {
       `${key} must scroll the picked surface`);
   }
   assert.doesNotMatch(electron, /case "j": scrollBy\(/);
-  assert.match(electron, /if \(key === "PageUp" \|\| key === "PageDown"\) \{\s*scrollSurfaceBy\(0, key === "PageUp" \? -90 : 90\);/);
+  // The surface, not the step: how far a page key moves is pinned by its own test.
+  assert.match(electron, /if \(key === "PageUp" \|\| key === "PageDown"\) \{[\s\S]*?scrollSurfaceBy\(0, /);
 });
 
 test("large canvas and SVG surfaces can be panned with scroll keys", () => {
