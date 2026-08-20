@@ -1011,6 +1011,39 @@ installPrintShim();
       .filter((element) => !ownId(element).startsWith("__tweb_") && hasPointerIntent(element));
   }
 
+  const dismissNames = new Set(["close", "closable", "cancel", "dismiss", "xbutton", "closebtn", "closebutton"]);
+
+  // Ad dismiss buttons are the one control a person actually wants and the one
+  // this file cannot see: the real ones are bare `<div class="Sticky__cancel">`
+  // with no cursor, no label, no attribute, and their click wired by
+  // `addEventListener` — often delegated from `document`, so the element itself
+  // never holds a listener at all and no amount of listener inspection would
+  // find it. What it does carry is a name. Matching that name is a guess, but it
+  // is the only signal such a button emits, and clicking one that turns out to
+  // be inert costs nothing.
+  function dismissNameTargets(roots) {
+    const named = [];
+    for (const root of roots) {
+      for (const element of root.querySelectorAll("[class],[id]")) {
+        if (ownId(element).startsWith("__tweb_")) continue;
+        const box = element.getBoundingClientRect();
+        // A dismiss button is small. The size bound is what keeps a
+        // `.modal-close-overlay` covering the page out of the hints.
+        if (box.width < 4 || box.height < 4 || box.width > 48 || box.height > 48) continue;
+        // `Sticky__cancel` and `closableContainer` both have to yield their word,
+        // and matching by substring would take `disclosure` for a close button.
+        const words = `${element.className?.baseVal ?? (typeof element.className === "string" ? element.className : "")} ${ownId(element)}`
+          .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+          .toLowerCase()
+          .split(/[^a-z0-9]+/);
+        if (!words.some((word) => dismissNames.has(word))) continue;
+        if (getComputedStyle(element).pointerEvents === "none") continue;
+        named.push(element);
+      }
+    }
+    return named;
+  }
+
   function interactiveTargets() {
     forgetDeclaredCursors();
     const roots = collectRoots();
@@ -1019,6 +1052,7 @@ installPrintShim();
     const elements = [
       ...semantic.filter((element) => !element.matches("video,audio")),
       ...pointerIntentTargets(roots),
+      ...dismissNameTargets(roots),
     ];
     const targets = uniqueVisibleTargets(hitTestTargets(elements), (element) => ({
       nativeSurface: isTag(element, "canvas"),

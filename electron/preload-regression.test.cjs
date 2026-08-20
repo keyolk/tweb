@@ -117,6 +117,39 @@ test("an element that declares its own pointer cursor keeps its hint", () => {
   assert.match(targets, /forgetDeclaredCursors\(\)/);
 });
 
+// The reported ad's close button was a bare `<div class="Sticky__cancel">` —
+// no cursor, no label, no attribute, its click added with `addEventListener`.
+// Listener inspection would not have found it either: such a click is often
+// delegated from `document`, so the element holds no listener at all. The name
+// is the only signal it emits.
+test("a dismiss button is found by its name when nothing else marks it", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const dismiss = source.slice(source.indexOf("function dismissNameTargets(roots)"),
+    source.indexOf("function interactiveTargets()"));
+
+  // `Sticky__cancel` and `closableContainer` both have to yield their word.
+  assert.match(dismiss, /replace\(\/\(\[a-z0-9\]\)\(\[A-Z\]\)\/g, "\$1 \$2"\)/,
+    "camelCase names must be split or closableContainer never matches");
+  assert.match(dismiss, /split\(\/\[\^a-z0-9\]\+\//);
+  assert.match(dismiss, /dismissNames\.has\(word\)/,
+    "matching by substring would take `disclosure` for a close button");
+  assert.doesNotMatch(dismiss, /\.includes\(name\)|indexOf\(name\)/);
+
+  // A dismiss button is small; the bound keeps a page-covering close overlay out.
+  assert.match(dismiss, /box\.width > 48 \|\| box\.height > 48/);
+  assert.match(dismiss, /pointerEvents === "none"/);
+
+  for (const name of ["close", "cancel", "dismiss", "closable"]) {
+    assert.match(dismiss.slice(0, 0) + source, new RegExp(`"${name}"`),
+      `dismissNames is missing ${name}`);
+  }
+
+  const targets = source.slice(source.indexOf("function interactiveTargets()"),
+    source.indexOf("function resourceUrl(value, element)"));
+  assert.match(targets, /dismissNameTargets\(roots\)/,
+    "the source has to be collected, not just defined");
+});
+
 test("Electron sends each Unicode terminal key through one input path", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.doesNotMatch(main, /codepoint > 0x7f\) sendToTabFrames\(win, "tweb-terminal-text"/);
