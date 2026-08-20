@@ -116,6 +116,42 @@ unavailable. When several Electron engines share one profile, one process owns a
 worker; its DNR rules still apply to the other panes, but filter-list updates require restarting all
 TWeb panes together.
 
+## Sites that need real Chrome
+
+Some pages refuse to work anywhere but Google Chrome. Okta's Device Trust is the reason: the
+check is an attestation performed by an extension inside a *managed* Chrome and evaluated on
+every authentication. A user agent string cannot answer it, and neither can a copied session
+cookie — the cookie is what the check produces, not what it accepts. TWeb does not pretend
+otherwise, and DESIGN.md names both shortcuts in its non-goals:
+
+> - Do not imitate Google Chrome by spoofing the User-Agent.
+> - Do not replicate Okta session cookies automatically or continuously.
+
+So those URLs leave. Navigating to one — by link, by `tweb open`, by `window.open` — hands it
+to Chrome and shows an **Opened in Chrome** page in the pane instead:
+
+```bash
+tweb chrome open https://your-tenant.okta.com/app/   # the handoff, by hand
+tweb chrome status                                   # bridge, tmux-chrome, Chrome
+```
+
+[tmux-chrome](https://github.com/keyolk/tmux-chrome) is preferred when it is running, because
+the tab then joins this tmux window's Chrome tab group and the handoff stays part of the same
+workspace. Without it the URL still opens, through `open -a "Google Chrome"`. Neither path
+reads or writes the Chrome profile: they hand over a URL and nothing else.
+
+Which domains route this way is `TWEB_MANAGED_CHROME_DOMAINS`, a comma-separated list of hosts
+and `*.` patterns. It **replaces** the defaults (`*.okta.com`, `aws.amazon.com`) rather than
+adding to them, and an empty value routes nothing:
+
+```bash
+set -x TWEB_MANAGED_CHROME_DOMAINS "*.okta.com,*.example-idp.com"
+set -x TWEB_MANAGED_CHROME_DOMAINS ""   # keep everything in TWeb
+```
+
+A handoff that cannot reach Chrome does not eat the navigation — the URL loads in TWeb and
+fails however that site fails, which is what happened before any of this existed.
+
 ## Agent control (CLI · MCP)
 
 Finishing frontend work in the terminal means agents have to be able to drive the same browser. A
@@ -605,11 +641,6 @@ Honestly absent, with no code pretending otherwise:
   exit with `command not yet implemented` — run against a real Chrome profile to confirm. Nothing
   reads Chrome's bookmarks, extensions or site state. The *import* is the migration blocker, more than
   the bookmarks bar itself.
-- **The managed Chrome handoff.** `tweb chrome open` and `tweb chrome status` both exit with
-  `command not yet implemented`. `BrowserRoutingPolicy` exists in `crates/tweb-core/src/routing.rs`
-  with an `*.okta.com` denylist, but nothing calls it — it is a dead type. **A URL that needs Okta
-  Device Trust or enterprise-managed Chrome is not handed off; it simply loads in TWeb and fails
-  however that site fails.**
 - **Agent resource exchange as a broker.** `tweb resource list` exits with `command not yet
   implemented` and `ResourceBrokerImpl` is 38 lines. What does work is the agent socket:
   `snapshot`, `screenshot`, `console`, `errors` and `eval` genuinely hand page context to an agent.

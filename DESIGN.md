@@ -1500,7 +1500,7 @@ The supported items are split by security level.
 | Local storage | explicit per-origin approval | an adapter, for supportable sites only |
 | Extension storage | excluded by default | a per-extension migration adapter |
 | Passwords/passkeys | excluded | re-authenticate with the original provider |
-| Okta/IdP sessions | excluded | the actual managed Chrome handoff |
+| Okta/IdP sessions | excluded | the managed Chrome handoff (built; section 11) |
 
 ### 10.2 No direct profile DB access
 
@@ -1589,15 +1589,21 @@ Extension compatibility results are managed in a per-version registry, never gue
 
 ## 11. The managed Chrome handoff
 
-> **Nothing in this section is implemented.** `tweb chrome open <url>` and `tweb chrome status` both
-> exit with `command not yet implemented`. `BrowserRoutingPolicy` exists as a type in
-> `crates/tweb-core/src/routing.rs`, complete with the `*.okta.com` denylist below — and **nothing
-> calls it.** Grep for `RouteDecision` or `BrowserRoutingPolicy` outside that one file returns zero
-> consumers. A dead type is not a handoff.
+> **Built, in its minimum form.** `tweb chrome open` and `tweb chrome status` work, and routing is
+> automatic: `will-navigate` catches a link followed inside a page and `createTab` catches everything
+> that starts a tab already pointed at a URL, so a sensitive domain reaches Chrome however it was
+> asked for. The policy lives in `electron/browser-routing.cjs` rather than in
+> `crates/tweb-core/src/routing.rs` — the decision has to be made in the process that owns the
+> navigation, and that is the engine. The Rust type is still the specification the JavaScript
+> mirrors, defaults included, but it remains without consumers.
 >
-> What actually happens today: a URL that needs Okta Device Trust or enterprise-managed Chrome loads
-> in TWeb and fails however that site fails, with no handoff and no warning. Section 10.4's
-> "these domains open in real managed Google Chrome instead" is false as written.
+> The bridge is `tmux-chrome`, which already satisfies this section's minimum — open a URL, track the
+> tab, focus it — with none of the permissions withheld below: no `debugger`, no broad `scripting`,
+> no cookie access. Without it, `open -a "Google Chrome"` takes the URL.
+>
+> What is not built: tab-close detection, focus return, and the `remote`/`ask` arms of the policy.
+> Routing is embedded-or-managed-chrome, decided by domain, with `TWEB_MANAGED_CHROME_DOMAINS` as
+> the override.
 
 URLs that need real Google Chrome are handled by a separate trusted provider.
 

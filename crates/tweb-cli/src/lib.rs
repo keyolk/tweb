@@ -4,6 +4,7 @@
 //! after: `tweb snapshot --pane %3`. Global selectors and per-subcommand selectors are never mixed.
 
 pub mod agent;
+pub mod chrome;
 pub mod doctor;
 pub mod mcp;
 
@@ -487,6 +488,18 @@ pub async fn run() -> Result<()> {
         Command::Doctor { fix } => {
             doctor::run(fix).await?;
         }
+        Command::Chrome { action } => match action {
+            ChromeAction::Open { url } => {
+                let url = resolve_url_argument(&url, &working_directory);
+                match chrome::open(&url)? {
+                    chrome::Handoff::Bridge => println!("Opened in managed Chrome: {url}"),
+                    chrome::Handoff::SystemOpen => {
+                        println!("Opened in Google Chrome (no tmux-chrome bridge): {url}");
+                    }
+                }
+            }
+            ChromeAction::Status => println!("{}", chrome::status().report()),
+        },
         Command::Panes { agent } => agent::list_panes(agent.json)?,
         Command::Mcp { agent } => mcp::serve(agent.pane.as_deref())?,
         Command::Tab { action } => {

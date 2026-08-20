@@ -1,6 +1,17 @@
 //! BrowserRoutingPolicy — the URL routing policy.
 //!
 //! DESIGN.md section 11. embedded/managed-chrome/remote/ask.
+//!
+//! This type has no consumers, and that is not an oversight waiting to be fixed by calling
+//! it from here. The routing decision has to be made in the process that owns the
+//! navigation — the engine — because the useful hook is `will-navigate`, which is
+//! cancellable and lives in Electron. `electron/browser-routing.cjs` performs it and
+//! mirrors the defaults below deliberately; the two are kept in step by
+//! `electron/browser-routing.test.cjs`, which asserts the same domains.
+//!
+//! What survives here is the shape: the four-way decision, including the `Remote` and
+//! `Ask` arms the engine does not implement. Deleting it would lose the specification
+//! along with the dead code.
 
 use serde::{Deserialize, Serialize};
 use url::Url;

@@ -20,7 +20,7 @@ const {
   writeFileSync,
   writeSync,
 } = require("node:fs");
-const { execFile, execFileSync } = require("node:child_process");
+const { execFile, execFileSync, spawnSync } = require("node:child_process");
 const { Worker } = require("node:worker_threads");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const net = require("node:net");
@@ -77,6 +77,7 @@ const {
   watchServiceWorkers,
 } = require("./extensions.cjs");
 const { extensionReport } = require("./extension-report.cjs");
+const { needsManagedChrome } = require("./browser-routing.cjs");
 const { createPaneWriter, fdSink, channelSink } = require("./frame-writer.cjs");
 const { serverIdentityFrom, paneKey } = require("./pane-identity.cjs");
 const {
@@ -4432,6 +4433,23 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     return { action: "deny" };
   });
 
+  // A link to a sensitive domain leaves for Chrome before it commits here. `will-navigate`
+  // rather than `did-start-navigation`, because this one is cancellable: by the time the
+  // navigation has started, stopping it leaves the pane on a half-abandoned page.
+  onContents("will-navigate", (event, url) => {
+    if (!needsManagedChrome(url)) return;
+    event.preventDefault();
+    const how = handOffToChrome(url);
+    // A handoff that could not reach Chrome is a dead end, so the navigation is allowed
+    // to proceed here instead. Failing that site in TWeb is what happened before any of
+    // this existed, and it beats a pane showing nothing at all.
+    if (!how) {
+      void contents.loadURL(url);
+      return;
+    }
+    void contents.loadURL(handedOffPage(url, how));
+  });
+
   onContents("did-start-navigation", (details) => {
     if (details.isSameDocument || !details.frame) return;
     if (details.isMainFrame) scheduleLoadingProgress(tab, 0.3);
@@ -4626,6 +4644,16 @@ function createTab(
     activate,
     initialZoomFactor
   );
+  // The other entry point. `will-navigate` covers links followed inside a page; this
+  // covers everything that starts a tab already pointed at a URL — `tweb open`,
+  // `tweb navigate`, a restored session, `window.open`.
+  if (needsManagedChrome(url)) {
+    const how = handOffToChrome(url);
+    if (how) {
+      void tab.loadURL(handedOffPage(url, how)).catch(() => {});
+      return tab;
+    }
+  }
   const load = () => {
     // did-fail-load owns user-visible failures. loadURL also rejects for a normal
     // client-side redirect with ERR_ABORTED, which must not replace the new page.
@@ -4648,6 +4676,41 @@ function createTab(
     load();
   }
   return tab;
+}
+
+// Hands a URL to real Google Chrome and reports which way it got there.
+//
+// `tmux-chrome` first, because it puts the tab in this tmux window's Chrome tab group —
+// the handoff then reads as part of the same workspace rather than a page that vanished
+// into another application. Its absence is not a failure: a URL that has to reach Chrome
+// is worth more than the grouping, so `open -a` takes it from there.
+//
+// Neither path reads or writes the Chrome profile. They hand over a URL and nothing else,
+// which is the permission boundary DESIGN.md 11 draws around this bridge.
+function handOffToChrome(url) {
+  const bridged = spawnSync("tmux-chrome", ["open", url], { stdio: "ignore" });
+  if (bridged.status === 0) return "bridge";
+  const opened = spawnSync("open", ["-a", "Google Chrome", url], { stdio: "ignore" });
+  if (opened.status === 0) return "open";
+  return null;
+}
+
+// What the pane shows once a URL has left for Chrome. It replaces the navigation rather
+// than sitting beside it, because the alternative is a blank page whose address bar says
+// a URL that is not loading — indistinguishable from a hang.
+function handedOffPage(target, how) {
+  const detail = how === "bridge"
+    ? "in this window's Chrome tab group"
+    : "in Google Chrome";
+  const html = `<!doctype html><meta charset="utf-8"><style>
+    :root{color-scheme:light dark}body{font:16px system-ui;margin:3rem;line-height:1.5}
+    code{overflow-wrap:anywhere}small{opacity:.7}
+  </style><h1>Opened in Chrome</h1><p><code>${escapeHtml(target)}</code></p>
+  <p>This site needs real Google Chrome, so it was opened ${escapeHtml(detail)}.</p>
+  <p><small>Device Trust is checked by an extension in a managed Chrome, which is not
+  something this browser can present. Set <code>TWEB_MANAGED_CHROME_DOMAINS</code> to
+  change which domains are routed this way, or to an empty value to route none.</small></p>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
 // Deliberately plain: it exists to put *something* on the pane within the first
