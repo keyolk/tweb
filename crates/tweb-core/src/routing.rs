@@ -2,16 +2,23 @@
 //!
 //! DESIGN.md section 11. embedded/managed-chrome/remote/ask.
 //!
-//! This type has no consumers, and that is not an oversight waiting to be fixed by calling
-//! it from here. The routing decision has to be made in the process that owns the
-//! navigation — the engine — because the useful hook is `will-navigate`, which is
-//! cancellable and lives in Electron. `electron/browser-routing.cjs` performs it and
-//! mirrors the defaults below deliberately; the two are kept in step by
-//! `electron/browser-routing.test.cjs`, which asserts the same domains.
+//! This type has no consumers, and after an attempt to give it some, that is a decision
+//! rather than an oversight.
 //!
-//! What survives here is the shape: the four-way decision, including the `Remote` and
-//! `Ask` arms the engine does not implement. Deleting it would lose the specification
-//! along with the dead code.
+//! Automatic routing by domain was built into the engine and removed. An SSO login is not a
+//! page but a redirect chain — the service sets a state cookie, the IdP authenticates, the
+//! callback needs that cookie again — so sending only the IdP to another browser puts a
+//! boundary in the middle of the flow. Measured against a real Argo CD tenant: the login
+//! started in TWeb, the callback landed in Chrome, and dex answered `Bad Request — User
+//! session error`, because the session was in the other browser's cookie store. Two browsers
+//! cannot share one OAuth flow.
+//!
+//! What ships instead is `tweb chrome open <url>`: a person hands over a whole site, entry
+//! point included, and the entire chain happens in one browser. `sensitive_domains` below
+//! therefore describes a judgement nobody automates.
+//!
+//! The type survives as the specification — the four-way decision, including the `Remote`
+//! and `Ask` arms nothing implements. Deleting it would lose that along with the dead code.
 
 use serde::{Deserialize, Serialize};
 use url::Url;

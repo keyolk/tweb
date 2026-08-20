@@ -1589,21 +1589,28 @@ Extension compatibility results are managed in a per-version registry, never gue
 
 ## 11. The managed Chrome handoff
 
-> **Built, in its minimum form.** `tweb chrome open` and `tweb chrome status` work, and routing is
-> automatic: `will-navigate` catches a link followed inside a page and `createTab` catches everything
-> that starts a tab already pointed at a URL, so a sensitive domain reaches Chrome however it was
-> asked for. The policy lives in `electron/browser-routing.cjs` rather than in
-> `crates/tweb-core/src/routing.rs` — the decision has to be made in the process that owns the
-> navigation, and that is the engine. The Rust type is still the specification the JavaScript
-> mirrors, defaults included, but it remains without consumers.
+> **Built as a manual handoff only.** `tweb chrome open` and `tweb chrome status` work. The
+> bridge is `tmux-chrome`, which already satisfies this section's minimum — open a URL, track
+> the tab, focus it — with none of the permissions withheld below: no `debugger`, no broad
+> `scripting`, no cookie access. Without it, `open -a "Google Chrome"` takes the URL. Neither
+> path reads or writes the Chrome profile.
 >
-> The bridge is `tmux-chrome`, which already satisfies this section's minimum — open a URL, track the
-> tab, focus it — with none of the permissions withheld below: no `debugger`, no broad `scripting`,
-> no cookie access. Without it, `open -a "Google Chrome"` takes the URL.
+> **Automatic routing was built and then removed, and the reason belongs in this section.**
+> Routing by domain — send `*.okta.com` to Chrome, keep everything else here — cannot work,
+> because an SSO login is not a page. It is a redirect chain that starts at the service, goes
+> to the IdP and comes back: `/auth/login` sets a state cookie, the IdP authenticates, the
+> `/callback` needs that cookie again. Routing the IdP alone puts a browser boundary in the
+> middle of it. Measured against a real Argo CD tenant: the login began in TWeb, the callback
+> landed in Chrome, and dex answered `Bad Request — User session error`, because the session
+> it was looking for lived in the other browser's cookie store. **Two browsers cannot share
+> one OAuth flow**, so a routing policy that splits one is wrong however good its domain list
+> is.
 >
-> What is not built: tab-close detection, focus return, and the `remote`/`ask` arms of the policy.
-> Routing is embedded-or-managed-chrome, decided by domain, with `TWEB_MANAGED_CHROME_DOMAINS` as
-> the override.
+> The unit that can be handed off is a whole site, chosen by a person who knows they need it.
+> `sensitive_domains` below therefore describes a decision nothing makes automatically; it is
+> kept as specification, and `crates/tweb-core/src/routing.rs` says so in a comment.
+>
+> Also unbuilt: tab-close detection, focus return, and the `remote`/`ask` arms.
 
 URLs that need real Google Chrome are handled by a separate trusted provider.
 

@@ -10,6 +10,16 @@
 //! withholds: no `debugger`, no broad `scripting`, no cookie access. When it is not
 //! there, the URL still opens: `open -a "Google Chrome"` hands the URL over and nothing
 //! else. Neither path reads or writes the profile.
+//!
+//! **Hand over a site, not an identity provider, and do not automate the choice.** That was
+//! tried: the engine routed `*.okta.com` to Chrome on navigation. It fails, because an SSO
+//! login is a redirect chain rather than a page — the service sets a state cookie, the IdP
+//! authenticates, the callback needs that cookie again. Routing the IdP alone puts a browser
+//! boundary inside the chain. Measured against a real Argo CD tenant: the login started in
+//! TWeb, the callback landed in Chrome, and dex answered `Bad Request — User session error`,
+//! because the session was in the other browser's store. Two browsers cannot share one OAuth
+//! flow, so the unit that can be handed off is a whole site, chosen by someone who knows they
+//! need it.
 
 use std::path::PathBuf;
 use std::process::Command;

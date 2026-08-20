@@ -127,30 +127,26 @@ otherwise, and DESIGN.md names both shortcuts in its non-goals:
 > - Do not imitate Google Chrome by spoofing the User-Agent.
 > - Do not replicate Okta session cookies automatically or continuously.
 
-So those URLs leave. Navigating to one — by link, by `tweb open`, by `window.open` — hands it
-to Chrome and shows an **Opened in Chrome** page in the pane instead:
+What TWeb offers instead is a manual handoff:
 
 ```bash
-tweb chrome open https://your-tenant.okta.com/app/   # the handoff, by hand
-tweb chrome status                                   # bridge, tmux-chrome, Chrome
+tweb chrome open https://argocd.example.com/    # the whole site, in Chrome
+tweb chrome status                              # bridge, tmux-chrome, Chrome
 ```
+
+**Hand over the site, not the identity provider.** An SSO login is a redirect chain that ends
+back where it started — `/auth/login` sets a state cookie, the IdP authenticates, the
+`/callback` needs that cookie again — and a browser boundary anywhere inside it breaks the
+flow. Routing only `*.okta.com` was tried and produced exactly that: the login started in TWeb
+and the callback landed in Chrome, where dex answered `Bad Request — User session error`,
+because the cookie it was looking for was in the other browser's store. Two browsers cannot
+share one OAuth flow. So open the *entry point* in Chrome and let the whole chain happen
+there.
 
 [tmux-chrome](https://github.com/keyolk/tmux-chrome) is preferred when it is running, because
 the tab then joins this tmux window's Chrome tab group and the handoff stays part of the same
 workspace. Without it the URL still opens, through `open -a "Google Chrome"`. Neither path
 reads or writes the Chrome profile: they hand over a URL and nothing else.
-
-Which domains route this way is `TWEB_MANAGED_CHROME_DOMAINS`, a comma-separated list of hosts
-and `*.` patterns. It **replaces** the defaults (`*.okta.com`, `aws.amazon.com`) rather than
-adding to them, and an empty value routes nothing:
-
-```bash
-set -x TWEB_MANAGED_CHROME_DOMAINS "*.okta.com,*.example-idp.com"
-set -x TWEB_MANAGED_CHROME_DOMAINS ""   # keep everything in TWeb
-```
-
-A handoff that cannot reach Chrome does not eat the navigation — the URL loads in TWeb and
-fails however that site fails, which is what happened before any of this existed.
 
 ## Agent control (CLI · MCP)
 
