@@ -1847,12 +1847,20 @@ installPrintShim();
     if (!isElement(element)) return false;
     if (isTag(element, "input", "textarea")) {
       const value = element.value ?? "";
-      const end = element.selectionEnd ?? value.length;
-      return !value.slice(end).trim();
+      const start = element.selectionStart ?? value.length;
+      // A range selection is never a place to compose: the next character replaces it, and
+      // the surface would sit on the highlight. `selectionEnd` is also the wrong end to ask
+      // about — Shift+Home leaves it at the far end of the text while the caret is drawn at
+      // `selectionStart`, so measuring from it said "at the end" while the caret sat in
+      // front of everything. That is the reported smear: three cells of `asdfasdf` blurred
+      // out, immediately right of a caret at position 0.
+      if ((element.selectionEnd ?? start) !== start) return false;
+      return !value.slice(start).trim();
     }
     if (!element.isContentEditable) return false;
     const selection = getSelection();
     if (!selection?.rangeCount) return true;
+    if (!selection.isCollapsed) return false;
     try {
       const after = selection.getRangeAt(0).cloneRange();
       after.collapse(false);

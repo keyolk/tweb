@@ -1502,8 +1502,14 @@ test("the IME slot is withheld when the caret is not at the end", () => {
   assert.match(electron, /const slot = point && composing && caretAtContentEnd\(\)/);
   const helper = electron.slice(electron.indexOf("  function caretAtContentEnd()"),
     electron.indexOf("  function reportCaret()"));
-  // Text controls answer from the value; trailing whitespace hides nothing worth keeping.
-  assert.match(helper, /!value\.slice\(end\)\.trim\(\)/);
+  // Measured from `selectionStart`, which is where the caret is drawn. Shift+Home leaves
+  // `selectionEnd` at the far end of the text, so asking it said "at the end" while the
+  // caret sat in front of everything — the reported smear.
+  assert.match(helper, /const start = element\.selectionStart/);
+  assert.match(helper, /!value\.slice\(start\)\.trim\(\)/);
+  // A range selection is never a place to compose: the next character replaces it.
+  assert.match(helper, /if \(\(element\.selectionEnd \?\? start\) !== start\) return false;/);
+  assert.match(helper, /if \(!selection\.isCollapsed\) return false;/);
   // contentEditable has no value, so the range from the caret to the end of the host is it.
   assert.match(helper, /after\.setEndAfter\(element\)/);
 
