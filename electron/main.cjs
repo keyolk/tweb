@@ -5085,19 +5085,6 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
     }
   }
 
-  // Option-arrow is word motion in every macOS text field, and it reaches the page the same
-  // way Cmd-arrow does not: AppKit translates the real key into `moveWordLeft:` before the
-  // web content sees it, and a key this process synthesises skips that translation. So it
-  // is driven through the renderer, like the Cmd motions, rather than dispatched natively.
-  // Up/Down are left alone — Option-Up/Down is paragraph motion, which no field here has.
-  if (modifiers.includes("alt") && (key === "ArrowLeft" || key === "ArrowRight")) {
-    if (pressed) {
-      sendToFocusedTabFrame(currentWindows().win, "tweb-caret-motion",
-        { key: key === "ArrowLeft" ? "WordLeft" : "WordRight", extend: shift });
-    }
-    return;
-  }
-
   // A PDF is rendered by an extension frame the preload never reaches, so both the
   // passthrough and the vimium key paths below would deliver into an empty document.
   // Only the press is routed: the viewer has no notion of a key being held.

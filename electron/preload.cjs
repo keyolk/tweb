@@ -270,22 +270,6 @@ installPrintShim();
       const end = value.indexOf("\n", position);
       return end < 0 ? value.length : end;
     }
-    if (key === "WordLeft" || key === "WordRight") {
-      // Whitespace first, then the run of word characters — the same two-phase walk every
-      // editor does, so Option-Left from mid-word lands on that word's start rather than
-      // skipping past it.
-      const forward = key === "WordRight";
-      let index = position;
-      const wordAt = (offset) => /[\p{L}\p{N}_]/u.test(value[offset] ?? "");
-      if (forward) {
-        while (index < value.length && !wordAt(index)) index += 1;
-        while (index < value.length && wordAt(index)) index += 1;
-      } else {
-        while (index > 0 && !wordAt(index - 1)) index -= 1;
-        while (index > 0 && wordAt(index - 1)) index -= 1;
-      }
-      return index;
-    }
     if (key === "PageUp" || key === "PageDown") {
       // A page of the field, not of the document. Single-line inputs have no page to move
       // through, so they answer with the ends — which is what a browser does there too.
@@ -349,7 +333,6 @@ installPrintShim();
       Home: ["backward", "lineboundary"], End: ["forward", "lineboundary"],
       DocumentStart: ["backward", "documentboundary"],
       DocumentEnd: ["forward", "documentboundary"],
-      WordLeft: ["backward", "word"], WordRight: ["forward", "word"],
       PageUp: ["backward", "line"], PageDown: ["forward", "line"],
     }[key];
     if (!motion) return false;
