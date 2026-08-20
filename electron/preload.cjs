@@ -689,6 +689,18 @@ installPrintShim();
     else if (isEditable(activeElement())) setMode("insert");
     else if (panSurface()) setMode("normal", "↔ pan · Esc");
     else setMode("normal", scrollSurface() ? "⇅ inner · Esc" : "");
+    // Every other caret trigger is an event on the focused field, and a field can leave
+    // without firing one: Chrome does not fire blur or focusout when the focused element is
+    // removed from the DOM, which is how a search overlay closes. The terminal cursor was
+    // then stranded on the vanished field's last position, in normal mode, with nothing to
+    // clear it until some unrelated key happened to report again. Measured on Google:
+    // Escape left `caret {col:22,row:28}` with `activeElement: body`, and the next `j`
+    // cleared it. A mode change is the one moment that always happens, so it reports.
+    // `lastCaretReport` is invalidated with a sentinel rather than `""`, because `""` IS the
+    // no-caret report: resetting to it would make dedup swallow the very send that clears
+    // the cursor. `null` matches no report the function can build.
+    lastCaretReport = null;
+    reportCaret();
   }
 
   const koreanLangmap = new Map(Object.entries({

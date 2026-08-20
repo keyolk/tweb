@@ -1478,3 +1478,17 @@ test("the loading bar steps rather than animates", () => {
   assert.match(bar, /pointer-events:none/);
   assert.match(electron, /ipcRenderer\.on\("tweb-loading"/);
 });
+
+// Chrome does not fire blur or focusout when the focused element is removed from the DOM,
+// which is exactly how a search overlay closes. Every other caret trigger is an event on the
+// focused field, so the terminal cursor stayed parked on a field that no longer existed —
+// visible in normal mode, on top of the page, until some unrelated key reported again.
+test("leaving a mode re-reports the caret", () => {
+  const normal = electron.slice(electron.indexOf("  function normalMode() {"),
+    electron.indexOf("  function hasTransientMode()"));
+  assert.match(normal, /reportCaret\(\);/);
+  // `""` is itself the no-caret report, so resetting the dedup key to it would swallow the
+  // one send that clears the cursor.
+  assert.match(normal, /lastCaretReport = null;/);
+});
+
