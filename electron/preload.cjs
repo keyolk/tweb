@@ -235,6 +235,25 @@ installPrintShim();
     return position + (/[\uD800-\uDBFF]/.test(value[position]) && /[\uDC00-\uDFFF]/.test(value[position + 1]) ? 2 : 1);
   }
 
+  // The editing host the caret is in — `activeElement` when a page focuses the
+  // contentEditable itself, otherwise the closest ancestor that is one.
+  function contentEditableHost() {
+    const active = activeElement();
+    if (active?.isContentEditable) return active;
+    const node = getSelection()?.anchorNode;
+    const element = isElement(node) ? node : node?.parentElement;
+    return element?.closest?.("[contenteditable]") || null;
+  }
+
+  // How many lines a page is worth in this field. Its own height, not the window's — the
+  // key is moving a caret inside the box, and a textarea is routinely much shorter than
+  // the viewport. Nine tenths, matching the page keys' own overlap on a scrolled page.
+  function textControlPageLines(element) {
+    const computed = getComputedStyle(element);
+    const lineHeight = parseFloat(computed.lineHeight) || (parseFloat(computed.fontSize) || 13) * 1.25;
+    return Math.max(1, Math.floor(element.clientHeight * 0.9 / lineHeight));
+  }
+
   function textControlDestination(element, key, position) {
     const value = element.value;
     // Cmd-Up/Down go to the ends of the field, not of a line — the one motion the
@@ -250,6 +269,18 @@ installPrintShim();
       if (!(isTag(element, "textarea"))) return value.length;
       const end = value.indexOf("\n", position);
       return end < 0 ? value.length : end;
+    }
+    if (key === "PageUp" || key === "PageDown") {
+      // A page of the field, not of the document. Single-line inputs have no page to move
+      // through, so they answer with the ends — which is what a browser does there too.
+      if (!(isTag(element, "textarea"))) return key === "PageUp" ? 0 : value.length;
+      let destination = position;
+      for (let line = 0; line < textControlPageLines(element); line += 1) {
+        const next = textControlDestination(element, key === "PageUp" ? "ArrowUp" : "ArrowDown", destination);
+        if (next === destination) break;
+        destination = next;
+      }
+      return destination;
     }
     if (key === "ArrowUp" || key === "ArrowDown") {
       if (!(isTag(element, "textarea"))) return key === "ArrowUp" ? 0 : value.length;
@@ -302,9 +333,17 @@ installPrintShim();
       Home: ["backward", "lineboundary"], End: ["forward", "lineboundary"],
       DocumentStart: ["backward", "documentboundary"],
       DocumentEnd: ["forward", "documentboundary"],
+      PageUp: ["backward", "line"], PageDown: ["forward", "line"],
     }[key];
     if (!motion) return false;
-    selection.modify(extend ? "extend" : "move", motion[0], motion[1]);
+    // `selection.modify` has no page granularity, so a page is a run of line steps — the
+    // same count the text-control path uses, taken from the editing host's own height.
+    const steps = key === "PageUp" || key === "PageDown"
+      ? textControlPageLines(contentEditableHost() || document.documentElement)
+      : 1;
+    for (let step = 0; step < steps; step += 1) {
+      selection.modify(extend ? "extend" : "move", motion[0], motion[1]);
+    }
     return true;
   }
 
@@ -345,6 +384,12 @@ installPrintShim();
       return;
     }
     if (key === "PageUp" || key === "PageDown") {
+      // A focused field gets the caret motion, exactly as the arrows above do. These two
+      // skipped that step and scrolled the page from inside a textarea, which is not what
+      // any other editor does with them. A single-line input has no page of its own, so
+      // `textControlDestination` answers with the ends there.
+      if (moveTextControlCaret(active, key, Boolean(payload.shiftKey))) return;
+      if (active?.isContentEditable && moveContentEditableCaret(key, Boolean(payload.shiftKey))) return;
       // A page, not a line. 90px is the line step `j`/`k` use, which made these two keys
       // do the same thing as the ones right next to them. Measured against the scroll
       // surface like `d`/`u`, so an inner pane pages by its own height rather than the

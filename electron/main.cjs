@@ -1054,9 +1054,14 @@ function applyClientListing(clients, placement) {
   const changed = recordVisibility(currentPane(), next.size > 0);
   if (changed) {
     updatePaintingState();
-    if (debugLogging) {
-      console.error(`tweb: visibility ${changed.visible ? "visible" : "hidden"}`);
-    }
+    // Logged unconditionally, not behind `debugLogging`. A pane that goes hidden and does
+    // not come back is invisible from the outside — no frames arrive, and every other
+    // symptom (a strip of stale image, a dead-looking page) is downstream of this one line.
+    // The placement and the client set go with it because "hidden" has two very different
+    // causes: no client is watching, or this pane resolved to the wrong window.
+    console.error(`tweb: visibility ${changed.visible ? "visible" : "hidden"}`
+      + ` ttys=${[...next].join(",") || "none"} source=${vis().source}`
+      + ` placement=${vis().placement?.session}:${vis().placement?.windowId}:${vis().placement?.paneId}`);
   }
   if (becameVisible) repaintActiveTab();
 }
