@@ -5220,9 +5220,22 @@ function dispatchPrivateShortcut(code) {
     setCmdBypassEnabled(code === 5012);
     return;
   }
-  // Driven through the renderer rather than as a key event: a `meta` modifier takes the
-  // native path, and a synthetic native key brings no default editing behaviour with it —
-  // the same reason Cmd-C/V/X and Cmd-A are driven directly a few lines above.
+  // Driven through the renderer rather than as a key event, and this was measured rather
+  // than assumed. Sending the combination straight to Electron does nothing at all — same
+  // field, caret at offset 12, each key delivered by `sendInputEvent`:
+  //
+  //     Left               12 -> 11        moved
+  //     Shift-Left         12 -> [11,12]   selected
+  //     Cmd-Left           12 -> 12        nothing
+  //     Cmd-Shift-Right    12 -> 12        nothing
+  //     Cmd-Up (textarea)  20 -> 20        nothing
+  //     Cmd-Left (in a contenteditable)    nothing
+  //
+  // The plain arrows work because Blink moves the caret itself. Cmd-arrow is not web
+  // behaviour at all: on macOS, AppKit translates the key into an editing selector like
+  // `moveToBeginningOfLine:` before the web content ever sees it, and a synthetic key
+  // skips that translation entirely. Nothing downstream gives it meaning, which is the
+  // same reason Cmd-C/V/X and Cmd-A are driven directly a few lines above.
   const motion = CMD_CARET_MOTIONS.get(code);
   if (motion) {
     sendToFocusedTabFrame(currentWindows().win, "tweb-caret-motion", motion);
