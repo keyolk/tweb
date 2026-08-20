@@ -286,6 +286,11 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Which browser extensions loaded, and what each one actually got.
+    Extensions {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// Read the engine debug log (the TWEB_DEBUG lines).
     EngineLog {
         #[arg(long, default_value_t = 60)]
@@ -522,6 +527,7 @@ fn agent_call(
         Command::Reload { agent } => ("reload", json!({}), agent),
         Command::Status { agent } => ("status", json!({}), agent),
         Command::Diag { agent } => ("diag", json!({}), agent),
+        Command::Extensions { agent } => ("extensions", json!({}), agent),
         Command::EngineLog { limit, agent } => ("engine-log", json!({ "limit": limit }), agent),
         Command::Snapshot { text, agent } => (
             "snapshot",

@@ -260,6 +260,38 @@ pub fn render(method: &str, result: &Value) -> String {
             }
             "ok\n".to_string()
         }
+        // A dead service worker leaves the rules unarmed while everything still reports
+        // success, so the state column names that rather than showing a bare "loaded".
+        "extensions" => {
+            let entries = result
+                .get("extensions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if entries.is_empty() {
+                let dir = text_field(result, "dir");
+                return if dir.is_empty() {
+                    "no extensions\n".to_string()
+                } else {
+                    format!("no extensions in {dir}\n")
+                };
+            }
+            entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{:<10} {:<28} {}",
+                        text_field(entry, "state"),
+                        text_field(entry, "name"),
+                        text_field(entry, "detail")
+                    )
+                    .trim_end()
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        }
         "console" | "errors" => {
             let key = if method == "console" {
                 "messages"

@@ -68,6 +68,7 @@ function surfacePlan(active, terminalVisible, logical, held = false) {
 // buffer, none of which touch the renderer's layout.
 const GEOMETRY_FREE_METHODS = new Set([
   "engine-log",
+  "extensions",
   "status",
   "tabs",
   "tab",
