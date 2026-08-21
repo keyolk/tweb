@@ -452,6 +452,8 @@ pub enum ProfileAction {
 pub enum ChromeAction {
     /// Open a URL in managed Chrome.
     Open { url: String },
+    /// Open the current tab's URL in managed Chrome.
+    Current,
     /// Bridge status.
     Status,
 }
@@ -573,6 +575,27 @@ pub async fn run() -> Result<()> {
                 }
             }
             ChromeAction::Status => println!("{}", chrome::status().report()),
+            ChromeAction::Current => {
+                // Ask the pane for the URL it is showing, then hand it to Chrome.
+                // `agent::run` prints the rendered result, so call `request` directly
+                // to get the JSON back and pull the URL out of it.
+                let result = agent::request(None, "status", json!({}))?;
+                let url = result
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if url.is_empty() {
+                    println!("no browser pane to hand off");
+                } else {
+                    match chrome::open(&url)? {
+                        chrome::Handoff::Bridge => println!("Opened in managed Chrome: {url}"),
+                        chrome::Handoff::SystemOpen => {
+                            println!("Opened in Google Chrome (no tmux-chrome bridge): {url}");
+                        }
+                    }
+                }
+            }
         },
         Command::Daemon { action } => match action {
             DaemonAction::Status => daemon::status()?,

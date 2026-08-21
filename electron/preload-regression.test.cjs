@@ -1906,3 +1906,17 @@ test("w key toggles floating mode from the browser", () => {
   assert.match(main, /function toggleFloat\(\)/);
   assert.match(main, /state\.floating = !state\.floating/);
 });
+
+// `tweb chrome current` hands the current tab's URL to Chrome, without the user
+// having to copy it. It calls `status` to get the URL, then `chrome::open`.
+test("chrome current hands the active tab to Chrome", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // The ChromeAction enum has a Current variant.
+  const lib = fs.readFileSync(path.join(__dirname, "..", "crates/tweb-cli/src/lib.rs"), "utf8");
+  assert.match(lib, /Current,/);
+  // Current calls agent::request for the URL, not agent::run (which would print).
+  const current = lib.slice(lib.indexOf("ChromeAction::Current"));
+  assert.match(current, /agent::request\(None, "status"/);
+  assert.match(current, /serde_json::Value::as_str/);
+  assert.match(current, /chrome::open\(&url\)/);
+});
