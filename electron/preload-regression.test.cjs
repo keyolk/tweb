@@ -1764,3 +1764,28 @@ test("the full-page screenshot holds the surface open", () => {
   const { agentNeedsGeometry } = require("./surface-policy.cjs");
   assert.strictEqual(agentNeedsGeometry("full-screenshot"), true);
 });
+
+// The inspect mode's y/h/t keys now send the element context to an agent too, not just the
+// clipboard. Orca's design mode does this as an attachment; tweb's inspect mode was
+// clipboard-only, so an agent had no way to receive what the user picked.
+test("inspect mode sends element context to an agent", () => {
+  // The preload keeps the payload so an agent asking later still gets it.
+  assert.match(electron, /let lastInspectPayload/);
+  // agentDispatch answers the "inspect-element" method from the kept payload.
+  assert.match(electron, /case "inspect-element": \{[\s\S]*return lastInspectPayload \|\| null/);
+  // The payload carries all three — selector, html, text — not just the one the key picked.
+  const handler = electron.slice(electron.indexOf('const payload = {'),
+    electron.indexOf('window.dispatchEvent(new CustomEvent("tweb-agent-inspect"'));
+  assert.match(handler, /selector: item\.selector/);
+  assert.match(handler, /html: item\.element\.outerHTML/);
+  assert.match(handler, /text: item\.element\.innerText/);
+  assert.match(handler, /rect: \{/);
+  // Clipboard still gets the one the key selected.
+  assert.match(handler, /if \(key === "y"\) send\("copy-text", item\.selector\)/);
+  // cancelInspect clears the payload, so a stale pick does not leak to the next agent.
+  assert.match(electron, /lastInspectPayload = null;/);
+  // main.cjs forwards the method as an agent RPC.
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "inspect-element"/);
+  assert.match(main, /agentPageRequest\("inspect-element"/);
+});

@@ -269,6 +269,13 @@ const TOOLS: &[Tool] = &[
         ],
         fixed: &[],
     },
+    Tool {
+        name: "tweb_inspect_element",
+        method: "inspect-element",
+        description: "The element the user picked in inspect mode —                       selector, HTML, text, bounding box and URL.                       Like Orca's design mode: the user selects an element                       in the browser, and the agent gets its context.",
+        fields: &[],
+        fixed: &[],
+    },
 ];
 
 fn tool_schema(tool: &Tool) -> Value {

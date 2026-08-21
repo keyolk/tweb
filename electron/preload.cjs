@@ -117,6 +117,9 @@ installPrintShim();
   const FIND_PLACEHOLDER = "Find in page";
   let visualState = null;
   let inspectState = null;
+  // The element context the user picked in inspect mode, kept so an agent that
+  // asks for it later still gets it. Cleared when inspect mode closes.
+  let lastInspectPayload = null;
   let tabListState = null;
   let historyState = null;
   let helpHost = null;
@@ -2234,6 +2237,13 @@ installPrintShim();
           },
         };
       }
+      case "inspect-element": {
+        // An agent asked for the element the user picked in inspect mode. The payload
+        // is built in the key handler rather than here because the element is gone by
+        // the time this runs — inspect mode may have closed and the reference is to a
+        // live DOM node.
+        return lastInspectPayload || null;
+      }
       default: throw new Error(`unknown agent method ${JSON.stringify(request.method)}`);
     }
   }
@@ -3616,6 +3626,7 @@ installPrintShim();
     inspectState.outline.remove();
     inspectState.panel.remove();
     inspectState = null;
+    lastInspectPayload = null;
     if (restoreMode) normalMode();
   }
 
@@ -3657,18 +3668,30 @@ installPrintShim();
     event.stopImmediatePropagation();
     const item = inspectState;
     if (key === "Escape") cancelInspect();
-    else if (key === "y") {
-      send("copy-text", item.selector);
+    else if (key === "y" || key === "h" || key === "t") {
+      // Clipboard stays — a person at the terminal can still paste. The agent gets the
+      // same context as an Orca design-mode attachment: the selector, the HTML, the text,
+      // and the element's box, all in one message, so it does not have to re-fetch what the
+      // user already picked. Which of the three the agent leans on is its call; it gets all
+      // three rather than just the one the key selected.
+      const payload = {
+        selector: item.selector,
+        html: item.element.outerHTML,
+        text: item.element.innerText || item.element.textContent || "",
+        rect: { width: Math.round(item.rect.width), height: Math.round(item.rect.height),
+                left: Math.round(item.rect.left), top: Math.round(item.rect.top) },
+        url: location.href,
+        tag: item.element.localName,
+      };
+      if (key === "y") send("copy-text", item.selector);
+      else if (key === "h") send("copy-text", item.element.outerHTML);
+      else if (key === "t") send("copy-text", item.element.innerText || item.element.textContent || "");
+      // The agent sees this only if it asked for it — `tweb-agent-inspect` is a preload
+      // listener an agent registers by calling the `inspect-element` MCP tool once, so a
+      // pane with no agent driving it pays nothing.
+      window.dispatchEvent(new CustomEvent("tweb-agent-inspect", { detail: payload }));
       cancelInspect(false);
-      flash("selector");
-    } else if (key === "h") {
-      send("copy-text", item.element.outerHTML);
-      cancelInspect(false);
-      flash("html");
-    } else if (key === "t") {
-      send("copy-text", item.element.innerText || item.element.textContent || "");
-      cancelInspect(false);
-      flash("text");
+      flash(key === "y" ? "selector" : key === "h" ? "html" : "text");
     }
     return true;
   }

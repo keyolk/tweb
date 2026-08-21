@@ -445,6 +445,19 @@ pub fn render(method: &str, result: &Value) -> String {
                 screenshot
             )
         }
+        "inspect-element" => {
+            if result.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                return "no element picked\n".to_string();
+            }
+            let selector = text_field(result, "selector");
+            let tag = text_field(result, "tag");
+            let url = text_field(result, "url");
+            if selector.is_empty() {
+                "no element picked\n".to_string()
+            } else {
+                format!("{}  {}  {}\n", tag, selector, url)
+            }
+        }
         "tabs" | "tab" | "tab-new" | "tab-close" => {
             let tabs = result
                 .get("tabs")

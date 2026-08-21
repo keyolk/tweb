@@ -306,6 +306,11 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// The element the user picked in inspect mode — selector, HTML, text, box.
+    InspectElement {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// MCP server for agents (stdio).
     Mcp {
         #[command(flatten)]
@@ -666,6 +671,7 @@ fn agent_call(
             let path = path.map(|value| resolve_output_path(&value, working_directory));
             ("capture", json!({ "path": path, "limit": limit }), agent)
         }
+        Command::InspectElement { agent } => ("inspect-element", json!({}), agent),
         Command::Console {
             limit,
             clear,

@@ -3928,6 +3928,12 @@ async function dispatchAgentCommand(method, params) {
       return { errors: consoleLog.filter((entry) => entry.level === "error").slice(-(params.limit || 50)) };
     case "network":
       return { requests: params.clear ? networkLog.splice(0) : networkLog.slice(-(params.limit || 100)) };
+    case "inspect-element": {
+      // The user picked an element in inspect mode. Forward the payload the preload
+      // collected to the agent — or answer null if inspect mode is closed.
+      const result = await agentPageRequest("inspect-element", {}, 3000);
+      return result || { ok: false, message: "no element picked" };
+    }
     case "capture":
       return agentCapture(params);
     case "status":
