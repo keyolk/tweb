@@ -2075,8 +2075,14 @@ function applySurfacePlan(tab, plan) {
     // every second and would move this window back offscreen between show() and
     // the next tick. Adding first means keepWindowHidden skips it from that point on.
     floatingTabs.add(tab);
+    // A floating window is a real OS desktop window, not an offscreen buffer. Turn
+    // offscreen off so the page composes into the visible window rather than into
+    // the Kitty graphics channel. The user can move and resize it freely.
+    tab.webContents.setAudioMuted(true);
     tab.setOpacity(1);
     tab.setFocusable(true);
+    tab.setResizable(true);
+    tab.setMovable(true);
     // Centre on the display the pane is on, at the pane's current size. The user can
     // move the window freely afterwards — this is just a sensible default.
     const display = screen.getDisplayMatching(tab.getBounds());
@@ -2093,6 +2099,11 @@ function applySurfacePlan(tab, plan) {
   // A tab that was floating and is no longer: hide it again and put it back offscreen.
   if (floatingTabs.has(tab) && !plan.floating) {
     floatingTabs.delete(tab);
+    // Restore the offscreen rendering mode: the page goes back into the Kitty
+    // graphics channel, and the window returns to its hidden offscreen position.
+    tab.setResizable(false);
+    tab.setMovable(false);
+    tab.webContents.setAudioMuted(false);
     keepWindowHidden(tab);
   }
   const size = tab.getContentSize();
