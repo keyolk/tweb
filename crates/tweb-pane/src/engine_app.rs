@@ -139,6 +139,18 @@ const FILES: &[(&str, &str)] = &[
         "extensions.cjs",
         include_str!("../../../electron/extensions.cjs"),
     ),
+    (
+        "float-display.cjs",
+        include_str!("../../../electron/float-display.cjs"),
+    ),
+    (
+        "float-preload.cjs",
+        include_str!("../../../electron/float-preload.cjs"),
+    ),
+    (
+        "float-viewer.html",
+        include_str!("../../../electron/float-viewer.html"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.

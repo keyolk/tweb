@@ -73,6 +73,8 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/pdf-frame.cjs
 	node --check electron/extension-policy.cjs
 	node --check electron/extensions.cjs
+	node --check electron/float-display.cjs
+	node --check electron/float-preload.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

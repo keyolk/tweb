@@ -34,6 +34,12 @@ const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibilit
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
 const {
+  RELAY_JPEG_QUALITY,
+  displayWindowOptions,
+  centeredDisplayBounds,
+  relayInputEvents,
+} = require("./float-display.cjs");
+const {
   frameRateTiers,
   playbackWindowMs,
   settledFrameRate,
@@ -2066,44 +2072,30 @@ function currentViewport() {
 // surface grows back is repainted from scratch: the collapsed frames are a different size
 // and `queueFrame` drops them, so nothing stale can survive the restore.
 function applySurfacePlan(tab, plan) {
-  // A floating tab is shown on the OS desktop rather than painted into the Kitty graphics
-  // channel, so it gets a real window position and opacity rather than the offscreen
-  // treatment `keepWindowHidden` applies to every other tab.
+  // A floating tab is shown on the OS desktop as well as in the pane. The window that
+  // shows it is NOT this tab's own window: an offscreen webContents composites into its
+  // `paint` stream or onto a native surface, never both, so showing this one produced a
+  // window reading "No content under offscreen mode". See float-display.cjs for the three
+  // measurements that close off every variant of attaching it directly. Instead the frames
+  // it is already painting are relayed to a plain viewer window, and the tab stays hidden —
+  // which is exactly what keeps them coming.
   if (plan.floating) {
-    if (tab.isVisible()) return;
-    // Add to floatingTabs BEFORE setBounds/show: the hidden-window watchdog runs
-    // every second and would move this window back offscreen between show() and
-    // the next tick. Adding first means keepWindowHidden skips it from that point on.
-    floatingTabs.add(tab);
-    // A floating window is a real OS desktop window, not an offscreen buffer. Turn
-    // offscreen off so the page composes into the visible window rather than into
-    // the Kitty graphics channel. The user can move and resize it freely.
-    tab.webContents.setAudioMuted(true);
-    tab.setOpacity(1);
-    tab.setFocusable(true);
-    tab.setResizable(true);
-    tab.setMovable(true);
-    // Centre on the display the pane is on, at the pane's current size. The user can
-    // move the window freely afterwards — this is just a sensible default.
-    const display = screen.getDisplayMatching(tab.getBounds());
-    const bounds = {
-      x: Math.round(display.bounds.x + (display.bounds.width - plan.width) / 2),
-      y: Math.round(display.bounds.y + (display.bounds.height - plan.height) / 2),
-      width: plan.width,
-      height: plan.height,
-    };
-    tab.setBounds(bounds);
-    tab.show();
-    return;
-  }
-  // A tab that was floating and is no longer: hide it again and put it back offscreen.
-  if (floatingTabs.has(tab) && !plan.floating) {
+    if (!floatingTabs.has(tab)) {
+      // Added BEFORE the window exists: the hidden-window watchdog runs every second and
+      // `browser-window-created` fires inside the constructor, so a tab that is not yet
+      // marked would be reconciled as an ordinary offscreen one in between.
+      floatingTabs.add(tab);
+      openDisplayWindow(tab, plan);
+    }
+    // Deliberately no early return: the offscreen surface still has to be reconciled. It is
+    // the source of the frames the viewer draws, so a floating tab needs it at full size
+    // rather than collapsed — `surfacePlan` already returns `painting: true` for one.
+  } else if (floatingTabs.has(tab)) {
+    // A tab that was floating and is no longer: the viewer goes away and the page is back
+    // to Kitty graphics only. The webContents never moved, so nothing about the page —
+    // history, scroll, form state — is affected by either direction of this toggle.
     floatingTabs.delete(tab);
-    // Restore the offscreen rendering mode: the page goes back into the Kitty
-    // graphics channel, and the window returns to its hidden offscreen position.
-    tab.setResizable(false);
-    tab.setMovable(false);
-    tab.webContents.setAudioMuted(false);
+    closeDisplayWindow(tab);
     keepWindowHidden(tab);
   }
   const size = tab.getContentSize();
@@ -4716,10 +4708,11 @@ const hiddenWindowLatched = new WeakSet();
 
 function keepWindowHidden(tab) {
   if (!tab || tab.isDestroyed()) return;
-  // A floating tab is intentionally visible on the OS desktop — the watchdog would
-  // hide it every tick, fighting the user's `tweb float`. Skip it here rather than
-  // in the watchdog, so the watchdog's "hide everything" loop stays simple.
-  if (floatingTabs.has(tab)) return;
+  // A floating tab's viewer is a real desktop window the user is looking at, and the
+  // watchdog would move it offscreen a tick after it opened. The tab's OWN window still
+  // gets hidden even while floating — it is the offscreen source of the relayed frames,
+  // and showing it is what stops it painting.
+  if (isDisplayWindow(tab)) return;
   const bounds = tab.getBounds();
   if (bounds.x !== -10_000 || bounds.y !== -10_000) {
     tab.setBounds({ ...bounds, x: -10_000, y: -10_000 });
@@ -4816,6 +4809,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     // The dirty rect used to be discarded, so a blinking caret cost the same whole-frame
     // encode as a page load. It decides the patch path now.
     queueFrame(tab, image, false, dirty);
+    // A floating tab's viewer draws the same frames. Second in line deliberately: the pane
+    // is the primary surface and must not wait on the relay's JPEG encode.
+    if (floatingTabs.has(tab)) relayFrameToDisplay(tab, image);
   });
 
   // Before Electron attaches our custom offscreen child, it can surface the macOS OffScreenView
@@ -4969,6 +4965,10 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
 
   tab.on("closed", bindPane(() => tabPanes.get(tab), () => {
     tabPanes.delete(tab);
+    // A floating tab taking its viewer down with it. Ordered before the early return
+    // below: a tab can be closed while floating whether or not it is still in the list.
+    floatingTabs.delete(tab);
+    closeDisplayWindow(tab);
     const closedIndex = currentWindows().tabs.indexOf(tab);
     if (closedIndex < 0) return;
     const wasActive = tab === currentWindows().win;
@@ -5348,8 +5348,131 @@ function keyName(codepoint) {
 
 // Half of a `gg`, kept next to the key path rather than in the pure mapping so the
 // mapping stays a function of its arguments.
-// Tabs currently shown as OS desktop windows (floating mode, see surface-policy.cjs).
+// Tabs currently mirrored into an OS desktop window (floating mode, see float-display.cjs).
 let floatingTabs = new Set();
+// The viewer window each floating tab's frames are relayed to, and the reverse lookup the
+// input IPC needs — an input message arrives from the viewer's webContents and has to find
+// the page it belongs to. Kept as two maps rather than a search so a pane with several
+// floating tabs costs nothing per event.
+const displayWindows = new Map();
+const displayWindowTabs = new Map();
+// `browser-window-created` fires from inside the BrowserWindow constructor, so a display
+// window cannot be registered before the hidden-window watchdog first sees it. The latch is
+// what tells that handler the window being born is a viewer, not a page.
+let creatingDisplayWindow = false;
+
+/// Whether this window is a floating tab's viewer rather than a page's offscreen window.
+/// The watchdog hides everything it does not recognise, and a hidden viewer is the whole
+/// feature failing silently.
+function isDisplayWindow(window) {
+  return creatingDisplayWindow || displayWindowTabs.has(window);
+}
+
+/// Opens the viewer window for a tab entering floating mode.
+///
+/// The window shows `float-viewer.html`, which draws the relayed frames on a canvas and
+/// sends input back. The tab's own window is never shown — see `applySurfacePlan`.
+function openDisplayWindow(tab, plan) {
+  if (displayWindows.has(tab)) return;
+  const anchor = screen.getDisplayMatching(tab.getBounds());
+  const bounds = centeredDisplayBounds(anchor.bounds, plan.width, plan.height);
+  let display;
+  creatingDisplayWindow = true;
+  try {
+    display = new BrowserWindow(displayWindowOptions(bounds, path.join(__dirname, "float-preload.cjs")));
+  } finally {
+    creatingDisplayWindow = false;
+  }
+  displayWindows.set(tab, display);
+  displayWindowTabs.set(display, tab);
+  display.setTitle(tab.webContents.getTitle() || "TWeb");
+  display.loadFile(path.join(__dirname, "float-viewer.html")).then(() => {
+    if (display.isDestroyed()) return;
+    display.show();
+    sendDisplayPageSize(tab);
+    // Nothing may have changed on the page since the last paint, and the viewer starts
+    // blank — so the first frame is asked for rather than waited for.
+    if (!tab.isDestroyed()) tab.webContents.invalidate();
+  }).catch((error) => {
+    console.error(`tweb: float viewer failed to load: ${error.message}`);
+  });
+
+  // The user closing the viewer means "pin", not "leave the pane thinking it floats".
+  // Without this the state stays floating with no window to show it, and the `w` toggle
+  // then reads as turning floating *off* when the user is trying to turn it on.
+  display.on("closed", bindPane(() => tabPanes.get(tab), () => {
+    displayWindowTabs.delete(display);
+    if (displayWindows.get(tab) === display) displayWindows.delete(tab);
+    if (!floatingTabs.has(tab)) return;
+    floatingTabs.delete(tab);
+    inputState().floating = false;
+    if (!tab.isDestroyed()) keepWindowHidden(tab);
+    updatePaintingState();
+  }));
+}
+
+/// Tears the viewer down: on pin, on the tab closing, and on the pane detaching.
+function closeDisplayWindow(tab) {
+  const display = displayWindows.get(tab);
+  displayWindows.delete(tab);
+  if (!display) return;
+  displayWindowTabs.delete(display);
+  if (!display.isDestroyed()) display.destroy();
+}
+
+/// The page's logical size, which is the space the viewer maps a click into.
+function sendDisplayPageSize(tab) {
+  const display = displayWindows.get(tab);
+  if (!display || display.isDestroyed() || tab.isDestroyed()) return;
+  const size = tab.getContentSize();
+  display.webContents.send("tweb-float-page-size", { width: size[0], height: size[1] });
+}
+
+/// Relays one painted frame to a floating tab's viewer.
+///
+/// Called from the same `paint` handler that feeds the pane, so the viewer and the Kitty
+/// channel see the same frames — this is a second consumer, not a second renderer.
+function relayFrameToDisplay(tab, image) {
+  const display = displayWindows.get(tab);
+  if (!display || display.isDestroyed() || !image || image.isEmpty()) return;
+  try {
+    display.webContents.send("tweb-float-frame", image.toJPEG(RELAY_JPEG_QUALITY));
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: float relay failed: ${error.message}`);
+  }
+}
+
+// Input from a viewer window goes to the page it mirrors. The viewer has already mapped the
+// point into page coordinates — it is the only side that knows how its canvas is laid out.
+ipcMain.on("tweb-float-input", (event, kind, data) => {
+  const display = BrowserWindow.fromWebContents(event.sender);
+  const tab = display && displayWindowTabs.get(display);
+  if (!tab || tab.isDestroyed()) return;
+  withPaneScope(tabPanes.get(tab), () => {
+    for (const input of relayInputEvents(kind, data)) tab.webContents.sendInputEvent(input);
+  });
+});
+
+// A resized viewer window re-lays out the page at its new size. The pane's own surface
+// reconciler owns the offscreen window's size, so this only takes effect while floating —
+// and `updatePaintingState` puts it back to the pane's size the moment the tab pins.
+ipcMain.on("tweb-float-resized", (event, size) => {
+  const display = BrowserWindow.fromWebContents(event.sender);
+  const tab = display && displayWindowTabs.get(display);
+  if (!tab || tab.isDestroyed() || !floatingTabs.has(tab)) return;
+  const width = Math.max(1, Math.round(size?.width || 1));
+  const height = Math.max(1, Math.round(size?.height || 1));
+  const current = tab.getContentSize();
+  if (current[0] === width && current[1] === height) return;
+  withPaneScope(tabPanes.get(tab), () => {
+    tab.setContentSize(width, height);
+    sendDisplayPageSize(tab);
+    // The pane's cached frames are the old size and `queueFrame` drops mismatched ones, so
+    // the viewer would sit on a stale image until the page happened to paint by itself.
+    tab.webContents.invalidate();
+  });
+});
+
 let pdfPendingG = false;
 let pdfPendingGTimer = null;
 
@@ -6040,6 +6163,8 @@ function closePaneOnce(record, reason) {
         tabZoomFactors.delete(tab);
         tabSessionUrls.delete(tab);
         tabRendererRecoveries.delete(tab);
+        floatingTabs.delete(tab);
+        closeDisplayWindow(tab);
       }
       windows.tabs.length = 0;
       windows.win = null;
@@ -6184,9 +6309,9 @@ process.stdin.resume();
 // --- app lifecycle ---
 
 app.on("browser-window-created", (_event, window) => {
-    // A floating tab is shown on purpose — do not let the watchdog hide it
-    // before applySurfacePlan has had a chance to add it to floatingTabs.
-    if (!floatingTabs.has(window)) keepWindowHidden(window);
+    // A floating tab's viewer is shown on purpose. This fires from inside the constructor,
+    // before the window can be registered, which is what `creatingDisplayWindow` covers.
+    if (!isDisplayWindow(window)) keepWindowHidden(window);
   });
 
 app.whenReady().then(async () => {
