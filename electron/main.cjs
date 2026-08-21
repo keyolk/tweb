@@ -2032,7 +2032,7 @@ function updatePaintingState() {
   const held = surfaceHeldForAgent();
   for (const tab of currentWindows().tabs) {
     if (tab.isDestroyed()) continue;
-    const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held);
+    const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held, inputState().floating);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
     applySurfacePlan(tab, plan);
@@ -2066,6 +2066,32 @@ function currentViewport() {
 // surface grows back is repainted from scratch: the collapsed frames are a different size
 // and `queueFrame` drops them, so nothing stale can survive the restore.
 function applySurfacePlan(tab, plan) {
+  // A floating tab is shown on the OS desktop rather than painted into the Kitty graphics
+  // channel, so it gets a real window position and opacity rather than the offscreen
+  // treatment `keepWindowHidden` applies to every other tab.
+  if (plan.floating) {
+    if (tab.isVisible()) return;
+    tab.setOpacity(1);
+    tab.setFocusable(true);
+    // Centre on the display the pane is on, at the pane's current size. The user can
+    // move the window freely afterwards — this is just a sensible default.
+    const display = screen.getDisplayMatching(tab.getBounds());
+    const bounds = {
+      x: Math.round(display.bounds.x + (display.bounds.width - plan.width) / 2),
+      y: Math.round(display.bounds.y + (display.bounds.height - plan.height) / 2),
+      width: plan.width,
+      height: plan.height,
+    };
+    tab.setBounds(bounds);
+    tab.show();
+    floatingTabs.add(tab);
+    return;
+  }
+  // A tab that was floating and is no longer: hide it again and put it back offscreen.
+  if (floatingTabs.has(tab) && !plan.floating) {
+    floatingTabs.delete(tab);
+    keepWindowHidden(tab);
+  }
   const size = tab.getContentSize();
   const current = { width: size[0], height: size[1] };
   if (!surfaceResizeNeeded(plan, current)) return;
@@ -3934,6 +3960,16 @@ async function dispatchAgentCommand(method, params) {
       const result = await agentPageRequest("inspect-element", {}, 3000);
       return result || { ok: false, message: "no element picked" };
     }
+    case "float": {
+      inputState().floating = true;
+      updatePaintingState();
+      return { ok: true, floating: true };
+    }
+    case "pin": {
+      inputState().floating = false;
+      updatePaintingState();
+      return { ok: true, floating: false };
+    }
     case "capture":
       return agentCapture(params);
     case "status":
@@ -4652,6 +4688,10 @@ const hiddenWindowLatched = new WeakSet();
 
 function keepWindowHidden(tab) {
   if (!tab || tab.isDestroyed()) return;
+  // A floating tab is intentionally visible on the OS desktop — the watchdog would
+  // hide it every tick, fighting the user's `tweb float`. Skip it here rather than
+  // in the watchdog, so the watchdog's "hide everything" loop stays simple.
+  if (floatingTabs.has(tab)) return;
   const bounds = tab.getBounds();
   if (bounds.x !== -10_000 || bounds.y !== -10_000) {
     tab.setBounds({ ...bounds, x: -10_000, y: -10_000 });
@@ -5043,7 +5083,7 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
     // resize is exactly when a hidden pane is most likely to be resized.
     for (const tab of currentWindows().tabs) {
       if (tab.isDestroyed()) continue;
-      applySurfacePlan(tab, surfacePlan(tab === currentWindows().win, record.visible, logical, surfaceHeldForAgent()));
+      applySurfacePlan(tab, surfacePlan(tab === currentWindows().win, record.visible, logical, surfaceHeldForAgent(), inputState().floating));
     }
   }
   currentWindows().win?.webContents.invalidate();
@@ -5116,6 +5156,8 @@ function inputState() {
       vimium: true,
       bypass: false,
       insertMode: false,
+      // Whether this pane's page is shown as an OS desktop window (floating mode).
+      floating: false,
     };
     paneInputStates.set(record.key, state);
   }
@@ -5269,6 +5311,8 @@ function keyName(codepoint) {
 
 // Half of a `gg`, kept next to the key path rather than in the pure mapping so the
 // mapping stays a function of its arguments.
+// Tabs currently shown as OS desktop windows (floating mode, see surface-policy.cjs).
+let floatingTabs = new Set();
 let pdfPendingG = false;
 let pdfPendingGTimer = null;
 

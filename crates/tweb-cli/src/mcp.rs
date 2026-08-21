@@ -276,6 +276,20 @@ const TOOLS: &[Tool] = &[
         fields: &[],
         fixed: &[],
     },
+    Tool {
+        name: "tweb_float",
+        method: "float",
+        description: "Show the current pane's page as an OS desktop window,                       detached from the tmux pane. The page state and                       profile stay with the pane; only the display moves.",
+        fields: &[],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_pin",
+        method: "pin",
+        description: "Bring a floating page back into the tmux pane.",
+        fields: &[],
+        fixed: &[],
+    },
 ];
 
 fn tool_schema(tool: &Tool) -> Value {
