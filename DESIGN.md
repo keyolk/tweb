@@ -17,8 +17,12 @@
 > - **§6.3** — C++, Objective-C++, Zig and TypeScript are named as implementation languages. **None
 >   of those files exist in this repository.** Rust and CommonJS ship.
 > - **§7.2** — the Ghostty GPU surface fast path is unbuilt. No TWeb-enhanced Ghostty exists.
-> - **§10, §11** — Chrome profile bootstrap and the managed Chrome handoff are **entirely unbuilt**.
->   The CLI subcommands parse and then exit with `command not yet implemented`.
+> - **§10** — Chrome profile bootstrap is unbuilt. `tweb profile bootstrap <source>` and
+>   `tweb profile list` parse their arguments and exit with `command not yet implemented`.
+> - **§11** — the managed Chrome handoff is built in its minimum form: `tweb chrome open` and
+>   `tweb chrome status` work, routing sensitive domains to real Chrome via tmux-chrome or `open -a`.
+>   Automatic routing was built and removed — an SSO login is a redirect chain, and a browser
+>   boundary inside it breaks the cookie store. See §11 for the measurement.
 > - **§12.3, §12.14** — the ResourceBroker is a 38-line stub and the resource CLI is unimplemented.
 >   The agent socket, which is a different mechanism, does ship and does work.
 

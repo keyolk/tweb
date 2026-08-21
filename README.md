@@ -69,6 +69,32 @@ tweb snapshot --pane %3
 tweb click a --pane %3
 tweb screenshot shot.png --pane %3
 
+# Save the page as a PDF (caller-specified path, or base64 without one)
+tweb pdf report.pdf --pane %3
+
+# Recent network requests (--clear resets the buffer)
+tweb network --limit 50 --pane %3
+
+# Capture the whole page, including content below the fold
+tweb full-screenshot full.png --pane %3
+
+# Emulate a mobile device viewport (--reset clears it)
+tweb device "iPhone 12" --pane %3
+tweb device --reset --pane %3
+
+# Console + network + screenshot in one call
+tweb capture --pane %3
+
+# The element the user picked in inspect mode (selector, HTML, text, box)
+tweb inspect-element --pane %3
+
+# Supervisor status, stop and restart
+tweb daemon status
+tweb daemon restart
+
+# Hand a site that needs real Chrome to Chrome
+tweb chrome open https://argocd.example.com/
+
 # Diagnose the environment
 tweb doctor
 
@@ -76,10 +102,10 @@ tweb doctor
 tweb doctor --fix
 ```
 
-`tweb --help` also lists `resource`, `profile` and `chrome`. Those are **placeholders for unbuilt
+`tweb --help` also lists `resource` and `profile`. Those are **placeholders for unbuilt
 subsystems** — each one parses its arguments and then exits with
 `command not yet implemented`. They are listed here so nobody discovers it mid-migration; see
-[Status](#status).
+[Status](#status). `chrome` is built — see [Sites that need real Chrome](#sites-that-need-real-chrome).
 
 ## Extensions
 
@@ -562,6 +588,15 @@ contradict them, but most of their mechanics were not re-exercised.
 | Video with sound | Measured: real decode, a live `AudioService` child process, `audible=true`. |
 | Korean IME | **Validated this run**, and this README previously listed it as unvalidated. `안녕하세요` and `한글 렌더 테스트 abc123` land byte-exact (`U+C548 U+B155 U+D558 U+C138 U+C694`, no mojibake, no doubling) and render correctly with the caret in the right place. Two honest limits: a live macOS 2-set IME with per-jamo backspace mid-composition was **not** driven, and typing hangul with no field focused flips the mode indicator to `insert` cosmetically — the keys still work and `Esc` clears it. |
 | Agent control (CLI · MCP) | Measured throughout the audit; it is how most of this table was driven. |
+| Scrollbars | The OS widget paints a light-mode track over dark content. A style injected at engine start makes the track transparent and the thumb a thin muted slate, so it reads on both light and dark pages. |
+| PDF export | `tweb pdf` saves the page as a caller-specified path. `printToPDF` was already used by the in-page print command, but only to write a generated name into `~/Downloads`; this exposes it to an agent. |
+| Network monitoring | `tweb network` shows recent requests (URL, method, status, resource type) from a 200-entry ring buffer fed by `webRequest` interceptors. `--clear` resets it. |
+| Full-page screenshot | `tweb full-screenshot` captures a page taller than the viewport by scrolling and stitching, rather than by resizing the window (which the surface watchdog would fight). |
+| Device emulation | `tweb device` emulates a mobile viewport (iPhone 12, iPad, Pixel 5) via `enableDeviceEmulation`. `--reset` clears it. |
+| Combined capture | `tweb capture` returns console + network + screenshot in one call, so the logs and the picture describe the same moment. |
+| Inspect → agent | Inspect mode's `y`/`h`/`t` keys now send the element context (selector, HTML, text, bounding box, URL) to an agent as well as the clipboard — Orca design-mode parity. Exposed as `tweb inspect-element` (CLI) and `tweb_inspect_element` (MCP). |
+| Daemon control | `tweb daemon status` / `stop` / `restart` — the supervisor's pid, socket, uptime, pane count and engine state, plus a one-command restart that panes reattach from automatically. |
+| Chrome handoff | `tweb chrome open <url>` hands a site that needs real Chrome (Okta Device Trust, etc.) to Chrome via tmux-chrome or `open -a`. Neither path reads or writes the Chrome profile. |
 
 ### What is broken today
 
@@ -656,8 +691,8 @@ that merely looks like them:
   is a path prompt with completion, which is *faster* than a Finder dialog for anyone who lives in a
   shell. It does not exist yet, so uploads are broken today, but the GUI chooser is not the target.
 - **Chrome's print preview GUI** — paper size, margins, scaling, page range, a live preview, the macOS
-  print dialog. The honest split is save-as-PDF via `printToPDF()` for the common case and `lpr` for
-  actual paper.
+  print dialog. The honest split is `tweb pdf` (save-as-PDF via `printToPDF()`) for the common case and
+  `lpr` for actual paper. The GUI preview itself is not the target.
 - **Chrome's autofill dropdown** anchored to a field, and its Touch ID / keychain confirmation. Those
   are OS-level surfaces. A terminal port of autofill should be *more* explicit than Chrome's, not
   less — silent autofill without a visible origin confirmation is a phishing risk.
