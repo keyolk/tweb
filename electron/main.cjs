@@ -3097,6 +3097,8 @@ function toggleFloat() {
 
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
+  // `toggle-float` is a view toggle, not a browser shortcut — it works regardless of vimium mode.
+  if (action === "toggle-float") { toggleFloat(); return; }
   if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
