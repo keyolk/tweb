@@ -4056,6 +4056,7 @@ installPrintShim();
       case "X": send("restore-tab"); break;
       case "y": send("copy-url"); flash("URL"); break;
       case "r": send("reload"); break;
+      case "w": send("toggle-float"); break;
       case "Escape":
         // Release a picked scroll or pan surface before bothering the page.
         if (scrollSurface() || panSurface()) {

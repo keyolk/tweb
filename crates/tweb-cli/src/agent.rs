@@ -458,6 +458,20 @@ pub fn render(method: &str, result: &Value) -> String {
                 format!("{}  {}  {}\n", tag, selector, url)
             }
         }
+        "float" => {
+            if result.get("floating").and_then(|v| v.as_bool()) == Some(true) {
+                "floating\n".to_string()
+            } else {
+                "not floating\n".to_string()
+            }
+        }
+        "pin" => {
+            if result.get("floating").and_then(|v| v.as_bool()) == Some(false) {
+                "pinned\n".to_string()
+            } else {
+                "still floating\n".to_string()
+            }
+        }
         "tabs" | "tab" | "tab-new" | "tab-close" => {
             let tabs = result
                 .get("tabs")

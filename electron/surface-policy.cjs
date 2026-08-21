@@ -34,10 +34,13 @@ const COLLAPSED_HEIGHT = 1;
 ///
 /// `held` overrides the collapse for the active tab: an agent is reading the page and
 /// needs it laid out at its real size. See `agentNeedsGeometry` for why.
-function surfacePlan(active, terminalVisible, logical, held = false) {
+function surfacePlan(active, terminalVisible, logical, held = false, floating = false) {
   const width = Math.max(1, Math.round(logical?.width || 1));
   const height = Math.max(1, Math.round(logical?.height || 1));
-  const painting = Boolean(active && terminalVisible);
+  // A floating tab detaches its display from the tmux pane: the OS window is the
+  // surface, not the Kitty graphics channel. It paints at full size regardless of
+  // terminal visibility, because the user is looking at the OS window, not the pane.
+  const painting = floating || Boolean(active && terminalVisible);
   // A held tab is laid out and painting even though nobody is watching the pane. It costs
   // the surface bytes back for the length of one agent call, which is the price of the
   // call returning the page instead of a one-pixel strip of it.
@@ -49,6 +52,8 @@ function surfacePlan(active, terminalVisible, logical, held = false) {
     backgroundThrottling: !laidOut,
     width,
     height: laidOut ? height : Math.min(COLLAPSED_HEIGHT, height),
+    // Passed through to applySurfacePlan so it knows to show the OS window.
+    floating,
   };
 }
 

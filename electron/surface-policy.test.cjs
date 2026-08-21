@@ -16,6 +16,7 @@ test("the visible active tab keeps its full surface and paints", () => {
     backgroundThrottling: false,
     width: 1440,
     height: 900,
+    floating: false,
   });
 });
 

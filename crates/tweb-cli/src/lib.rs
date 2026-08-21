@@ -311,6 +311,16 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Show the current pane's page as an OS desktop window (floating mode).
+    Float {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// Bring a floating page back into the tmux pane.
+    Pin {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// MCP server for agents (stdio).
     Mcp {
         #[command(flatten)]
@@ -672,6 +682,8 @@ fn agent_call(
             ("capture", json!({ "path": path, "limit": limit }), agent)
         }
         Command::InspectElement { agent } => ("inspect-element", json!({}), agent),
+        Command::Float { agent } => ("float", json!({}), agent),
+        Command::Pin { agent } => ("pin", json!({}), agent),
         Command::Console {
             limit,
             clear,

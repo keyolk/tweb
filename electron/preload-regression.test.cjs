@@ -1789,3 +1789,45 @@ test("inspect mode sends element context to an agent", () => {
   assert.match(main, /case "inspect-element"/);
   assert.match(main, /agentPageRequest\("inspect-element"/);
 });
+
+// Floating mode detaches the display from the tmux pane — the offscreen BrowserWindow
+// is shown on the OS desktop. The page state stays with the pane; only the display moves.
+test("floating mode shows and hides the OS window", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // surfacePlan accepts a floating parameter and passes it through.
+  const policy = fs.readFileSync(path.join(__dirname, "surface-policy.cjs"), "utf8");
+  assert.match(policy, /floating = false/);
+  assert.match(policy, /const painting = floating \|\| Boolean/);
+  assert.match(policy, /floating,/);
+  // applySurfacePlan shows the window when floating.
+  const apply = main.slice(main.indexOf("function applySurfacePlan(tab, plan) {"),
+    main.indexOf("// === The agent"));
+  assert.match(apply, /if \(plan\.floating\)/);
+  assert.match(apply, /tab\.show\(\)/);
+  assert.match(apply, /tab\.setOpacity\(1\)/);
+  assert.match(apply, /floatingTabs\.add\(tab\)/);
+  // keepWindowHidden skips floating tabs — the watchdog would hide them.
+  const keep = main.slice(main.indexOf("function keepWindowHidden(tab) {"),
+    main.indexOf("function enforceHiddenWindows"));
+  assert.match(keep, /if \(floatingTabs\.has\(tab\)\) return/);
+  // inputState carries the floating flag.
+  assert.match(main, /floating: false,/);
+  // agent RPC: float and pin toggle the flag.
+  const dispatch = main.slice(main.indexOf("function dispatchAgentCommand(method, params) {"),
+    main.indexOf("function unparkTerminalCaret"));
+  assert.match(dispatch, /case "float"/);
+  assert.match(dispatch, /inputState\(\)\.floating = true/);
+  assert.match(dispatch, /case "pin"/);
+  assert.match(dispatch, /inputState\(\)\.floating = false/);
+});
+
+// `w` toggles floating mode from inside the browser, the way `f`/`v`/`s` do — not a
+// separate CLI command. The key sends a `toggle-float` shortcut that flips
+// `inputState().floating` and re-runs `updatePaintingState`.
+test("w key toggles floating mode from the browser", () => {
+  assert.match(electron, /case "w": send\("toggle-float"\)/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "toggle-float": toggleFloat\(\)/);
+  assert.match(main, /function toggleFloat\(\)/);
+  assert.match(main, /state\.floating = !state\.floating/);
+});
