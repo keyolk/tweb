@@ -82,8 +82,9 @@ const { serverIdentityFrom, paneKey } = require("./pane-identity.cjs");
 const {
   PaneRegistry, createPaneRecord, applyVisibility: recordVisibility,
   applyFrameTier: recordFrameTier, applySurface: recordSurface, applyAudio: recordAudio,
-  audioOwnerAmong, paneImageIds, paneFrameFileNames, collidingImageRange, PATCH_ID_COUNT,
+  audioOwnerAmong, paneImageIds, collidingImageRange, PATCH_ID_COUNT,
 } = require("./pane-registry.cjs");
+const { paneFrameFileList, runTeardown } = require("./teardown.cjs");
 const {
   parseControlLine, resolveTarget, formatOutbound, keyboardRestoreEvent,
 } = require("./pane-control.cjs");
@@ -2400,7 +2401,22 @@ function installPageEnhancements(tab = currentWindows().win) {
     if (!style) {
       style = document.createElement('style');
       style.id = '__tweb_caret_style__';
-      style.textContent = 'input,textarea,[contenteditable]:focus{caret-color:#00e5ff!important}';
+      // Native scrollbars are drawn by the OS widget, not by the page, so a dark
+      // page (dogdrip, most dashboards) gets a white scrollbar from Chromium's
+      // light-mode default — a bright strip over dark content. This keeps the
+      // track transparent so the page shows through, and draws a thin thumb in a
+      // muted tone that reads on both light and dark pages. scrollbar-width:thin
+      // is the standards path; the webkit-* rules cover Chromium, which is
+      // what this engine is.
+      style.textContent = [
+        'input,textarea,[contenteditable]:focus{caret-color:#00e5ff!important}',
+        '::-webkit-scrollbar{width:8px;height:8px;background:transparent}',
+        '::-webkit-scrollbar-track{background:transparent}',
+        '::-webkit-scrollbar-thumb{background:rgba(130,130,140,.4);border-radius:4px;border:2px solid transparent;background-clip:padding-box}',
+        '::-webkit-scrollbar-thumb:hover{background:rgba(130,130,140,.6);background-clip:padding-box}',
+        '::-webkit-scrollbar-corner{background:transparent}',
+        '*{scrollbar-width:thin;scrollbar-color:rgba(130,130,140,.4) transparent}',
+      ].join('');
       (document.head || document.documentElement).append(style);
     }
 
@@ -5906,10 +5922,11 @@ app.whenReady().then(async () => {
     + ` · zoom ${Math.round(defaultZoomFactor * 100)}%`);
 });
 
-// The frame files one pane owns. The naming rule lives in pane-registry.cjs beside the id
-// layout it derives from; this only joins it to the userData directory.
-function paneFrameFiles(imageId) {
-  return paneFrameFileNames(process.pid, imageId)
+// The frame files a set of panes owns, as paths. The naming rule and the enumeration live in
+// pane-registry.cjs and teardown.cjs — pure, and tested there; this only joins them to the
+// userData directory, which is the one part that needs Electron.
+function paneFrameFilePaths(records) {
+  return paneFrameFileList(records, process.pid)
     .map((name) => path.join(app.getPath("userData"), name));
 }
 
@@ -5926,18 +5943,17 @@ function removeFrameFiles(paths) {
 // A detaching pane drops its files now rather than at process exit: a host that serves panes
 // for hours would otherwise hold the frames of every pane it has ever served.
 function cleanupPaneFrameFiles(record) {
-  const imageId = Number(record?.imageId);
-  if (!Number.isSafeInteger(imageId)) return;
-  removeFrameFiles(paneFrameFiles(imageId));
+  removeFrameFiles(paneFrameFilePaths([record]));
 }
 
 function cleanupFrameFiles() {
-  const panes = paneRegistry.list();
-  const ids = new Set(panes.map((record) => Number(record.imageId)).filter(Number.isSafeInteger));
-  // `solePane` is not in the registry on the hosted path and is on the default one, so it is
-  // added by id: a set means naming it twice costs nothing and forgetting it would leak.
-  if (Number.isSafeInteger(Number(solePane?.imageId))) ids.add(Number(solePane.imageId));
-  removeFrameFiles([...ids].flatMap(paneFrameFiles));
+  // Every live pane, plus the sole pane: it is attached to the registry on the default path and not
+  // on the hosted one (see the `attach` guarded by `!hostedRuntime`), and `paneFrameFileList` dedupes
+  // by image id, so naming it both ways costs nothing while forgetting it leaks. The enumeration is
+  // pure and tested because it is only ever reached from `before-quit` and the exit handler — no
+  // test and no measurement exercises it here, which is how a dead identifier once survived a green
+  // suite and took the whole teardown with it.
+  removeFrameFiles(paneFrameFilePaths([...paneRegistry.list(), solePane]));
 }
 
 // The above only removes this engine's own files, and only if it reaches its exit path. An
@@ -5975,69 +5991,108 @@ app.on("window-all-closed", () => {
   if (!quitting) app.quit();
 });
 
+// Every step guarded, and every failure logged. A throw out of this listener is not contained by
+// anything: Electron may cancel the quit outright — an orphaned engine was observed logging "owner
+// is gone, quitting" and then living on at ppid=1 with its window up, its image still placed on the
+// terminal and its 1.5MB frame file on disk — and where the quit does survive the throw, everything
+// after the throwing step is simply skipped, silently. Both were measured. On this Electron the
+// second is what reproduces: one dead identifier in the frame-file enumeration cut the teardown
+// from 532 bytes to 413, so `terminalCleanup`, all ten image deletes and the title restore never
+// ran, with nothing in the log to say why. A stranded image on a real terminal is invisible from
+// inside the process, so the failure is logged rather than swallowed. The steps are independent
+// effects on different surfaces, so each is attempted whether or not the one before it worked; see
+// `teardown.cjs`.
 app.on("before-quit", () => {
-  if (agentServer) {
-    agentServer.close();
-    agentServer = null;
-  }
-  // A clean exit hands audio back immediately rather than making the survivors wait out
-  // the TTL. The TTL is what covers the exit that is not clean.
-  if (audioTimer) {
-    clearInterval(audioTimer);
-    audioTimer = null;
-  }
-  clearAudioClaim();
-  if (hiddenWindowWatchdog) {
-    clearInterval(hiddenWindowWatchdog);
-    hiddenWindowWatchdog = null;
-  }
-  if (windowSessionSaveTimer) {
-    clearTimeout(windowSessionSaveTimer);
-    windowSessionSaveTimer = null;
-  }
-  writeWindowSession();
-  releaseWindowSessionClaim();
-  quitting = true;
-  void gfxWorker.terminate();
-  // Per pane: each has its own pending frame, its own tabs still painting, and its own image on the
-  // terminal. Running this once for the first pane would leave every other pane's image drawn over
-  // the terminal after the engine is gone — the four-hour stale-page failure, N-1 times over.
-  forEachPane(() => {
-    inputState().clicks.reset();
-    if (currentFrames().pendingFrameTimer) {
-      clearTimeout(currentFrames().pendingFrameTimer);
-      currentFrames().pendingFrameTimer = null;
-      currentFrames().pendingFrame = null;
-    }
-    currentFrames().pendingGfxFrame = null;
-    cleanupFrameFiles();
-    if (debugLogging && currentFrames().droppedGfxFrames > 0) {
-      console.error(`tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
-    }
-    for (const tab of currentWindows().tabs) {
-      if (!tab.isDestroyed()) tab.webContents.stopPainting();
-    }
-    terminalCleanup();
-    // Each pane's image is placed on the clients watching THAT pane's window, which after the move
-    // to per-pane visibility state are a different set per pane.
-    for (const tty of vis().clientTtys) deleteImageFromClientTty(tty);
-  });
-  restoreTmuxPassthroughClients();
-  restorePaneTitle();
+  runTeardown([
+    ["agent server", () => {
+      if (agentServer) {
+        agentServer.close();
+        agentServer = null;
+      }
+    }],
+    // A clean exit hands audio back immediately rather than making the survivors wait out
+    // the TTL. The TTL is what covers the exit that is not clean.
+    ["audio claim", () => {
+      if (audioTimer) {
+        clearInterval(audioTimer);
+        audioTimer = null;
+      }
+      clearAudioClaim();
+    }],
+    ["watchdog timers", () => {
+      if (hiddenWindowWatchdog) {
+        clearInterval(hiddenWindowWatchdog);
+        hiddenWindowWatchdog = null;
+      }
+      if (windowSessionSaveTimer) {
+        clearTimeout(windowSessionSaveTimer);
+        windowSessionSaveTimer = null;
+      }
+    }],
+    ["window session", () => {
+      writeWindowSession();
+      releaseWindowSessionClaim();
+    }],
+    ["graphics worker", () => {
+      quitting = true;
+      void gfxWorker.terminate();
+    }],
+    // Per pane: each has its own pending frame, its own tabs still painting, and its own image on
+    // the terminal. Running this once for the first pane would leave every other pane's image drawn
+    // over the terminal after the engine is gone — the four-hour stale-page failure, N-1 times over.
+    // Guarded per pane and per surface for the same reason it is per pane: one pane whose window is
+    // already destroyed must not take the remaining panes' images down with it.
+    ["panes", () => forEachPane((record) => {
+      const label = `pane ${record?.imageId ?? "?"}`;
+      runTeardown([
+        [`${label} pending frame`, () => {
+          inputState().clicks.reset();
+          if (currentFrames().pendingFrameTimer) {
+            clearTimeout(currentFrames().pendingFrameTimer);
+            currentFrames().pendingFrameTimer = null;
+            currentFrames().pendingFrame = null;
+          }
+          currentFrames().pendingGfxFrame = null;
+          if (debugLogging && currentFrames().droppedGfxFrames > 0) {
+            console.error(
+              `tweb: dropped ${currentFrames().droppedGfxFrames} superseded graphics frames`);
+          }
+        }],
+        [`${label} frame files`, cleanupFrameFiles],
+        [`${label} stop painting`, () => {
+          for (const tab of currentWindows().tabs) {
+            if (!tab.isDestroyed()) tab.webContents.stopPainting();
+          }
+        }],
+        [`${label} terminal`, () => terminalCleanup()],
+        // Each pane's image is placed on the clients watching THAT pane's window, which after the
+        // move to per-pane visibility state are a different set per pane.
+        [`${label} client images`, () => {
+          for (const tty of vis().clientTtys) deleteImageFromClientTty(tty);
+        }],
+      ]);
+    })],
+    ["tmux passthrough", restoreTmuxPassthroughClients],
+    ["pane title", restorePaneTitle],
+  ]);
 });
 
-// Delete the image on process exit too (safety net).
+// Delete the image on process exit too (safety net). Guarded for the same reason as `before-quit`:
+// this is the handler that runs when the quit path did not, so a throw out of its first step is a
+// backstop that fails exactly when it is needed. It was — the enumeration it shares with the quit
+// path threw the same ReferenceError, so the net had the same hole as the thing it was catching.
 process.on("exit", () => {
-  cleanupFrameFiles();
-  // The delete that takes each pane's image off the terminal. An exit handler cannot await, so
-  // this only works because every pane writer has a synchronous sink — see `fdSink`. Give a
-  // writer an async sink and these deletes are dropped, stranding the images.
-  // The record is already in hand, so the delete is written in that pane's scope: `writeGfx` picks
-  // the writer from the ambient pane, and unscoped it would address every pane's delete to the
-  // first one — leaving N-1 images on the terminal, which is precisely what this handler is for.
-  for (const record of paneRegistry.list()) {
-    try {
-      withPaneScope(record, () => writeGfx(`a=d,d=I,i=${record.imageId}`, ""));
-    } catch (e) {}
-  }
+  runTeardown([
+    ["exit frame files", cleanupFrameFiles],
+    // The delete that takes each pane's image off the terminal. An exit handler cannot await, so
+    // this only works because every pane writer has a synchronous sink — see `fdSink`. Give a
+    // writer an async sink and these deletes are dropped, stranding the images.
+    // The record is already in hand, so the delete is written in that pane's scope: `writeGfx` picks
+    // the writer from the ambient pane, and unscoped it would address every pane's delete to the
+    // first one — leaving N-1 images on the terminal, which is precisely what this handler is for.
+    ["exit image deletes", () => runTeardown(paneRegistry.list().map((record) => [
+      `exit image ${record.imageId}`,
+      () => withPaneScope(record, () => writeGfx(`a=d,d=I,i=${record.imageId}`, "")),
+    ]))],
+  ]);
 });
