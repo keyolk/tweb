@@ -23,6 +23,9 @@
 >   `tweb chrome status` work, routing sensitive domains to real Chrome via tmux-chrome or `open -a`.
 >   Automatic routing was built and removed — an SSO login is a redirect chain, and a browser
 >   boundary inside it breaks the cookie store. See §11 for the measurement.
+> - **§14** — floating mode is unbuilt. The offscreen `BrowserWindow` that renders the page
+>   can be shown on the OS desktop, but the detachment of the display from the tmux pane
+>   is not wired. See §14 for the design.
 > - **§12.3, §12.14** — the ResourceBroker is a 38-line stub and the resource CLI is unimplemented.
 >   The agent socket, which is a different mechanism, does ship and does work.
 
@@ -2126,7 +2129,83 @@ supersedes the old registration, and a detach or reap carrying a stale generatio
 rule is implemented in `crates/twebd/src/page_registry.rs` with tests. Page ids handed back to
 clients are opaque.
 
-## 14. Performance goals and measurement
+## 14. Floating mode
+
+> **Not implemented.** This section is a design target, not a description of shipping code.
+
+A browser pane is tied to its tmux pane — the cell grid, the window layout, the resize
+clock. That is the point: the page lives where the terminal lives, and survives detach and
+reattach. But the same binding is what makes a page *vibrate* when the pane next to it resizes,
+and what makes it *impossible to park on another monitor* while the shell keeps working.
+
+Floating mode detaches the display from the pane without detaching the page. The
+offscreen `BrowserWindow` that already renders the page is shown on the OS desktop — `show: true`,
+independent bounds, its own position — while the page state, the profile and the agent
+socket stay with the tmux pane. The Kitty graphics channel stops; the OS window is the
+surface now.
+
+```text
+tmux pane (normal)          tmux pane (floating)
+    │                             │
+    │  Kitty graphics             │  OS desktop window
+    │  a=T/a=p to cells            │  BrowserWindow show:true
+    │                               │  independent bounds
+    │                               │  can move to another monitor
+    │                               │
+    └── same page, same profile, same agent socket
+```
+
+### 14.1 What floats and what stays
+
+| Stays with the tmux pane | Floats to the OS window |
+|---|---|
+| Page state (URL, history, scroll) | Display surface |
+| Chromium profile | Window bounds and position |
+| Agent socket (`tweb snapshot` etc.) | — |
+| Mode indicator | — |
+| Input routing | — |
+
+The page is not copied. The same `webContents` that painted into the Kitty channel is
+redirected to the OS window, so a navigation or a form half-filled in the pane carries
+over to the float — and back, when floating is turned off.
+
+### 14.2 The commands
+
+```
+tweb float          # show the current pane's page as an OS window
+tweb pin            # bring it back into the tmux pane
+```
+
+`float` with no arguments opens the window at the pane's current size, centred on the
+display. `float --display external` parks it on another monitor. `pin` closes the OS
+window and resumes the Kitty graphics channel — the pane is a normal pane again.
+
+### 14.3 What does not float
+
+The terminal does not float. The shell, the agent, the editor and everything else in the
+tmux window stay where they are. Floating is a *view* mode, not a *session* mode: the tmux
+window is still the workspace, and the floating page is a guest surface on the desktop,
+not a replacement for the pane.
+
+This is the difference from "just open a Chrome window": the page is the one the user
+was already looking at, with its history and its scroll position and its half-filled
+form. It is a detachment of the display, not a second browser.
+
+### 14.4 Resize independence
+
+A floating window does not follow the tmux pane's resize clock. The user can resize the
+OS window freely, and the page reflows to the window — not to the cell grid. This is the one
+case where the surface budget (§6.5) and the frame rate apply to the OS window's size
+rather than to the tmux pane's cell count.
+
+### 14.5 Why not always float
+
+The pane is the better surface for the terminal workflow. The page sits beside the
+shell and the agent, in a layout that survives detach, on the same scrollback as the rest
+of the terminal. Floating is for the times the page needs to be *still* — a recording,
+a demo, a second monitor — without the pane next to it resizing it out from under.
+
+## 15. Performance goals and measurement
 
 Exact figures are fixed after a per-hardware baseline measurement, but the following are release gates.
 
@@ -2150,7 +2229,7 @@ The benchmark workloads:
 - video playback
 - Korean input and a long clipboard paste
 
-## 15. The conformance matrix
+## 16. The conformance matrix
 
 Support is declared by capability and validated combination, not by terminal name.
 
@@ -2162,7 +2241,7 @@ Support is declared by capability and validated combination, not by terminal nam
 | Kitty + tmux | native image the goal | the tmux table | pane mouse | client mode | a core target |
 | SSH remote | an inline/video backend | remote input | remote input | client mode | a separate transport |
 
-## 16. Security
+## 17. Security
 
 - Never disable the Chromium sandbox.
 - Separate the browser/renderer/GPU/utility process privileges.
@@ -2175,7 +2254,7 @@ Support is declared by capability and validated combination, not by terminal nam
 - Apply fuzzing to the terminal escape sequence parser.
 - Bound the tmux passthrough payload length and the parser boundary.
 
-## 17. A validation order, not an implementation order
+## 18. A validation order, not an implementation order
 
 > **Where this list now stands, measured 2026-08-16 — see [README Status](README.md#status) for the
 > evidence.** (1) partly: the Kitty path ships and works; the GPU fast path is unbuilt (§7.2).
@@ -2199,7 +2278,7 @@ Rather than scoping a short-term MVP, whether the architecture holds up is valid
 If 1–3 reveal a structural limit in the terminal protocol, the runtime is not discarded;
 `NativeSurfaceTransport` is added instead. The tmux pane/process/profile/automation model stays as it is.
 
-## 18. What to adopt from precedent and what to drop
+## 19. What to adopt from precedent and what to drop
 
 ### Adopted from `awrit`
 
@@ -2259,7 +2338,7 @@ If 1–3 reveal a structural limit in the terminal protocol, the runtime is not 
 an interactive primary renderer its ceiling is clearly lower than the GPU fast path's. It is used only as a
 low-framerate fallback where `RemoteVideoTransport` is unavailable, or as a static snapshot backend.
 
-## 19. The final product definition
+## 20. The final product definition
 
 > **This is the target definition, and two of its clauses are unbuilt.** Resource exchange as typed
 > window-scoped attachments is a 38-line stub (§12.3); the Chrome profile bootstrap and the managed
