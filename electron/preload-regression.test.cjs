@@ -1790,26 +1790,30 @@ test("inspect mode sends element context to an agent", () => {
   assert.match(main, /agentPageRequest\("inspect-element"/);
 });
 
-// Floating mode detaches the display from the tmux pane — the offscreen BrowserWindow
-// is shown on the OS desktop. The page state stays with the pane; only the display moves.
-test("floating mode shows and hides the OS window", () => {
+// Floating mode detaches the display from the tmux pane. The page's own window is NOT
+// shown to do it: an offscreen webContents composites into its `paint` stream or onto a
+// native surface, never both, so `tab.show()` produced a window reading "No content under
+// offscreen mode". Instead the frames it is already painting are relayed to a separate
+// viewer window. See float-display.cjs for the measurements that closed off the
+// alternatives, including the WebContentsView adoption that throws outright.
+test("floating mode relays frames to a display window instead of showing the tab", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   // surfacePlan accepts a floating parameter and passes it through.
   const policy = fs.readFileSync(path.join(__dirname, "surface-policy.cjs"), "utf8");
   assert.match(policy, /floating = false/);
   assert.match(policy, /const painting = floating \|\| Boolean/);
   assert.match(policy, /floating,/);
-  // applySurfacePlan shows the window when floating.
   const apply = main.slice(main.indexOf("function applySurfacePlan(tab, plan) {"),
     main.indexOf("// === The agent"));
   assert.match(apply, /if \(plan\.floating\)/);
-  assert.match(apply, /tab\.show\(\)/);
-  assert.match(apply, /tab\.setOpacity\(1\)/);
   assert.match(apply, /floatingTabs\.add\(tab\)/);
-  // keepWindowHidden skips floating tabs — the watchdog would hide them.
-  const keep = main.slice(main.indexOf("function keepWindowHidden(tab) {"),
-    main.indexOf("function enforceHiddenWindows"));
-  assert.match(keep, /if \(floatingTabs\.has\(tab\)\) return/);
+  assert.match(apply, /openDisplayWindow\(tab, plan\)/);
+  // The tab's own window must never be shown — that is the bug this design exists to fix.
+  assert.doesNotMatch(apply, /tab\.show\(\)/);
+  assert.doesNotMatch(apply, /tab\.setOpacity\(1\)/);
+  // Pinning takes the viewer down and puts the tab's window back under the watchdog.
+  assert.match(apply, /closeDisplayWindow\(tab\)/);
+  assert.match(apply, /keepWindowHidden\(tab\)/);
   // inputState carries the floating flag.
   assert.match(main, /floating: false,/);
   // agent RPC: float and pin toggle the flag.
@@ -1820,6 +1824,77 @@ test("floating mode shows and hides the OS window", () => {
   assert.match(dispatch, /case "pin"/);
   assert.match(dispatch, /inputState\(\)\.floating = false/);
 });
+
+// The tab keeps its offscreen surface reconciled while floating: the viewer draws the very
+// frames the pane does, so a collapsed or non-painting surface would blank both at once.
+// An early return in the floating branch is what would break it.
+test("a floating tab still has its offscreen surface reconciled", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const apply = main.slice(main.indexOf("function applySurfacePlan(tab, plan) {"),
+    main.indexOf("// === The agent"));
+  const floatingBranch = apply.slice(apply.indexOf("if (plan.floating)"), apply.indexOf("const size = tab.getContentSize()"));
+  // Comments stripped first: the branch explains in prose why it does not return early,
+  // and matching that sentence would pass the test for the wrong reason.
+  const code = floatingBranch.replace(/\/\/.*$/gm, "");
+  assert.doesNotMatch(code, /\breturn\b/);
+  // The paint handler feeds the viewer as a second consumer, after the pane.
+  assert.match(main, /if \(floatingTabs\.has\(tab\)\) relayFrameToDisplay\(tab, image\)/);
+  assert.match(main, /queueFrame\(tab, image, false, dirty\);/);
+});
+
+// The hidden-window watchdog hides every window it does not recognise, once a second. A
+// viewer it hid would take the whole feature down silently — and `browser-window-created`
+// fires from inside the constructor, before the viewer can be registered.
+test("the watchdog exempts display windows, including while one is being constructed", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const keep = main.slice(main.indexOf("function keepWindowHidden(tab) {"),
+    main.indexOf("function enforceHiddenWindows"));
+  assert.match(keep, /if \(isDisplayWindow\(tab\)\) return/);
+  assert.match(main, /if \(!isDisplayWindow\(window\)\) keepWindowHidden\(window\)/);
+  // The latch is what covers the window that does not exist yet.
+  assert.match(main, /return creatingDisplayWindow \|\| displayWindowTabs\.has\(window\)/);
+  assert.match(main, /creatingDisplayWindow = true;/);
+  assert.match(main, /creatingDisplayWindow = false;/);
+});
+
+// A viewer must not outlive the page it mirrors, and floating state must not outlive the
+// viewer — a pane left "floating" with no window makes the `w` toggle read backwards.
+test("display windows are torn down on close, on pin and with the pane", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // The user closing the viewer means pin, not "keep believing it floats".
+  const opener = main.slice(main.indexOf("function openDisplayWindow(tab, plan) {"),
+    main.indexOf("function closeDisplayWindow(tab) {"));
+  assert.match(opener, /display\.on\("closed"/);
+  assert.match(opener, /floatingTabs\.delete\(tab\)/);
+  assert.match(opener, /inputState\(\)\.floating = false/);
+  assert.match(opener, /updatePaintingState\(\)/);
+  // A tab closing takes its viewer with it.
+  const closed = main.slice(main.indexOf('tab.on("closed"'), main.indexOf("if (refreshTabListAfterClose)"));
+  assert.match(closed, /floatingTabs\.delete\(tab\)/);
+  assert.match(closed, /closeDisplayWindow\(tab\)/);
+  // So does a pane detaching, which destroys its tabs.
+  const detach = main.slice(main.indexOf("const windows = paneWindows.get(record.key);"));
+  assert.match(detach.slice(0, 2000), /closeDisplayWindow\(tab\)/);
+});
+
+// Input arrives from the viewer's own webContents and has to find the page it mirrors.
+// Resolving it through the reverse map is what keeps a second floating tab's clicks off
+// the first one's page.
+test("viewer input and resize are routed back to the tab they mirror", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /ipcMain\.on\("tweb-float-input"/);
+  assert.match(main, /const tab = display && displayWindowTabs\.get\(display\)/);
+  assert.match(main, /for \(const input of relayInputEvents\(kind, data\)\) tab\.webContents\.sendInputEvent\(input\)/);
+  // A resized viewer re-lays out the page, and the stale-size frames have to be replaced.
+  assert.match(main, /ipcMain\.on\("tweb-float-resized"/);
+  assert.match(main, /tab\.setContentSize\(width, height\)/);
+  assert.match(main, /sendDisplayPageSize\(tab\)/);
+  // Both run in the tab's pane scope — a host serves several, and the wrong scope draws
+  // into another pane's terminal.
+  const inputHandler = main.slice(main.indexOf('ipcMain.on("tweb-float-input"'));
+  assert.match(inputHandler.slice(0, 600), /withPaneScope\(tabPanes\.get\(tab\)/);
+});
+
 
 // `w` toggles floating mode from inside the browser, the way `f`/`v`/`s` do — not a
 // separate CLI command. The key sends a `toggle-float` shortcut that flips

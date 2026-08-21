@@ -1,0 +1,120 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>TWeb</title>
+<style>
+  /* The viewer is a frame surface and nothing else — no chrome of its own, so the page
+     fills the window exactly as it does in the pane. */
+  html, body { margin: 0; height: 100%; background: #1a1a1a; overflow: hidden; }
+  #surface { display: block; width: 100vw; height: 100vh; outline: none; }
+</style>
+<canvas id="surface" tabindex="0"></canvas>
+<script>
+  const surface = document.getElementById("surface");
+  const context = surface.getContext("2d", { alpha: false });
+  // The page's logical size, which is what sendInputEvent takes. Kept in sync from the
+  // main process rather than derived from the canvas: the canvas is in rendered pixels
+  // (logical x deviceScaleFactor) and the window is at whatever size the user dragged it to.
+  let pageSize = { width: 1, height: 1 };
+  // One decode in flight at a time. A frame that arrives while the previous is still
+  // decoding is dropped rather than queued — a queue under a fast-painting page grows
+  // without bound and shows the user an ever-older frame.
+  let decoding = false;
+
+  window.twebFloat.onPageSize((size) => { pageSize = size; });
+
+  window.twebFloat.onFrame(async (bytes) => {
+    if (decoding) return;
+    decoding = true;
+    try {
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+      if (surface.width !== bitmap.width || surface.height !== bitmap.height) {
+        surface.width = bitmap.width;
+        surface.height = bitmap.height;
+      }
+      context.drawImage(bitmap, 0, 0);
+      bitmap.close();
+    } catch (error) {
+      // A truncated frame is not worth tearing the viewer down for; the next one repaints.
+      console.error("tweb: float frame decode failed", error);
+    } finally {
+      decoding = false;
+    }
+  });
+
+  const modifiersOf = (event) => {
+    const modifiers = [];
+    if (event.shiftKey) modifiers.push("shift");
+    if (event.ctrlKey) modifiers.push("control");
+    if (event.altKey) modifiers.push("alt");
+    if (event.metaKey) modifiers.push("meta");
+    return modifiers;
+  };
+
+  // Where a pointer event lands in the page. The canvas is laid out at the window's size,
+  // so the click is taken as a fraction of the laid-out box and re-applied to the page's
+  // logical size — that keeps a resized window aiming at the right element.
+  const pagePoint = (event) => {
+    const rect = surface.getBoundingClientRect();
+    const x = Math.round(((event.clientX - rect.left) / Math.max(1, rect.width)) * pageSize.width);
+    const y = Math.round(((event.clientY - rect.top) / Math.max(1, rect.height)) * pageSize.height);
+    return {
+      x: Math.min(Math.max(0, x), Math.max(0, pageSize.width - 1)),
+      y: Math.min(Math.max(0, y), Math.max(0, pageSize.height - 1)),
+    };
+  };
+
+  const BUTTONS = ["left", "middle", "right"];
+
+  surface.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    surface.focus();
+    window.twebFloat.input("mouse", {
+      ...pagePoint(event),
+      button: BUTTONS[event.button] || "left",
+      clickCount: event.detail || 1,
+      modifiers: modifiersOf(event),
+    });
+  });
+
+  // Hover matters for menus and link targets, so moves are forwarded too — throttled to
+  // one per animation frame, because a raw mousemove stream is hundreds of IPC messages a
+  // second for something the page samples at its own frame rate anyway.
+  let pendingMove = null;
+  surface.addEventListener("mousemove", (event) => {
+    const move = { ...pagePoint(event), modifiers: modifiersOf(event) };
+    if (pendingMove) { pendingMove = move; return; }
+    pendingMove = move;
+    requestAnimationFrame(() => {
+      const next = pendingMove;
+      pendingMove = null;
+      if (next) window.twebFloat.input("move", next);
+    });
+  });
+
+  surface.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    window.twebFloat.input("wheel", {
+      ...pagePoint(event),
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      modifiers: modifiersOf(event),
+    });
+  }, { passive: false });
+
+  window.addEventListener("keydown", (event) => {
+    // Everything goes to the page, including `w` — that is the float toggle, and the
+    // page's own before-input-event handler is what turns it back off.
+    event.preventDefault();
+    window.twebFloat.input("key", { key: event.key, modifiers: modifiersOf(event) });
+  });
+
+  // A resized window re-lays out the page at the new size, so the main process is told
+  // in CSS pixels and resizes the offscreen surface to match.
+  const reportSize = () => window.twebFloat.resized({
+    width: Math.max(1, Math.round(window.innerWidth)),
+    height: Math.max(1, Math.round(window.innerHeight)),
+  });
+  window.addEventListener("resize", reportSize);
+  reportSize();
+  surface.focus();
+</script>
