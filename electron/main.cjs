@@ -3084,6 +3084,17 @@ function sendTabState(tab = currentWindows().win) {
   sendToMainTabFrame(tab, "tweb-tab-state", tabStateModel());
 }
 
+// Toggles the active pane's page between the tmux pane and an OS desktop window.
+// Sends the `float` or `pin` agent RPC, which flips `inputState().floating` and
+// re-runs `updatePaintingState`. The same webContents is redirected, so the
+// page state carries over — this is a view toggle, not a session toggle.
+function toggleFloat() {
+  const state = inputState();
+  state.floating = !state.floating;
+  updatePaintingState();
+}
+
+
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
   if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
@@ -4650,6 +4661,7 @@ function runBrowserContextMenuCommand(tab, action) {
       if (contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
       break;
     case "reload": contents.reload(); break;
+    case "toggle-float": toggleFloat(); break;
     case "inspect":
       sendToMainTabFrame(tab, "tweb-context-inspect", { x: params.x, y: params.y });
       break;

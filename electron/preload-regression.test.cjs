@@ -1820,3 +1820,14 @@ test("floating mode shows and hides the OS window", () => {
   assert.match(dispatch, /case "pin"/);
   assert.match(dispatch, /inputState\(\)\.floating = false/);
 });
+
+// `w` toggles floating mode from inside the browser, the way `f`/`v`/`s` do — not a
+// separate CLI command. The key sends a `toggle-float` shortcut that flips
+// `inputState().floating` and re-runs `updatePaintingState`.
+test("w key toggles floating mode from the browser", () => {
+  assert.match(electron, /case "w": send\("toggle-float"\)/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "toggle-float": toggleFloat\(\)/);
+  assert.match(main, /function toggleFloat\(\)/);
+  assert.match(main, /state\.floating = !state\.floating/);
+});
