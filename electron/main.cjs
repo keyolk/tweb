@@ -2084,6 +2084,7 @@ function applySurfacePlan(tab, plan) {
     };
     tab.setBounds(bounds);
     tab.show();
+    if (debugLogging) console.error(`tweb: float show tab=\${tab.id} visible=\${tab.isVisible()}`);
     floatingTabs.add(tab);
     return;
   }
@@ -4753,6 +4754,15 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   const onTab = (event, handler) => tab.on(event, scoped(handler));
   const setWindowOpenHandler = (handler) => contents.setWindowOpenHandler(scoped(handler));
   const contents = tab.webContents;
+  // A floating window takes focus from the tmux pane, so `w` (the toggle key)
+  // would not reach the pane's key handler. Catch it here and toggle back.
+  // This is after `const contents` so the reference is initialised.
+  contents.on("before-input-event", scoped((_event, input) => {
+    if (!floatingTabs.has(tab)) return;
+    if (input.type === "keyDown" && input.key === "w" && !input.control && !input.meta) {
+      toggleFloat();
+    }
+  }));
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
   attachChooserDebugger(tab);
@@ -6158,7 +6168,11 @@ process.stdin.resume();
 
 // --- app lifecycle ---
 
-app.on("browser-window-created", (_event, window) => keepWindowHidden(window));
+app.on("browser-window-created", (_event, window) => {
+    // A floating tab is shown on purpose — do not let the watchdog hide it
+    // before applySurfacePlan has had a chance to add it to floatingTabs.
+    if (!floatingTabs.has(window)) keepWindowHidden(window);
+  });
 
 app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock?.hide();
