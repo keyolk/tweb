@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod chrome;
+pub mod daemon;
 pub mod doctor;
 pub mod mcp;
 
@@ -282,6 +283,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ChromeAction,
     },
+    /// Supervisor (twebd) status, stop and restart.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// A running pane's geometry, zoom, frame and input state.
     Diag {
         #[command(flatten)]
@@ -392,6 +398,16 @@ pub enum ChromeAction {
     Status,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum DaemonAction {
+    /// Show the supervisor's pid, socket, uptime, pane count and engine state.
+    Status,
+    /// Shut the supervisor down. Every hosted pane goes with it.
+    Stop,
+    /// Stop the supervisor and start a fresh one. Panes reattach on their next navigation.
+    Restart,
+}
+
 fn default_open_args(mut args: Vec<OsString>) -> Vec<OsString> {
     // The installed command is the browser entry point. Requiring an otherwise
     // redundant `open` makes `make install && tweb` look like a broken install.
@@ -499,6 +515,11 @@ pub async fn run() -> Result<()> {
                 }
             }
             ChromeAction::Status => println!("{}", chrome::status().report()),
+        },
+        Command::Daemon { action } => match action {
+            DaemonAction::Status => daemon::status()?,
+            DaemonAction::Stop => daemon::stop()?,
+            DaemonAction::Restart => daemon::restart()?,
         },
         Command::Panes { agent } => agent::list_panes(agent.json)?,
         Command::Mcp { agent } => mcp::serve(agent.pane.as_deref())?,
