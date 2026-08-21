@@ -168,6 +168,7 @@ tweb select d Green
 tweb press Enter --mod shift
 tweb wait --selector "#result" --timeout 5000
 tweb errors                      # console errors only
+tweb network --limit 40          # requests the page made, with status
 tweb eval "location.pathname"
 tweb tab new https://localhost:5173
 tweb diag                        # pane geometry, zoom, frame and input state

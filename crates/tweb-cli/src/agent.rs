@@ -292,6 +292,18 @@ pub fn render(method: &str, result: &Value) -> String {
                 .join("\n")
                 + "\n"
         }
+        // Two shapes from one command: a written file, or the bytes themselves when the
+        // caller gave no path. Printing the base64 raw keeps it pipeable into `base64 -d`.
+        "pdf" => {
+            if let Some(Value::String(encoded)) = result.get("pdf") {
+                return format!("{encoded}\n");
+            }
+            format!(
+                "{} ({} bytes)\n",
+                text_field(result, "path"),
+                result.get("size").and_then(Value::as_i64).unwrap_or(0)
+            )
+        }
         "console" | "errors" => {
             let key = if method == "console" {
                 "messages"
@@ -314,6 +326,49 @@ pub fn render(method: &str, result: &Value) -> String {
                         text_field(entry, "level"),
                         text_field(entry, "message"),
                         text_field(entry, "source")
+                    )
+                    .trim_end()
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        }
+        // An entry with no status is a request that has not come back yet (or one whose
+        // completion arrived after it aged out of the ring) — "-" says that, where a bare
+        // 0 would read as a real status code.
+        "network" => {
+            let entries = result
+                .get("requests")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if entries.is_empty() {
+                return "no requests\n".to_string();
+            }
+            entries
+                .iter()
+                .map(|entry| {
+                    let status = entry
+                        .get("statusCode")
+                        .and_then(Value::as_i64)
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let cached = if entry
+                        .get("fromCache")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        " (cached)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{:<7} {:<4} {}{}",
+                        text_field(entry, "method"),
+                        status,
+                        text_field(entry, "url"),
+                        cached
                     )
                     .trim_end()
                     .to_string()
@@ -429,5 +484,28 @@ mod tests {
         if let Some(value) = saved {
             std::env::set_var("TMUX_PANE", value);
         }
+    }
+
+    /// A request still in flight has no status. Rendering its `null` as a number would
+    /// print `0`, which reads as a real (and alarming) status code.
+    #[test]
+    fn pending_requests_render_without_a_status_code() {
+        let result = serde_json::json!({
+            "requests": [
+                { "method": "GET", "url": "https://example.com/a.js", "statusCode": 200,
+                  "fromCache": true },
+                { "method": "POST", "url": "https://example.com/api", "statusCode": null,
+                  "fromCache": false },
+            ]
+        });
+        let rendered = super::render("network", &result);
+        assert!(
+            rendered.contains("GET     200  https://example.com/a.js (cached)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("POST    -    https://example.com/api"),
+            "{rendered}"
+        );
     }
 }

@@ -239,6 +239,16 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Network requests the page made.
+    Network {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Clear the buffer after reading.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// console errors only.
     Errors {
         #[arg(long, default_value_t = 50)]
@@ -259,6 +269,13 @@ pub enum Command {
     /// screenshot.
     Screenshot {
         /// Where to save it. Without a path, a base64 PNG is printed.
+        path: Option<String>,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// Save the page as a PDF.
+    Pdf {
+        /// Where to save it. Without a path, a base64 PDF is printed.
         path: Option<String>,
         #[command(flatten)]
         agent: AgentOptions,
@@ -602,11 +619,22 @@ fn agent_call(
             let path = path.map(|value| resolve_output_path(&value, working_directory));
             ("screenshot", json!({ "path": path }), agent)
         }
+        Command::Pdf { path, agent } => {
+            // Same resolution as the screenshot path, and for the same reason: the engine
+            // writes the file from its own directory, not the caller's.
+            let path = path.map(|value| resolve_output_path(&value, working_directory));
+            ("pdf", json!({ "path": path }), agent)
+        }
         Command::Console {
             limit,
             clear,
             agent,
         } => ("console", json!({ "limit": limit, "clear": clear }), agent),
+        Command::Network {
+            limit,
+            clear,
+            agent,
+        } => ("network", json!({ "limit": limit, "clear": clear }), agent),
         Command::Errors { limit, agent } => ("errors", json!({ "limit": limit }), agent),
         Command::Tabs { agent } => ("tabs", json!({}), agent),
         Command::Wait {

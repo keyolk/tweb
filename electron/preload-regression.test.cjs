@@ -317,6 +317,29 @@ test("agent bridge exposes snapshot, act and query to the socket", () => {
   assert.match(electron, /const labels = hintLabels\(targets\.length\);\s*\n\s*agentTargets = new Map/);
 });
 
+// A page that half-loaded is a network question, and Chromium keeps no history of the
+// requests once they finish, so the buffer has to exist before anyone thinks to ask.
+test("network requests are recorded into a bounded session-wide buffer", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const watch = main.slice(main.indexOf("function watchNetwork()"),
+    main.indexOf("ipcMain.on(\"tweb-agent-response\""));
+  assert.match(main, /const networkLog = \[\];/);
+  assert.match(main, /const networkLogLimit = 200;/);
+  assert.match(watch, /session\.defaultSession\.webRequest\.onBeforeRequest\(/);
+  assert.match(watch, /session\.defaultSession\.webRequest\.onCompleted\(/);
+  // A registered onBeforeRequest listener that never calls back stalls every request in
+  // the session — the browser stops loading pages at all, not just stops logging them.
+  assert.match(watch, /callback\(\{\}\);/);
+  // Unbounded, this grows for as long as the browser runs.
+  assert.match(watch, /networkLog\.splice\(0, networkLog\.length - networkLogLimit\)/);
+  // Registration replaces rather than stacks, so it belongs at startup, not per tab.
+  const configureTab = main.slice(main.indexOf("function configureTab(tab"),
+    main.indexOf("function createTab("));
+  assert.doesNotMatch(configureTab, /webRequest/, "webRequest must be wired once, not per tab");
+  assert.match(main, /case "network":/);
+  assert.match(main, /requests: params\.clear \? networkLog\.splice\(0\) : networkLog\.slice/);
+});
+
 // Deleting the image before the new tab paints uncovers the terminal behind it.
 test("switching tabs replaces the image instead of deleting it", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
@@ -1585,4 +1608,26 @@ test("scrollbar styling is injected with the caret style", () => {
   assert.match(block, /scrollbar-color:rgba\(130,130,140/);
   // The corner between two scrollbars — transparent, not white.
   assert.match(block, /::-webkit-scrollbar-corner\{[^}]*background:transparent/);
+});
+
+// `tweb pdf` cannot reuse printPageToPdf: that one is the Ctrl-P path, which invents a name
+// under ~/Downloads. An agent has already picked the path and cannot discover a generated
+// name afterwards, so the agent command has to own the destination.
+test("the pdf agent command prints to the caller's path", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const pdf = main.slice(main.indexOf("async function agentPdf(params)"),
+    main.indexOf("// Every agent command goes through the surface hold"));
+  // The same Chromium call printPageToPdf makes, on the agent's active tab.
+  assert.match(pdf, /await agentContents\(\)\.printToPDF\(\{\}\)/);
+  // No path means no file: the bytes come back inline, as screenshot does with its PNG.
+  assert.match(pdf, /if \(!params\.path\) return \{ pdf: pdf\.toString\("base64"\) \}/);
+  assert.match(pdf, /const target = path\.resolve\(params\.path\)/);
+  assert.match(pdf, /writeFileSync\(target, pdf, \{ mode: 0o600 \}\)/);
+  assert.match(pdf, /return \{ path: target, size: pdf\.length \}/);
+  // Not the download-badging path — that would put an agent's file in the transfer list
+  // under a name it never asked for.
+  assert.doesNotMatch(pdf, /printPageToPdf|trackTransfer/);
+
+  const dispatch = main.slice(main.indexOf("async function dispatchAgentCommand(method, params)"));
+  assert.match(dispatch, /case "pdf":\n\s+return agentPdf\(params\);/);
 });

@@ -3329,6 +3329,45 @@ function watchConsole(contents) {
   });
 }
 
+// The other half of "why is the page broken": the request that never came back. Same shape as
+// the console buffer — bounded, process-wide, each entry carrying its own url — because by the
+// time an agent thinks to ask, the request is long finished and Chromium keeps no history of it.
+const networkLog = [];
+const networkLogLimit = 200;
+
+// Session-wide, registered once at startup rather than per tab. `webRequest` keeps exactly one
+// listener per event per session, so a second registration *replaces* the first — a per-tab call
+// would look like it was watching every tab while only ever watching the newest. Every tab
+// already runs in `session.defaultSession` (see `setUpExtensions` for why no partition), so one
+// registration covers all of them.
+function watchNetwork() {
+  // No filter: an agent debugging a page wants the whole picture, and the ring buffer is what
+  // bounds the cost, not the filter.
+  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+    networkLog.push({
+      id: details.id,
+      url: details.url,
+      method: details.method,
+      resourceType: details.resourceType,
+      statusCode: null,
+      fromCache: false,
+      timestamp: new Date().toISOString(),
+    });
+    if (networkLog.length > networkLogLimit) networkLog.splice(0, networkLog.length - networkLogLimit);
+    // Not optional. A registered onBeforeRequest listener that returns without calling back
+    // stalls every request in the session — the browser stops loading pages entirely.
+    callback({});
+  });
+  session.defaultSession.webRequest.onCompleted((details) => {
+    // Searched from the back because the matching entry is almost always the most recent one,
+    // and a request whose entry has already aged out of the ring simply keeps no status.
+    const entry = networkLog.findLast((candidate) => candidate.id === details.id);
+    if (!entry) return;
+    entry.statusCode = details.statusCode;
+    entry.fromCache = Boolean(details.fromCache);
+  });
+}
+
 ipcMain.on("tweb-agent-response", (_event, response) => {
   const settle = agentPending.get(response?.id);
   if (!settle) return;
@@ -3534,6 +3573,22 @@ async function agentScreenshot(params) {
   return { path: target, size: image.getSize() };
 }
 
+/**
+ * `tweb pdf` — the page as a PDF, wherever the caller asked for it.
+ *
+ * Deliberately not `printPageToPdf`: that one is the Ctrl-P path, and it picks its own name
+ * under ~/Downloads and badges a transfer. An agent has already decided where the file goes
+ * and has no way to learn a generated name, so this takes the caller's path instead and
+ * stays out of the transfer list.
+ */
+async function agentPdf(params) {
+  const pdf = await agentContents().printToPDF({});
+  if (!params.path) return { pdf: pdf.toString("base64") };
+  const target = path.resolve(params.path);
+  writeFileSync(target, pdf, { mode: 0o600 });
+  return { path: target, size: pdf.length };
+}
+
 // Every agent command goes through the surface hold, so a pane nobody is watching still
 // answers with the page rather than with a one-pixel slice of it. The dispatch itself is
 // unchanged; `withAgentSurface` is a pass-through for a visible pane.
@@ -3611,6 +3666,8 @@ async function dispatchAgentCommand(method, params) {
       return { value: await agentContents().executeJavaScript(String(params.script || ""), true) };
     case "screenshot":
       return agentScreenshot(params);
+    case "pdf":
+      return agentPdf(params);
     case "wait":
       return agentWaitFor(params);
     case "tabs":
@@ -3628,6 +3685,8 @@ async function dispatchAgentCommand(method, params) {
       return { messages: params.clear ? consoleLog.splice(0) : consoleLog.slice(-(params.limit || 100)) };
     case "errors":
       return { errors: consoleLog.filter((entry) => entry.level === "error").slice(-(params.limit || 50)) };
+    case "network":
+      return { requests: params.clear ? networkLog.splice(0) : networkLog.slice(-(params.limit || 100)) };
     case "status":
       return {
         pid: process.pid,
@@ -5818,6 +5877,7 @@ app.whenReady().then(async () => {
     return;
   }
   configureDownloads();
+  watchNetwork();
   // A backstop, not the mechanism: `browser-window-created` above and the per-tab
   // show/focus/move listeners in `configureTab` are what actually keep a window hidden.
   // This caught anything they missed, twenty times a second, forever — a second is plenty
