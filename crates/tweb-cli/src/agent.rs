@@ -377,6 +377,37 @@ pub fn render(method: &str, result: &Value) -> String {
                 .join("\n")
                 + "\n"
         }
+        // A summary, not the three logs: the point of the combined call is to see at a glance
+        // whether anything was recorded, and `tweb console` / `tweb network` print the entries
+        // themselves. The inline PNG is counted rather than printed — it is a screenful of
+        // base64 that would bury the two lines above it.
+        "capture" => {
+            let count = |key: &str| {
+                result
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            };
+            let shot = result.get("screenshot");
+            let screenshot = match shot.and_then(|value| value.get("path")) {
+                Some(Value::String(path)) => path.clone(),
+                _ => {
+                    let bytes = shot
+                        .and_then(|value| value.get("png"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    format!("inline png ({bytes} base64 chars)")
+                }
+            };
+            format!(
+                "console: {}\nnetwork: {}\nscreenshot: {}\n",
+                count("console"),
+                count("network"),
+                screenshot
+            )
+        }
         "tabs" | "tab" | "tab-new" | "tab-close" => {
             let tabs = result
                 .get("tabs")

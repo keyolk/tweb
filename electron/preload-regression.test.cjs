@@ -340,6 +340,26 @@ test("network requests are recorded into a bounded session-wide buffer", () => {
   assert.match(main, /requests: params\.clear \? networkLog\.splice\(0\) : networkLog\.slice/);
 });
 
+// Console, network and screenshot asked for separately are three round trips, and the page
+// moves between them — the screenshot ends up showing a page the log entries no longer
+// describe. One dispatch reads all three inside a single surface hold.
+test("capture returns console, network and a screenshot from one dispatch", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const capture = main.slice(main.indexOf("async function agentCapture(params)"),
+    main.indexOf("// Every agent command goes through the surface hold"));
+  assert.match(main, /case "capture":\s*\n\s*return agentCapture\(params\);/);
+  // All three keys, and the screenshot goes through agentScreenshot so it reuses the frame
+  // the hold already collected rather than re-asking the compositor.
+  assert.match(capture, /console: messages, network: requests, screenshot: await agentScreenshot\(params\)/);
+  assert.match(capture, /consoleLog\.splice\(0\) : consoleLog\.slice\(-limit\)/);
+  assert.match(capture, /networkLog\.splice\(0\) : networkLog\.slice\(-limit\)/);
+  // `capture` must not be geometry-free: the screenshot inside it needs the restored surface.
+  const policy = fs.readFileSync(path.join(__dirname, "surface-policy.cjs"), "utf8");
+  const free = policy.slice(policy.indexOf("const GEOMETRY_FREE_METHODS"),
+    policy.indexOf("function agentNeedsGeometry(method)"));
+  assert.doesNotMatch(free, /"capture"/);
+});
+
 // Deleting the image before the new tab paints uncovers the terminal behind it.
 test("switching tabs replaces the image instead of deleting it", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");

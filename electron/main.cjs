@@ -3589,6 +3589,24 @@ async function agentPdf(params) {
   return { path: target, size: pdf.length };
 }
 
+/**
+ * `tweb capture` — console, network and a screenshot from one moment.
+ *
+ * Three commands already answer these separately, and running them separately is the problem:
+ * each round trip re-holds the surface and lets the page move on, so the screenshot shows a
+ * page the log entries no longer describe. Reading all three inside a single hold is what makes
+ * them one observation rather than three.
+ *
+ * Both buffers are drained together under `clear` so the next capture starts from this instant
+ * on both — clearing only one would leave the two logs describing different windows of time.
+ */
+async function agentCapture(params) {
+  const limit = params.limit || 100;
+  const messages = params.clear ? consoleLog.splice(0) : consoleLog.slice(-limit);
+  const requests = params.clear ? networkLog.splice(0) : networkLog.slice(-limit);
+  return { console: messages, network: requests, screenshot: await agentScreenshot(params) };
+}
+
 // Every agent command goes through the surface hold, so a pane nobody is watching still
 // answers with the page rather than with a one-pixel slice of it. The dispatch itself is
 // unchanged; `withAgentSurface` is a pass-through for a visible pane.
@@ -3687,6 +3705,8 @@ async function dispatchAgentCommand(method, params) {
       return { errors: consoleLog.filter((entry) => entry.level === "error").slice(-(params.limit || 50)) };
     case "network":
       return { requests: params.clear ? networkLog.splice(0) : networkLog.slice(-(params.limit || 100)) };
+    case "capture":
+      return agentCapture(params);
     case "status":
       return {
         pid: process.pid,

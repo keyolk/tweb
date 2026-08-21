@@ -280,6 +280,15 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Console, network and a screenshot from one moment.
+    Capture {
+        /// Where to save the screenshot. Without a path, the PNG comes back inline.
+        path: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// MCP server for agents (stdio).
     Mcp {
         #[command(flatten)]
@@ -624,6 +633,12 @@ fn agent_call(
             // writes the file from its own directory, not the caller's.
             let path = path.map(|value| resolve_output_path(&value, working_directory));
             ("pdf", json!({ "path": path }), agent)
+        }
+        Command::Capture { path, limit, agent } => {
+            // Same resolution as the screenshot path: the screenshot inside the capture is
+            // written by the engine, from the engine's directory rather than the caller's.
+            let path = path.map(|value| resolve_output_path(&value, working_directory));
+            ("capture", json!({ "path": path, "limit": limit }), agent)
         }
         Command::Console {
             limit,
