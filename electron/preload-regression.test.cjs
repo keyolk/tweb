@@ -1567,3 +1567,22 @@ test("a visibility transition is logged whether or not debug logging is on", () 
   assert.match(transition, /ttys=\$\{\[\.\.\.next\]\.join\(","\) \|\| "none"\}/);
   assert.match(transition, /placement=\$\{vis\(\)\.placement\?\.session\}/);
 });
+
+// Native scrollbars are an OS widget, not page CSS, so Chromium's light-mode default
+// paints a white track over dark content — a bright strip the user saw on dogdrip.
+// The fix is a style injected alongside the caret indicator.
+test("scrollbar styling is injected with the caret style", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const block = main.slice(main.indexOf("style.textContent = ["),
+    main.indexOf("(document.head || document.documentElement).append(style);"));
+  // Transparent track so the page shows through on both light and dark.
+  assert.match(block, /::-webkit-scrollbar\{[^}]*background:transparent/);
+  assert.match(block, /::-webkit-scrollbar-track\{[^}]*background:transparent/);
+  // A thin thumb in a muted tone, not the OS default white/grey.
+  assert.match(block, /::-webkit-scrollbar-thumb\{[^}]*background:rgba\(130,130,140/);
+  // The standards path for non-Chromium engines.
+  assert.match(block, /scrollbar-width:thin/);
+  assert.match(block, /scrollbar-color:rgba\(130,130,140/);
+  // The corner between two scrollbars — transparent, not white.
+  assert.match(block, /::-webkit-scrollbar-corner\{[^}]*background:transparent/);
+});
