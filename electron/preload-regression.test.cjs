@@ -317,6 +317,49 @@ test("agent bridge exposes snapshot, act and query to the socket", () => {
   assert.match(electron, /const labels = hintLabels\(targets\.length\);\s*\n\s*agentTargets = new Map/);
 });
 
+// A page that half-loaded is a network question, and Chromium keeps no history of the
+// requests once they finish, so the buffer has to exist before anyone thinks to ask.
+test("network requests are recorded into a bounded session-wide buffer", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const watch = main.slice(main.indexOf("function watchNetwork()"),
+    main.indexOf("ipcMain.on(\"tweb-agent-response\""));
+  assert.match(main, /const networkLog = \[\];/);
+  assert.match(main, /const networkLogLimit = 200;/);
+  assert.match(watch, /session\.defaultSession\.webRequest\.onBeforeRequest\(/);
+  assert.match(watch, /session\.defaultSession\.webRequest\.onCompleted\(/);
+  // A registered onBeforeRequest listener that never calls back stalls every request in
+  // the session — the browser stops loading pages at all, not just stops logging them.
+  assert.match(watch, /callback\(\{\}\);/);
+  // Unbounded, this grows for as long as the browser runs.
+  assert.match(watch, /networkLog\.splice\(0, networkLog\.length - networkLogLimit\)/);
+  // Registration replaces rather than stacks, so it belongs at startup, not per tab.
+  const configureTab = main.slice(main.indexOf("function configureTab(tab"),
+    main.indexOf("function createTab("));
+  assert.doesNotMatch(configureTab, /webRequest/, "webRequest must be wired once, not per tab");
+  assert.match(main, /case "network":/);
+  assert.match(main, /requests: params\.clear \? networkLog\.splice\(0\) : networkLog\.slice/);
+});
+
+// Console, network and screenshot asked for separately are three round trips, and the page
+// moves between them — the screenshot ends up showing a page the log entries no longer
+// describe. One dispatch reads all three inside a single surface hold.
+test("capture returns console, network and a screenshot from one dispatch", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const capture = main.slice(main.indexOf("async function agentCapture(params)"),
+    main.indexOf("// Every agent command goes through the surface hold"));
+  assert.match(main, /case "capture":\s*\n\s*return agentCapture\(params\);/);
+  // All three keys, and the screenshot goes through agentScreenshot so it reuses the frame
+  // the hold already collected rather than re-asking the compositor.
+  assert.match(capture, /console: messages, network: requests, screenshot: await agentScreenshot\(params\)/);
+  assert.match(capture, /consoleLog\.splice\(0\) : consoleLog\.slice\(-limit\)/);
+  assert.match(capture, /networkLog\.splice\(0\) : networkLog\.slice\(-limit\)/);
+  // `capture` must not be geometry-free: the screenshot inside it needs the restored surface.
+  const policy = fs.readFileSync(path.join(__dirname, "surface-policy.cjs"), "utf8");
+  const free = policy.slice(policy.indexOf("const GEOMETRY_FREE_METHODS"),
+    policy.indexOf("function agentNeedsGeometry(method)"));
+  assert.doesNotMatch(free, /"capture"/);
+});
+
 // Deleting the image before the new tab paints uncovers the terminal behind it.
 test("switching tabs replaces the image instead of deleting it", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
@@ -1585,4 +1628,164 @@ test("scrollbar styling is injected with the caret style", () => {
   assert.match(block, /scrollbar-color:rgba\(130,130,140/);
   // The corner between two scrollbars — transparent, not white.
   assert.match(block, /::-webkit-scrollbar-corner\{[^}]*background:transparent/);
+});
+
+// `tweb pdf` cannot reuse printPageToPdf: that one is the Ctrl-P path, which invents a name
+// under ~/Downloads. An agent has already picked the path and cannot discover a generated
+// name afterwards, so the agent command has to own the destination.
+test("the pdf agent command prints to the caller's path", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const pdf = main.slice(main.indexOf("async function agentPdf(params)"),
+    main.indexOf("// Every agent command goes through the surface hold"));
+  // The same Chromium call printPageToPdf makes, on the agent's active tab.
+  assert.match(pdf, /await agentContents\(\)\.printToPDF\(\{\}\)/);
+  // No path means no file: the bytes come back inline, as screenshot does with its PNG.
+  assert.match(pdf, /if \(!params\.path\) return \{ pdf: pdf\.toString\("base64"\) \}/);
+  assert.match(pdf, /const target = path\.resolve\(params\.path\)/);
+  assert.match(pdf, /writeFileSync\(target, pdf, \{ mode: 0o600 \}\)/);
+  assert.match(pdf, /return \{ path: target, size: pdf\.length \}/);
+  // Not the download-badging path — that would put an agent's file in the transfer list
+  // under a name it never asked for.
+  assert.doesNotMatch(pdf, /printPageToPdf|trackTransfer/);
+
+  const dispatch = main.slice(main.indexOf("async function dispatchAgentCommand(method, params)"));
+  assert.match(dispatch, /case "pdf":\n\s+return agentPdf\(params\);/);
+});
+
+// Two independent mechanisms make `setContentSize` the wrong lever for a device viewport, and
+// both are silent: the hidden-window watchdog recomputes the surface from the tmux viewport
+// once a second and reverts it, and until it does, `queueFrame` drops every paint whose size
+// fails to match the viewport's — freezing the pane on a stale frame. Emulation re-lays the
+// page out while the surface stays the size the pane actually is.
+test("device emulation re-lays the page out without resizing the pane's surface", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const device = main.slice(main.indexOf("const emulatedDevices = {"),
+    main.indexOf("// Every agent command goes through the surface hold"));
+
+  // The three devices, at the CSS-pixel sizes the real hardware reports.
+  assert.match(device, /"iPhone 12": \{\s*width: 390,\s*height: 844,/);
+  assert.match(device, /iPad: \{\s*width: 820,\s*height: 1180,/);
+  assert.match(device, /"Pixel 5": \{\s*width: 393,\s*height: 851,/);
+
+  // `viewSize` is what moves layout to the device width; `screenSize` alone leaves the page
+  // laid out at the pane's width with only screen.width lying about it.
+  assert.match(device, /enableDeviceEmulation\(\{/);
+  assert.match(device, /screenSize: \{ width: device\.width, height: device\.height \}/);
+  assert.match(device, /viewSize: \{ width: device\.width, height: device\.height \}/);
+  assert.match(device, /screenPosition: "mobile"/);
+  // The pane's own scale factor, not the device's 2x/3x — the terminal would only scale it back.
+  assert.match(device, /deviceScaleFactor: 0/);
+  // The assert that keeps the reconciler conflict from being reintroduced. Matched on the call
+  // form rather than the bare word, because the comment above the emulation call names
+  // `setContentSize` precisely to say why it is not used.
+  assert.doesNotMatch(device, /\.setContentSize\(/,
+    "device emulation must not resize the surface the watchdog owns");
+
+  // Chromium's emulation Parameters carry no userAgent, so a device that set only the viewport
+  // would be served the desktop page by every UA-sniffing site. The UA goes on separately.
+  assert.match(device, /contents\.setUserAgent\(device\.userAgent\)/);
+  assert.match(device, /Mobile\/15E148 Safari\/604\.1/, "iOS devices need a real Safari UA");
+  assert.match(device, /Android 14; Pixel 5/, "Pixel needs a real Android Chrome UA");
+
+  // Reset is `disableDeviceEmulation`, not `enableDeviceEmulation(null)` — the latter is not
+  // an API and would throw on the params read.
+  assert.match(device, /contents\.disableDeviceEmulation\(\)/);
+  assert.doesNotMatch(device, /enableDeviceEmulation\(null\)/);
+  // The UA has to come back too, from the value captured before the first override: reading it
+  // at reset time would answer with the phone's UA and pin the tab to mobile forever.
+  assert.match(device, /tabDefaultUserAgents\.set\(tab, contents\.getUserAgent\(\)\)/);
+  assert.match(device, /contents\.setUserAgent\(tabDefaultUserAgents\.get\(tab\)\)/);
+
+  // And the method the Rust CLI asks for.
+  assert.match(main, /case "device":/, "main must expose the agent method the CLI calls");
+});
+
+// `screenshot` can only ever return the viewport, because that is all the compositor holds —
+// everything below the fold is absent from that frame rather than cropped out of it. So the
+// full-page command has to move the page and stitch, and the way a naive stitch goes wrong is
+// the clamped final scroll: the document stops it at its own bottom, so that frame re-shows
+// rows already captured. (Sticky chrome repeating per slice is a known limit, not a bug — see
+// the docblock; fixing it would mean mutating a page the user may be watching.)
+test("the full-page screenshot stitches new bands rather than whole frames", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const full = main.slice(main.indexOf("async function agentFullScreenshot(params)"),
+    main.indexOf("/**\n * `tweb pdf`"));
+
+  // The document's height, not the body's alone: a page whose scrolling element is <html>
+  // reports 0 on body, which would make every long page look like it fit.
+  assert.match(full, /document\.documentElement\?\.scrollHeight \|\| 0, document\.body\?\.scrollHeight \|\| 0/);
+  // A page that fits needs no scrolling at all, and the hold already collected its frame.
+  assert.match(full, /if \(start\.scrollHeight <= start\.innerHeight\) return agentScreenshot\(params\)/);
+
+  // Only the rows nobody has captured yet are pasted, which is what makes the clamped final
+  // scroll safe — pasting that frame whole would duplicate the band it re-shows.
+  assert.match(full, /const skipRows = Math\.min\(size\.height, Math\.round\(Math\.max\(0, covered - at\.scrollY\) \* scale\)\)/);
+  assert.match(full, /slice\.bitmap\.copy\(canvas, slice\.destRow \* stride,/);
+  // Progress is measured from where the page LANDED, not where it was sent: the document
+  // clamps the last scroll at its own bottom.
+  assert.match(full, /covered = at\.scrollY \+ at\.innerHeight;/);
+  // Measured off the frame, because zoom is per tab (see tabZoomFactors) and cannot be assumed.
+  assert.match(full, /scale = size\.height \/ Math\.max\(1, at\.innerHeight\)/);
+
+  // Bounded: the surface hold expires at AGENT_SURFACE_HOLD_TTL_MS and the tick that notices
+  // collapses the surface mid-call, so an infinite feed has to stop rather than stitch onto
+  // one-pixel frames.
+  assert.match(main, /const FULL_SCREENSHOT_MAX_SLICES = \d+;/);
+  assert.match(full, /index < FULL_SCREENSHOT_MAX_SLICES/);
+  // A page that stops moving ends the loop instead of running to the cap.
+  assert.match(full, /if \(rows <= 0\) break;/);
+  // The user's scroll position is restored however the capture ended.
+  assert.match(full, /} finally \{[\s\S]*scrollProbeScript\(start\.scrollY\)/);
+
+  // The same wait the surface hold uses, not a bare capturePage: a frame taken before the
+  // scroll repaints still shows the previous slice.
+  const frame = main.slice(main.indexOf("async function fullScreenshotFrame(contents)"),
+    main.indexOf("async function agentFullScreenshot(params)"));
+  assert.match(frame, /await awaitRestoredFrame\(contents\)\) \|\| await contents\.capturePage\(\)/);
+
+  // The scroll is a request; the read-back is the answer. Both come from one round trip so
+  // they describe the same instant.
+  const probe = main.slice(main.indexOf("function scrollProbeScript(top)"),
+    main.indexOf("async function fullScreenshotFrame(contents)"));
+  assert.match(probe, /behavior: "instant"/);
+  assert.match(probe, /scrollY: Math\.round\(scrollY\)/);
+  // Two frames of settle, with a timer behind it for a page whose rAF never runs.
+  assert.match(probe, /requestAnimationFrame\(\(\) => requestAnimationFrame\(/);
+  assert.match(probe, /const timer = setTimeout\(answer, \d+\)/);
+
+  const dispatch = main.slice(main.indexOf("async function dispatchAgentCommand(method, params)"));
+  assert.match(dispatch, /case "full-screenshot":\n\s+return agentFullScreenshot\(params\);/);
+});
+
+// A hidden pane collapses its surface to one pixel, which is precisely the state this command
+// cannot tolerate: every slice would be a one-pixel band. The hold is opt-out, so the only way
+// to lose it is to be named in the exclude list.
+test("the full-page screenshot holds the surface open", () => {
+  const { agentNeedsGeometry } = require("./surface-policy.cjs");
+  assert.strictEqual(agentNeedsGeometry("full-screenshot"), true);
+});
+
+// The inspect mode's y/h/t keys now send the element context to an agent too, not just the
+// clipboard. Orca's design mode does this as an attachment; tweb's inspect mode was
+// clipboard-only, so an agent had no way to receive what the user picked.
+test("inspect mode sends element context to an agent", () => {
+  // The preload keeps the payload so an agent asking later still gets it.
+  assert.match(electron, /let lastInspectPayload/);
+  // agentDispatch answers the "inspect-element" method from the kept payload.
+  assert.match(electron, /case "inspect-element": \{[\s\S]*return lastInspectPayload \|\| null/);
+  // The payload carries all three — selector, html, text — not just the one the key picked.
+  const handler = electron.slice(electron.indexOf('const payload = {'),
+    electron.indexOf('window.dispatchEvent(new CustomEvent("tweb-agent-inspect"'));
+  assert.match(handler, /selector: item\.selector/);
+  assert.match(handler, /html: item\.element\.outerHTML/);
+  assert.match(handler, /text: item\.element\.innerText/);
+  assert.match(handler, /rect: \{/);
+  // Clipboard still gets the one the key selected.
+  assert.match(handler, /if \(key === "y"\) send\("copy-text", item\.selector\)/);
+  // cancelInspect clears the payload, so a stale pick does not leak to the next agent.
+  assert.match(electron, /lastInspectPayload = null;/);
+  // main.cjs forwards the method as an agent RPC.
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "inspect-element"/);
+  assert.match(main, /agentPageRequest\("inspect-element"/);
 });

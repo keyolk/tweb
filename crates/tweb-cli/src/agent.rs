@@ -292,6 +292,38 @@ pub fn render(method: &str, result: &Value) -> String {
                 .join("\n")
                 + "\n"
         }
+        // Two shapes from one command: a written file, or the bytes themselves when the
+        // caller gave no path. Printing the base64 raw keeps it pipeable into `base64 -d`.
+        "pdf" => {
+            if let Some(Value::String(encoded)) = result.get("pdf") {
+                return format!("{encoded}\n");
+            }
+            format!(
+                "{} ({} bytes)\n",
+                text_field(result, "path"),
+                result.get("size").and_then(Value::as_i64).unwrap_or(0)
+            )
+        }
+        // A stitched capture is taller than the pane, which is the one fact worth stating:
+        // the height is how the caller sees that anything below the fold was reached at all.
+        // The inline form stays a bare base64 line so it still pipes into `base64 -d`.
+        "full-screenshot" => {
+            if let Some(Value::String(encoded)) = result.get("png") {
+                return format!("{encoded}\n");
+            }
+            let size = result.get("size");
+            let axis = |key: &str| {
+                size.and_then(|value| value.get(key))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            };
+            format!(
+                "{} ({}x{})\n",
+                text_field(result, "path"),
+                axis("width"),
+                axis("height")
+            )
+        }
         "console" | "errors" => {
             let key = if method == "console" {
                 "messages"
@@ -321,6 +353,110 @@ pub fn render(method: &str, result: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
                 + "\n"
+        }
+        // Needs its own arm rather than the single-key fallback below: a reset answers
+        // `{ reset: true }`, which that fallback would print as a bare `true`.
+        "device" => {
+            if result
+                .get("reset")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return "reset\n".to_string();
+            }
+            format!(
+                "{} {}x{}\n",
+                text_field(result, "device"),
+                result.get("width").and_then(Value::as_i64).unwrap_or(0),
+                result.get("height").and_then(Value::as_i64).unwrap_or(0)
+            )
+        }
+        // An entry with no status is a request that has not come back yet (or one whose
+        // completion arrived after it aged out of the ring) — "-" says that, where a bare
+        // 0 would read as a real status code.
+        "network" => {
+            let entries = result
+                .get("requests")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if entries.is_empty() {
+                return "no requests\n".to_string();
+            }
+            entries
+                .iter()
+                .map(|entry| {
+                    let status = entry
+                        .get("statusCode")
+                        .and_then(Value::as_i64)
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let cached = if entry
+                        .get("fromCache")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        " (cached)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{:<7} {:<4} {}{}",
+                        text_field(entry, "method"),
+                        status,
+                        text_field(entry, "url"),
+                        cached
+                    )
+                    .trim_end()
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        }
+        // A summary, not the three logs: the point of the combined call is to see at a glance
+        // whether anything was recorded, and `tweb console` / `tweb network` print the entries
+        // themselves. The inline PNG is counted rather than printed — it is a screenful of
+        // base64 that would bury the two lines above it.
+        "capture" => {
+            let count = |key: &str| {
+                result
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            };
+            let shot = result.get("screenshot");
+            let screenshot = match shot.and_then(|value| value.get("path")) {
+                Some(Value::String(path)) => path.clone(),
+                _ => {
+                    let bytes = shot
+                        .and_then(|value| value.get("png"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    format!("inline png ({bytes} base64 chars)")
+                }
+            };
+            format!(
+                "console: {}\nnetwork: {}\nscreenshot: {}\n",
+                count("console"),
+                count("network"),
+                screenshot
+            )
+        }
+        "inspect-element" => {
+            if result.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                return "no element picked\n".to_string();
+            }
+            let selector = text_field(result, "selector");
+            let tag = text_field(result, "tag");
+            let url = text_field(result, "url");
+            if selector.is_empty() {
+                "no element picked\n".to_string()
+            } else {
+                format!("{}  {}  {}\n", tag, selector, url)
+            }
         }
         "tabs" | "tab" | "tab-new" | "tab-close" => {
             let tabs = result
@@ -429,5 +565,28 @@ mod tests {
         if let Some(value) = saved {
             std::env::set_var("TMUX_PANE", value);
         }
+    }
+
+    /// A request still in flight has no status. Rendering its `null` as a number would
+    /// print `0`, which reads as a real (and alarming) status code.
+    #[test]
+    fn pending_requests_render_without_a_status_code() {
+        let result = serde_json::json!({
+            "requests": [
+                { "method": "GET", "url": "https://example.com/a.js", "statusCode": 200,
+                  "fromCache": true },
+                { "method": "POST", "url": "https://example.com/api", "statusCode": null,
+                  "fromCache": false },
+            ]
+        });
+        let rendered = super::render("network", &result);
+        assert!(
+            rendered.contains("GET     200  https://example.com/a.js (cached)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("POST    -    https://example.com/api"),
+            "{rendered}"
+        );
     }
 }

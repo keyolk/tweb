@@ -225,6 +225,57 @@ const TOOLS: &[Tool] = &[
         fields: &[],
         fixed: &[],
     },
+    Tool {
+        name: "tweb_pdf",
+        method: "pdf",
+        description: "Save the page as a PDF. With a path it writes the file,                       otherwise it returns base64.",
+        fields: &[("path", "string", "File path to write", false)],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_network",
+        method: "network",
+        description: "Recent network requests. Each entry has url, method, status code                       and resource type. Clear with clear=true.",
+        fields: &[
+            ("limit", "number", "Most recent N entries (default 100)", false),
+            ("clear", "boolean", "Clear the buffer after reading", false),
+        ],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_full_screenshot",
+        method: "full-screenshot",
+        description: "Capture the whole page including content below the fold,                       by scrolling and stitching. With a path it writes a PNG,                       otherwise it returns base64.",
+        fields: &[("path", "string", "File path to write", false)],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_device",
+        method: "device",
+        description: "Emulate a mobile device viewport (e.g. iPhone 12, iPad,                       Pixel 5). Use reset=true to clear emulation.",
+        fields: &[
+            ("name", "string", "Device name to emulate", false),
+            ("reset", "boolean", "Clear device emulation", false),
+        ],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_capture",
+        method: "capture",
+        description: "A combined snapshot: console messages, network requests                       and a screenshot in one call, so the logs and the picture                       describe the same moment.",
+        fields: &[
+            ("path", "string", "File path for the screenshot", false),
+            ("limit", "number", "Most recent N log entries (default 100)", false),
+        ],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_inspect_element",
+        method: "inspect-element",
+        description: "The element the user picked in inspect mode —                       selector, HTML, text, bounding box and URL.                       Like Orca's design mode: the user selects an element                       in the browser, and the agent gets its context.",
+        fields: &[],
+        fixed: &[],
+    },
 ];
 
 fn tool_schema(tool: &Tool) -> Value {
