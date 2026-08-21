@@ -2079,7 +2079,7 @@ function applySurfacePlan(tab, plan) {
     tab.setFocusable(true);
     // Centre on the display the pane is on, at the pane's current size. The user can
     // move the window freely afterwards — this is just a sensible default.
-    const display = screen.getDisplayNearestToPoint(screen.getCursorScreenPoint());
+    const display = screen.getDisplayMatching(tab.getBounds());
     const bounds = {
       x: Math.round(display.bounds.x + (display.bounds.width - plan.width) / 2),
       y: Math.round(display.bounds.y + (display.bounds.height - plan.height) / 2),
