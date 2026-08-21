@@ -3607,6 +3607,94 @@ async function agentCapture(params) {
   return { console: messages, network: requests, screenshot: await agentScreenshot(params) };
 }
 
+/**
+ * `tweb device` — lay the page out as a phone or tablet does.
+ *
+ * Two things make a site serve its mobile form, and a device that sets only one of them gets a
+ * half-emulated page: the viewport the media queries match against, and the user agent the
+ * server and any UA-sniffing script read. Chromium's device emulation covers the first and has
+ * no opinion at all about the second — `Parameters` carries no userAgent field — so the UA is
+ * overridden separately, through `setUserAgent` on the same contents.
+ */
+const emulatedDevices = {
+  // Dimensions are CSS pixels, which is what `screenSize` and `viewSize` are measured in.
+  // The user agents are the real ones those devices send; a made-up string is worse than
+  // none, because sniffers match on the specific tokens rather than on "looks mobile".
+  "iPhone 12": {
+    width: 390,
+    height: 844,
+    userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+      + " (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  },
+  iPad: {
+    width: 820,
+    height: 1180,
+    userAgent: "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+      + " (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  },
+  "Pixel 5": {
+    width: 393,
+    height: 851,
+    userAgent: "Mozilla/5.0 (Linux; Android 14; Pixel 5) AppleWebKit/537.36"
+      + " (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+  },
+};
+
+// The user agent each tab had before emulation first overrode it. Captured on the way in
+// because `getUserAgent` answers with the override once one is set, so reading it at reset
+// time would restore the phone's UA over itself and leave the tab permanently mobile.
+// Keyed by tab like `tabZoomFactors`, since the tab that gets reset need not be the one that
+// was emulated.
+const tabDefaultUserAgents = new Map();
+
+// Resolved case-insensitively: the names are display strings with a capital and a space in
+// them, and `tweb device "iphone 12"` is the same request as `tweb device "iPhone 12"`.
+function findEmulatedDevice(name) {
+  const wanted = String(name).trim().toLowerCase();
+  const key = Object.keys(emulatedDevices).find((candidate) => candidate.toLowerCase() === wanted);
+  return key ? { name: key, ...emulatedDevices[key] } : null;
+}
+
+function agentDevice(params) {
+  const contents = agentContents();
+  const tab = currentWindows().win;
+  if (params.reset) {
+    contents.disableDeviceEmulation();
+    // Only if this tab was ever emulated. Restoring an uncaptured default would write the
+    // literal string "undefined" as the user agent.
+    if (tabDefaultUserAgents.has(tab)) {
+      contents.setUserAgent(tabDefaultUserAgents.get(tab));
+      tabDefaultUserAgents.delete(tab);
+    }
+    return { reset: true };
+  }
+  const device = findEmulatedDevice(params.name || "");
+  if (!device) {
+    throw new Error(`unknown device ${JSON.stringify(String(params.name || ""))};`
+      + ` known: ${Object.keys(emulatedDevices).join(", ")}`);
+  }
+  // `viewSize` is what re-lays the page out at the device's width — NOT `setContentSize`.
+  // The window's content size is not ours to set: `updatePaintingState` recomputes it from
+  // the tmux viewport every second through the hidden-window watchdog, so a resize here is
+  // reverted within a second; and until it is, `queueFrame` drops every paint whose size
+  // fails to match `renderedFrameSize(viewport)`, freezing the pane on a stale frame.
+  // Emulation asks the renderer for a different layout while the surface stays the size the
+  // pane actually is, which is the same separation the zoom factor already relies on.
+  contents.enableDeviceEmulation({
+    screenPosition: "mobile",
+    screenSize: { width: device.width, height: device.height },
+    viewSize: { width: device.width, height: device.height },
+    viewPosition: { x: 0, y: 0 },
+    // Zero means "keep the pane's own scale factor". Forcing the device's 2x or 3x would
+    // render a frame the terminal has to scale down again for no gain in fidelity.
+    deviceScaleFactor: 0,
+    scale: 1,
+  });
+  if (!tabDefaultUserAgents.has(tab)) tabDefaultUserAgents.set(tab, contents.getUserAgent());
+  contents.setUserAgent(device.userAgent);
+  return { device: device.name, width: device.width, height: device.height };
+}
+
 // Every agent command goes through the surface hold, so a pane nobody is watching still
 // answers with the page rather than with a one-pixel slice of it. The dispatch itself is
 // unchanged; `withAgentSurface` is a pass-through for a visible pane.
@@ -3686,6 +3774,8 @@ async function dispatchAgentCommand(method, params) {
       return agentScreenshot(params);
     case "pdf":
       return agentPdf(params);
+    case "device":
+      return agentDevice(params);
     case "wait":
       return agentWaitFor(params);
     case "tabs":

@@ -1651,3 +1651,51 @@ test("the pdf agent command prints to the caller's path", () => {
   const dispatch = main.slice(main.indexOf("async function dispatchAgentCommand(method, params)"));
   assert.match(dispatch, /case "pdf":\n\s+return agentPdf\(params\);/);
 });
+
+// Two independent mechanisms make `setContentSize` the wrong lever for a device viewport, and
+// both are silent: the hidden-window watchdog recomputes the surface from the tmux viewport
+// once a second and reverts it, and until it does, `queueFrame` drops every paint whose size
+// fails to match the viewport's — freezing the pane on a stale frame. Emulation re-lays the
+// page out while the surface stays the size the pane actually is.
+test("device emulation re-lays the page out without resizing the pane's surface", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const device = main.slice(main.indexOf("const emulatedDevices = {"),
+    main.indexOf("// Every agent command goes through the surface hold"));
+
+  // The three devices, at the CSS-pixel sizes the real hardware reports.
+  assert.match(device, /"iPhone 12": \{\s*width: 390,\s*height: 844,/);
+  assert.match(device, /iPad: \{\s*width: 820,\s*height: 1180,/);
+  assert.match(device, /"Pixel 5": \{\s*width: 393,\s*height: 851,/);
+
+  // `viewSize` is what moves layout to the device width; `screenSize` alone leaves the page
+  // laid out at the pane's width with only screen.width lying about it.
+  assert.match(device, /enableDeviceEmulation\(\{/);
+  assert.match(device, /screenSize: \{ width: device\.width, height: device\.height \}/);
+  assert.match(device, /viewSize: \{ width: device\.width, height: device\.height \}/);
+  assert.match(device, /screenPosition: "mobile"/);
+  // The pane's own scale factor, not the device's 2x/3x — the terminal would only scale it back.
+  assert.match(device, /deviceScaleFactor: 0/);
+  // The assert that keeps the reconciler conflict from being reintroduced. Matched on the call
+  // form rather than the bare word, because the comment above the emulation call names
+  // `setContentSize` precisely to say why it is not used.
+  assert.doesNotMatch(device, /\.setContentSize\(/,
+    "device emulation must not resize the surface the watchdog owns");
+
+  // Chromium's emulation Parameters carry no userAgent, so a device that set only the viewport
+  // would be served the desktop page by every UA-sniffing site. The UA goes on separately.
+  assert.match(device, /contents\.setUserAgent\(device\.userAgent\)/);
+  assert.match(device, /Mobile\/15E148 Safari\/604\.1/, "iOS devices need a real Safari UA");
+  assert.match(device, /Android 14; Pixel 5/, "Pixel needs a real Android Chrome UA");
+
+  // Reset is `disableDeviceEmulation`, not `enableDeviceEmulation(null)` — the latter is not
+  // an API and would throw on the params read.
+  assert.match(device, /contents\.disableDeviceEmulation\(\)/);
+  assert.doesNotMatch(device, /enableDeviceEmulation\(null\)/);
+  // The UA has to come back too, from the value captured before the first override: reading it
+  // at reset time would answer with the phone's UA and pin the tab to mobile forever.
+  assert.match(device, /tabDefaultUserAgents\.set\(tab, contents\.getUserAgent\(\)\)/);
+  assert.match(device, /contents\.setUserAgent\(tabDefaultUserAgents\.get\(tab\)\)/);
+
+  // And the method the Rust CLI asks for.
+  assert.match(main, /case "device":/, "main must expose the agent method the CLI calls");
+});

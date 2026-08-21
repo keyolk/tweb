@@ -334,6 +334,23 @@ pub fn render(method: &str, result: &Value) -> String {
                 .join("\n")
                 + "\n"
         }
+        // Needs its own arm rather than the single-key fallback below: a reset answers
+        // `{ reset: true }`, which that fallback would print as a bare `true`.
+        "device" => {
+            if result
+                .get("reset")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return "reset\n".to_string();
+            }
+            format!(
+                "{} {}x{}\n",
+                text_field(result, "device"),
+                result.get("width").and_then(Value::as_i64).unwrap_or(0),
+                result.get("height").and_then(Value::as_i64).unwrap_or(0)
+            )
+        }
         // An entry with no status is a request that has not come back yet (or one whose
         // completion arrived after it aged out of the ring) — "-" says that, where a bare
         // 0 would read as a real status code.

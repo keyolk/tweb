@@ -273,6 +273,16 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Emulate a mobile device viewport.
+    Device {
+        /// iPhone 12, iPad or Pixel 5. Matched without regard to case.
+        name: Option<String>,
+        /// Go back to the pane's own viewport and user agent.
+        #[arg(long)]
+        reset: bool,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// Save the page as a PDF.
     Pdf {
         /// Where to save it. Without a path, a base64 PDF is printed.
@@ -627,6 +637,9 @@ fn agent_call(
             // there is nothing to resolve.
             let path = path.map(|value| resolve_output_path(&value, working_directory));
             ("screenshot", json!({ "path": path }), agent)
+        }
+        Command::Device { name, reset, agent } => {
+            ("device", json!({ "name": name, "reset": reset }), agent)
         }
         Command::Pdf { path, agent } => {
             // Same resolution as the screenshot path, and for the same reason: the engine
