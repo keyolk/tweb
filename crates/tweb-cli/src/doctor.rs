@@ -226,6 +226,9 @@ pub async fn run(fix: bool) -> Result<()> {
         check_ghostty_cmd_passthrough(),
         check_ghostty_terminal_copy(),
         check_pixel_size_query(),
+        check_kitty_graphics_probe(),
+        check_tmux_user_keys(),
+        check_tmux_environment(),
     ];
 
     // Output.
@@ -274,16 +277,37 @@ fn needs_fix(check: &Check) -> bool {
 fn check_terminal() -> Check {
     let term = std::env::var("TERM").unwrap_or_default();
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    // tmux overwrites both of the above with its own name, so the outer terminal is
+    // invisible from the environment alone. `client_termname` is the attached
+    // client's real TERM (`xterm-ghostty`), and it is live rather than whatever the
+    // server happened to inherit at start.
+    let client_termname = command_output("tmux", &["display-message", "-p", "#{client_termname}"])
+        .filter(|name| !name.is_empty());
+    terminal_check(&term, &term_program, client_termname.as_deref())
+}
+
+/// Whether the terminal is one known to speak Kitty graphics.
+///
+/// A name is only a hint — the real answer comes from the `a=q` query at startup —
+/// so an unrecognised name is a warning, never a failure.
+fn terminal_check(term: &str, term_program: &str, client_termname: Option<&str>) -> Check {
     let detail = if term_program.is_empty() {
         format!("TERM={term} (TERM_PROGRAM unset)")
     } else {
         format!("TERM={term}, TERM_PROGRAM={term_program}")
     };
-    // Kitty graphics support should be decided by a query rather than a name; doctor only hints here.
-    let status = if term_program.to_ascii_lowercase().contains("ghostty")
-        || term_program.contains("WezTerm")
-        || term == "xterm-kitty"
-    {
+    let inside_tmux = term_program.eq_ignore_ascii_case("tmux") || term.starts_with("tmux");
+    let (detail, names) = match client_termname {
+        // Only credit the client's name when this shell's own name is tmux's; a
+        // stale one from a detached session must not vouch for a bare xterm.
+        Some(name) if inside_tmux => (
+            format!("{detail}, tmux client TERM={name}"),
+            vec![term_program.to_string(), term.to_string(), name.to_string()],
+        ),
+        _ => (detail, vec![term_program.to_string(), term.to_string()]),
+    };
+    let known = names.iter().any(|name| is_known_terminal(name));
+    let status = if known {
         CheckStatus::Ok
     } else if term.is_empty() {
         CheckStatus::Fail
@@ -295,6 +319,13 @@ fn check_terminal() -> Check {
         status,
         detail,
     }
+}
+
+fn is_known_terminal(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["ghostty", "wezterm", "kitty"]
+        .iter()
+        .any(|known| name.contains(known))
 }
 
 fn check_tmux() -> Check {
@@ -478,12 +509,131 @@ fn check_ghostty_cmd_passthrough() -> Check {
 }
 
 fn check_pixel_size_query() -> Check {
-    // TODO: confirm the terminal pixel size with a real CSI 14t query.
-    // A placeholder for now.
+    // The interactive probe reads stdin, so it belongs here and not on the resize
+    // path — doctor is one-shot and nothing else is holding the terminal.
+    let probe = tweb_pane::terminal::probe_terminal_pixels();
+    // Inside tmux the pane, not the terminal window, is what gets drawn: CSI 14t
+    // measures the whole window and would overstate a split pane. tmux's own cell
+    // size scaled by the pane's cells is the accurate answer, so it goes first.
+    let pane = tweb_pane::terminal::query_pixel_size();
+    let detail = match (pane, probe.pixel_size) {
+        (Some(size), _) if std::env::var_os("TMUX").is_some() => {
+            format!("pane {}x{} from tmux cells", size.width, size.height)
+        }
+        (_, Some(size)) => format!("{}x{} via CSI 14t", size.width, size.height),
+        (Some(size), None) => format!("pane {}x{} from the PTY", size.width, size.height),
+        (None, None) => String::new(),
+    };
+    if detail.is_empty() {
+        return Check {
+            name: "pixel size query (CSI 14t)",
+            status: CheckStatus::Warn,
+            detail: "no reply; falling back to an estimated size".to_string(),
+        };
+    }
+    let cell = tweb_pane::terminal::query_cell_size().or(probe.cell_size);
     Check {
         name: "pixel size query (CSI 14t)",
+        status: CheckStatus::Ok,
+        detail: match cell {
+            Some((width, height)) => format!("{detail}, cell {width}x{height}"),
+            None => detail,
+        },
+    }
+}
+
+/// Whether the terminal actually answers the Kitty graphics query (`a=q`).
+///
+/// `terminal_check` hints from the name, but a name is only a name — the real answer is
+/// the protocol probe the engine sends at startup. A terminal that reports a known
+/// name and then does not answer the query is the failure mode this catches: the
+/// name passed doctor while the pixels did not.
+fn check_kitty_graphics_probe() -> Check {
+    let support = tweb_pane::terminal::probe_graphics_support();
+    let (status, detail) = match support {
+        tweb_pane::graphics::GraphicsSupport::Supported => (
+            CheckStatus::Ok,
+            "Kitty graphics query (a=q) answered".to_string(),
+        ),
+        tweb_pane::graphics::GraphicsSupport::Unsupported => (
+            CheckStatus::Fail,
+            "no reply to the Kitty graphics query (a=q); \
+             tweb needs a Kitty-graphics-capable terminal"
+                .to_string(),
+        ),
+        tweb_pane::graphics::GraphicsSupport::Unknown => (
+            CheckStatus::Warn,
+            "Kitty graphics query (a=q) did not answer yet".to_string(),
+        ),
+    };
+    Check {
+        name: "Kitty graphics probe (a=q)",
+        status,
+        detail,
+    }
+}
+
+/// Whether the tmux `user-keys` slots tweb's Cmd caret motions need are registered.
+///
+/// Those motions (#64) bind tmux user-keys 100-101 and 124-131. A missing slot means
+/// Cmd-Left and friends are swallowed by tmux rather than reaching the engine,
+/// and the failure is silent — the key just does nothing. This names the slots
+/// so a "not configured" tells the user what to fix.
+fn check_tmux_user_keys() -> Check {
+    let slots = [100, 101, 124, 125, 126, 127, 128, 129, 130, 131];
+    let mut missing = Vec::new();
+    for slot in slots {
+        let value = command_output(
+            "tmux",
+            &["show-options", "-s", &format!("user-keys[{slot}]")],
+        );
+        // An unset tmux option prints the name with an empty value. A set one prints
+        // `name "value"`, so the presence of a quote means it is configured.
+        if value.as_deref().map(|v| !v.contains('"')).unwrap_or(true) {
+            missing.push(slot);
+        }
+    }
+    if missing.is_empty() {
+        return Check {
+            name: "tmux user-keys (Cmd caret motions)",
+            status: CheckStatus::Ok,
+            detail: "slots 100-101, 124-131 registered".to_string(),
+        };
+    }
+    Check {
+        name: "tmux user-keys (Cmd caret motions)",
         status: CheckStatus::Warn,
-        detail: "not yet probed (TODO)".to_string(),
+        detail: format!(
+            "slots {} not configured; run `tweb doctor --fix` to install them",
+            missing
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Whether tweb is running inside tmux.
+///
+/// The Kitty graphics protocol passes through tmux's `allow-passthrough`, but only
+/// when the pane is actually inside tmux. A bare terminal — no tmux at all —
+/// cannot pass the image frames through, so `tweb open` outside tmux shows nothing.
+/// This is the one check that tells a new user what to do about it.
+fn check_tmux_environment() -> Check {
+    if std::env::var_os("TMUX").is_some() {
+        return Check {
+            name: "tmux environment",
+            status: CheckStatus::Ok,
+            detail: "running inside tmux".to_string(),
+        };
+    }
+    Check {
+        name: "tmux environment",
+        status: CheckStatus::Warn,
+        detail: "not inside tmux; tweb needs a tmux pane to pass image frames \
+            through. Start one with `tmux new` and run `tweb open` inside it"
+            .to_string(),
     }
 }
 
@@ -1034,8 +1184,9 @@ mod tests {
         ghostty_copy_on_select_enabled, ghostty_include_block, ghostty_managed_config,
         ghostty_version_supported, managed_block, migrate_legacy_ghostty_config,
         migrate_legacy_tmux_config, private_sequence_hex, select_ghostty_config_candidate,
-        tmux_include_block, tmux_managed_config, upsert_managed_block, CMD_PASSTHROUGH_KEYS,
-        GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END, TMUX_BEGIN, TMUX_END,
+        terminal_check, tmux_include_block, tmux_managed_config, upsert_managed_block, CheckStatus,
+        CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END,
+        TMUX_BEGIN, TMUX_END,
     };
 
     fn ghostty_include() -> String {
@@ -1289,5 +1440,44 @@ mod tests {
         assert!(!ghostty_version_supported("Ghostty 1.2.0"));
         assert!(ghostty_version_supported("Ghostty 1.3.1\nVersion"));
         assert!(ghostty_version_supported("  - version: 2.0.0"));
+    }
+
+    /// tmux replaces TERM and TERM_PROGRAM with its own, hiding the terminal that
+    /// actually draws. Judging on the environment alone warned about a supported
+    /// setup for as long as the user stayed inside tmux.
+    #[test]
+    fn credits_the_terminal_tmux_hides() {
+        let check = terminal_check("tmux-256color", "tmux", Some("xterm-ghostty"));
+        assert!(matches!(check.status, CheckStatus::Ok));
+        assert!(check.detail.contains("tmux client TERM=xterm-ghostty"));
+    }
+
+    /// Outside tmux the client name is whatever a detached session left behind, so
+    /// it must not vouch for the terminal this shell is really running under.
+    #[test]
+    fn ignores_the_tmux_client_name_outside_tmux() {
+        let check = terminal_check("xterm-256color", "Apple_Terminal", Some("xterm-ghostty"));
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert!(!check.detail.contains("xterm-ghostty"));
+    }
+
+    #[test]
+    fn judges_terminals_by_name_when_tmux_is_out_of_the_way() {
+        for (term, program) in [
+            ("xterm-ghostty", "ghostty"),
+            ("xterm-kitty", ""),
+            ("wezterm", "WezTerm"),
+        ] {
+            let check = terminal_check(term, program, None);
+            assert!(matches!(check.status, CheckStatus::Ok), "{term}");
+        }
+        assert!(matches!(
+            terminal_check("xterm-256color", "Apple_Terminal", None).status,
+            CheckStatus::Warn
+        ));
+        assert!(matches!(
+            terminal_check("", "", None).status,
+            CheckStatus::Fail
+        ));
     }
 }
