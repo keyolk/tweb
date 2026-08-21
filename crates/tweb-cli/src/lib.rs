@@ -273,6 +273,13 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Screenshot of the whole document, including what is below the fold.
+    FullScreenshot {
+        /// Where to save it. Without a path, a base64 PNG is printed.
+        path: Option<String>,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// Emulate a mobile device viewport.
     Device {
         /// iPhone 12, iPad or Pixel 5. Matched without regard to case.
@@ -637,6 +644,12 @@ fn agent_call(
             // there is nothing to resolve.
             let path = path.map(|value| resolve_output_path(&value, working_directory));
             ("screenshot", json!({ "path": path }), agent)
+        }
+        Command::FullScreenshot { path, agent } => {
+            // Same resolution as `screenshot`, and the same reason: the engine writes the
+            // file from its own directory rather than the caller's.
+            let path = path.map(|value| resolve_output_path(&value, working_directory));
+            ("full-screenshot", json!({ "path": path }), agent)
         }
         Command::Device { name, reset, agent } => {
             ("device", json!({ "name": name, "reset": reset }), agent)

@@ -3573,6 +3573,137 @@ async function agentScreenshot(params) {
   return { path: target, size: image.getSize() };
 }
 
+// How many viewports one full-page capture will stitch before it stops and returns what it has.
+//
+// The bound is not arbitrary. The agent surface hold expires after AGENT_SURFACE_HOLD_TTL_MS, and
+// the tick that notices collapses the surface again — so a capture that outlived the hold would
+// stitch full-height slices onto one-pixel ones and call the result a screenshot. Sixteen
+// viewports stays well inside that, and it bounds the stitched bytes the way DESIGN.md 6.5 bounds
+// every other frame buffer here: an infinite-scroll feed has no last page, so this has to stop
+// short rather than fill memory looking for one.
+const FULL_SCREENSHOT_MAX_SLICES = 16;
+
+// Scroll, then report where the page actually landed — in one round trip, because the two answers
+// have to describe the same instant.
+//
+// The read-back is the load-bearing half. `scrollTo` is a request: the document clamps it at its
+// own bottom, and the last slice of any page that is not an exact multiple of the viewport lands
+// short of where it was sent. Pasting that frame at the row that was ASKED for instead of the row
+// that was REACHED is what duplicates the final band.
+//
+// Two frames of settle, because one is not enough: the first lands the new scroll offset in
+// layout, and the second is the one whose paint is worth capturing. The timer is the backstop for
+// a page whose rAF never runs — the capture should lose a slice's fidelity there, not hang.
+function scrollProbeScript(top) {
+  return `new Promise((resolve) => {
+    const answer = () => resolve({
+      scrollY: Math.round(scrollY),
+      innerHeight: Math.round(innerHeight),
+      scrollHeight: Math.round(Math.max(
+        document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0)),
+    });
+    scrollTo({ top: ${Math.round(top)}, left: 0, behavior: "instant" });
+    const timer = setTimeout(answer, 250);
+    requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(timer); answer(); }));
+  })`;
+}
+
+// One slice's pixels. `awaitRestoredFrame` is the same wait the surface hold uses — it invalidates
+// and takes the next paint at the expected size — which is exactly the question here, since a
+// frame that arrives before the scroll has repainted shows the previous slice.
+//
+// It answers null rather than throwing when no paint arrives in time. `capturePage` is the same
+// read one round later, and one blurry slice beats failing a capture that is otherwise complete.
+async function fullScreenshotFrame(contents) {
+  return (await awaitRestoredFrame(contents)) || await contents.capturePage();
+}
+
+/**
+ * `tweb full-screenshot` — the whole document, not the part of it that fits.
+ *
+ * `screenshot` returns what the compositor has, and the compositor only ever has the viewport.
+ * Everything below the fold is not cropped or dimmed in that frame, it is absent — so the only
+ * way to photograph it is to scroll the page past the viewport and stitch the frames. A short
+ * page has nothing below the fold and is handed straight to `screenshot`, which already has the
+ * frame the hold collected and needs no scrolling at all.
+ *
+ * Each slice contributes only the rows nobody has captured yet, which is what makes the final
+ * scroll safe: the document clamps it at its own bottom, so its frame re-shows rows already
+ * stitched and pasting it whole would duplicate that band.
+ *
+ * What this does NOT fix, and cannot without mutating the page: sticky and fixed chrome repaints
+ * at the top of every frame, so a sticky header appears once per slice in the stitch — and the
+ * document rows it covers are occluded in that frame, so they are missing rather than merely
+ * duplicated. Hiding those elements mid-capture is the only way to stitch around them, and it
+ * would mean editing a page the user may be watching and perturbing its own scroll handlers, to
+ * fix an artifact every stitcher that leaves the page alone has. Stated here rather than
+ * half-fixed.
+ */
+async function agentFullScreenshot(params) {
+  const contents = agentContents();
+  const start = await contents.executeJavaScript(`({
+    scrollY: Math.round(scrollY),
+    innerHeight: Math.round(innerHeight),
+    scrollHeight: Math.round(Math.max(
+      document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0)),
+  })`, true);
+  if (start.scrollHeight <= start.innerHeight) return agentScreenshot(params);
+
+  const slices = [];
+  // How much of the document is already stitched, in CSS pixels. It doubles as the next scroll
+  // target: the viewport is sent to the first row nobody has captured yet.
+  let covered = 0;
+  let width = 0;
+  let scale = 1;
+  try {
+    for (let index = 0; index < FULL_SCREENSHOT_MAX_SLICES; index += 1) {
+      const at = await contents.executeJavaScript(scrollProbeScript(covered), true);
+      const image = await fullScreenshotFrame(contents);
+      const size = image.getSize();
+      if (!width) {
+        width = size.width;
+        // Device pixels per CSS pixel, measured off this frame rather than assumed. It folds the
+        // pane's scale factor and the tab's zoom together, and zoom is per tab — see
+        // `tabZoomFactors` — so neither can be read off a constant.
+        scale = size.height / Math.max(1, at.innerHeight);
+      }
+      // A viewport that changed mid-capture (the pane was resized) makes the remaining frames a
+      // different width, and there is no honest way to stitch those onto what is already here.
+      if (size.width !== width) break;
+      const skipRows = Math.min(size.height, Math.round(Math.max(0, covered - at.scrollY) * scale));
+      const rows = size.height - skipRows;
+      // No new rows means the page stopped moving — a shorter document than it claimed, or one
+      // that refuses to scroll. Stopping is what keeps that from looping to the slice cap.
+      if (rows <= 0) break;
+      slices.push({ destRow: Math.round(covered * scale), bitmap: image.toBitmap(), skipRows, rows });
+      covered = at.scrollY + at.innerHeight;
+      if (covered >= at.scrollHeight) break;
+    }
+  } finally {
+    // The page goes back where the user left it however this ended. An agent's capture is
+    // supposed to observe the page, not to have moved it.
+    await contents.executeJavaScript(scrollProbeScript(start.scrollY), true).catch(() => {});
+  }
+  if (!slices.length) return agentScreenshot(params);
+
+  const stride = width * 4;
+  const last = slices[slices.length - 1];
+  const height = last.destRow + last.rows;
+  const canvas = Buffer.alloc(height * stride);
+  for (const slice of slices) {
+    slice.bitmap.copy(canvas, slice.destRow * stride,
+      slice.skipRows * stride, (slice.skipRows + slice.rows) * stride);
+  }
+  // Scale factor 1 because the stitch is already in device pixels: the slices came off the
+  // compositor at the pane's scale, and declaring that scale again would halve the reported size
+  // of an image whose bytes are the full-resolution page.
+  const image = nativeImage.createFromBitmap(canvas, { width, height, scaleFactor: 1 });
+  if (!params.path) return { png: image.toPNG().toString("base64") };
+  const target = path.resolve(params.path);
+  writeFileSync(target, image.toPNG());
+  return { path: target, size: image.getSize() };
+}
+
 /**
  * `tweb pdf` — the page as a PDF, wherever the caller asked for it.
  *
@@ -3772,6 +3903,8 @@ async function dispatchAgentCommand(method, params) {
       return { value: await agentContents().executeJavaScript(String(params.script || ""), true) };
     case "screenshot":
       return agentScreenshot(params);
+    case "full-screenshot":
+      return agentFullScreenshot(params);
     case "pdf":
       return agentPdf(params);
     case "device":

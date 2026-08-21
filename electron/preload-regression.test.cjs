@@ -1699,3 +1699,68 @@ test("device emulation re-lays the page out without resizing the pane's surface"
   // And the method the Rust CLI asks for.
   assert.match(main, /case "device":/, "main must expose the agent method the CLI calls");
 });
+
+// `screenshot` can only ever return the viewport, because that is all the compositor holds —
+// everything below the fold is absent from that frame rather than cropped out of it. So the
+// full-page command has to move the page and stitch, and the way a naive stitch goes wrong is
+// the clamped final scroll: the document stops it at its own bottom, so that frame re-shows
+// rows already captured. (Sticky chrome repeating per slice is a known limit, not a bug — see
+// the docblock; fixing it would mean mutating a page the user may be watching.)
+test("the full-page screenshot stitches new bands rather than whole frames", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const full = main.slice(main.indexOf("async function agentFullScreenshot(params)"),
+    main.indexOf("/**\n * `tweb pdf`"));
+
+  // The document's height, not the body's alone: a page whose scrolling element is <html>
+  // reports 0 on body, which would make every long page look like it fit.
+  assert.match(full, /document\.documentElement\?\.scrollHeight \|\| 0, document\.body\?\.scrollHeight \|\| 0/);
+  // A page that fits needs no scrolling at all, and the hold already collected its frame.
+  assert.match(full, /if \(start\.scrollHeight <= start\.innerHeight\) return agentScreenshot\(params\)/);
+
+  // Only the rows nobody has captured yet are pasted, which is what makes the clamped final
+  // scroll safe — pasting that frame whole would duplicate the band it re-shows.
+  assert.match(full, /const skipRows = Math\.min\(size\.height, Math\.round\(Math\.max\(0, covered - at\.scrollY\) \* scale\)\)/);
+  assert.match(full, /slice\.bitmap\.copy\(canvas, slice\.destRow \* stride,/);
+  // Progress is measured from where the page LANDED, not where it was sent: the document
+  // clamps the last scroll at its own bottom.
+  assert.match(full, /covered = at\.scrollY \+ at\.innerHeight;/);
+  // Measured off the frame, because zoom is per tab (see tabZoomFactors) and cannot be assumed.
+  assert.match(full, /scale = size\.height \/ Math\.max\(1, at\.innerHeight\)/);
+
+  // Bounded: the surface hold expires at AGENT_SURFACE_HOLD_TTL_MS and the tick that notices
+  // collapses the surface mid-call, so an infinite feed has to stop rather than stitch onto
+  // one-pixel frames.
+  assert.match(main, /const FULL_SCREENSHOT_MAX_SLICES = \d+;/);
+  assert.match(full, /index < FULL_SCREENSHOT_MAX_SLICES/);
+  // A page that stops moving ends the loop instead of running to the cap.
+  assert.match(full, /if \(rows <= 0\) break;/);
+  // The user's scroll position is restored however the capture ended.
+  assert.match(full, /} finally \{[\s\S]*scrollProbeScript\(start\.scrollY\)/);
+
+  // The same wait the surface hold uses, not a bare capturePage: a frame taken before the
+  // scroll repaints still shows the previous slice.
+  const frame = main.slice(main.indexOf("async function fullScreenshotFrame(contents)"),
+    main.indexOf("async function agentFullScreenshot(params)"));
+  assert.match(frame, /await awaitRestoredFrame\(contents\)\) \|\| await contents\.capturePage\(\)/);
+
+  // The scroll is a request; the read-back is the answer. Both come from one round trip so
+  // they describe the same instant.
+  const probe = main.slice(main.indexOf("function scrollProbeScript(top)"),
+    main.indexOf("async function fullScreenshotFrame(contents)"));
+  assert.match(probe, /behavior: "instant"/);
+  assert.match(probe, /scrollY: Math\.round\(scrollY\)/);
+  // Two frames of settle, with a timer behind it for a page whose rAF never runs.
+  assert.match(probe, /requestAnimationFrame\(\(\) => requestAnimationFrame\(/);
+  assert.match(probe, /const timer = setTimeout\(answer, \d+\)/);
+
+  const dispatch = main.slice(main.indexOf("async function dispatchAgentCommand(method, params)"));
+  assert.match(dispatch, /case "full-screenshot":\n\s+return agentFullScreenshot\(params\);/);
+});
+
+// A hidden pane collapses its surface to one pixel, which is precisely the state this command
+// cannot tolerate: every slice would be a one-pixel band. The hold is opt-out, so the only way
+// to lose it is to be named in the exclude list.
+test("the full-page screenshot holds the surface open", () => {
+  const { agentNeedsGeometry } = require("./surface-policy.cjs");
+  assert.strictEqual(agentNeedsGeometry("full-screenshot"), true);
+});

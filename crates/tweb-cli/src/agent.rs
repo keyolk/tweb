@@ -304,6 +304,26 @@ pub fn render(method: &str, result: &Value) -> String {
                 result.get("size").and_then(Value::as_i64).unwrap_or(0)
             )
         }
+        // A stitched capture is taller than the pane, which is the one fact worth stating:
+        // the height is how the caller sees that anything below the fold was reached at all.
+        // The inline form stays a bare base64 line so it still pipes into `base64 -d`.
+        "full-screenshot" => {
+            if let Some(Value::String(encoded)) = result.get("png") {
+                return format!("{encoded}\n");
+            }
+            let size = result.get("size");
+            let axis = |key: &str| {
+                size.and_then(|value| value.get(key))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            };
+            format!(
+                "{} ({}x{})\n",
+                text_field(result, "path"),
+                axis("width"),
+                axis("height")
+            )
+        }
         "console" | "errors" => {
             let key = if method == "console" {
                 "messages"
