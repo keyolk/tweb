@@ -2071,11 +2071,15 @@ function applySurfacePlan(tab, plan) {
   // treatment `keepWindowHidden` applies to every other tab.
   if (plan.floating) {
     if (tab.isVisible()) return;
+    // Add to floatingTabs BEFORE setBounds/show: the hidden-window watchdog runs
+    // every second and would move this window back offscreen between show() and
+    // the next tick. Adding first means keepWindowHidden skips it from that point on.
+    floatingTabs.add(tab);
     tab.setOpacity(1);
     tab.setFocusable(true);
     // Centre on the display the pane is on, at the pane's current size. The user can
     // move the window freely afterwards — this is just a sensible default.
-    const display = screen.getDisplayMatching(tab.getBounds());
+    const display = screen.getDisplayNearestToPoint(screen.getCursorScreenPoint());
     const bounds = {
       x: Math.round(display.bounds.x + (display.bounds.width - plan.width) / 2),
       y: Math.round(display.bounds.y + (display.bounds.height - plan.height) / 2),
@@ -2084,8 +2088,6 @@ function applySurfacePlan(tab, plan) {
     };
     tab.setBounds(bounds);
     tab.show();
-    if (debugLogging) console.error(`tweb: float show tab=\${tab.id} visible=\${tab.isVisible()}`);
-    floatingTabs.add(tab);
     return;
   }
   // A tab that was floating and is no longer: hide it again and put it back offscreen.
