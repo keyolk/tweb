@@ -2041,13 +2041,10 @@ function updatePaintingState() {
     const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held, inputState().floating);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
-    // A floating tab's audio belongs to the display window, not the pane. The pane's
-    // tab is the same webContents — it keeps playing — so mute it here to stop the
-    // pane from emitting sound while the floating viewer is showing. The display
-    // window's viewer does not play audio (it draws frames on a canvas), so this
-    // does not silence the floating window — it silences the pane only.
-    if (plan.floating) tab.webContents.setAudioMuted(true);
-    else if (!plan.floating) tab.webContents.setAudioMuted(audioMutedByOther);
+    // A floating tab's audio should keep playing — the display window's viewer draws
+    // frames on a canvas, but the page's audio comes from the same webContents,
+    // and the user expects to hear it while watching the floating window. Do not
+    // mute it here; the pane is not visible, so it does not emit sound on its own.
     applySurfacePlan(tab, plan);
     // Read before write, like the resize above: `startPainting()` on a tab that is
     // already painting *provokes a paint*, and this reconciler runs every second, so
@@ -4783,7 +4780,16 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     }
     // Forward the key into the offscreen webContents so the page sees it.
     // The floating viewer is a canvas — it has no DOM to receive keys.
-    tab.webContents.sendInputEvent(input);
+    // `before-input-event` gives us a raw object; `sendInputEvent` needs an
+    // explicit event with the fields it expects.
+    tab.webContents.sendInputEvent({
+      type: "keyDown",
+      key: input.key,
+      code: input.code || "",
+      modifiers: input.modifiers || [],
+      autoRepeat: input.autoRepeat || false,
+      isTrusted: true,
+    });
   }));
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
