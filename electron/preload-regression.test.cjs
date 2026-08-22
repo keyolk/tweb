@@ -788,7 +788,7 @@ test("collectors reach into a same-origin frame", () => {
 test("every function the preload calls is defined in it", () => {
   // CSS text carries function-looking tokens that are not calls.
   const cssFunctions = new Set(["calc", "clamp", "minmax", "repeat", "rgba", "rgb", "scale",
-    "translate", "var", "url", "type", "value", "attr", "linear", "cubic"]);
+    "translate", "translateX", "translateY", "var", "url", "type", "value", "attr", "linear", "cubic"]);
   const builtins = new Set(["require", "setTimeout", "clearTimeout", "setInterval",
     "clearInterval", "parseInt", "parseFloat", "getComputedStyle", "getSelection",
     "addEventListener", "removeEventListener", "queueMicrotask", "requestAnimationFrame",
@@ -1919,4 +1919,31 @@ test("chrome current hands the active tab to Chrome", () => {
   assert.match(current, /agent::request\(None, "status"/);
   assert.match(current, /serde_json::Value::as_str/);
   assert.match(current, /chrome::open\(&url\)/);
+});
+
+// The command palette is the third fixed-position key (`c`): a menu of actions,
+// the way `Cmd-Space` or `Ctrl-Shift-P` work in an editor. It is a menu, not a
+// mode — it does not change the keyboard's meaning, it presents a list and runs
+// the one the user picks.
+test("command palette opens with c and lists actions", () => {
+  // The entries are a static list.
+  assert.match(electron, /const commandPaletteEntries = \[/);
+  // Each entry has a label, a hint, and an action.
+  assert.match(electron, /\{ label: "Copy URL", hint: "y", action:/);
+  assert.match(electron, /\{ label: "Float", hint: "w", action:/);
+  assert.match(electron, /\{ label: "Inspect", hint: "I", action:/);
+  // `c` enters the palette from normal mode.
+  assert.match(electron, /case "c": startCommandPalette\(\); break;/);
+  // `cancelCommandPalette` is in `cancelTransient`.
+  assert.match(electron, /cancelCommandPalette\(false\);/);
+  // `handleCommandPaletteKey` handles j/k/Enter/Escape and typeahead.
+  assert.match(electron, /function handleCommandPaletteKey/);
+  assert.match(electron, /key === "j" \|\| key === "ArrowDown"/);
+  assert.match(electron, /key === "k" \|\| key === "ArrowUp"/);
+  assert.match(electron, /key === "Enter"/);
+  assert.match(electron, /key === "Escape"/);
+  // A mouse click is a first-class confirmation.
+  assert.match(electron, /row\.addEventListener\("click"/);
+  // `emptyPickerReason` has a command entry.
+  assert.match(electron, /command: "no command to run"/);
 });

@@ -106,6 +106,9 @@ installPrintShim();
   let pendingZ = false;
   let pendingZTimer = null;
   let pickerState = null;
+  // The command palette: a fixed-position menu of actions, opened with `c`. Unlike the
+  // hint picker this is a static list, not a DOM scan — see DESIGN §15.
+  let commandPaletteState = null;
   let promptHost = null;
   let searchState = null;
   // Requests still waiting for a result, and the backstop that un-hides the bar if one
@@ -1468,6 +1471,7 @@ installPrintShim();
     visual: "no text·link·image",
     scroll: "no inner scroll area",
     inspect: "no target",
+    command: "no command to run",
   };
 
   function startPicker(targets, mode, onPick) {
@@ -3630,6 +3634,112 @@ installPrintShim();
     if (restoreMode) normalMode();
   }
 
+  // The command palette entries. A static list, not a DOM scan — see DESIGN §15.
+  // Each entry is a label, a key hint for typeahead, and an action that runs on
+  // confirm. The action is either a direct shortcut send or a mode entry call.
+  const commandPaletteEntries = [
+    { label: "Copy URL", hint: "y", action: () => send("copy-url") },
+    { label: "Copy text", hint: "t", action: () => send("copy-text", window.getSelection()?.toString() || "") },
+    { label: "View source", hint: "html", action: () => send("act", { ref: ".", action: "html" }) },
+    { label: "Zoom to fit", hint: "0", action: () => send("zoom-reset") },
+    { label: "Print", hint: "print", action: () => send("print") },
+    { label: "Float", hint: "w", action: () => send("toggle-float") },
+    { label: "Inspect", hint: "I", action: () => startInspect() },
+    { label: "Tabs", hint: "b", action: () => showTabList() },
+    { label: "History", hint: "gh", action: () => showHistory() },
+    { label: "Downloads", hint: "gd", action: () => showDownloads() },
+  ];
+
+  function cancelCommandPalette(restoreMode = true) {
+    if (!commandPaletteState) return;
+    commandPaletteState.host.remove();
+    commandPaletteState = null;
+    if (restoreMode) normalMode();
+  }
+
+  function startCommandPalette() {
+    cancelTransient(false);
+    const entries = commandPaletteEntries;
+    if (entries.length === 0) {
+      setMode("command", emptyPickerReason.command);
+      setTimeout(normalMode, 1100);
+      return;
+    }
+    const host = document.createElement("div");
+    host.id = "__tweb_command_palette__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "open" });
+    const list = document.createElement("div");
+    list.style.cssText = [
+      "position:fixed", "left:50%", "top:30%", "transform:translateX(-50%)",
+      "min-width:280px", "max-width:min(560px,calc(100vw - 40px))", "max-height:60vh", "overflow:auto",
+      "padding:4px 0", "border:1px solid #5f6368", "border-radius:8px", "background:#111e",
+      "box-shadow:0 8px 32px #000a", "color:#e8eaed", "font:14px/1.5 system-ui,sans-serif",
+      "pointer-events:auto",
+    ].join(";");
+    const items = entries.map((entry, index) => {
+      const row = document.createElement("div");
+      row.style.cssText = "padding:6px 12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      const labelSpan = document.createElement("span");
+      labelSpan.textContent = entry.label;
+      const hintSpan = document.createElement("span");
+      hintSpan.textContent = entry.hint;
+      hintSpan.style.cssText = "float:right;color:#8ab4f8;font:12px ui-monospace,monospace";
+      row.append(labelSpan, hintSpan);
+      if (index === 0) row.style.background = "#1a3a5e";
+      // A click is a first-class confirmation, the way a context menu works.
+      row.addEventListener("click", () => {
+        if (!commandPaletteState) return;
+        cancelCommandPalette(false);
+        entry.action();
+      });
+      list.append(row);
+      return { row, ...entry };
+    });
+    shadow.append(list);
+    document.documentElement.append(host);
+    paintNow();
+    commandPaletteState = { host, items, selected: 0, typed: "" };
+    setMode("command", `${entries.length}`);
+  }
+
+  function handleCommandPaletteKey(event, key) {
+    if (!commandPaletteState) return false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const items = commandPaletteState.items;
+    if (key === "Escape") {
+      cancelCommandPalette(false);
+    } else if (key === "Enter") {
+      const entry = items[commandPaletteState.selected];
+      cancelCommandPalette(false);
+      entry.action();
+    } else if (key === "j" || key === "ArrowDown") {
+      items[commandPaletteState.selected].row.style.background = "";
+      commandPaletteState.selected = Math.min(items.length - 1, commandPaletteState.selected + 1);
+      items[commandPaletteState.selected].row.style.background = "#1a3a5e";
+      items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+    } else if (key === "k" || key === "ArrowUp") {
+      items[commandPaletteState.selected].row.style.background = "";
+      commandPaletteState.selected = Math.max(0, commandPaletteState.selected - 1);
+      items[commandPaletteState.selected].row.style.background = "#1a3a5e";
+      items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+    } else if (key.length === 1 && /[a-z]/i.test(key)) {
+      // Typeahead: filter by the typed character against label and hint.
+      commandPaletteState.typed += key.toLowerCase();
+      const match = items.findIndex((item) =>
+        item.label.toLowerCase().includes(commandPaletteState.typed)
+        || item.hint.toLowerCase().includes(commandPaletteState.typed));
+      if (match >= 0) {
+        items[commandPaletteState.selected].row.style.background = "";
+        commandPaletteState.selected = match;
+        items[commandPaletteState.selected].row.style.background = "#1a3a5e";
+        items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+      }
+    }
+    return true;
+  }
+
   function enterInspect(item) {
     const element = item.element;
     const selector = cssSelector(element);
@@ -3844,6 +3954,7 @@ installPrintShim();
 
   function cancelTransient(restoreMode = true) {
     cancelPicker(false);
+    cancelCommandPalette(false);
     cancelPrompt(false);
     cancelSearch(true, false);
     cancelVisual(false);
@@ -3942,6 +4053,7 @@ installPrintShim();
 
     if (handleHelpKey(event, key)) return;
     if (handlePickerKey(event, key)) return;
+    if (handleCommandPaletteKey(event, key)) return;
     if (handleVisualKey(event, key)) return;
     if (handleInspectKey(event, key)) return;
     if (handleTabListKey(event, key)) return;
@@ -4057,6 +4169,7 @@ installPrintShim();
       case "y": send("copy-url"); flash("URL"); break;
       case "r": send("reload"); break;
       case "w": send("toggle-float"); break;
+      case "c": startCommandPalette(); break;
       case "Escape":
         // Release a picked scroll or pan surface before bothering the page.
         if (scrollSurface() || panSurface()) {
