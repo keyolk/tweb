@@ -3206,7 +3206,12 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
         const url = contents.getURL();
         const { execFile } = require("node:child_process");
         execFile("tmux-chrome", ["open", url], { stdio: "ignore" }, (error) => {
-          if (error) execFile("open", ["-a", "Google Chrome", url], { stdio: "ignore" });
+          if (error) {
+            if (debugLogging) console.error(`tweb: chrome-current tmux-chrome failed: ${error.message}`);
+            execFile("open", ["-a", "Google Chrome", url], { stdio: "ignore" }, (openError) => {
+              if (openError && debugLogging) console.error(`tweb: chrome-current open -a failed: ${openError.message}`);
+            });
+          }
         });
       }
       break;
