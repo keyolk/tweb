@@ -23,9 +23,11 @@
 >   `tweb chrome status` work, routing sensitive domains to real Chrome via tmux-chrome or `open -a`.
 >   Automatic routing was built and removed — an SSO login is a redirect chain, and a browser
 >   boundary inside it breaks the cookie store. See §11 for the measurement.
-> - **§14** — floating mode is unbuilt. The offscreen `BrowserWindow` that renders the page
->   can be shown on the OS desktop, but the detachment of the display from the tmux pane
->   is not wired. See §14 for the design.
+> - **§14** — floating mode is built. The offscreen window keeps painting and a
+>   separate display window shows the frames; see §14. The display window split
+>   (§14.5) is the next step — base64 IPC will not hold at 30fps.
+> - **§15** — command palette is unbuilt. The third fixed-position key (`c`)
+>   presents a menu of actions the way a context menu does. See §15 for the design.
 > - **§12.3, §12.14** — the ResourceBroker is a 38-line stub and the resource CLI is unimplemented.
 >   The agent socket, which is a different mechanism, does ship and does work.
 
@@ -2205,7 +2207,80 @@ shell and the agent, in a layout that survives detach, on the same scrollback as
 of the terminal. Floating is for the times the page needs to be *still* — a recording,
 a demo, a second monitor — without the pane next to it resizing it out from under.
 
-## 15. Performance goals and measurement
+## 15. Command palette
+
+> **Not implemented.** This section is a design target.
+
+`f` opens hints, `v` opens visual caret, `s` picks a scroll surface — each
+is one key for one mode. The third fixed-position key is `c`: a command palette,
+the way `Cmd-Space` or `Ctrl-Shift-P` work in an editor. It is a menu, not a
+mode: it does not change the keyboard's meaning, it presents a list of actions
+and runs the one the user picks.
+
+### 15.1 Why a palette and not more keys
+
+Every key on the home row is taken. `f`/`v`/`s`/`b`/`o`/`t`/`x`/`r`/`m`/`g`/`z`/`H`/`L`/`J`/`K`
+are bound, and the remaining free keys (`c`/`e`/`p`/`q` and their shifted forms)
+are not enough for the features a browser needs — copy image, view source,
+open devtools, clear cookies, zoom to fit, print, save page, toggle dark mode.
+A palette holds any number of these behind one key, the way a context menu
+holds them behind a right-click.
+
+### 15.2 Keyboard and mouse
+
+The palette is a fixed-position overlay, like the hint label overlay and the
+search bar. It does not scroll — it anchors to the pane. The user moves a
+selection with `j`/`k` (or the mouse) and confirms with `Enter` (or a click),
+the same vocabulary the tab list and the history list already use. `Escape`
+closes it, the way it closes every other overlay.
+
+A mouse click is a first-class confirmation, not a fallback: the palette is a
+menu, and a menu that cannot be clicked is a keyboard shortcut list with a
+different name. The click target is the palette entry, not the page element
+under it — the overlay intercepts the pointer the way the hint overlay does.
+
+### 15.3 The entries
+
+The palette is built from a static list of commands, not from a DOM scan.
+Each entry has a label, a hint letter (for `j`/`k`-less typeahead), and an
+action that runs on confirm. The action is either a direct shortcut send (`copy-url`,
+`reload`, `toggle-float`) or a mode entry (`startInspect`, `showTabList`).
+This is the extension point: a new feature adds a row to the list, not a key to
+the home row.
+
+```text
+Command            Key hint    Action
+──────────────────────────────────────────────────
+Copy URL           y            send("copy-url")
+Copy image          —            send("copy-image") (needs a hovered target)
+Copy text           t            send("copy-text", selection)
+View source          html         act(current, "html")
+Open devtools        d            send("devtools")
+Clear cookies         —            send("clear-cookies")
+Zoom to fit           0            send("zoom-reset")
+Print                 —            send("print")
+Save page             —            send("save-page")
+Toggle dark mode      —            send("toggle-dark-mode")
+Float                 w            send("toggle-float")
+Inspect               I            startInspect()
+Tabs                  b            showTabList()
+History               gh           showHistoryPage()
+Downloads             gd           showDownloadsPage()
+```
+
+### 15.4 What the palette is not
+
+It is not a command line. `o`/`O` is the omnibox, `t` is the tab prompt, and
+`/` is search — those take typed input. The palette takes a selection, and a
+selection only. Typing filters the list (the way `f`'s label picker does); it
+does not execute.
+
+It is not a mode. `i` is insert mode and changes what the keys mean; `c`
+presents a menu and leaves them unchanged. The keyboard is in normal mode
+before `c` and after `c`, so `Escape` is the only exit and `Enter` is the
+only confirm — no `c`-mode key has a meaning the way `i`-mode keys do.
+
+## 16. Performance goals and measurement
 
 Exact figures are fixed after a per-hardware baseline measurement, but the following are release gates.
 
@@ -2229,7 +2304,7 @@ The benchmark workloads:
 - video playback
 - Korean input and a long clipboard paste
 
-## 16. The conformance matrix
+## 17. The conformance matrix
 
 Support is declared by capability and validated combination, not by terminal name.
 
@@ -2241,7 +2316,7 @@ Support is declared by capability and validated combination, not by terminal nam
 | Kitty + tmux | native image the goal | the tmux table | pane mouse | client mode | a core target |
 | SSH remote | an inline/video backend | remote input | remote input | client mode | a separate transport |
 
-## 17. Security
+## 18. Security
 
 - Never disable the Chromium sandbox.
 - Separate the browser/renderer/GPU/utility process privileges.
@@ -2254,7 +2329,7 @@ Support is declared by capability and validated combination, not by terminal nam
 - Apply fuzzing to the terminal escape sequence parser.
 - Bound the tmux passthrough payload length and the parser boundary.
 
-## 18. A validation order, not an implementation order
+## 19. A validation order, not an implementation order
 
 > **Where this list now stands, measured 2026-08-16 — see [README Status](README.md#status) for the
 > evidence.** (1) partly: the Kitty path ships and works; the GPU fast path is unbuilt (§7.2).
@@ -2278,7 +2353,7 @@ Rather than scoping a short-term MVP, whether the architecture holds up is valid
 If 1–3 reveal a structural limit in the terminal protocol, the runtime is not discarded;
 `NativeSurfaceTransport` is added instead. The tmux pane/process/profile/automation model stays as it is.
 
-## 19. What to adopt from precedent and what to drop
+## 20. What to adopt from precedent and what to drop
 
 ### Adopted from `awrit`
 
@@ -2338,7 +2413,7 @@ If 1–3 reveal a structural limit in the terminal protocol, the runtime is not 
 an interactive primary renderer its ceiling is clearly lower than the GPU fast path's. It is used only as a
 low-framerate fallback where `RemoteVideoTransport` is unavailable, or as a static snapshot backend.
 
-## 20. The final product definition
+## 21. The final product definition
 
 > **This is the target definition, and two of its clauses are unbuilt.** Resource exchange as typed
 > window-scoped attachments is a 38-line stub (§12.3); the Chrome profile bootstrap and the managed
