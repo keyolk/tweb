@@ -3199,14 +3199,15 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       clipboard.writeText(contents.getURL());
       break;
     case "chrome-current":
-      // Hand the current tab's URL to Chrome — the palette entry for `tweb chrome current`.
-      // `chrome::open` is in the Rust CLI, not here; replicate its fallback: try
-      // tmux-chrome, fall back to `open -a "Google Chrome"`.
+      // Hand the current tab's URL to Chrome via the user's $BROWSER, which is
+      // `tmux-chrome-open` — the same wrapper `tweb chrome open` uses. It tries
+      // tmux-chrome first and falls back to `open -a "Google Chrome"`, so the
+      // palette and the CLI take the same path.
       {
         const url = contents.getURL();
         const { execFile } = require("node:child_process");
-        execFile("tmux-chrome", ["open", url], { stdio: "ignore" }, (error) => {
-          if (error) execFile("open", ["-a", "Google Chrome", url], { stdio: "ignore" });
+        execFile(process.env.BROWSER || "tmux-chrome-open", [url], { stdio: "ignore" }, (error) => {
+          if (error && debugLogging) console.error(`tweb: chrome-current failed: ${error.message}`);
         });
       }
       break;
