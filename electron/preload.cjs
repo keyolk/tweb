@@ -3683,7 +3683,11 @@ installPrintShim();
       labelSpan.textContent = entry.label;
       const hintSpan = document.createElement("span");
       hintSpan.textContent = entry.hint;
-      hintSpan.style.cssText = "float:right;color:#8ab4f8;font:12px ui-monospace,monospace";
+      // A text span inside shadow DOM does not render to Kitty graphics — shadow
+      // content is not part of the terminal's cell grid. A bordered box does,
+      // the same way the hint picker's badge does: it is a background + border that
+      // composites onto the pane, not text the terminal reflows.
+      hintSpan.style.cssText = "float:right;padding:1px 5px;border:1px solid #2a4a6e;border-radius:3px;background:#0d1f3d;color:#8ab4f8;font:11px ui-monospace,monospace";
       row.append(labelSpan, hintSpan);
       if (index === 0) row.style.background = "#1a3a5e";
       // A click is a first-class confirmation, the way a context menu works.
