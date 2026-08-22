@@ -3198,6 +3198,18 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "copy-url":
       clipboard.writeText(contents.getURL());
       break;
+    case "chrome-current":
+      // Hand the current tab's URL to Chrome — the palette entry for `tweb chrome current`.
+      // `chrome::open` is in the Rust CLI, not here; replicate its fallback: try
+      // tmux-chrome, fall back to `open -a "Google Chrome"`.
+      {
+        const url = contents.getURL();
+        const { execFile } = require("node:child_process");
+        execFile("tmux-chrome", ["open", url], { stdio: "ignore" }, (error) => {
+          if (error) execFile("open", ["-a", "Google Chrome", url], { stdio: "ignore" });
+        });
+      }
+      break;
     case "copy-image":
       if ([value?.x, value?.y, value?.width, value?.height].every(Number.isFinite)) {
         const rect = {

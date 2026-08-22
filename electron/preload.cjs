@@ -3639,12 +3639,11 @@ installPrintShim();
   // confirm. The action is either a direct shortcut send or a mode entry call.
   const commandPaletteEntries = [
     { label: "Copy URL", hint: "y", action: () => send("copy-url") },
-    { label: "Copy text", hint: "t", action: () => send("copy-text", window.getSelection()?.toString() || "") },
+    { label: "Open in Chrome", hint: "chrome", action: () => send("chrome-current") },
     { label: "View source", hint: "html", action: () => send("act", { ref: ".", action: "html" }) },
     { label: "Zoom to fit", hint: "0", action: () => send("zoom-reset") },
     { label: "Print", hint: "print", action: () => send("print") },
     { label: "Float", hint: "w", action: () => send("toggle-float") },
-    { label: "Inspect", hint: "I", action: () => startInspect() },
     { label: "Tabs", hint: "b", action: () => showTabList() },
     { label: "History", hint: "gh", action: () => showHistory() },
     { label: "Downloads", hint: "gd", action: () => showDownloads() },
@@ -3671,10 +3670,10 @@ installPrintShim();
     const shadow = host.attachShadow({ mode: "open" });
     const list = document.createElement("div");
     list.style.cssText = [
-      "position:fixed", "left:50%", "top:30%", "transform:translateX(-50%)",
-      "min-width:280px", "max-width:min(560px,calc(100vw - 40px))", "max-height:60vh", "overflow:auto",
-      "padding:4px 0", "border:1px solid #5f6368", "border-radius:8px", "background:#111e",
-      "box-shadow:0 8px 32px #000a", "color:#e8eaed", "font:14px/1.5 system-ui,sans-serif",
+      "position:fixed", "right:8px", "bottom:8px",
+      "min-width:240px", "max-width:min(420px,calc(100vw - 24px))", "max-height:40vh", "overflow:auto",
+      "padding:3px 0", "border:1px solid #5f6368", "border-radius:6px", "background:#111e",
+      "box-shadow:0 4px 16px #000a", "color:#e8eaed", "font:13px/1.4 system-ui,sans-serif",
       "pointer-events:auto",
     ].join(";");
     const items = entries.map((entry, index) => {
