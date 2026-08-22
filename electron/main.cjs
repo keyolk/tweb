@@ -4815,7 +4815,12 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     }
     // The dirty rect used to be discarded, so a blinking caret cost the same whole-frame
     // encode as a page load. It decides the patch path now.
-    queueFrame(tab, image, false, dirty);
+    // A floating tab's pane is not visible, so `queueFrame` would drop the frame
+    // anyway (it checks `currentPane().visible`). Skip it entirely rather than
+    // letting the offscreen paint pipeline run — the pane must not update while
+    // the display window is the surface. The viewer gets the frame from the relay
+    // below, which is a second consumer of the same paint, not a second renderer.
+    if (!floatingTabs.has(tab)) queueFrame(tab, image, false, dirty);
     // A floating tab's viewer draws the same frames. Second in line deliberately: the pane
     // is the primary surface and must not wait on the relay's JPEG encode.
     if (floatingTabs.has(tab)) relayFrameToDisplay(tab, image);
