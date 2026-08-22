@@ -2041,6 +2041,13 @@ function updatePaintingState() {
     const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held, inputState().floating);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
+    // A floating tab's audio belongs to the display window, not the pane. The pane's
+    // tab is the same webContents — it keeps playing — so mute it here to stop the
+    // pane from emitting sound while the floating viewer is showing. The display
+    // window's viewer does not play audio (it draws frames on a canvas), so this
+    // does not silence the floating window — it silences the pane only.
+    if (plan.floating) tab.webContents.setAudioMuted(true);
+    else if (!plan.floating) tab.webContents.setAudioMuted(audioMutedByOther);
     applySurfacePlan(tab, plan);
     // Read before write, like the resize above: `startPainting()` on a tab that is
     // already painting *provokes a paint*, and this reconciler runs every second, so
