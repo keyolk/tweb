@@ -108,7 +108,16 @@ installPrintShim();
   let pickerState = null;
   // The command palette: a fixed-position menu of actions, opened with `c`. Unlike the
   // hint picker this is a static list, not a DOM scan — see DESIGN §15.
+  // The palette is a fuzzy-search menu: type letters to filter by label, and the
+  // match runs immediately. `j`/`k` + `Enter` is the fallback when the filter
+  // leaves more than one entry. There are no keyboard-shortcut hints in the
+  // list — shortcuts like `gd`/`gh`/`b` already work from normal mode, and
+  // listing them here would only duplicate them. The palette is for actions
+  // that do not have a key: "Open in Chrome" is the reason it exists.
   let commandPaletteState = null;
+  const commandPaletteEntries = [
+    { label: "Open in Chrome", action: () => send("chrome-current") },
+  ];
   let promptHost = null;
   let searchState = null;
   // Requests still waiting for a result, and the backstop that un-hides the bar if one
@@ -3634,21 +3643,6 @@ installPrintShim();
     if (restoreMode) normalMode();
   }
 
-  // The command palette entries. A static list, not a DOM scan — see DESIGN §15.
-  // Each entry is a label, a key hint for typeahead, and an action that runs on
-  // confirm. The action is either a direct shortcut send or a mode entry call.
-  const commandPaletteEntries = [
-    { label: "Copy URL", hint: "y", action: () => send("copy-url") },
-    { label: "Open in Chrome", hint: "chrome", action: () => send("chrome-current") },
-    { label: "View source", hint: "html", action: () => send("act", { ref: ".", action: "html" }) },
-    { label: "Zoom to fit", hint: "0", action: () => send("zoom-reset") },
-    { label: "Print", hint: "print", action: () => send("print") },
-    { label: "Float", hint: "w", action: () => send("toggle-float") },
-    { label: "Tabs", hint: "b", action: () => showTabList() },
-    { label: "History", hint: "gh", action: () => showHistory() },
-    { label: "Downloads", hint: "gd", action: () => showDownloads() },
-  ];
-
   function cancelCommandPalette(restoreMode = true) {
     if (!commandPaletteState) return;
     commandPaletteState.host.remove();
@@ -3669,23 +3663,21 @@ installPrintShim();
     host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
     const shadow = host.attachShadow({ mode: "open" });
     const list = document.createElement("div");
+    // Bottom-right, above the mode indicator (which sits at bottom:0). The palette
+    // is a menu popping up in a corner, not a dialog blocking the page.
     list.style.cssText = [
-      "position:fixed", "right:8px", "bottom:8px",
-      "min-width:240px", "max-width:min(420px,calc(100vw - 24px))", "max-height:40vh", "overflow:auto",
-      "padding:3px 0", "border:1px solid #5f6368", "border-radius:6px", "background:#111e",
+      "position:fixed", "right:8px", "bottom:24px",
+      "min-width:200px", "max-width:min(380px,calc(100vw - 24px))", "max-height:30vh", "overflow:auto",
+      "padding:2px 0", "border:1px solid #5f6368", "border-radius:6px", "background:#111e",
       "box-shadow:0 4px 16px #000a", "color:#e8eaed", "font:13px/1.4 system-ui,sans-serif",
       "pointer-events:auto",
     ].join(";");
-    const items = entries.map((entry, index) => {
+    const items = entries.map((entry) => {
       const row = document.createElement("div");
-      row.style.cssText = "padding:6px 12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      row.style.cssText = "padding:5px 10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
       const labelSpan = document.createElement("span");
       labelSpan.textContent = entry.label;
-      const hintSpan = document.createElement("span");
-      hintSpan.textContent = entry.hint;
-      hintSpan.style.cssText = "float:right;color:#8ab4f8;font:12px ui-monospace,monospace";
-      row.append(labelSpan, hintSpan);
-      if (index === 0) row.style.background = "#1a3a5e";
+      row.append(labelSpan);
       // A click is a first-class confirmation, the way a context menu works.
       row.addEventListener("click", () => {
         if (!commandPaletteState) return;
@@ -3724,14 +3716,18 @@ installPrintShim();
       items[commandPaletteState.selected].row.style.background = "#1a3a5e";
       items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
     } else if (key.length === 1 && /[a-z]/i.test(key)) {
-      // Typeahead: filter by the typed character against label and hint.
+      // Fuzzy search: filter by typed characters against label. If exactly one
+      // entry matches, run it immediately and close — the palette is a menu,
+      // not a mode, so there is no "confirm" step when the filter is unambiguous.
       commandPaletteState.typed += key.toLowerCase();
-      const match = items.findIndex((item) =>
-        item.label.toLowerCase().includes(commandPaletteState.typed)
-        || item.hint.toLowerCase().includes(commandPaletteState.typed));
-      if (match >= 0) {
+      const matches = items.filter((item) =>
+        item.label.toLowerCase().includes(commandPaletteState.typed));
+      if (matches.length === 1) {
+        cancelCommandPalette(false);
+        matches[0].action();
+      } else if (matches.length > 0) {
         items[commandPaletteState.selected].row.style.background = "";
-        commandPaletteState.selected = match;
+        commandPaletteState.selected = items.indexOf(matches[0]);
         items[commandPaletteState.selected].row.style.background = "#1a3a5e";
         items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
       }
@@ -4057,6 +4053,7 @@ installPrintShim();
     if (handleInspectKey(event, key)) return;
     if (handleTabListKey(event, key)) return;
     if (handleSearchKey(event, key)) return;
+    if (commandPaletteState) return;
     if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
 
     // The keys a Chrome refugee's hands already know. `H`/`L` do the same thing and are
