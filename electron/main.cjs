@@ -4785,30 +4785,19 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   const onTab = (event, handler) => tab.on(event, scoped(handler));
   const setWindowOpenHandler = (handler) => contents.setWindowOpenHandler(scoped(handler));
   const contents = tab.webContents;
-  // A floating window takes focus from the tmux pane, so keys would not reach the
-  // pane's key handler. Forward every keydown into the hidden offscreen webContents
-  // so the page keeps working — scrolling, form input, shortcuts — while the
-  // floating viewer shows it. `w` is special: it toggles float off rather than
-  // reaching the page.
-  contents.on("before-input-event", scoped((_event, input) => {
+  // Safety net for `w` (the float toggle) that reaches this webContents directly
+  // rather than through the float-input IPC. The IPC handler is the primary path
+  // and intercepts `w` before expansion; this catches a key the tmux pane injected.
+  // No other key is forwarded from here — the IPC path relays them via
+  // sendInputEvent, and forwarding here too would re-fire before-input-event and
+  // recurse ("Invalid event object").
+  contents.on("before-input-event", scoped((event, input) => {
     if (!floatingTabs.has(tab)) return;
     if (input.type !== "keyDown") return;
     if (input.key === "w" && !input.control && !input.meta) {
+      event.preventDefault();
       toggleFloat();
-      return;
     }
-    // Forward the key into the offscreen webContents so the page sees it.
-    // The floating viewer is a canvas — it has no DOM to receive keys.
-    // `before-input-event` gives us a raw object; `sendInputEvent` needs an
-    // explicit event with the fields it expects.
-    tab.webContents.sendInputEvent({
-      type: "keyDown",
-      key: input.key,
-      code: input.code || "",
-      modifiers: input.modifiers || [],
-      autoRepeat: input.autoRepeat || false,
-      isTrusted: true,
-    });
   }));
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
@@ -5491,7 +5480,18 @@ function relayFrameToDisplay(tab, image) {
 ipcMain.on("tweb-float-input", (event, kind, data) => {
   const display = BrowserWindow.fromWebContents(event.sender);
   const tab = display && displayWindowTabs.get(display);
-  if (!tab || tab.isDestroyed()) return;
+  if (!tab || tab.isDestroyed() || !floatingTabs.has(tab)) return;
+  // `w` is the float toggle. The viewer sends it like any other key, but it must
+  // not reach the page — and because `relayInputEvents` expands it into keyDown,
+  // char, and keyUp, the keyDown would toggle float off (via before-input-event)
+  // while the char still lands in the page as a literal "w". Catch it here, before
+  // expansion, so neither the keyDown nor the trailing char is sent.
+  if (kind === "key" && String(data?.key) === "w" && !(data?.modifiers || []).some(
+    (m) => m === "control" || m === "meta",
+  )) {
+    withPaneScope(tabPanes.get(tab), () => toggleFloat());
+    return;
+  }
   withPaneScope(tabPanes.get(tab), () => {
     for (const input of relayInputEvents(kind, data)) tab.webContents.sendInputEvent(input);
   });
@@ -5597,6 +5597,18 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   const shift = modifiers.includes("shift");
   if (debugLogging && modifiers.length) {
     console.error(`tweb: key ${key} [${modifiers.join("+")}] kind=${eventKind}`);
+  }
+
+  // `w` toggles float. Intercept it here — before `dispatchNativeKey` expands it
+  // into keyDown/char/keyUp — so the char event does not leak into the page as a
+  // literal "w" after the keyDown already toggled float off. The `before-input-event`
+  // safety net catches the same key but only the keyDown; this catches the press
+  // before any of the three events is sent. Only the press matters: the release is
+  // harmless once float has toggled.
+  if (pressed && key === "w" && !control && !modifiers.includes("meta")
+      && floatingTabs.has(currentWindows().win)) {
+    toggleFloat();
+    return;
   }
 
   // Where tmux does not strip the modifiers, standard CSI-u is supported too.
