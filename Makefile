@@ -73,6 +73,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/pdf-frame.cjs
 	node --check electron/extension-policy.cjs
 	node --check electron/extensions.cjs
+	node --check electron/extension-report.cjs
 	node --check electron/float-display.cjs
 	node --check electron/float-preload.cjs
 

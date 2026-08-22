@@ -140,6 +140,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/extensions.cjs"),
     ),
     (
+        "extension-report.cjs",
+        include_str!("../../../electron/extension-report.cjs"),
+    ),
+    (
         "float-display.cjs",
         include_str!("../../../electron/float-display.cjs"),
     ),
