@@ -4057,6 +4057,7 @@ installPrintShim();
     if (handleInspectKey(event, key)) return;
     if (handleTabListKey(event, key)) return;
     if (handleSearchKey(event, key)) return;
+    if (commandPaletteState) return;
     if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
 
     // The keys a Chrome refugee's hands already know. `H`/`L` do the same thing and are
