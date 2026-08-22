@@ -4769,14 +4769,21 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   const onTab = (event, handler) => tab.on(event, scoped(handler));
   const setWindowOpenHandler = (handler) => contents.setWindowOpenHandler(scoped(handler));
   const contents = tab.webContents;
-  // A floating window takes focus from the tmux pane, so `w` (the toggle key)
-  // would not reach the pane's key handler. Catch it here and toggle back.
-  // This is after `const contents` so the reference is initialised.
+  // A floating window takes focus from the tmux pane, so keys would not reach the
+  // pane's key handler. Forward every keydown into the hidden offscreen webContents
+  // so the page keeps working — scrolling, form input, shortcuts — while the
+  // floating viewer shows it. `w` is special: it toggles float off rather than
+  // reaching the page.
   contents.on("before-input-event", scoped((_event, input) => {
     if (!floatingTabs.has(tab)) return;
-    if (input.type === "keyDown" && input.key === "w" && !input.control && !input.meta) {
+    if (input.type !== "keyDown") return;
+    if (input.key === "w" && !input.control && !input.meta) {
       toggleFloat();
+      return;
     }
+    // Forward the key into the offscreen webContents so the page sees it.
+    // The floating viewer is a canvas — it has no DOM to receive keys.
+    tab.webContents.sendInputEvent(input);
   }));
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
