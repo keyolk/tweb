@@ -3203,10 +3203,16 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       // `tmux-chrome-open` — the same wrapper `tweb chrome open` uses. It tries
       // tmux-chrome first and falls back to `open -a "Google Chrome"`, so the
       // palette and the CLI take the same path.
+      // `$BROWSER` is a shell variable the engine process may not inherit, so
+      // default to the absolute path rather than relying on PATH.
       {
         const url = contents.getURL();
         const { execFile } = require("node:child_process");
-        execFile(process.env.BROWSER || "tmux-chrome-open", [url], { stdio: "ignore" }, (error) => {
+        const path = require("node:path");
+        const os = require("node:os");
+        const browser = process.env.BROWSER
+          || path.join(os.homedir(), ".local", "bin", "tmux-chrome-open");
+        execFile(browser, [url], { stdio: "ignore" }, (error) => {
           if (error && debugLogging) console.error(`tweb: chrome-current failed: ${error.message}`);
         });
       }
