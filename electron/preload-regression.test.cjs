@@ -1926,27 +1926,31 @@ test("chrome current hands the active tab to Chrome", () => {
 // mode — it does not change the keyboard's meaning, it presents a list and runs
 // the one the user picks.
 test("command palette opens with c and lists actions", () => {
-  // The entries are a static list.
+  // The entries are a static list — only actions without a keyboard shortcut.
   assert.match(electron, /const commandPaletteEntries = \[/);
-  // Each entry has a label, a hint, and an action.
-  assert.match(electron, /\{ label: "Copy URL", hint: "y", action:/);
-  assert.match(electron, /\{ label: "Open in Chrome", hint: "", action:/);
-  assert.match(electron, /\{ label: "Float", hint: "w", action:/);
-  // Inspect and Copy text are deliberately absent — `I` already enters inspect mode
-  // from normal mode, and copy-text belongs in inspect mode (selecting a position),
-  // not in the palette (where the user has not selected anything yet).
-  assert.doesNotMatch(electron, /\{ label: "Inspect", hint: "I", action:/);
-  assert.doesNotMatch(electron, /\{ label: "Copy text", hint: "t", action:/);
+  assert.match(electron, /\{ label: "Open in Chrome", action:/);
+  // Shortcuts like Copy URL (y), Float (w), Tabs (b), History (gh), Downloads (gd),
+  // Zoom (0) are deliberately absent — they already work from normal mode, and
+  // listing them here would only duplicate them.
+  assert.doesNotMatch(electron, /\{ label: "Copy URL"/);
+  assert.doesNotMatch(electron, /\{ label: "Float"/);
+  assert.doesNotMatch(electron, /\{ label: "Tabs"/);
+  assert.doesNotMatch(electron, /\{ label: "History"/);
+  assert.doesNotMatch(electron, /\{ label: "Downloads"/);
+  assert.doesNotMatch(electron, /\{ label: "Zoom to fit"/);
   // `c` enters the palette from normal mode.
   assert.match(electron, /case "c": startCommandPalette\(\); break;/);
   // `cancelCommandPalette` is in `cancelTransient`.
   assert.match(electron, /cancelCommandPalette\(false\);/);
-  // `handleCommandPaletteKey` handles j/k/Enter/Escape and typeahead.
+  // `handleCommandPaletteKey` handles j/k/Enter/Escape and fuzzy search.
   assert.match(electron, /function handleCommandPaletteKey/);
   assert.match(electron, /key === "j" \|\| key === "ArrowDown"/);
   assert.match(electron, /key === "k" \|\| key === "ArrowUp"/);
   assert.match(electron, /key === "Enter"/);
   assert.match(electron, /key === "Escape"/);
+  // Fuzzy search: typed characters filter by label, and a single match runs immediately.
+  assert.match(electron, /commandPaletteState\.typed/);
+  assert.match(electron, /matches\[0\]\.action\(\)/);
   // A mouse click is a first-class confirmation.
   assert.match(electron, /row\.addEventListener\("click"/);
   // `emptyPickerReason` has a command entry.
