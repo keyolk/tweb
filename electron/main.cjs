@@ -2041,6 +2041,13 @@ function updatePaintingState() {
     const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held, inputState().floating);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
+    // A floating tab's audio belongs to the display window, not the pane. The pane's
+    // tab is the same webContents — it keeps playing — so mute it here to stop the
+    // pane from emitting sound while the floating viewer is showing. The display
+    // window's viewer does not play audio (it draws frames on a canvas), so this
+    // does not silence the floating window — it silences the pane only.
+    if (plan.floating) tab.webContents.setAudioMuted(true);
+    else if (!plan.floating) tab.webContents.setAudioMuted(audioMutedByOther);
     applySurfacePlan(tab, plan);
     // Read before write, like the resize above: `startPainting()` on a tab that is
     // already painting *provokes a paint*, and this reconciler runs every second, so
@@ -4762,14 +4769,21 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   const onTab = (event, handler) => tab.on(event, scoped(handler));
   const setWindowOpenHandler = (handler) => contents.setWindowOpenHandler(scoped(handler));
   const contents = tab.webContents;
-  // A floating window takes focus from the tmux pane, so `w` (the toggle key)
-  // would not reach the pane's key handler. Catch it here and toggle back.
-  // This is after `const contents` so the reference is initialised.
+  // A floating window takes focus from the tmux pane, so keys would not reach the
+  // pane's key handler. Forward every keydown into the hidden offscreen webContents
+  // so the page keeps working — scrolling, form input, shortcuts — while the
+  // floating viewer shows it. `w` is special: it toggles float off rather than
+  // reaching the page.
   contents.on("before-input-event", scoped((_event, input) => {
     if (!floatingTabs.has(tab)) return;
-    if (input.type === "keyDown" && input.key === "w" && !input.control && !input.meta) {
+    if (input.type !== "keyDown") return;
+    if (input.key === "w" && !input.control && !input.meta) {
       toggleFloat();
+      return;
     }
+    // Forward the key into the offscreen webContents so the page sees it.
+    // The floating viewer is a canvas — it has no DOM to receive keys.
+    tab.webContents.sendInputEvent(input);
   }));
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
@@ -4808,7 +4822,12 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     }
     // The dirty rect used to be discarded, so a blinking caret cost the same whole-frame
     // encode as a page load. It decides the patch path now.
-    queueFrame(tab, image, false, dirty);
+    // A floating tab's pane is not visible, so `queueFrame` would drop the frame
+    // anyway (it checks `currentPane().visible`). Skip it entirely rather than
+    // letting the offscreen paint pipeline run — the pane must not update while
+    // the display window is the surface. The viewer gets the frame from the relay
+    // below, which is a second consumer of the same paint, not a second renderer.
+    if (!floatingTabs.has(tab)) queueFrame(tab, image, false, dirty);
     // A floating tab's viewer draws the same frames. Second in line deliberately: the pane
     // is the primary surface and must not wait on the relay's JPEG encode.
     if (floatingTabs.has(tab)) relayFrameToDisplay(tab, image);
