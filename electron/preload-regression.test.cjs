@@ -1930,7 +1930,7 @@ test("command palette opens with c and lists actions", () => {
   assert.match(electron, /const commandPaletteEntries = \[/);
   // Each entry has a label, a hint, and an action.
   assert.match(electron, /\{ label: "Copy URL", hint: "y", action:/);
-  assert.match(electron, /\{ label: "Open in Chrome", hint: "chrome", action:/);
+  assert.match(electron, /\{ label: "Open in Chrome", hint: "", action:/);
   assert.match(electron, /\{ label: "Float", hint: "w", action:/);
   // Inspect and Copy text are deliberately absent — `I` already enters inspect mode
   // from normal mode, and copy-text belongs in inspect mode (selecting a position),

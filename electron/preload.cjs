@@ -3639,10 +3639,10 @@ installPrintShim();
   // confirm. The action is either a direct shortcut send or a mode entry call.
   const commandPaletteEntries = [
     { label: "Copy URL", hint: "y", action: () => send("copy-url") },
-    { label: "Open in Chrome", hint: "chrome", action: () => send("chrome-current") },
-    { label: "View source", hint: "html", action: () => send("act", { ref: ".", action: "html" }) },
+    { label: "Open in Chrome", hint: "", action: () => send("chrome-current") },
+    { label: "View source", hint: "", action: () => send("act", { ref: ".", action: "html" }) },
     { label: "Zoom to fit", hint: "0", action: () => send("zoom-reset") },
-    { label: "Print", hint: "print", action: () => send("print") },
+    { label: "Print", hint: "", action: () => send("print") },
     { label: "Float", hint: "w", action: () => send("toggle-float") },
     { label: "Tabs", hint: "b", action: () => showTabList() },
     { label: "History", hint: "gh", action: () => showHistory() },
@@ -3682,8 +3682,19 @@ installPrintShim();
       const labelSpan = document.createElement("span");
       labelSpan.textContent = entry.label;
       const hintSpan = document.createElement("span");
-      hintSpan.textContent = entry.hint;
-      hintSpan.style.cssText = "float:right;color:#8ab4f8;font:12px ui-monospace,monospace";
+      hintSpan.textContent = `→ ${entry.hint}`;
+      // A text span inside shadow DOM does not render to Kitty graphics — shadow
+      // content is not part of the terminal's cell grid. A bordered box does,
+      // the same way the hint picker's badge does: it is a background + border that
+      // composites onto the pane, not text the terminal reflows. The `→ ` prefix
+      // and inline (not float) placement make it read as "this entry's key is …"
+      // rather than a mysterious token floating off to the right.
+      // Entries without a keyboard shortcut (Open in Chrome, View source, Print)
+      // have an empty hint — hide the box so they do not look like they have
+      // a key when they do not.
+      hintSpan.style.cssText = entry.hint
+        ? "margin-left:8px;padding:1px 5px;border:1px solid #2a4a6e;border-radius:3px;background:#0d1f3d;color:#8ab4f8;font:11px ui-monospace,monospace"
+        : "display:none";
       row.append(labelSpan, hintSpan);
       if (index === 0) row.style.background = "#1a3a5e";
       // A click is a first-class confirmation, the way a context menu works.
@@ -4057,6 +4068,7 @@ installPrintShim();
     if (handleInspectKey(event, key)) return;
     if (handleTabListKey(event, key)) return;
     if (handleSearchKey(event, key)) return;
+    if (commandPaletteState) return;
     if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
 
     // The keys a Chrome refugee's hands already know. `H`/`L` do the same thing and are
