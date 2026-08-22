@@ -1969,6 +1969,31 @@ test("dispatchNamedKey intercepts w during float before native dispatch", () => 
   assert.match(fn, /toggleFloat\(\)/);
 });
 
+// Floating takes OS focus (the viewer window) and tmux selection (the pane may
+// be in a different session/window than what the client is currently viewing).
+// Neither is restored automatically when the viewer closes. `restoreFocusFromFloat`
+// does both: `tmux select-window` + `select-pane` for tmux, `app.hide()` for OS.
+test("float end restores tmux selection and OS focus", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // The restore function exists and targets the pane's live placement.
+  assert.match(main, /function restoreFocusFromFloat\(\)/);
+  assert.match(main, /select-window.*-t.*placement\.windowId/);
+  assert.match(main, /select-pane.*-t.*placement\.paneId/);
+  assert.match(main, /app\.hide\(\)/);
+  // Called from both float-off paths: the updatePaintingState branch and the
+  // viewer's closed handler.
+  const paintBranch = main.slice(
+    main.indexOf("} else if (floatingTabs.has(tab))"),
+    main.indexOf("const size = tab.getContentSize()"),
+  );
+  assert.match(paintBranch, /restoreFocusFromFloat\(\)/);
+  const closedHandler = main.slice(
+    main.indexOf('display.on("closed"'),
+    main.indexOf("function closeDisplayWindow"),
+  );
+  assert.match(closedHandler, /restoreFocusFromFloat\(\)/);
+});
+
 // `tweb chrome current` hands the current tab's URL to Chrome, without the user
 // having to copy it. It calls `status` to get the URL, then `chrome::open`.
 test("chrome current hands the active tab to Chrome", () => {

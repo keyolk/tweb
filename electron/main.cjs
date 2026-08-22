@@ -2101,6 +2101,7 @@ function applySurfacePlan(tab, plan) {
     floatingTabs.delete(tab);
     closeDisplayWindow(tab);
     keepWindowHidden(tab);
+    restoreFocusFromFloat();
   }
   const size = tab.getContentSize();
   const current = { width: size[0], height: size[1] };
@@ -3102,6 +3103,38 @@ function toggleFloat() {
   const state = inputState();
   state.floating = !state.floating;
   updatePaintingState();
+}
+
+// Returns focus to the tmux pane after floating ends. Two layers must be
+// restored, and neither is automatic:
+//
+//   OS focus — the viewer window took it when it showed. Closing the window
+//   does NOT hand it back on macOS; the terminal stays behind whatever app
+//   was next in the MRU order. `app.hide()` withdraws this process so the
+//   terminal receives focus again.
+//
+//   tmux selection — the pane may have been in a different session/window than
+//   the one the user is currently viewing. `select-window` + `select-pane`
+//   puts the tmux client back where it was when float started.
+//
+// `vis().placement` carries the live session/window/pane the pane occupies, so
+// no snapshot is needed at float-start time: the pane does not move while it is
+// floating (it has no UI to trigger a break-pane from), and a hosted pane's
+// placement arrives over its own connection.
+function restoreFocusFromFloat() {
+  const placement = vis().placement;
+  if (placement?.paneId) {
+    // select-window before select-pane: the pane must be in a visible window
+    // for the client to land on it.
+    if (placement.windowId) {
+      execFile("tmux", ["select-window", "-t", placement.windowId], { timeout: 1000, stdio: "ignore" }, () => {});
+    }
+    execFile("tmux", ["select-pane", "-t", placement.paneId], { timeout: 1000, stdio: "ignore" }, () => {});
+  }
+  // Withdraw this process so the terminal — the app the user launched tweb
+  // from — receives OS focus. Without this the floating viewer is gone but
+  // focus stays with this Electron process, invisible and inactive.
+  app.hide();
 }
 
 
@@ -5441,6 +5474,7 @@ function openDisplayWindow(tab, plan) {
     inputState().floating = false;
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
+    restoreFocusFromFloat();
   }));
 }
 
