@@ -1994,6 +1994,21 @@ test("float end restores tmux selection and OS focus", () => {
   assert.match(closedHandler, /restoreFocusFromFloat\(\)/);
 });
 
+// Floating is the active tab's toggle, not every tab's. `inputState().floating` is a
+// pane-level flag, and `updatePaintingState` iterates all tabs — passing it
+// unconditionally opened a display window per tab, so a pane with two tabs showed
+// two viewer windows on float. Only the active tab (=== currentWindows().win) gets
+// floating=true in surfacePlan; background tabs paint only when the pane is visible.
+test("floating applies to the active tab only, not every tab", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const fn = main.slice(
+    main.indexOf("function updatePaintingState"),
+    main.indexOf("function readIsPainting"),
+  );
+  // The floating flag is gated on the tab being the active one.
+  assert.match(fn, /isActiveTab\(tab\) && inputState\(\)\.floating/);
+});
+
 // `tweb chrome current` hands the current tab's URL to Chrome, without the user
 // having to copy it. It calls `status` to get the URL, then `chrome::open`.
 test("chrome current hands the active tab to Chrome", () => {

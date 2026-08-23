@@ -2036,9 +2036,14 @@ function updatePaintingState() {
   // the cache is empty, which is the same path a resize generation bump takes.
   if (!currentPane().visible) tabFrames.clear();
   const held = surfaceHeldForAgent();
+  const isActiveTab = (tab) => tab === currentWindows().win;
   for (const tab of currentWindows().tabs) {
     if (tab.isDestroyed()) continue;
-    const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held, inputState().floating);
+    // Floating applies to the active tab only — `inputState().floating` is a pane-level
+    // toggle, and passing it for every tab opened a display window per tab. A non-active
+    // tab has no viewer and no user looking at it, so it paints only when the pane is visible.
+    const floating = isActiveTab(tab) && inputState().floating;
+    const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logicalContentSize(currentViewport()), held, floating);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
     // A floating tab's audio should keep playing — the display window's viewer draws
@@ -5186,7 +5191,10 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
     // resize is exactly when a hidden pane is most likely to be resized.
     for (const tab of currentWindows().tabs) {
       if (tab.isDestroyed()) continue;
-      applySurfacePlan(tab, surfacePlan(tab === currentWindows().win, record.visible, logical, surfaceHeldForAgent(), inputState().floating));
+      const isActive = tab === currentWindows().win;
+      // Same reason as updatePaintingState: floating is the active tab's toggle, not
+      // every tab's. Passing it unconditionally opened a display window per tab on resize.
+      applySurfacePlan(tab, surfacePlan(isActive, record.visible, logical, surfaceHeldForAgent(), isActive && inputState().floating));
     }
   }
   currentWindows().win?.webContents.invalidate();
