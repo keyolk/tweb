@@ -3153,6 +3153,11 @@ function toggleFloat(fullscreen = false) {
   if (!state.floating) fullscreenSize = null;
   updatePaintingState();
   updatePaneTitle();
+  // Tell the preload so it can show the floating/fullscreen state in the indicator.
+  sendToMainTabFrame(currentWindows().win, "tweb-float-state", {
+    floating: state.floating,
+    fullscreen: fullscreenFloat,
+  });
   // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
   // would only withdraw the terminal that already has it. tmux selection still
   // needs restoring — the client may have wandered to another window.
@@ -5588,6 +5593,7 @@ function openDisplayWindow(tab, plan) {
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
     updatePaneTitle();
+    sendToMainTabFrame(tab, "tweb-float-state", { floating: false, fullscreen: false });
     restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
 }
