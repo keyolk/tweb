@@ -2023,7 +2023,11 @@ test("command palette has a Fullscreen action that toggle-fullscreen dispatches"
   // If already floating, it flips fullscreen on the existing viewer.
   assert.match(main, /display\.setFullScreen\(!display\.isFullScreen\(\)\)/);
   // openDisplayWindow enters fullscreen after show when fullscreenFloat is set.
-  assert.match(main, /if \(fullscreenFloat\) display\.setFullScreen\(true\)/);
+  assert.match(main, /if \(fullscreenFloat\) \{/);
+  assert.match(main, /display\.setFullScreen\(true\)/);
+  // Fullscreen resizes the offscreen tab to the screen's resolution once the
+  // macOS fullscreen animation finishes, so frames are not stretched.
+  assert.match(main, /enter-full-screen/);
   // Fullscreen picks a different display than the terminal's so the terminal stays
   // visible. Falls back to the same display when there is only one monitor.
   assert.match(main, /others\.length > 0\) anchor = others\[0\]/);

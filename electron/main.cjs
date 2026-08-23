@@ -5491,7 +5491,22 @@ function openDisplayWindow(tab, plan) {
     display.show();
     // Fullscreen is set after show: macOS enters fullscreen from a visible window,
     // and setting it before show leaves a blank frame on the desktop briefly.
-    if (fullscreenFloat) display.setFullScreen(true);
+    if (fullscreenFloat) {
+      display.setFullScreen(true);
+      // macOS fullscreen is an animation — the window's content size settles only after
+      // `enter-full-screen`. The viewer's `resize` event fires then and drives
+      // `tweb-float-resized`, which resizes the offscreen tab to match. But the event
+      // can race the IPC, so we also nudge the page size here once the transition ends.
+      display.once("enter-full-screen", () => {
+        if (display.isDestroyed() || tab.isDestroyed()) return;
+        const [w, h] = display.getContentSize();
+        withPaneScope(tabPanes.get(tab), () => {
+          tab.setContentSize(Math.max(1, w), Math.max(1, h));
+          sendDisplayPageSize(tab);
+          tab.webContents.invalidate();
+        });
+      });
+    }
     sendDisplayPageSize(tab);
     // Nothing may have changed on the page since the last paint, and the viewer starts
     // blank — so the first frame is asked for rather than waited for.
