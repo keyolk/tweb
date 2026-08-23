@@ -2872,7 +2872,12 @@ function closeTab(index = currentWindows().activeTabIndex) {
     if (currentWindows().closedTabs.length > 25) currentWindows().closedTabs.shift();
   }
   if (currentWindows().tabs.length === 1) {
-    app.quit();
+    // A per-pane engine serves exactly one pane, so its last tab IS the last tab and quitting
+    // is right. A host serving several panes must NOT quit the process — that takes every
+    // other pane down too. Close just this pane instead; the `closed` handler's "last tab"
+    // branch already does the same, but this path reaches app.quit() first.
+    if (hostedRuntime && paneRegistry.size > 1) closePane(currentPane(), "last tab closed");
+    else app.quit();
     return;
   }
   tab.close();
