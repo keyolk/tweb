@@ -2003,9 +2003,30 @@ function scheduleWindowSessionSave() {
 
 function updatePaneTitle() {
   if (!ownTmuxPane) return;
+  // The pane title is the one place tmux itself shows what a pane is doing —
+  // `tmux list-panes`, the status line, and `#{pane_title}` all read it. So it
+  // carries the state the user needs to see without switching to the pane:
+  //
+  //   tweb              — a page is loaded
+  //   tweb:blank        — about:blank, no page yet
+  //   tweb:float        — floating mode, page in an OS window
+  //   tweb:fullscreen   — floating + fullscreen on another monitor
+  //
   // Tab state belongs to this pane's in-page badge. Putting it in tmux's pane
   // title makes one active pane look like the state of the whole window.
-  execFile("tmux", ["select-pane", "-t", ownTmuxPane, "-T", "tweb"], () => {});
+  let label = "tweb";
+  const tab = currentWindows().win;
+  if (tab && !tab.isDestroyed()) {
+    const url = tab.webContents.getURL();
+    if (!url || url === "about:blank") {
+      label = "tweb:blank";
+    } else if (fullscreenFloat) {
+      label = "tweb:fullscreen";
+    } else if (inputState().floating) {
+      label = "tweb:float";
+    }
+  }
+  execFile("tmux", ["select-pane", "-t", ownTmuxPane, "-T", label], () => {});
 }
 
 function restorePaneTitle() {
@@ -2043,7 +2064,11 @@ function updatePaintingState() {
     // toggle, and passing it for every tab opened a display window per tab. A non-active
     // tab has no viewer and no user looking at it, so it paints only when the pane is visible.
     const floating = isActiveTab(tab) && inputState().floating;
-    const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logicalContentSize(currentViewport()), held, floating);
+    // Fullscreen float uses the fullscreen display's size, not the pane's — the watchdog
+    // runs every second and would otherwise resize the tab back to the pane, clobbering
+    // the fullscreen resolution the viewer is showing.
+    const logical = (floating && fullscreenFloat && fullscreenSize) ? fullscreenSize : logicalContentSize(currentViewport());
+    const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logical, held, floating);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
     // A floating tab's audio should keep playing — the display window's viewer draws
@@ -3110,12 +3135,19 @@ function sendTabState(tab = currentWindows().win) {
 // `fullscreen` opens the viewer in OS fullscreen instead of a centered window.
 // It only applies when turning floating ON; turning OFF clears it regardless.
 let fullscreenFloat = false;
+// The fullscreen display's content size, captured once the macOS fullscreen animation
+// finishes. `updatePaintingState` runs every second from the watchdog and would
+// otherwise resize the offscreen tab back to the pane's size, clobbering the
+// fullscreen resolution.
+let fullscreenSize = null;
 function toggleFloat(fullscreen = false) {
   const state = inputState();
   const wasFullscreen = fullscreenFloat;
   state.floating = !state.floating;
   fullscreenFloat = state.floating ? fullscreen : false;
+  if (!state.floating) fullscreenSize = null;
   updatePaintingState();
+  updatePaneTitle();
   // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
   // would only withdraw the terminal that already has it. tmux selection still
   // needs restoring — the client may have wandered to another window.
@@ -5217,9 +5249,13 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
     for (const tab of currentWindows().tabs) {
       if (tab.isDestroyed()) continue;
       const isActive = tab === currentWindows().win;
+      const isFloating = isActive && inputState().floating;
       // Same reason as updatePaintingState: floating is the active tab's toggle, not
       // every tab's. Passing it unconditionally opened a display window per tab on resize.
-      applySurfacePlan(tab, surfacePlan(isActive, record.visible, logical, surfaceHeldForAgent(), isActive && inputState().floating));
+      // Fullscreen float uses the fullscreen display's size so the pane resize does not
+      // clobber the fullscreen resolution.
+      const resizeLogical = (isFloating && fullscreenFloat && fullscreenSize) ? fullscreenSize : logical;
+      applySurfacePlan(tab, surfacePlan(isActive, record.visible, resizeLogical, surfaceHeldForAgent(), isFloating));
     }
   }
   currentWindows().win?.webContents.invalidate();
@@ -5510,11 +5546,16 @@ function openDisplayWindow(tab, plan) {
       display.once("enter-full-screen", () => {
         if (display.isDestroyed() || tab.isDestroyed()) return;
         const [w, h] = display.getContentSize();
+        fullscreenSize = { width: w, height: h };
         withPaneScope(tabPanes.get(tab), () => {
           tab.setContentSize(Math.max(1, w), Math.max(1, h));
           sendDisplayPageSize(tab);
           tab.webContents.invalidate();
         });
+        // setFullScreen can steal OS focus even after showInactive. Blur the viewer
+        // so macOS hands focus back to the terminal — the user is still driving it.
+        display.blur();
+        updatePaneTitle();
       });
     } else {
       display.show();
@@ -5538,8 +5579,10 @@ function openDisplayWindow(tab, plan) {
     inputState().floating = false;
     const wasFullscreen = fullscreenFloat;
     fullscreenFloat = false;
+    fullscreenSize = null;
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
+    updatePaneTitle();
     restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
 }
