@@ -2021,18 +2021,24 @@ test("floating applies to the active tab only, not every tab", () => {
 });
 
 // When floating, the page leaves the terminal pane — the user sees the bare terminal,
-// not the page. A `tmux display-message` on the pane tells them where it went and how
-// to get it back, so an empty pane is not mistaken for a broken one.
-test("float toggle shows status message in the terminal", () => {
+// not the page. A full-screen centered overlay in the terminal tells them where the page
+// went and how to get it back, so an empty pane is not mistaken for a broken one.
+test("float toggle shows status overlay in the terminal", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const fn = main.slice(
     main.indexOf("function toggleFloat"),
     main.indexOf("function restoreFocusFromFloat"),
   );
-  // display-message is called with the float/fullscreen label on the pane's own tmux id.
-  assert.match(fn, /display-message.*-t.*ownTmuxPane/);
-  assert.match(fn, /FLOATING/);
-  assert.match(fn, /FULLSCREEN/);
+  // The main process sends tweb-float-state to the preload so it can render the overlay.
+  assert.match(fn, /sendToMainTabFrame.*tweb-float-state/);
+  assert.match(fn, /floating.*fullscreen/);
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  // The preload renders a centered overlay with the float/fullscreen label.
+  assert.match(preload, /function renderFloatOverlay/);
+  assert.match(preload, /FULLSCREEN/);
+  assert.match(preload, /FLOATING/);
+  // The overlay is removed when the page is pinned back.
+  assert.match(preload, /floatOverlayHost\.remove/);
 });
 
 // The command palette's "Fullscreen" action opens the float viewer in OS fullscreen.

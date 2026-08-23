@@ -3153,15 +3153,13 @@ function toggleFloat(fullscreen = false) {
   if (!state.floating) fullscreenSize = null;
   updatePaintingState();
   updatePaneTitle();
-  // Show the float state in the terminal itself — the page is gone from the pane, so the
-  // user sees the bare terminal instead of the page. A centered message tells them
-  // where it went and how to get it back. `display-message` puts it on the status line,
-  // which is the one place every tmux user looks at without switching panes.
-  if (ownTmuxPane) {
-    const label = fullscreenFloat ? "FULLSCREEN — page on another monitor"
-      : "FLOATING — page in an OS window";
-    execFile("tmux", ["display-message", "-d", "0", "-t", ownTmuxPane, label], { timeout: 1000, stdio: "ignore" }, () => {});
-  }
+  // Tell the preload so it can show the floating/fullscreen state as a centered
+  // overlay in the terminal — the page is gone from the pane, so the user sees the
+  // bare terminal. The overlay tells them where it went and how to get it back.
+  sendToMainTabFrame(currentWindows().win, "tweb-float-state", {
+    floating: state.floating,
+    fullscreen: fullscreenFloat,
+  });
   // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
   // would only withdraw the terminal that already has it. tmux selection still
   // needs restoring — the client may have wandered to another window.
@@ -5597,6 +5595,7 @@ function openDisplayWindow(tab, plan) {
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
     updatePaneTitle();
+    sendToMainTabFrame(tab, "tweb-float-state", { floating: false, fullscreen: false });
     restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
 }
