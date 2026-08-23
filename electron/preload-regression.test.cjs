@@ -620,7 +620,11 @@ test("each pane owns an interactive tab badge instead of publishing tabs in tmux
   assert.match(main, /function activateTab\(index\)[\s\S]*sendTabState\(\)/);
   const paneTitle = main.slice(main.indexOf("function updatePaneTitle()"),
     main.indexOf("function restorePaneTitle()"));
-  assert.match(paneTitle, /"-T", "tweb"/);
+  // The pane title now reflects the pane's state: tweb, tweb:blank, tweb:float, tweb:fullscreen.
+  assert.match(paneTitle, /"-T", label/);
+  assert.match(paneTitle, /tweb:blank/);
+  assert.match(paneTitle, /tweb:fullscreen/);
+  assert.match(paneTitle, /tweb:float/);
   assert.doesNotMatch(paneTitle, /tabLabel|activeTabIndex/);
 
   const tauriBrowser = fs.readFileSync(path.join(root,

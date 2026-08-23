@@ -2003,9 +2003,30 @@ function scheduleWindowSessionSave() {
 
 function updatePaneTitle() {
   if (!ownTmuxPane) return;
+  // The pane title is the one place tmux itself shows what a pane is doing —
+  // `tmux list-panes`, the status line, and `#{pane_title}` all read it. So it
+  // carries the state the user needs to see without switching to the pane:
+  //
+  //   tweb              — a page is loaded
+  //   tweb:blank        — about:blank, no page yet
+  //   tweb:float        — floating mode, page in an OS window
+  //   tweb:fullscreen   — floating + fullscreen on another monitor
+  //
   // Tab state belongs to this pane's in-page badge. Putting it in tmux's pane
   // title makes one active pane look like the state of the whole window.
-  execFile("tmux", ["select-pane", "-t", ownTmuxPane, "-T", "tweb"], () => {});
+  let label = "tweb";
+  const tab = currentWindows().win;
+  if (tab && !tab.isDestroyed()) {
+    const url = tab.webContents.getURL();
+    if (!url || url === "about:blank") {
+      label = "tweb:blank";
+    } else if (fullscreenFloat) {
+      label = "tweb:fullscreen";
+    } else if (inputState().floating) {
+      label = "tweb:float";
+    }
+  }
+  execFile("tmux", ["select-pane", "-t", ownTmuxPane, "-T", label], () => {});
 }
 
 function restorePaneTitle() {
@@ -3126,6 +3147,7 @@ function toggleFloat(fullscreen = false) {
   fullscreenFloat = state.floating ? fullscreen : false;
   if (!state.floating) fullscreenSize = null;
   updatePaintingState();
+  updatePaneTitle();
   // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
   // would only withdraw the terminal that already has it. tmux selection still
   // needs restoring — the client may have wandered to another window.
@@ -5533,6 +5555,7 @@ function openDisplayWindow(tab, plan) {
         // setFullScreen can steal OS focus even after showInactive. Blur the viewer
         // so macOS hands focus back to the terminal — the user is still driving it.
         display.blur();
+        updatePaneTitle();
       });
     } else {
       display.show();
@@ -5559,6 +5582,7 @@ function openDisplayWindow(tab, plan) {
     fullscreenSize = null;
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
+    updatePaneTitle();
     restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
 }
