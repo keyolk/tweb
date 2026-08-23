@@ -10,6 +10,10 @@ Ghostty / Kitty
     └── TWeb browser pane
 ```
 
+## Demo
+
+![TWeb float mode demo](media/tweb-float-demo.gif)
+
 ## Core principles
 
 - **tmux-native**: tmux is the authority for sessions, windows, panes, resize, focus and lifecycle.
@@ -17,10 +21,6 @@ Ghostty / Kitty
 - **Browser mode**: input ownership is split between tmux shortcuts and browser shortcuts, per client mode.
 - **Shared browser profile**: every browser pane shares one persistent Chromium profile — cookies, storage and history are the same across panes and across restarts.
 - **Agent control on the user's own screen**: an agent drives the very page the user is looking at, over a per-pane unix socket, with no separate headless session.
-
-## Demo
-
-![TWeb float mode demo](media/tweb-float-demo.gif)
 
 Read the [Status](#status) section before switching to TWeb as a daily browser. It states what runs,
 what is broken today, and which Chrome behaviours are deliberately not attempted.
