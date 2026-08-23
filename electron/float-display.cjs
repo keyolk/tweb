@@ -48,6 +48,7 @@ function displayWindowOptions(bounds, preloadPath) {
     resizable: true,
     movable: true,
     focusable: true,
+    fullscreenable: true,
     // The viewer is chrome for a page the user is actively looking at, and Chromium
     // throttles an unfocused window's timers and rAF. That throttle ate the resize the
     // viewer reports back: measured by resizing the window twice while the terminal held

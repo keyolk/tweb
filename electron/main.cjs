@@ -3104,9 +3104,14 @@ function sendTabState(tab = currentWindows().win) {
 // Sends the `float` or `pin` agent RPC, which flips `inputState().floating` and
 // re-runs `updatePaintingState`. The same webContents is redirected, so the
 // page state carries over — this is a view toggle, not a session toggle.
-function toggleFloat() {
+//
+// `fullscreen` opens the viewer in OS fullscreen instead of a centered window.
+// It only applies when turning floating ON; turning OFF clears it regardless.
+let fullscreenFloat = false;
+function toggleFloat(fullscreen = false) {
   const state = inputState();
   state.floating = !state.floating;
+  fullscreenFloat = state.floating ? fullscreen : false;
   updatePaintingState();
 }
 
@@ -3144,8 +3149,19 @@ function restoreFocusFromFloat() {
 
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  // `toggle-float` is a view toggle, not a browser shortcut — it works regardless of vimium mode.
+  // `toggle-float` and `toggle-fullscreen` are view toggles, not browser shortcuts —
+  // they work regardless of vimium mode.
   if (action === "toggle-float") { toggleFloat(); return; }
+  if (action === "toggle-fullscreen") {
+    // If already floating, just flip fullscreen on the existing viewer.
+    if (inputState().floating) {
+      const display = displayWindows.get(currentWindows().win);
+      if (display && !display.isDestroyed()) display.setFullScreen(!display.isFullScreen());
+    } else {
+      toggleFloat(true);
+    }
+    return;
+  }
   if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
@@ -5463,6 +5479,9 @@ function openDisplayWindow(tab, plan) {
   display.loadFile(path.join(__dirname, "float-viewer.html")).then(() => {
     if (display.isDestroyed()) return;
     display.show();
+    // Fullscreen is set after show: macOS enters fullscreen from a visible window,
+    // and setting it before show leaves a blank frame on the desktop briefly.
+    if (fullscreenFloat) display.setFullScreen(true);
     sendDisplayPageSize(tab);
     // Nothing may have changed on the page since the last paint, and the viewer starts
     // blank — so the first frame is asked for rather than waited for.
@@ -5480,6 +5499,7 @@ function openDisplayWindow(tab, plan) {
     if (!floatingTabs.has(tab)) return;
     floatingTabs.delete(tab);
     inputState().floating = false;
+    fullscreenFloat = false;
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
     restoreFocusFromFloat();

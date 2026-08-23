@@ -1907,7 +1907,7 @@ test("w key toggles floating mode from the browser", () => {
   assert.match(electron, /case "w": send\("toggle-float"\)/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "toggle-float": toggleFloat\(\)/);
-  assert.match(main, /function toggleFloat\(\)/);
+  assert.match(main, /function toggleFloat\(fullscreen = false\)/);
   assert.match(main, /state\.floating = !state\.floating/);
 });
 
@@ -2007,6 +2007,23 @@ test("floating applies to the active tab only, not every tab", () => {
   );
   // The floating flag is gated on the tab being the active one.
   assert.match(fn, /isActiveTab\(tab\) && inputState\(\)\.floating/);
+});
+
+// The command palette's "Fullscreen" action opens the float viewer in OS fullscreen.
+// It goes through the same toggleFloat path but passes fullscreen=true, which makes
+// openDisplayWindow call setFullScreen(true) after show.
+test("command palette has a Fullscreen action that toggle-fullscreen dispatches", () => {
+  const electron = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  assert.match(electron, /\{ label: "Fullscreen", action: \(\) => send\("toggle-fullscreen"\) \}/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // handleNativeShortcut handles toggle-fullscreen before the vimium gate.
+  assert.match(main, /action === "toggle-fullscreen"/);
+  // If not already floating, it turns float on with fullscreen.
+  assert.match(main, /toggleFloat\(true\)/);
+  // If already floating, it flips fullscreen on the existing viewer.
+  assert.match(main, /display\.setFullScreen\(!display\.isFullScreen\(\)\)/);
+  // openDisplayWindow enters fullscreen after show when fullscreenFloat is set.
+  assert.match(main, /if \(fullscreenFloat\) display\.setFullScreen\(true\)/);
 });
 
 // `tweb chrome current` hands the current tab's URL to Chrome, without the user
