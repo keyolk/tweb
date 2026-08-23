@@ -5016,9 +5016,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
   };
-  onContents("did-navigate", (_event, url) => recordNavigation(url));
+  onContents("did-navigate", (_event, url) => { recordNavigation(url); updatePaneTitle(); });
   onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
-    if (isMainFrame) recordNavigation(url);
+    if (isMainFrame) { recordNavigation(url); updatePaneTitle(); }
   });
 
   let initialZoomApplied = false;
