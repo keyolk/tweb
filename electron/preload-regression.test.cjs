@@ -2020,6 +2020,21 @@ test("floating applies to the active tab only, not every tab", () => {
   assert.match(fn, /isActiveTab\(tab\) && inputState\(\)\.floating/);
 });
 
+// When floating, the page leaves the terminal pane — the user sees the bare terminal,
+// not the page. A `tmux display-message` on the pane tells them where it went and how
+// to get it back, so an empty pane is not mistaken for a broken one.
+test("float toggle shows status message in the terminal", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const fn = main.slice(
+    main.indexOf("function toggleFloat"),
+    main.indexOf("function restoreFocusFromFloat"),
+  );
+  // display-message is called with the float/fullscreen label on the pane's own tmux id.
+  assert.match(fn, /display-message.*-t.*ownTmuxPane/);
+  assert.match(fn, /FLOATING/);
+  assert.match(fn, /FULLSCREEN/);
+});
+
 // The command palette's "Fullscreen" action opens the float viewer in OS fullscreen.
 // It goes through the same toggleFloat path but passes fullscreen=true, which makes
 // openDisplayWindow call setFullScreen(true) after show.

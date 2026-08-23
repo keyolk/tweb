@@ -152,7 +152,6 @@ installPrintShim();
   let tabPopoverTimer = null;
   let indicatorMode = "normal";
   let indicatorDetail = "";
-  let floatState = { floating: false, fullscreen: false };
   let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "New tab" }] };
   let lastSearch = "";
 
@@ -643,16 +642,8 @@ installPrintShim();
     if (!topFrame) return;
     ensureIndicator();
     const short = modeLabels[indicatorMode] || indicatorMode.slice(0, 1).toUpperCase();
-    // Floating/fullscreen appends a marker to the mode label so the user can see
-    // the pane's state without switching to it. ⛶ for float, ⛶ for fullscreen —
-    // the pane is still driven from the terminal, the page is just shown elsewhere.
-    const floatMarker = floatState.fullscreen ? "⛶"
-      : floatState.floating ? "◳"
-      : "";
-    indicatorLabel.textContent = floatMarker
-      ? (indicatorDetail ? `${short} ${floatMarker} ${indicatorDetail}` : `${short} ${floatMarker}`)
-      : (indicatorDetail ? `${short} ${indicatorDetail}` : short);
-    indicatorLabel.title = `TWeb ${indicatorMode}${floatState.fullscreen ? " (fullscreen)" : floatState.floating ? " (float)" : ""}${indicatorDetail ? ` — ${indicatorDetail}` : ""}`;
+    indicatorLabel.textContent = indicatorDetail ? `${short} ${indicatorDetail}` : short;
+    indicatorLabel.title = `TWeb ${indicatorMode}${indicatorDetail ? ` — ${indicatorDetail}` : ""}`;
     indicatorLabel.style.color = indicatorMode === "normal" ? "#8ab4f8"
       : indicatorMode === "insert" ? "#81c995"
       : "#fdd663";
@@ -4252,11 +4243,6 @@ installPrintShim();
 
   ipcRenderer.on("tweb-audio-state", (_event, state) => {
     audioState = { muted: Boolean(state?.muted), owner: state?.owner || null };
-    renderIndicator();
-  });
-
-  ipcRenderer.on("tweb-float-state", (_event, state) => {
-    floatState = { floating: Boolean(state?.floating), fullscreen: Boolean(state?.fullscreen) };
     renderIndicator();
   });
 
