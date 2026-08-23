@@ -2024,6 +2024,9 @@ test("command palette has a Fullscreen action that toggle-fullscreen dispatches"
   assert.match(main, /display\.setFullScreen\(!display\.isFullScreen\(\)\)/);
   // openDisplayWindow enters fullscreen after show when fullscreenFloat is set.
   assert.match(main, /if \(fullscreenFloat\) display\.setFullScreen\(true\)/);
+  // Fullscreen picks a different display than the terminal's so the terminal stays
+  // visible. Falls back to the same display when there is only one monitor.
+  assert.match(main, /others\.length > 0\) anchor = others\[0\]/);
 });
 
 // `tweb chrome current` hands the current tab's URL to Chrome, without the user

@@ -5464,7 +5464,17 @@ function isDisplayWindow(window) {
 /// sends input back. The tab's own window is never shown — see `applySurfacePlan`.
 function openDisplayWindow(tab, plan) {
   if (displayWindows.has(tab)) return;
-  const anchor = screen.getDisplayMatching(tab.getBounds());
+  // The offscreen tab sits at (-10000, -10000), so getDisplayMatching returns the
+  // display the terminal is on — the right anchor for a centered float window, but
+  // the WRONG one for fullscreen: fullscreen should take a different monitor so the
+  // terminal stays visible. If there is no other monitor (single display), the same
+  // one is used — the user explicitly asked for that case to just enlarge.
+  const terminalDisplay = screen.getDisplayMatching(tab.getBounds());
+  let anchor = terminalDisplay;
+  if (fullscreenFloat) {
+    const others = screen.getAllDisplays().filter((d) => d.id !== terminalDisplay.id);
+    if (others.length > 0) anchor = others[0];
+  }
   const bounds = centeredDisplayBounds(anchor.bounds, plan.width, plan.height);
   let display;
   creatingDisplayWindow = true;
