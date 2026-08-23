@@ -10,6 +10,18 @@ Ghostty / Kitty
     └── TWeb browser pane
 ```
 
+## Demo
+
+![TWeb float mode demo](media/tweb-float-demo.gif)
+
+## Features
+
+- **Floating mode** — press `w` to detach the page into an OS desktop window. Fullscreen via the command palette takes another monitor while the terminal stays operational.
+- **Command palette** — press `c` for a fuzzy-search menu of actions: Open in Chrome, Fullscreen, and more.
+- **Agent control** — drive the page from a CLI or MCP agent over a per-pane unix socket, on the same screen the user is watching.
+
+See [docs/FEATURES.md](docs/FEATURES.md) for details.
+
 ## Core principles
 
 - **tmux-native**: tmux is the authority for sessions, windows, panes, resize, focus and lifecycle.

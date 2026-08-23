@@ -117,6 +117,7 @@ installPrintShim();
   let commandPaletteState = null;
   const commandPaletteEntries = [
     { label: "Open in Chrome", action: () => send("chrome-current") },
+    { label: "Fullscreen", action: () => send("toggle-fullscreen") },
   ];
   let promptHost = null;
   let searchState = null;

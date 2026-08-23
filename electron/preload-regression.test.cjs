@@ -1890,9 +1890,13 @@ test("viewer input and resize are routed back to the tab they mirror", () => {
   assert.match(main, /tab\.setContentSize\(width, height\)/);
   assert.match(main, /sendDisplayPageSize\(tab\)/);
   // Both run in the tab's pane scope — a host serves several, and the wrong scope draws
-  // into another pane's terminal.
-  const inputHandler = main.slice(main.indexOf('ipcMain.on("tweb-float-input"'));
-  assert.match(inputHandler.slice(0, 600), /withPaneScope\(tabPanes\.get\(tab\)/);
+  // into another pane's terminal. Slice to the next ipcMain handler so the assertion
+  // sees only this handler regardless of how long the w-interception preamble grows.
+  const inputHandler = main.slice(
+    main.indexOf('ipcMain.on("tweb-float-input"'),
+    main.indexOf('ipcMain.on("tweb-float-resized"'),
+  );
+  assert.match(inputHandler, /withPaneScope\(tabPanes\.get\(tab\)/);
 });
 
 
@@ -1903,8 +1907,137 @@ test("w key toggles floating mode from the browser", () => {
   assert.match(electron, /case "w": send\("toggle-float"\)/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "toggle-float": toggleFloat\(\)/);
-  assert.match(main, /function toggleFloat\(\)/);
+  assert.match(main, /function toggleFloat\(fullscreen = false\)/);
   assert.match(main, /state\.floating = !state\.floating/);
+});
+
+// The before-input-event handler must only catch `w` (the toggle key). Forwarding
+// every keydown back into the same webContents via sendInputEvent re-fires
+// before-input-event and recurses — the "Invalid event object" crash on float.
+// The viewer's own input IPC is the single source of keys while floating; this
+// handler must not duplicate that path.
+test("float before-input-event handler only toggles w, does not forward keys", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const handler = main.slice(
+    main.indexOf('contents.on("before-input-event"'),
+    main.indexOf('keepHidden = () => keepWindowHidden(tab)'),
+  );
+  // `w` toggles float — this is the one key the handler acts on, and it must
+  // preventDefault so the keyDown does not also reach the page.
+  assert.match(handler, /input\.key === "w"/);
+  assert.match(handler, /toggleFloat\(\)/);
+  assert.match(handler, /event\.preventDefault\(\)/);
+  // No sendInputEvent inside the handler — forwarding from here is the recurse.
+  assert.doesNotMatch(handler, /sendInputEvent/);
+});
+
+// `w` arriving from the viewer must be intercepted in the IPC handler before
+// `relayInputEvents` expands it into keyDown/char/keyUp. Otherwise the keyDown
+// toggles float off via before-input-event while the char event still lands in
+// the page as a literal "w".
+test("float input IPC intercepts w before relay expansion", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const ipc = main.slice(
+    main.indexOf('ipcMain.on("tweb-float-input"'),
+    main.indexOf('ipcMain.on("tweb-float-resized"'),
+  );
+  // The handler gates on floatingTabs so a late IPC from a closing viewer does
+  // not inject into a tab that is no longer floating.
+  assert.match(ipc, /floatingTabs\.has\(tab\)/);
+  // The interception checks kind === "key" and key === "w" before calling
+  // relayInputEvents, and toggles float instead of injecting.
+  assert.match(ipc, /kind === "key" && String\(data\?\.key\) === "w"/);
+  assert.match(ipc, /toggleFloat\(\)/);
+  // The relay loop still exists for non-w keys.
+  assert.match(ipc, /for \(const input of relayInputEvents\(kind, data\)\)/);
+});
+
+// `w` from the tmux pane (via `dispatchNamedKey`) must also be intercepted before
+// `dispatchNativeKey` expands it into keyDown/char/keyUp. The `before-input-event`
+// safety net only catches the keyDown; the char would still leak into the page as
+// a literal "w" after float has toggled off.
+test("dispatchNamedKey intercepts w during float before native dispatch", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const fn = main.slice(
+    main.indexOf("function dispatchNamedKey"),
+    main.indexOf("function dispatchKey("),
+  );
+  // The interception fires only on the press (eventKind !== 3), only for plain `w`
+  // (no control, no meta), and only while the current tab is floating.
+  assert.match(fn, /key === "w" && !control && !modifiers\.includes\("meta"\)/);
+  assert.match(fn, /floatingTabs\.has\(currentWindows\(\)\.win\)/);
+  assert.match(fn, /toggleFloat\(\)/);
+});
+
+// Floating takes OS focus (the viewer window) and tmux selection (the pane may
+// be in a different session/window than what the client is currently viewing).
+// Neither is restored automatically when the viewer closes. `restoreFocusFromFloat`
+// does both: `tmux select-window` + `select-pane` for tmux, `app.hide()` for OS.
+test("float end restores tmux selection and OS focus", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // The restore function exists and targets the pane's live placement.
+  assert.match(main, /function restoreFocusFromFloat\(\{ skipHide = false \} = \{\}\)/);
+  assert.match(main, /select-window.*-t.*placement\.windowId/);
+  assert.match(main, /select-pane.*-t.*placement\.paneId/);
+  assert.match(main, /app\.hide\(\)/);
+  // Called from toggleFloat (the w toggle / agent RPC path) and the viewer's closed
+  // handler. NOT called from updatePaintingState — that also runs from the watchdog
+  // and resize paths, which must not steal or restore focus.
+  const toggleFn = main.slice(
+    main.indexOf("function toggleFloat"),
+    main.indexOf("function restoreFocusFromFloat"),
+  );
+  assert.match(toggleFn, /restoreFocusFromFloat\(\{ skipHide: wasFullscreen \}\)/);
+  const closedHandler = main.slice(
+    main.indexOf('display.on("closed"'),
+    main.indexOf("function closeDisplayWindow"),
+  );
+  assert.match(closedHandler, /restoreFocusFromFloat\(\{ skipHide: wasFullscreen \}\)/);
+  // The updatePaintingState float-off branch must NOT call restoreFocusFromFloat.
+  const paintBranch = main.slice(
+    main.indexOf("} else if (floatingTabs.has(tab))"),
+    main.indexOf("const size = tab.getContentSize()"),
+  );
+  assert.doesNotMatch(paintBranch, /restoreFocusFromFloat/);
+});
+
+// Floating is the active tab's toggle, not every tab's. `inputState().floating` is a
+// pane-level flag, and `updatePaintingState` iterates all tabs — passing it
+// unconditionally opened a display window per tab, so a pane with two tabs showed
+// two viewer windows on float. Only the active tab (=== currentWindows().win) gets
+// floating=true in surfacePlan; background tabs paint only when the pane is visible.
+test("floating applies to the active tab only, not every tab", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const fn = main.slice(
+    main.indexOf("function updatePaintingState"),
+    main.indexOf("function readIsPainting"),
+  );
+  // The floating flag is gated on the tab being the active one.
+  assert.match(fn, /isActiveTab\(tab\) && inputState\(\)\.floating/);
+});
+
+// The command palette's "Fullscreen" action opens the float viewer in OS fullscreen.
+// It goes through the same toggleFloat path but passes fullscreen=true, which makes
+// openDisplayWindow call setFullScreen(true) after show.
+test("command palette has a Fullscreen action that toggle-fullscreen dispatches", () => {
+  const electron = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  assert.match(electron, /\{ label: "Fullscreen", action: \(\) => send\("toggle-fullscreen"\) \}/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // handleNativeShortcut handles toggle-fullscreen before the vimium gate.
+  assert.match(main, /action === "toggle-fullscreen"/);
+  // If not already floating, it turns float on with fullscreen.
+  assert.match(main, /toggleFloat\(true\)/);
+  // If already floating, it flips fullscreen on the existing viewer.
+  assert.match(main, /display\.setFullScreen\(!display\.isFullScreen\(\)\)/);
+  // openDisplayWindow enters fullscreen after show when fullscreenFloat is set.
+  assert.match(main, /if \(fullscreenFloat\) \{/);
+  assert.match(main, /display\.setFullScreen\(true\)/);
+  // Fullscreen resizes the offscreen tab to the screen's resolution once the
+  // macOS fullscreen animation finishes, so frames are not stretched.
+  assert.match(main, /enter-full-screen/);
+  // Fullscreen picks a different display than the terminal's so the terminal stays
+  // visible. Falls back to the same display when there is only one monitor.
+  assert.match(main, /others\.length > 0\) anchor = others\[0\]/);
 });
 
 // `tweb chrome current` hands the current tab's URL to Chrome, without the user

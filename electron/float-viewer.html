@@ -102,8 +102,9 @@
   }, { passive: false });
 
   window.addEventListener("keydown", (event) => {
-    // Everything goes to the page, including `w` — that is the float toggle, and the
-    // page's own before-input-event handler is what turns it back off.
+    // Everything goes to the page, including `w` — that is the float toggle. The
+    // main process's `tweb-float-input` handler intercepts `w` before injecting it,
+    // so it toggles float off without reaching the page as a literal "w".
     event.preventDefault();
     window.twebFloat.input("key", { key: event.key, modifiers: modifiersOf(event) });
   });

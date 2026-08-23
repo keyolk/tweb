@@ -2036,9 +2036,14 @@ function updatePaintingState() {
   // the cache is empty, which is the same path a resize generation bump takes.
   if (!currentPane().visible) tabFrames.clear();
   const held = surfaceHeldForAgent();
+  const isActiveTab = (tab) => tab === currentWindows().win;
   for (const tab of currentWindows().tabs) {
     if (tab.isDestroyed()) continue;
-    const plan = surfacePlan(tab === currentWindows().win, currentPane().visible, logicalContentSize(currentViewport()), held, inputState().floating);
+    // Floating applies to the active tab only — `inputState().floating` is a pane-level
+    // toggle, and passing it for every tab opened a display window per tab. A non-active
+    // tab has no viewer and no user looking at it, so it paints only when the pane is visible.
+    const floating = isActiveTab(tab) && inputState().floating;
+    const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logicalContentSize(currentViewport()), held, floating);
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
     // A floating tab's audio should keep playing — the display window's viewer draws
@@ -2098,6 +2103,9 @@ function applySurfacePlan(tab, plan) {
     // A tab that was floating and is no longer: the viewer goes away and the page is back
     // to Kitty graphics only. The webContents never moved, so nothing about the page —
     // history, scroll, form state — is affected by either direction of this toggle.
+    // Focus restoration is handled by the caller (toggleFloat / closed handler), not here:
+    // updatePaintingState also runs from the watchdog and resize paths, which must not
+    // steal or restore focus.
     floatingTabs.delete(tab);
     closeDisplayWindow(tab);
     keepWindowHidden(tab);
@@ -3098,16 +3106,71 @@ function sendTabState(tab = currentWindows().win) {
 // Sends the `float` or `pin` agent RPC, which flips `inputState().floating` and
 // re-runs `updatePaintingState`. The same webContents is redirected, so the
 // page state carries over — this is a view toggle, not a session toggle.
-function toggleFloat() {
+//
+// `fullscreen` opens the viewer in OS fullscreen instead of a centered window.
+// It only applies when turning floating ON; turning OFF clears it regardless.
+let fullscreenFloat = false;
+function toggleFloat(fullscreen = false) {
   const state = inputState();
+  const wasFullscreen = fullscreenFloat;
   state.floating = !state.floating;
+  fullscreenFloat = state.floating ? fullscreen : false;
   updatePaintingState();
+  // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
+  // would only withdraw the terminal that already has it. tmux selection still
+  // needs restoring — the client may have wandered to another window.
+  if (!state.floating) restoreFocusFromFloat({ skipHide: wasFullscreen });
+}
+
+// Returns focus to the tmux pane after floating ends. Two layers must be
+// restored, and neither is automatic:
+//
+//   OS focus — the viewer window took it when it showed. Closing the window
+//   does NOT hand it back on macOS; the terminal stays behind whatever app
+//   was next in the MRU order. `app.hide()` withdraws this process so the
+//   terminal receives focus again.
+//
+//   tmux selection — the pane may have been in a different session/window than
+//   the one the user is currently viewing. `select-window` + `select-pane`
+//   puts the tmux client back where it was when float started.
+//
+// `vis().placement` carries the live session/window/pane the pane occupies, so
+// no snapshot is needed at float-start time: the pane does not move while it is
+// floating (it has no UI to trigger a break-pane from), and a hosted pane's
+// placement arrives over its own connection.
+function restoreFocusFromFloat({ skipHide = false } = {}) {
+  const placement = vis().placement;
+  if (placement?.paneId) {
+    // select-window before select-pane: the pane must be in a visible window
+    // for the client to land on it.
+    if (placement.windowId) {
+      execFile("tmux", ["select-window", "-t", placement.windowId], { timeout: 1000, stdio: "ignore" }, () => {});
+    }
+    execFile("tmux", ["select-pane", "-t", placement.paneId], { timeout: 1000, stdio: "ignore" }, () => {});
+  }
+  // Fullscreen never took OS focus (showInactive), so there is nothing to hand back.
+  if (skipHide) return;
+  // Withdraw this process so the terminal — the app the user launched tweb
+  // from — receives OS focus. Without this the floating viewer is gone but
+  // focus stays with this Electron process, invisible and inactive.
+  app.hide();
 }
 
 
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
-  // `toggle-float` is a view toggle, not a browser shortcut — it works regardless of vimium mode.
+  // `toggle-float` and `toggle-fullscreen` are view toggles, not browser shortcuts —
+  // they work regardless of vimium mode.
   if (action === "toggle-float") { toggleFloat(); return; }
+  if (action === "toggle-fullscreen") {
+    // If already floating, just flip fullscreen on the existing viewer.
+    if (inputState().floating) {
+      const display = displayWindows.get(currentWindows().win);
+      if (display && !display.isDestroyed()) display.setFullScreen(!display.isFullScreen());
+    } else {
+      toggleFloat(true);
+    }
+    return;
+  }
   if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
@@ -4785,30 +4848,19 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   const onTab = (event, handler) => tab.on(event, scoped(handler));
   const setWindowOpenHandler = (handler) => contents.setWindowOpenHandler(scoped(handler));
   const contents = tab.webContents;
-  // A floating window takes focus from the tmux pane, so keys would not reach the
-  // pane's key handler. Forward every keydown into the hidden offscreen webContents
-  // so the page keeps working — scrolling, form input, shortcuts — while the
-  // floating viewer shows it. `w` is special: it toggles float off rather than
-  // reaching the page.
-  contents.on("before-input-event", scoped((_event, input) => {
+  // Safety net for `w` (the float toggle) that reaches this webContents directly
+  // rather than through the float-input IPC. The IPC handler is the primary path
+  // and intercepts `w` before expansion; this catches a key the tmux pane injected.
+  // No other key is forwarded from here — the IPC path relays them via
+  // sendInputEvent, and forwarding here too would re-fire before-input-event and
+  // recurse ("Invalid event object").
+  contents.on("before-input-event", scoped((event, input) => {
     if (!floatingTabs.has(tab)) return;
     if (input.type !== "keyDown") return;
     if (input.key === "w" && !input.control && !input.meta) {
+      event.preventDefault();
       toggleFloat();
-      return;
     }
-    // Forward the key into the offscreen webContents so the page sees it.
-    // The floating viewer is a canvas — it has no DOM to receive keys.
-    // `before-input-event` gives us a raw object; `sendInputEvent` needs an
-    // explicit event with the fields it expects.
-    tab.webContents.sendInputEvent({
-      type: "keyDown",
-      key: input.key,
-      code: input.code || "",
-      modifiers: input.modifiers || [],
-      autoRepeat: input.autoRepeat || false,
-      isTrusted: true,
-    });
   }));
   const keepHidden = () => keepWindowHidden(tab);
   keepHidden();
@@ -5164,7 +5216,10 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
     // resize is exactly when a hidden pane is most likely to be resized.
     for (const tab of currentWindows().tabs) {
       if (tab.isDestroyed()) continue;
-      applySurfacePlan(tab, surfacePlan(tab === currentWindows().win, record.visible, logical, surfaceHeldForAgent(), inputState().floating));
+      const isActive = tab === currentWindows().win;
+      // Same reason as updatePaintingState: floating is the active tab's toggle, not
+      // every tab's. Passing it unconditionally opened a display window per tab on resize.
+      applySurfacePlan(tab, surfacePlan(isActive, record.visible, logical, surfaceHeldForAgent(), isActive && inputState().floating));
     }
   }
   currentWindows().win?.webContents.invalidate();
@@ -5418,7 +5473,17 @@ function isDisplayWindow(window) {
 /// sends input back. The tab's own window is never shown — see `applySurfacePlan`.
 function openDisplayWindow(tab, plan) {
   if (displayWindows.has(tab)) return;
-  const anchor = screen.getDisplayMatching(tab.getBounds());
+  // The offscreen tab sits at (-10000, -10000), so getDisplayMatching returns the
+  // display the terminal is on — the right anchor for a centered float window, but
+  // the WRONG one for fullscreen: fullscreen should take a different monitor so the
+  // terminal stays visible. If there is no other monitor (single display), the same
+  // one is used — the user explicitly asked for that case to just enlarge.
+  const terminalDisplay = screen.getDisplayMatching(tab.getBounds());
+  let anchor = terminalDisplay;
+  if (fullscreenFloat) {
+    const others = screen.getAllDisplays().filter((d) => d.id !== terminalDisplay.id);
+    if (others.length > 0) anchor = others[0];
+  }
   const bounds = centeredDisplayBounds(anchor.bounds, plan.width, plan.height);
   let display;
   creatingDisplayWindow = true;
@@ -5432,7 +5497,28 @@ function openDisplayWindow(tab, plan) {
   display.setTitle(tab.webContents.getTitle() || "TWeb");
   display.loadFile(path.join(__dirname, "float-viewer.html")).then(() => {
     if (display.isDestroyed()) return;
-    display.show();
+    // Fullscreen keeps terminal focus: the viewer is on a different monitor and the
+    // user is still driving the terminal. showInactive displays the window without
+    // stealing OS focus, and `app.hide` is skipped so the terminal stays where it is.
+    if (fullscreenFloat) {
+      display.showInactive();
+      display.setFullScreen(true);
+      // macOS fullscreen is an animation — the window's content size settles only after
+      // `enter-full-screen`. The viewer's `resize` event fires then and drives
+      // `tweb-float-resized`, which resizes the offscreen tab to match. But the event
+      // can race the IPC, so we also nudge the page size here once the transition ends.
+      display.once("enter-full-screen", () => {
+        if (display.isDestroyed() || tab.isDestroyed()) return;
+        const [w, h] = display.getContentSize();
+        withPaneScope(tabPanes.get(tab), () => {
+          tab.setContentSize(Math.max(1, w), Math.max(1, h));
+          sendDisplayPageSize(tab);
+          tab.webContents.invalidate();
+        });
+      });
+    } else {
+      display.show();
+    }
     sendDisplayPageSize(tab);
     // Nothing may have changed on the page since the last paint, and the viewer starts
     // blank — so the first frame is asked for rather than waited for.
@@ -5450,8 +5536,11 @@ function openDisplayWindow(tab, plan) {
     if (!floatingTabs.has(tab)) return;
     floatingTabs.delete(tab);
     inputState().floating = false;
+    const wasFullscreen = fullscreenFloat;
+    fullscreenFloat = false;
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
+    restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
 }
 
@@ -5491,7 +5580,18 @@ function relayFrameToDisplay(tab, image) {
 ipcMain.on("tweb-float-input", (event, kind, data) => {
   const display = BrowserWindow.fromWebContents(event.sender);
   const tab = display && displayWindowTabs.get(display);
-  if (!tab || tab.isDestroyed()) return;
+  if (!tab || tab.isDestroyed() || !floatingTabs.has(tab)) return;
+  // `w` is the float toggle. The viewer sends it like any other key, but it must
+  // not reach the page — and because `relayInputEvents` expands it into keyDown,
+  // char, and keyUp, the keyDown would toggle float off (via before-input-event)
+  // while the char still lands in the page as a literal "w". Catch it here, before
+  // expansion, so neither the keyDown nor the trailing char is sent.
+  if (kind === "key" && String(data?.key) === "w" && !(data?.modifiers || []).some(
+    (m) => m === "control" || m === "meta",
+  )) {
+    withPaneScope(tabPanes.get(tab), () => toggleFloat());
+    return;
+  }
   withPaneScope(tabPanes.get(tab), () => {
     for (const input of relayInputEvents(kind, data)) tab.webContents.sendInputEvent(input);
   });
@@ -5597,6 +5697,18 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   const shift = modifiers.includes("shift");
   if (debugLogging && modifiers.length) {
     console.error(`tweb: key ${key} [${modifiers.join("+")}] kind=${eventKind}`);
+  }
+
+  // `w` toggles float. Intercept it here — before `dispatchNativeKey` expands it
+  // into keyDown/char/keyUp — so the char event does not leak into the page as a
+  // literal "w" after the keyDown already toggled float off. The `before-input-event`
+  // safety net catches the same key but only the keyDown; this catches the press
+  // before any of the three events is sent. Only the press matters: the release is
+  // harmless once float has toggled.
+  if (pressed && key === "w" && !control && !modifiers.includes("meta")
+      && floatingTabs.has(currentWindows().win)) {
+    toggleFloat();
+    return;
   }
 
   // Where tmux does not strip the modifiers, standard CSI-u is supported too.
