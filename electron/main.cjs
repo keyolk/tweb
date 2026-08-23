@@ -2103,10 +2103,12 @@ function applySurfacePlan(tab, plan) {
     // A tab that was floating and is no longer: the viewer goes away and the page is back
     // to Kitty graphics only. The webContents never moved, so nothing about the page —
     // history, scroll, form state — is affected by either direction of this toggle.
+    // Focus restoration is handled by the caller (toggleFloat / closed handler), not here:
+    // updatePaintingState also runs from the watchdog and resize paths, which must not
+    // steal or restore focus.
     floatingTabs.delete(tab);
     closeDisplayWindow(tab);
     keepWindowHidden(tab);
-    restoreFocusFromFloat();
   }
   const size = tab.getContentSize();
   const current = { width: size[0], height: size[1] };
@@ -3110,9 +3112,14 @@ function sendTabState(tab = currentWindows().win) {
 let fullscreenFloat = false;
 function toggleFloat(fullscreen = false) {
   const state = inputState();
+  const wasFullscreen = fullscreenFloat;
   state.floating = !state.floating;
   fullscreenFloat = state.floating ? fullscreen : false;
   updatePaintingState();
+  // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
+  // would only withdraw the terminal that already has it. tmux selection still
+  // needs restoring — the client may have wandered to another window.
+  if (!state.floating) restoreFocusFromFloat({ skipHide: wasFullscreen });
 }
 
 // Returns focus to the tmux pane after floating ends. Two layers must be
@@ -3131,7 +3138,7 @@ function toggleFloat(fullscreen = false) {
 // no snapshot is needed at float-start time: the pane does not move while it is
 // floating (it has no UI to trigger a break-pane from), and a hosted pane's
 // placement arrives over its own connection.
-function restoreFocusFromFloat() {
+function restoreFocusFromFloat({ skipHide = false } = {}) {
   const placement = vis().placement;
   if (placement?.paneId) {
     // select-window before select-pane: the pane must be in a visible window
@@ -3141,6 +3148,8 @@ function restoreFocusFromFloat() {
     }
     execFile("tmux", ["select-pane", "-t", placement.paneId], { timeout: 1000, stdio: "ignore" }, () => {});
   }
+  // Fullscreen never took OS focus (showInactive), so there is nothing to hand back.
+  if (skipHide) return;
   // Withdraw this process so the terminal — the app the user launched tweb
   // from — receives OS focus. Without this the floating viewer is gone but
   // focus stays with this Electron process, invisible and inactive.
@@ -5488,10 +5497,11 @@ function openDisplayWindow(tab, plan) {
   display.setTitle(tab.webContents.getTitle() || "TWeb");
   display.loadFile(path.join(__dirname, "float-viewer.html")).then(() => {
     if (display.isDestroyed()) return;
-    display.show();
-    // Fullscreen is set after show: macOS enters fullscreen from a visible window,
-    // and setting it before show leaves a blank frame on the desktop briefly.
+    // Fullscreen keeps terminal focus: the viewer is on a different monitor and the
+    // user is still driving the terminal. showInactive displays the window without
+    // stealing OS focus, and `app.hide` is skipped so the terminal stays where it is.
     if (fullscreenFloat) {
+      display.showInactive();
       display.setFullScreen(true);
       // macOS fullscreen is an animation — the window's content size settles only after
       // `enter-full-screen`. The viewer's `resize` event fires then and drives
@@ -5506,6 +5516,8 @@ function openDisplayWindow(tab, plan) {
           tab.webContents.invalidate();
         });
       });
+    } else {
+      display.show();
     }
     sendDisplayPageSize(tab);
     // Nothing may have changed on the page since the last paint, and the viewer starts
@@ -5524,10 +5536,11 @@ function openDisplayWindow(tab, plan) {
     if (!floatingTabs.has(tab)) return;
     floatingTabs.delete(tab);
     inputState().floating = false;
+    const wasFullscreen = fullscreenFloat;
     fullscreenFloat = false;
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
-    restoreFocusFromFloat();
+    restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
 }
 

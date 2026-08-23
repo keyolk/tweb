@@ -1976,22 +1976,29 @@ test("dispatchNamedKey intercepts w during float before native dispatch", () => 
 test("float end restores tmux selection and OS focus", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   // The restore function exists and targets the pane's live placement.
-  assert.match(main, /function restoreFocusFromFloat\(\)/);
+  assert.match(main, /function restoreFocusFromFloat\(\{ skipHide = false \} = \{\}\)/);
   assert.match(main, /select-window.*-t.*placement\.windowId/);
   assert.match(main, /select-pane.*-t.*placement\.paneId/);
   assert.match(main, /app\.hide\(\)/);
-  // Called from both float-off paths: the updatePaintingState branch and the
-  // viewer's closed handler.
-  const paintBranch = main.slice(
-    main.indexOf("} else if (floatingTabs.has(tab))"),
-    main.indexOf("const size = tab.getContentSize()"),
+  // Called from toggleFloat (the w toggle / agent RPC path) and the viewer's closed
+  // handler. NOT called from updatePaintingState — that also runs from the watchdog
+  // and resize paths, which must not steal or restore focus.
+  const toggleFn = main.slice(
+    main.indexOf("function toggleFloat"),
+    main.indexOf("function restoreFocusFromFloat"),
   );
-  assert.match(paintBranch, /restoreFocusFromFloat\(\)/);
+  assert.match(toggleFn, /restoreFocusFromFloat\(\{ skipHide: wasFullscreen \}\)/);
   const closedHandler = main.slice(
     main.indexOf('display.on("closed"'),
     main.indexOf("function closeDisplayWindow"),
   );
-  assert.match(closedHandler, /restoreFocusFromFloat\(\)/);
+  assert.match(closedHandler, /restoreFocusFromFloat\(\{ skipHide: wasFullscreen \}\)/);
+  // The updatePaintingState float-off branch must NOT call restoreFocusFromFloat.
+  const paintBranch = main.slice(
+    main.indexOf("} else if (floatingTabs.has(tab))"),
+    main.indexOf("const size = tab.getContentSize()"),
+  );
+  assert.doesNotMatch(paintBranch, /restoreFocusFromFloat/);
 });
 
 // Floating is the active tab's toggle, not every tab's. `inputState().floating` is a
