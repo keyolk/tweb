@@ -4,7 +4,12 @@
 <style>
   /* The viewer is a frame surface and nothing else — no chrome of its own, so the page
      fills the window exactly as it does in the pane. */
-  html, body { margin: 0; height: 100%; background: #1a1a1a; overflow: hidden; }
+  /* color-scheme: dark keeps the window dark even when the OS is in light mode,
+     so a light-mode user does not see a white flash before the frame arrives. */
+  html, body { margin: 0; height: 100%; background: #1a1a1a; color-scheme: dark; overflow: hidden; }
+  @media (prefers-color-scheme: light) {
+    html, body { background: #1a1a1a; }
+  }
   #surface { display: block; width: 100vw; height: 100vh; outline: none; }
 </style>
 <canvas id="surface" tabindex="0"></canvas>
