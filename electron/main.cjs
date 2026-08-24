@@ -6735,7 +6735,11 @@ function sweepAbandonedFrameFiles() {
 }
 
 app.on("window-all-closed", () => {
-  if (!quitting) app.quit();
+  // A floating viewer is a real BrowserWindow, so closing it fires window-all-closed.
+  // But the offscreen tab window is still alive — quitting here takes down the
+  // whole process including Ghostty. Only quit when no non-display window remains.
+  const liveWindows = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed() && !isDisplayWindow(w));
+  if (!quitting && liveWindows.length === 0) app.quit();
 });
 
 // Every step guarded, and every failure logged. A throw out of this listener is not contained by

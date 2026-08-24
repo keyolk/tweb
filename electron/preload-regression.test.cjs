@@ -2130,3 +2130,16 @@ test("command palette opens with c and lists actions", () => {
   // `emptyPickerReason` has a command entry.
   assert.match(electron, /command: "no command to run"/);
 });
+
+// A floating viewer is a real BrowserWindow, so closing it fires window-all-closed.
+// But the offscreen tab window is still alive — quitting there takes down the
+// whole process including Ghostty. Only quit when no non-display window remains.
+test("window-all-closed does not quit when only display windows remain", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const fn = main.slice(
+    main.indexOf('app.on("window-all-closed"'),
+    main.indexOf('app.on("before-quit"'),
+  );
+  assert.match(fn, /isDisplayWindow/);
+  assert.match(fn, /liveWindows\.length === 0.*app\.quit/);
+});
