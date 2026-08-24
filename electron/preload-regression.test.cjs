@@ -2041,6 +2041,19 @@ test("float toggle shows status overlay in the terminal", () => {
   assert.match(preload, /floatOverlayHost\.remove/);
 });
 
+// The viewer window's title reflects the float state — "TWeb (floating)" or
+// "TWeb (fullscreen)" — not the page's own <title>, which says nothing about
+// the view mode.
+test("viewer window title reflects float state", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const fn = main.slice(
+    main.indexOf("function openDisplayWindow"),
+    main.indexOf("display.loadFile"),
+  );
+  assert.match(fn, /TWeb \(floating\)/);
+  assert.match(fn, /TWeb \(fullscreen\)/);
+});
+
 // The command palette's "Fullscreen" action opens the float viewer in OS fullscreen.
 // It goes through the same toggleFloat path but passes fullscreen=true, which makes
 // openDisplayWindow call setFullScreen(true) after show.
