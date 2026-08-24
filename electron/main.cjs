@@ -3153,13 +3153,17 @@ function toggleFloat(fullscreen = false) {
   if (!state.floating) fullscreenSize = null;
   updatePaintingState();
   updatePaneTitle();
-  // Tell the preload so it can show the floating/fullscreen state as a centered
-  // overlay in the terminal — the page is gone from the pane, so the user sees the
-  // bare terminal. The overlay tells them where it went and how to get it back.
-  sendToMainTabFrame(currentWindows().win, "tweb-float-state", {
-    floating: state.floating,
-    fullscreen: fullscreenFloat,
-  });
+  // When floating, the page leaves the terminal pane — the user sees bare terminal,
+  // not the page. Write a centered status line directly to the pane writer (ANSI to
+  // the pane's stdout), so it shows in the terminal itself, not in the page's preload.
+  // This is tmux-independent and per-pane: it goes to the pane's own tty/fd.
+  if (state.floating && !quitting) {
+    const label = fullscreenFloat ? "FULLSCREEN  page on another monitor  press w to pin"
+      : "FLOATING  page in an OS window  press w to to pin";
+    // Clear the terminal first, then move the cursor to center and write the label.
+    // ESC[2J clears the screen; ESC[<row>;<col>H moves the cursor.
+    writerFor(currentPane()).write(`\x1b[2J\x1b[12;1H\x1b[1m\x1b[36m${label}\x1b[0m`);
+  }
   // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
   // would only withdraw the terminal that already has it. tmux selection still
   // needs restoring — the client may have wandered to another window.
@@ -5599,7 +5603,6 @@ function openDisplayWindow(tab, plan) {
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
     updatePaneTitle();
-    sendToMainTabFrame(tab, "tweb-float-state", { floating: false, fullscreen: false });
     restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
 }
