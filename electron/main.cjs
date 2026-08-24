@@ -3171,7 +3171,12 @@ function toggleFloat(fullscreen = false) {
   // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
   // would only withdraw the terminal that already has it. tmux selection still
   // needs restoring — the client may have wandered to another window.
-  if (!state.floating) restoreFocusFromFloat({ skipHide: wasFullscreen });
+  if (!state.floating) {
+    // Clear the status text so the returning page is not obscured by it.
+    // ESC[2J clears the screen; the next frame replaces the placement.
+    writerFor(currentPane()).write(`\x1b[2J`);
+    restoreFocusFromFloat({ skipHide: wasFullscreen });
+  }
 }
 
 // Returns focus to the tmux pane after floating ends. Two layers must be
