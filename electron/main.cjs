@@ -3158,6 +3158,10 @@ function toggleFloat(fullscreen = false) {
   // the pane's stdout), so it shows in the terminal itself, not in the page's preload.
   // This is tmux-independent and per-pane: it goes to the pane's own tty/fd.
   if (state.floating && !quitting) {
+    // Delete the Kitty graphics placement first — it is the last frame the pane was
+    // showing, and it sits on top of the terminal text. Without deleting it the
+    // status line would be hidden behind the placement.
+    deletePlacement();
     const label = fullscreenFloat ? "FULLSCREEN  page on another monitor  press w to pin"
       : "FLOATING  page in an OS window  press w to to pin";
     // Clear the terminal first, then move the cursor to center and write the label.
