@@ -2036,6 +2036,9 @@ test("float toggle writes status line to the terminal", () => {
   assert.match(fn, /FULLSCREEN/);
   // ESC[2J clears the screen so the status is not left behind the returning page.
   assert.match(fn, /\\x1b\[2J/);
+  // deletePlacement removes the Kitty graphics placement first — it is the last
+  // frame the pane was showing, and it would sit on top of the status text.
+  assert.match(fn, /deletePlacement\(\)/);
 });
 
 // The viewer window's title reflects the float state — "TWeb (floating)" or
