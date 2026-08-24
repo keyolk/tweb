@@ -152,8 +152,6 @@ installPrintShim();
   let tabPopoverTimer = null;
   let indicatorMode = "normal";
   let indicatorDetail = "";
-  let floatState = { floating: false, fullscreen: false };
-  let floatOverlayHost = null;
   let tabState = { activeIndex: 0, count: 1, tabs: [{ index: 0, title: "New tab" }] };
   let lastSearch = "";
 
@@ -638,51 +636,6 @@ installPrintShim();
       return { text: "⌘", title: "Cmd combinations go to the page (Ctrl-; to keep them in tmux)" };
     }
     return { text: "", title: "" };
-  }
-
-  // A full-screen centered overlay shown when the page is floating or in fullscreen.
-  // The page has left the terminal pane, so the user sees bare terminal — this overlay
-  // tells them where it went and how to get it back. It is removed the moment the page
-  // is pinned, so a returning page is not obscured.
-  function renderFloatOverlay() {
-    if (!topFrame) return;
-    if (!floatState.floating) {
-      if (floatOverlayHost) {
-        floatOverlayHost.remove();
-        floatOverlayHost = null;
-      }
-      return;
-    }
-    if (floatOverlayHost) return; // already shown
-    const host = document.createElement("div");
-    host.id = "__tweb_float_overlay__";
-    host.style.cssText = [
-      "position:fixed",
-      "inset:0",
-      "display:flex",
-      "flex-direction:column",
-      "align-items:center",
-      "justify-content:center",
-      "z-index:2147483647",
-      "pointer-events:none",
-      "font:600 48px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace",
-      "color:#8ab4f8",
-      "background:rgba(26,26,26,0.85)",
-      "text-align:center",
-    ].join(";");
-    const label = floatState.fullscreen ? "FULLSCREEN" : "FLOATING";
-    const detail = floatState.fullscreen
-      ? "page on another monitor · press w to pin"
-      : "page in an OS window · press w to pin";
-    const title = document.createElement("div");
-    title.textContent = label;
-    title.style.cssText = "letter-spacing:2px";
-    const sub = document.createElement("div");
-    sub.textContent = detail;
-    sub.style.cssText = "font:400 16px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#5f6369;margin-top:8px";
-    host.append(title, sub);
-    document.documentElement.append(host);
-    floatOverlayHost = host;
   }
 
   function renderIndicator() {
@@ -4291,15 +4244,6 @@ installPrintShim();
   ipcRenderer.on("tweb-audio-state", (_event, state) => {
     audioState = { muted: Boolean(state?.muted), owner: state?.owner || null };
     renderIndicator();
-  });
-
-  // Floating/fullscreen: the page has left the terminal pane, so the user sees the bare
-  // terminal. A full-screen centered overlay tells them where the page went and how
-  // to get it back — "FLOATING" or "FULLSCREEN" — large enough to read from across
-  // the room, not tucked into a badge. Cleared when the page is pinned back.
-  ipcRenderer.on("tweb-float-state", (_event, state) => {
-    floatState = { floating: Boolean(state?.floating), fullscreen: Boolean(state?.fullscreen) };
-    renderFloatOverlay();
   });
 
   ipcRenderer.on("tweb-select-all", () => {

@@ -2021,24 +2021,21 @@ test("floating applies to the active tab only, not every tab", () => {
 });
 
 // When floating, the page leaves the terminal pane — the user sees the bare terminal,
-// not the page. A full-screen centered overlay in the terminal tells them where the page
-// went and how to get it back, so an empty pane is not mistaken for a broken one.
-test("float toggle shows status overlay in the terminal", () => {
+// not the page. A centered ANSI status line is written directly to the pane
+// writer (the pane's stdout), so it shows in the terminal itself — not in the
+// page's preload, not on the tmux status line. Tmux-independent and per-pane.
+test("float toggle writes status line to the terminal", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const fn = main.slice(
     main.indexOf("function toggleFloat"),
     main.indexOf("function restoreFocusFromFloat"),
   );
-  // The main process sends tweb-float-state to the preload so it can render the overlay.
-  assert.match(fn, /sendToMainTabFrame.*tweb-float-state/);
-  assert.match(fn, /floating.*fullscreen/);
-  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
-  // The preload renders a centered overlay with the float/fullscreen label.
-  assert.match(preload, /function renderFloatOverlay/);
-  assert.match(preload, /FULLSCREEN/);
-  assert.match(preload, /FLOATING/);
-  // The overlay is removed when the page is pinned back.
-  assert.match(preload, /floatOverlayHost\.remove/);
+  // toggleFloat writes ANSI clear + cursor home + label to the pane writer.
+  assert.match(fn, /writerFor\(currentPane\(\)\)\.write/);
+  assert.match(fn, /FLOATING/);
+  assert.match(fn, /FULLSCREEN/);
+  // ESC[2J clears the screen so the status is not left behind the returning page.
+  assert.match(fn, /\\x1b\[2J/);
 });
 
 // The viewer window's title reflects the float state — "TWeb (floating)" or
