@@ -5583,7 +5583,13 @@ function openDisplayWindow(tab, plan) {
         });
         // setFullScreen can steal OS focus even after showInactive. Blur the viewer
         // so macOS hands focus back to the terminal — the user is still driving it.
+        // app.hide withdraws all Electron windows (including the fullscreen viewer,
+        // which showInactive opened), then app.show brings them back. The net effect
+        // is that macOS re-evaluates focus from scratch and gives it to the terminal —
+        // the app the user launched tweb from — rather than to the re-shown viewer.
         display.blur();
+        app.hide();
+        app.show();
         updatePaneTitle();
       });
     } else {
