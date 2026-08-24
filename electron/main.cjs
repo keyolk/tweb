@@ -5542,7 +5542,11 @@ function openDisplayWindow(tab, plan) {
   }
   displayWindows.set(tab, display);
   displayWindowTabs.set(display, tab);
-  display.setTitle(tab.webContents.getTitle() || "TWeb");
+  // The viewer window's title reflects the float state so the user can tell at a glance
+  // what the window is showing — "TWeb (floating)" or "TWeb (fullscreen)" — not the page's
+  // own <title>, which is often a site name that says nothing about the view mode.
+  const floatLabel = fullscreenFloat ? "TWeb (fullscreen)" : "TWeb (floating)";
+  display.setTitle(floatLabel);
   display.loadFile(path.join(__dirname, "float-viewer.html")).then(() => {
     if (display.isDestroyed()) return;
     // Fullscreen keeps terminal focus: the viewer is on a different monitor and the
