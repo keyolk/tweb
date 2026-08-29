@@ -2131,6 +2131,52 @@ test("command palette opens with c and lists actions", () => {
   assert.match(electron, /command: "no command to run"/);
 });
 
+// The palette is drawn into a pane that repaints four times a second when nothing is
+// happening, so a DOM change with no paint behind it reaches the terminal up to 250ms late.
+// That read as the menu ignoring keys: the keystroke was handled, the pane just still showed
+// the frame from before it. `startCommandPalette` always painted on open; every later change
+// to what the menu looks like has to do the same.
+//
+// `setMode` is not a substitute. It writes the indicator's DOM and returns — the overlays that
+// only call it are relying on the frame clock, which is the thing being worked around here.
+test("every command palette state change asks for a paint", () => {
+  const handler = electron.slice(
+    electron.indexOf("function selectCommandPaletteIndex"),
+    electron.indexOf("function enterInspect"),
+  );
+  assert.notEqual(handler.length, 0);
+
+  // Moving the selection: one helper, so j/k/ArrowDown/ArrowUp and the fuzzy-match jump
+  // cannot drift apart.
+  assert.match(handler, /function selectCommandPaletteIndex[\s\S]*?paintNow\(\);\n  \}/);
+  assert.match(handler, /key === "j" \|\| key === "ArrowDown"[\s\S]*?selectCommandPaletteIndex\(commandPaletteState\.selected \+ 1\)/);
+  assert.match(handler, /key === "k" \|\| key === "ArrowUp"[\s\S]*?selectCommandPaletteIndex\(commandPaletteState\.selected - 1\)/);
+
+  // The menu coming down is a change to the pane too. Escape and Enter both remove the host,
+  // and `cancelCommandPalette` has no paint of its own.
+  const escape = handler.slice(handler.indexOf('key === "Escape"'), handler.indexOf('key === "Enter"'));
+  assert.match(escape, /paintNow\(\)/);
+  const enter = handler.slice(handler.indexOf('key === "Enter"'), handler.indexOf('key === "j"'));
+  assert.match(enter, /paintNow\(\)/);
+
+  // Running an entry from an unambiguous filter closes the menu the same way Enter does.
+  const fuzzy = handler.slice(handler.indexOf("matches.length === 1"));
+  assert.match(fuzzy, /matches\[0\]\.action\(\);\n\s*paintNow\(\)/);
+});
+
+// With two entries, most letters filter to exactly one and run it on the spot — `f` is
+// Fullscreen, `o` is Open in Chrome. A letter in NEITHER label used to leave the palette
+// looking untouched while still being appended to the filter, so the next letter was matched
+// against a buffer holding a character the user could not see. Typing `x` then `f` matched
+// "xf" and found nothing, and the palette that had just run on a single `f` now did nothing.
+test("a command palette keystroke that matches nothing does not poison the filter", () => {
+  const handler = electron.slice(
+    electron.indexOf("function handleCommandPaletteKey"),
+    electron.indexOf("function enterInspect"),
+  );
+  assert.match(handler, /commandPaletteState\.typed = commandPaletteState\.typed\.slice\(0, -1\)/);
+});
+
 // A floating viewer is a real BrowserWindow, so closing it fires window-all-closed.
 // But the offscreen tab window is still alive — quitting there takes down the
 // whole process including Ghostty. Only quit when no non-display window remains.

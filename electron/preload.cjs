@@ -3695,6 +3695,20 @@ installPrintShim();
     setMode("command", `${entries.length}`);
   }
 
+  // Moving the selection is a DOM change like any other, and at the idle rate the pane is
+  // repainted four times a second — so without a nudge a `j` lands up to 250ms after the key.
+  // `startCommandPalette` already paints when the menu goes up; every later change to what the
+  // menu LOOKS like has to do the same. `setMode` is not that nudge: it updates the indicator's
+  // DOM and returns, so the overlays that only call it are relying on the frame clock.
+  function selectCommandPaletteIndex(index) {
+    const items = commandPaletteState.items;
+    items[commandPaletteState.selected].row.style.background = "";
+    commandPaletteState.selected = Math.min(items.length - 1, Math.max(0, index));
+    items[commandPaletteState.selected].row.style.background = "#1a3a5e";
+    items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+    paintNow();
+  }
+
   function handleCommandPaletteKey(event, key) {
     if (!commandPaletteState) return false;
     event.preventDefault();
@@ -3702,20 +3716,18 @@ installPrintShim();
     const items = commandPaletteState.items;
     if (key === "Escape") {
       cancelCommandPalette(false);
+      // The menu coming DOWN is a change to the pane too, and the cancel path has no paint of
+      // its own — Escape looked ignored for the same quarter second the moves did.
+      paintNow();
     } else if (key === "Enter") {
       const entry = items[commandPaletteState.selected];
       cancelCommandPalette(false);
       entry.action();
+      paintNow();
     } else if (key === "j" || key === "ArrowDown") {
-      items[commandPaletteState.selected].row.style.background = "";
-      commandPaletteState.selected = Math.min(items.length - 1, commandPaletteState.selected + 1);
-      items[commandPaletteState.selected].row.style.background = "#1a3a5e";
-      items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+      selectCommandPaletteIndex(commandPaletteState.selected + 1);
     } else if (key === "k" || key === "ArrowUp") {
-      items[commandPaletteState.selected].row.style.background = "";
-      commandPaletteState.selected = Math.max(0, commandPaletteState.selected - 1);
-      items[commandPaletteState.selected].row.style.background = "#1a3a5e";
-      items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+      selectCommandPaletteIndex(commandPaletteState.selected - 1);
     } else if (key.length === 1 && /[a-z]/i.test(key)) {
       // Fuzzy search: filter by typed characters against label. If exactly one
       // entry matches, run it immediately and close — the palette is a menu,
@@ -3726,11 +3738,14 @@ installPrintShim();
       if (matches.length === 1) {
         cancelCommandPalette(false);
         matches[0].action();
+        paintNow();
       } else if (matches.length > 0) {
-        items[commandPaletteState.selected].row.style.background = "";
-        commandPaletteState.selected = items.indexOf(matches[0]);
-        items[commandPaletteState.selected].row.style.background = "#1a3a5e";
-        items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+        selectCommandPaletteIndex(items.indexOf(matches[0]));
+      } else {
+        // A key that matches nothing still consumed a keystroke. Without a paint the pane is
+        // identical to the frame before it, which reads as the palette having missed the key —
+        // the typed buffer has changed, and the next letter filters against it.
+        commandPaletteState.typed = commandPaletteState.typed.slice(0, -1);
       }
     }
     return true;
