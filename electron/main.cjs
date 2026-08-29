@@ -64,10 +64,12 @@ const {
   HEARTBEAT_MS: AUDIO_HEARTBEAT_MS,
 } = require("./audio-owner.cjs");
 const {
+  abandonedClaimFiles,
   claimIsReleasable,
   claimWindowSessionSlot,
   isRestorableUrl,
   normalizeWindowSession,
+  parseSlotClaim,
   windowSessionForSave,
 } = require("./window-session.cjs");
 const {
@@ -6606,6 +6608,7 @@ app.whenReady().then(async () => {
 
   compactHistory();
   sweepAbandonedFrameFiles();
+  sweepAbandonedClaimFiles();
 
   // A host has no pane at startup and must not act as though it does: no terminal setup (there is
   // no terminal), no window (there is no url or geometry yet), no visibility poll (the pane it
@@ -6738,6 +6741,43 @@ function sweepAbandonedFrameFiles() {
     }
   }
   if (removed > 0) console.error(`tweb: swept ${removed} frame files from dead engines`);
+}
+
+// The claim counterpart to `sweepAbandonedFrameFiles`, and here for the same reason: the slot
+// reclaim in `takeSlot` only runs for a slot a pane asks for again, and a pane whose tmux window
+// is gone is asked for by nobody. See `abandonedClaimFiles` for why an unparseable claim is left
+// alone rather than swept.
+function sweepAbandonedClaimFiles() {
+  const directory = path.join(app.getPath("userData"), "window-sessions");
+  let names;
+  try {
+    names = readdirSync(directory);
+  } catch (error) {
+    // ENOENT is the first-run case, not a failure: no directory means no claims to sweep.
+    if (error.code !== "ENOENT" && debugLogging) {
+      console.error(`tweb: claim sweep failed: ${error.message}`);
+    }
+    return;
+  }
+  const parse = (name) => {
+    try {
+      return parseSlotClaim(readFileSync(path.join(directory, name), "utf8"));
+    } catch (_) {
+      return null;
+    }
+  };
+  let removed = 0;
+  for (const name of abandonedClaimFiles(names, parse, processAlive, process.pid)) {
+    try {
+      unlinkSync(path.join(directory, name));
+      removed += 1;
+    } catch (error) {
+      if (error.code !== "ENOENT" && debugLogging) {
+        console.error(`tweb: claim sweep failed ${name}: ${error.message}`);
+      }
+    }
+  }
+  if (removed > 0) console.error(`tweb: swept ${removed} claim files from dead engines`);
 }
 
 app.on("window-all-closed", () => {
