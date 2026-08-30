@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
+  abandonedClaimFiles,
   claimIsReleasable,
   claimWindowSessionSlot,
   isRestorableUrl,
@@ -294,4 +295,94 @@ test("save omits internal tabs and remaps the active index", () => {
     activeIndex: 0,
     tabs: [{ url: "https://example.com", zoom: 1.25 }],
   });
+});
+
+
+// === Sweeping claims left by engines that are gone ==================================
+//
+// The reclaim in `takeSlot` only runs for a slot some pane asks for again, and tmux does not
+// reuse pane ids — so a claim whose window is gone is reclaimed by nobody. Fifteen such claims
+// spanning ten days were measured in a real userData directory, every one naming a dead pid.
+
+const DEAD_PID = 999_000_001;
+const LIVE_PID = 999_000_002;
+const SELF_PID = 999_000_003;
+const aliveOnly = (pid) => pid === LIVE_PID;
+const key = (n) => String(n).repeat(24).slice(0, 24);
+const claimText = (pid, pane) => JSON.stringify({ pane, pid, at: 1 });
+
+function sweep(files, isAlive = aliveOnly, selfPid = SELF_PID) {
+  const names = Object.keys(files);
+  return abandonedClaimFiles(names, (name) => parseSlotClaim(files[name]), isAlive, selfPid);
+}
+
+test("a claim naming a dead pid is swept", () => {
+  const name = `${key(1)}.claim`;
+  assert.deepEqual(sweep({ [name]: claimText(DEAD_PID, "%304") }), [name]);
+});
+
+// The corrupting direction. Deleting a live pane's claim hands its session to a second pane,
+// which is the failure the whole slot mechanism exists to prevent.
+test("a claim naming a live pid is left alone", () => {
+  const name = `${key(2)}.claim`;
+  assert.deepEqual(sweep({ [name]: claimText(LIVE_PID, "%305") }), []);
+});
+
+// A host holds N panes on one pid. Sweeping our own claim would delete a sibling pane's slot
+// out from under it while this process is still saving into it.
+test("our own claim is never swept, dead-looking or not", () => {
+  const name = `${key(3)}.claim`;
+  assert.deepEqual(sweep({ [name]: claimText(SELF_PID, "%306") }, () => false), []);
+});
+
+// A reader can arrive mid-write. An unparseable claim costs a few hundred bytes until the next
+// launch; deleting one that turns out to be live costs a pane its session.
+test("an unparseable or unreadable claim is left alone", () => {
+  const files = {
+    [`${key(4)}.claim`]: "{ truncated",
+    [`${key(5)}.claim`]: "",
+    [`${key(6)}.claim`]: JSON.stringify({ pane: "%307", at: 1 }),
+  };
+  assert.deepEqual(sweep(files, () => false), []);
+});
+
+// Session files, temp files and the frame files the other sweeper owns all live here too.
+test("only claim files are considered", () => {
+  const files = {
+    [`${key(7)}.json`]: claimText(DEAD_PID, "%308"),
+    [`${key(8)}.json.${DEAD_PID}.tmp`]: claimText(DEAD_PID, "%309"),
+    [`tweb-frame-${DEAD_PID}-1.rgba`]: claimText(DEAD_PID, "%310"),
+    "not-a-key.claim": claimText(DEAD_PID, "%311"),
+  };
+  assert.deepEqual(sweep(files, () => false), []);
+});
+
+test("a directory of mixed claims sweeps exactly the dead ones", () => {
+  const dead1 = `${key(1)}.claim`;
+  const dead2 = `${key(2)}.claim`;
+  const files = {
+    [dead1]: claimText(DEAD_PID, "%304"),
+    [`${key(3)}.claim`]: claimText(LIVE_PID, "%305"),
+    [dead2]: claimText(DEAD_PID, "%306"),
+    [`${key(4)}.claim`]: claimText(SELF_PID, "%307"),
+    [`${key(5)}.json`]: "{}",
+  };
+  assert.deepEqual(sweep(files).sort(), [dead1, dead2].sort());
+});
+
+test("sweeping tolerates a missing or empty directory listing", () => {
+  assert.deepEqual(abandonedClaimFiles([], () => null, aliveOnly, SELF_PID), []);
+  assert.deepEqual(abandonedClaimFiles(null, () => null, aliveOnly, SELF_PID), []);
+});
+
+// The wiring, not the function. Both sweepers are pure and both were correct in isolation; what
+// actually failed in the field was that only one of them was ever called. A sweeper nothing
+// invokes is the same as no sweeper, and that is invisible to a unit test of the function.
+test("startup calls the claim sweeper beside the frame sweeper", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /sweepAbandonedFrameFiles\(\);\n\s*sweepAbandonedClaimFiles\(\);/);
+  assert.match(main, /function sweepAbandonedClaimFiles\(\)/);
+  assert.match(main, /abandonedClaimFiles\(names, parse, processAlive, process\.pid\)/);
 });

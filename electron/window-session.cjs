@@ -188,6 +188,49 @@ function takeSlot(claimPath, mine, pid, io, paneId = null) {
   return claimOwnedBy(parseSlotClaim(io.readClaim(claimPath)), pid, paneId);
 }
 
+// A claim is released only by the process named in it, on a clean exit. A SIGKILLed engine
+// leaves its claim behind, and the reasoning used to be that this costs nothing: the next pane
+// in that window reads the claim, finds the pid gone, and takes the slot over.
+//
+// That reclaim only ever runs for a slot some pane asks for again, and tmux does not reuse pane
+// ids — so a claim whose window is gone is asked for by nobody and is reclaimed by nobody. It is
+// not a slot leak (the slots are per window, and that window will not come back) but the files
+// accumulate for as long as the profile lives. Measured in a real userData directory: fifteen
+// claims spanning ten days, every one naming a dead pid, none reclaimable.
+//
+// So the same treatment `abandonedFrameFiles` gives frame files, by the same rule: the owner pid
+// is in the file, and a pid that is gone means the claim is. `isAlive` is injected for the same
+// reason it is there — the decision stays testable without spawning processes.
+//
+// A claim we cannot parse is LEFT ALONE. A reader can arrive mid-write, and the cost of being
+// wrong in that direction is deleting a live pane's claim and handing its session to a second
+// pane — the corrupting failure this whole mechanism exists to prevent. An unparseable claim
+// costs a few hundred bytes until the next launch.
+const CLAIM_FILE_PATTERN = /^[0-9a-f]{24}\.claim$/;
+
+/**
+ * Picks the claim files left behind by engines that are no longer running.
+ *
+ * @param {string[]} names directory entries to consider
+ * @param {(text: string) => object|null} parse reads a claim file's contents
+ * @param {(pid: number) => boolean} isAlive whether a pid still exists
+ * @param {number} selfPid this engine's pid, never swept
+ * @returns {string[]} the names safe to delete
+ */
+function abandonedClaimFiles(names, parse, isAlive, selfPid) {
+  const collectable = [];
+  for (const name of names || []) {
+    if (!CLAIM_FILE_PATTERN.test(String(name))) continue;
+    const claim = parse(name);
+    // Unreadable or unparseable: not ours to judge. See above.
+    if (!claim || !Number.isSafeInteger(claim.pid)) continue;
+    if (claim.pid === Number(selfPid)) continue;
+    if (isAlive(claim.pid)) continue;
+    collectable.push(name);
+  }
+  return collectable;
+}
+
 /** Whether an exiting process may delete a claim file — only ever its own. */
 function claimIsReleasable(text, pid, paneId = null) {
   return claimOwnedBy(parseSlotClaim(text), pid, paneId);
@@ -239,6 +282,7 @@ function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
 }
 
 module.exports = {
+  abandonedClaimFiles,
   claimIsReleasable,
   claimWindowSessionSlot,
   isRestorableUrl,
@@ -248,5 +292,6 @@ module.exports = {
   slotClaimPath,
   windowSessionForSave,
   windowSessionKeys,
+  CLAIM_FILE_PATTERN,
   MAX_SESSION_SLOTS,
 };
