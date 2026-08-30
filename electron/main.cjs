@@ -309,6 +309,69 @@ const engineLog = [];
 // it. Now that engine stderr goes to a file rather than over the page, they can
 // always be recorded; TWEB_DEBUG only decides whether stderr is inherited.
 const debugLogging = true;
+
+// --- frame latency probe -------------------------------------------------------------
+//
+// Off unless TWEB_FRAME_PROBE is set, and deliberately so: this samples `hrtime` several
+// times per paint, and the thing being measured is single-digit milliseconds. A probe that
+// is always on shows up in its own numbers.
+//
+// What it answers is the one question the code cannot answer by being read: between the
+// compositor producing a frame and the bytes reaching the terminal, how much is pipeline
+// COST (readback, encode, hand-off, escape-sequence write) and how much is a deliberate
+// WAIT (the frame-rate pacer holding a frame until the interval expires)? The first is what
+// a GPU-surface fast path (DESIGN 7.2) would remove. The second it would not touch — no
+// amount of Zig makes a 250ms idle interval shorter.
+//
+// Stages, in the order a whole frame passes through them:
+//   pace     queueFrame -> flushPendingFrame     the pacer's deliberate wait
+//   bitmap   image.toBitmap() / toPNG()          GPU -> CPU readback and encode
+//   transfer transferFrame -> queueGfxFrame      header build, hand-off to the worker
+// A patch reports `patch` for its crop+encode instead of `bitmap`, and no `pace` — patches
+// deliberately bypass the pacer.
+const frameProbeEnabled = Boolean(process.env.TWEB_FRAME_PROBE);
+const frameProbeSamples = [];
+const frameProbeMark = () => (frameProbeEnabled ? process.hrtime.bigint() : 0n);
+// Nanoseconds to milliseconds. A number, not a bigint: these are summarised, not accumulated.
+const frameProbeMs = (from, to) => Number(to - from) / 1e6;
+
+function frameProbeRecord(kind, stages, bytes) {
+  if (!frameProbeEnabled) return;
+  frameProbeSamples.push({ kind, ...stages, bytes });
+  // Bounded: the probe runs as long as the pane does, and a session left open overnight must
+  // not turn a diagnostic into the reason the engine ran out of memory.
+  if (frameProbeSamples.length > 600) frameProbeSamples.shift();
+}
+
+// Percentiles rather than a mean. A mean hides exactly the case that matters — the occasional
+// whole frame behind a run of cheap patches — and latency is felt at the peak, not at the
+// average. Same reasoning frame-rate-policy.cjs records for the playback budget.
+function frameProbeSummary() {
+  if (!frameProbeEnabled || frameProbeSamples.length === 0) return null;
+  const sortedValues = (rows, key) => rows
+    .map((row) => row[key])
+    .filter((value) => typeof value === "number")
+    .sort((a, b) => a - b);
+  const at = (sorted, q) => (sorted.length === 0
+    ? null
+    : Number(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))].toFixed(2)));
+  const summarise = (rows) => {
+    if (rows.length === 0) return null;
+    const out = { n: rows.length };
+    for (const key of ["pace", "bitmap", "patch", "transfer", "total"]) {
+      const sorted = sortedValues(rows, key);
+      if (sorted.length === 0) continue;
+      out[key] = { p50: at(sorted, 0.5), p95: at(sorted, 0.95), max: at(sorted, 1) };
+    }
+    const bytes = sortedValues(rows, "bytes");
+    if (bytes.length > 0) out.bytes = { p50: at(bytes, 0.5), max: at(bytes, 1) };
+    return out;
+  };
+  return {
+    whole: summarise(frameProbeSamples.filter((row) => row.kind === "whole")),
+    patch: summarise(frameProbeSamples.filter((row) => row.kind === "patch")),
+  };
+}
 const writeError = console.error.bind(console);
 console.error = (...args) => {
   const line = args.map((part) => (typeof part === "string" ? part : String(part))).join(" ");
@@ -1596,6 +1659,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   const geometry = patchGeometry(damage, frames.cells, size);
   if (!geometry) return false;
 
+  const patchStarted = frameProbeMark();
   let png;
   try {
     png = image.crop(geometry.crop).toPNG();
@@ -1604,12 +1668,20 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
     return false;
   }
   if (!png || png.length === 0) return false;
+  const patchEncoded = frameProbeMark();
 
   const id = takeNextPatchId(frames);
   const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames);
   // The id may still hold an older patch from a previous cycle through the pool.
   writeGfx(`a=d,d=I,i=${id},q=2`, "");
   writeGfxChunked(header, png.toString("base64"), prefix, suffix);
+  frameProbeRecord("patch", {
+    // No `pace`: a patch deliberately bypasses the pacer, which is the whole reason it
+    // exists. `patch` is the crop+encode, `transfer` the base64 and escape-sequence write.
+    patch: frameProbeMs(patchStarted, patchEncoded),
+    transfer: frameProbeMs(patchEncoded, frameProbeMark()),
+    total: frameProbeMs(patchStarted, frameProbeMark()),
+  }, png.length);
   notePatch(frames, id, damage);
   record.frames.patches += 1;
   const patchFramesSent = record.frames.patches;
@@ -1621,7 +1693,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   return true;
 }
 
-function transferFrame(pixels, generation, format = "png", size = null) {
+function transferFrame(pixels, generation, format = "png", size = null, probe = null) {
   if (currentFrames().pendingImageDelete) deletePlacement();
   // Any patch on screen describes damage this frame already contains, so it goes out with
   // the frame that supersedes it. Dropping them earlier would bare the stale pixels
@@ -1642,14 +1714,28 @@ function transferFrame(pixels, generation, format = "png", size = null) {
     console.error(`tweb: frame sent #${++currentFrames().framesSentCount} ${format}`);
   }
   currentFrames().lastFrameSentAt = Date.now();
+  if (probe) {
+    const handedOff = frameProbeMark();
+    frameProbeRecord("whole", {
+      // Zero when the frame went out through the `immediate` path rather than the pacer:
+      // a genuine zero, not a missing reading.
+      pace: probe.queuedAt ? frameProbeMs(probe.queuedAt, probe.flushed) : 0,
+      bitmap: frameProbeMs(probe.flushed, probe.encoded),
+      transfer: frameProbeMs(probe.encoded, handedOff),
+      total: frameProbeMs(probe.queuedAt || probe.flushed, handedOff),
+    }, pixels.length);
+  }
 }
 
-function sendFrameNow(image, generation) {
+function sendFrameNow(image, generation, queuedAt = 0n) {
   if (!currentPane().visible || generation !== currentFrames().generation || !image || image.isEmpty()) return;
   const viewport = currentFrames().viewport;
   const size = image.getSize();
   const expected = viewport && renderedFrameSize(viewport);
   if (!expected || size.width !== expected.width || size.height !== expected.height) return;
+  // The wait ended when this ran, not when the timer was set: a busy main thread delays the
+  // callback past its delay, and `pace` is the honest place for that — the frame was waiting.
+  const flushed = frameProbeMark();
   try {
     // Raw pixels skip the encode entirely; the worker swaps the channels and writes the
     // file. `toBitmap` hands back an owned copy, which is what the worker needs anyway —
@@ -1657,14 +1743,14 @@ function sendFrameNow(image, generation) {
     if (rawFramesEnabled) {
       const bitmap = image.toBitmap();
       currentFrames().imageTransferred = true;
-      transferFrame(bitmap, generation, "raw", size);
+      transferFrame(bitmap, generation, "raw", size, { flushed, encoded: frameProbeMark(), queuedAt });
       return;
     }
     // Hand the base64 conversion and the terminal write off to a worker once the PNG exists.
     // Even under stdout backpressure, the Electron main thread and keyboard input keep going.
     const png = image.toPNG();
     currentFrames().imageTransferred = true;
-    transferFrame(png, generation, "png", size);
+    transferFrame(png, generation, "png", size, { flushed, encoded: frameProbeMark(), queuedAt });
   } catch (error) {
     console.error(`tweb: frame encode failed: ${error.message}`);
   }
@@ -1675,7 +1761,7 @@ function flushPendingFrame() {
   const frame = currentFrames().pendingFrame;
   currentFrames().pendingFrame = null;
   if (!frame || frame.tab !== currentWindows().win || frame.generation !== currentFrames().generation || !currentPane().visible) return;
-  sendFrameNow(frame.image, frame.generation);
+  sendFrameNow(frame.image, frame.generation, frame.queuedAt);
 }
 
 function queueFrame(tab, image, immediate = false, dirty = null) {
@@ -1709,7 +1795,7 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
     currentFrames().lastFrameSentAt = Date.now();
     return;
   }
-  currentFrames().pendingFrame = { tab, image, generation };
+  currentFrames().pendingFrame = { tab, image, generation, queuedAt: frameProbeMark() };
   if (currentFrames().pendingFrameTimer) return;
   const elapsed = Date.now() - currentFrames().lastFrameSentAt;
   const delay = immediate ? 0 : Math.max(0, currentWindows().frameIntervalMs - elapsed);
@@ -3631,6 +3717,14 @@ function agentDiagnostics() {
       whole: currentPane().frames.whole,
       patches: currentPane().frames.patches,
       patchesPlaced: currentFrames().livePatchIds.length,
+      // Where the time between a paint and the terminal actually goes, in milliseconds, when
+      // TWEB_FRAME_PROBE is set — null otherwise, because the probe is off by default.
+      //
+      // `pace` is the frame-rate pacer's deliberate wait; the rest is pipeline cost. The two
+      // answer different questions and only one of them is a rendering problem: a large
+      // `pace` against a small `bitmap` means the pane is waiting on the rate policy, not on
+      // the GPU readback that DESIGN 7.2's fast path would remove.
+      probe: frameProbeSummary(),
       // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
       wholeFormat: rawFramesEnabled ? "raw" : "png",
