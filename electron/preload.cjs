@@ -197,6 +197,24 @@ installPrintShim();
     return active;
   }
 
+  // Whether THIS frame is the one holding the caret, for the editing commands the engine
+  // drives directly (`tweb-select-all`, `tweb-caret-motion`). Those go to every frame in the
+  // tab, so each has to decide for itself whether the command was meant for it.
+  //
+  // Not `document.hasFocus()`, which was the test here and is always false in this browser:
+  // every page renders into an offscreen window, and an offscreen window never holds OS
+  // focus. Measured — an offscreen BrowserWindow with an input focused reports
+  // `{hasFocus: false, activeElement: "input"}`. So a subframe returned early every time,
+  // while the main frame yields as soon as its activeElement is the iframe. Between the two
+  // guards, a caret inside any iframe was reachable by nobody: Cmd-A did nothing at all.
+  //
+  // The document's own `activeElement` is the right question and needs no OS focus. A frame
+  // that is not the one being typed in has `body` (or null) there, not an editable.
+  function frameOwnsCaret() {
+    if (topFrame && isTag(document.activeElement, "iframe", "frame")) return false;
+    return isEditable(activeElement()) || Boolean(topFrame);
+  }
+
   function eventIsEditable(event) {
     return event.composedPath().some(isEditable) || isEditable(activeElement());
   }
@@ -4247,8 +4265,7 @@ installPrintShim();
   });
 
   ipcRenderer.on("tweb-select-all", () => {
-    if (topFrame && isTag(document.activeElement, "iframe", "frame")) return;
-    if (!topFrame && !document.hasFocus()) return;
+    if (!frameOwnsCaret()) return;
     const active = activeElement();
     if (isTag(active, "input") || isTag(active, "textarea")) {
       active.select();
@@ -4262,8 +4279,7 @@ installPrintShim();
   // synthetic native key carries no default editing behaviour with it. Here the renderer
   // already knows the selection and the focused field, which is all these need.
   ipcRenderer.on("tweb-caret-motion", (_event, motion) => {
-    if (topFrame && isTag(document.activeElement, "iframe", "frame")) return;
-    if (!topFrame && !document.hasFocus()) return;
+    if (!frameOwnsCaret()) return;
     const active = activeElement();
     const key = motion?.key;
     const extend = Boolean(motion?.extend);
