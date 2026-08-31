@@ -2189,3 +2189,43 @@ test("window-all-closed does not quit when only display windows remain", () => {
   assert.match(fn, /isDisplayWindow/);
   assert.match(fn, /liveWindows\.length === 0.*app\.quit/);
 });
+
+
+// Cmd-A did nothing inside an iframe, and the two guards that produced it each looked
+// correct on its own:
+//
+//   main frame:  yields when its activeElement is the iframe        -> returns
+//   subframe:    handles only when `document.hasFocus()`            -> returns
+//
+// `document.hasFocus()` is always false here. Every page renders into an OFFSCREEN window
+// and an offscreen window never holds OS focus — measured directly: an offscreen
+// BrowserWindow with an input focused reports `{hasFocus: false, activeElement: "input"}`.
+// So the subframe's guard was not "am I the focused frame", it was "never". Between the
+// two, a caret inside any iframe belonged to nobody.
+//
+// The document's own `activeElement` needs no OS focus and answers the real question.
+test("the editing commands do not gate on OS focus, which offscreen never has", () => {
+  const guard = electron.slice(
+    electron.indexOf("function frameOwnsCaret"),
+    electron.indexOf("function eventIsEditable"),
+  );
+  assert.notEqual(guard.length, 0);
+  // The main frame still yields to a focused iframe: without this both frames would act on
+  // one keystroke and the page would select twice.
+  assert.match(guard, /topFrame && isTag\(document\.activeElement, "iframe", "frame"\)/);
+  // A subframe qualifies by holding an editable, not by owning OS focus.
+  assert.match(guard, /isEditable\(activeElement\(\)\) \|\| Boolean\(topFrame\)/);
+  assert.doesNotMatch(guard, /document\.hasFocus/);
+});
+
+// Both commands the engine drives directly rather than as key events. They are the two that
+// need a frame to decide whether a keystroke was meant for it, and they must not drift apart
+// — a caret motion that lands in a different frame from select-all is worse than either bug.
+test("select-all and caret-motion share one frame test", () => {
+  for (const channel of ["tweb-select-all", "tweb-caret-motion"]) {
+    const handler = electron.slice(electron.indexOf(`ipcRenderer.on("${channel}"`));
+    const body = handler.slice(0, handler.indexOf("});"));
+    assert.match(body, /if \(!frameOwnsCaret\(\)\) return;/, channel);
+    assert.doesNotMatch(body, /document\.hasFocus/, channel);
+  }
+});
