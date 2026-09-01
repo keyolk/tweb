@@ -2238,3 +2238,23 @@ test("select-all and caret-motion share one frame test", () => {
     assert.doesNotMatch(body, /document\.hasFocus/, channel);
   }
 });
+// The engine used to appear in `ps` as "Electron", which is also what Slack and Claude call
+// their processes — so `pkill -f Electron` while chasing a stuck pane took the user's chat apps
+// with it, and no engine could be told from any other. It names itself now.
+test("the engine names its own process rather than answering to Electron", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // NOT `app.setName`. That looks like the right call and also moves `app.getPath("userData")`,
+  // which is where every cookie and login lives — measured at 1.5GB under "tweb-electron". A
+  // nicer `ps` line is not worth silently starting a fresh profile.
+  assert.doesNotMatch(main, /app\.setName\(/,
+    "setName would relocate userData and log the user out of everything");
+  assert.match(main, /process\.title = "tweb";/);
+  // Set again once the pane is known: `ps` shows one engine per pane, and which pane this is
+  // happens to be the question being asked when someone reaches for `ps` at all.
+  assert.match(main,
+    /process\.title = hostedRuntime \? "tweb host" : \(ownTmuxPane \? `tweb \$\{ownTmuxPane\}` : "tweb"\)/);
+  // The pane id has to come early enough to survive `comm`, which truncates around 15 chars.
+  for (const title of ["tweb %5", "tweb %138", "tweb host"]) {
+    assert.ok(title.length <= 15, `${title} must survive the comm column`);
+  }
+});

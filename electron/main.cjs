@@ -126,6 +126,28 @@ if (process.env.TWEB_DOWNLOAD_DIR) {
 if (process.platform === "darwin") {
   app.setActivationPolicy("prohibited");
 }
+// What `ps`, Activity Monitor and `pkill` call this process.
+//
+// Without it the engine is one of several processes on the machine named "Electron" — Slack and
+// Claude ship their own — and the one that belongs to a terminal pane is indistinguishable from
+// the ones that do not. That matters beyond tidiness: `pkill -f Electron` while debugging a
+// stuck pane takes the user's chat apps with it, and DESIGN.md's orphan sweeper reasons about
+// engines by process, so the name is what a human cross-checks its decisions against.
+//
+// `process.title` rather than `app.setName`. setName looks like the right call and is the wrong
+// one: it also moves `app.getPath("userData")`, which is where every cookie, session and login
+// lives — measured here at 1.5GB under "tweb-electron". Renaming the app silently starts a fresh
+// profile and logs the user out of everything, which is a steep price for a nicer `ps` line.
+// Verified under Electron 43.2.0 that `process.title` alone changes both the `comm` and `args`
+// columns and leaves userData exactly where it was.
+//
+// The helper processes (GPU, renderer, network) keep Chromium's own names: each is a separate
+// exec of `Electron Helper`, not a fork of this one, so nothing set here reaches them. They are
+// still attributable — their parent is this process, and their --user-data-dir names tweb.
+//
+// Set again below once the pane is known, since `ps` shows one engine per pane and "which pane
+// is this one" is the question being asked when someone reaches for `ps` at all.
+process.title = "tweb";
 // Whether a supervisor started this process to host panes. Read once: it cannot change over a
 // process's life, and re-reading it invites two call sites to disagree about which runtime they
 // are in — which is exactly how a hosted pane ends up drawing into a control pipe.
@@ -142,6 +164,11 @@ const hostedRuntime = isHostedRuntime(process.env);
 // call sites falls through to its "not in tmux" branch, which already exists and is already
 // correct. A hosted pane's geometry and visibility arrive over its own connection instead.
 const ownTmuxPane = hostedRuntime ? null : (process.env.TMUX_PANE || null);
+// Now that the pane is known, say which one this is. A host serves many panes and names none of
+// them; a per-pane engine names the pane it belongs to, which is what tells two engines apart in
+// `ps` when two panes are open. The `comm` column truncates to about 15 characters, so the
+// distinguishing part goes early — `tweb %5`, not `tweb (pane %5)`.
+process.title = hostedRuntime ? "tweb host" : (ownTmuxPane ? `tweb ${ownTmuxPane}` : "tweb");
 let quitting = false;
 // Independent toggles: bypass (P) and vimium turn on and off separately.
 //   Ctrl-;  → bypass toggle (whether Cmd-K/A/... go to the page)
