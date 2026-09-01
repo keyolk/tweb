@@ -30,9 +30,27 @@
 // JPEG rather than PNG for the relay. The pane's own path already encodes PNG (or raw
 // pixels) for Kitty; encoding a *second* PNG for the viewer measured 3ms per frame at
 // 700x500 dsf2, and a full-screen page costs several times that — at 30fps that is main-
-// thread time the keyboard is waiting for. JPEG at this quality is visually clean on text
-// and decodes in the viewer through `createImageBitmap` off the main thread.
-const RELAY_JPEG_QUALITY = 80;
+// thread time the keyboard is waiting for. JPEG decodes in the viewer through
+// `createImageBitmap` off the main thread.
+//
+// The quality was 80, which was never measured — it was the number that came with the
+// choice of JPEG over PNG. Measured on Electron 43.2.0, a 2800x1800 frame (a typical float
+// window at dsf2), encode time against quality:
+//
+//   q80  26.6ms  2.00MB      q92  29.6ms  2.91MB
+//   q88  28.2ms  2.53MB      q95  27.6ms  3.41MB
+//
+// Encode time is dominated by pixel count and barely responds to quality at all — 80 to 92
+// is +11%, inside the run-to-run noise. What it buys is measurable, on 1200x720 of
+// antialiased black-on-white text against the source bitmap:
+//
+//   q80  MAE 3.70  max error 26  14.1% of pixels off by more than 8  PSNR 33.1dB
+//   q92  MAE 1.52  max error 10   0.3% of pixels off by more than 8  PSNR 40.7dB
+//
+// q80 is inside the range where ringing around text strokes is visible. And unlike the
+// Kitty path, these bytes never reach a disk or a terminal — the relay is IPC inside one
+// process — so the byte growth costs nothing the pane's own budget cares about.
+const RELAY_JPEG_QUALITY = 92;
 
 /// The BrowserWindow options for a tab's display window.
 ///
@@ -75,6 +93,43 @@ function centeredDisplayBounds(displayBounds, width, height) {
     y: Math.round(displayBounds.y + (displayBounds.height - h) / 2),
     width: w,
     height: h,
+  };
+}
+
+/// How much to shrink a fullscreen float's surface so its frame matches the monitor.
+///
+/// An offscreen window's `deviceScaleFactor` is fixed when the window is constructed, from the
+/// PRIMARY display, and there is no runtime setter — verified under Electron 43.2.0:
+/// `setDeviceScaleFactor` is undefined on both webContents and BrowserWindow. Fullscreen float
+/// deliberately opens on a DIFFERENT monitor so the terminal stays visible, and that monitor
+/// need not share the primary's scale. Measured here: primary 1728x1117 @2x, external 2560x1440
+/// @1x, so asking for 2560x1440 DIPs rendered 5120x2880 — four times the pixels the monitor can
+/// show, all of them discarded by the viewer's canvas, and enough to set the ceiling on its own
+/// (q92: 87.4ms/8.51MB at 5120x2880 against ~20ms/2.13MB at 2560x1440).
+///
+/// Below 1 only when the target is coarser than the surface. A monitor at or above the window's
+/// own scale gets 1 — shrinking there would throw away pixels the user can actually see.
+function fullscreenSurfaceScale(targetScaleFactor, surfaceScaleFactor) {
+  const target = Number(targetScaleFactor) || 0;
+  const surface = Number(surfaceScaleFactor) || 0;
+  if (!(target > 0) || !(surface > 0) || target >= surface) return 1;
+  return target / surface;
+}
+
+/// The DIPs a surface laid out at `logical` CSS pixels is asked for under `scale`.
+///
+/// Rounded to even numbers so the fixed dsf produces a whole-pixel frame; an odd DIP count at
+/// dsf2 lands the frame half a pixel off the monitor's, which the viewer then resamples for
+/// nothing. The zoom that keeps the layout unchanged is `scale` applied to the user's own
+/// factor — the two are always set together, since the resize alone would lay the page out at a
+/// fraction of the monitor and the zoom alone would render the same pixels at a different size.
+function scaledSurfaceSize(logical, scale) {
+  if (!(scale > 0) || scale === 1) {
+    return { width: Math.max(1, Math.round(logical.width)), height: Math.max(1, Math.round(logical.height)) };
+  }
+  return {
+    width: Math.max(2, Math.round((logical.width * scale) / 2) * 2),
+    height: Math.max(2, Math.round((logical.height * scale) / 2) * 2),
   };
 }
 
@@ -149,6 +204,8 @@ function relayInputEvents(kind, data = {}) {
 
 module.exports = {
   RELAY_JPEG_QUALITY,
+  fullscreenSurfaceScale,
+  scaledSurfaceSize,
   displayWindowOptions,
   centeredDisplayBounds,
   canvasPointToPage,

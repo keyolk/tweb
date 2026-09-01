@@ -374,9 +374,12 @@ test("overlays ask for a paint instead of waiting for the frame clock", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "repaint":/);
   assert.match(main, new RegExp(`const wasIdle = isThrottled\\((?:soleWindows|currentWindows\\(\\))\\);`));
+  // The visibility term also admits a floating pane: while floating, the OS window is the
+  // surface, so the pane's own visibility says nothing about whether anyone is waiting.
   assert.match(main, new RegExp(
     `if \\(wasIdle && (?:soleWindows|currentWindows\\(\\))\\.win && !(?:soleWindows|currentWindows\\(\\))\\.win\\.isDestroyed\\(\\)`
-    + ` && currentPane\\(\\)\\.visible\\)\\s*\\{?\\s*(?:soleWindows|currentWindows\\(\\))\\.win\\.webContents\\.invalidate\\(\\);`));
+    + `\\s*&& \\(currentPane\\(\\)\\.visible \\|\\| inputState\\(\\)\\.floating\\)\\)`
+    + `\\s*(?:soleWindows|currentWindows\\(\\))\\.win\\.webContents\\.invalidate\\(\\);`));
   assert.match(electron, /function paintNow\(\)/);
   // Every transient overlay mount requests a paint. The persistent mode/tab
   // indicator additionally repaints when its hover popover opens or closes.
@@ -1888,10 +1891,16 @@ test("viewer input and resize are routed back to the tab they mirror", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /ipcMain\.on\("tweb-float-input"/);
   assert.match(main, /const tab = display && displayWindowTabs\.get\(display\)/);
-  assert.match(main, /for \(const input of relayInputEvents\(kind, data\)\) tab\.webContents\.sendInputEvent\(input\)/);
+  // Through `scaleRelayInput`, which is identity except while a fullscreen float has shrunk
+  // its surface below the size the viewer maps clicks into.
+  assert.match(main, /for \(const input of relayInputEvents\(kind, scaleRelayInput\(tab, kind, data\)\)\)/);
+  assert.match(main, /tab\.webContents\.sendInputEvent\(input\)/);
   // A resized viewer re-lays out the page, and the stale-size frames have to be replaced.
+  // Through `applyFullscreenSurface`, which pairs the resize with the zoom that keeps the
+  // layout unchanged — the two must never be applied separately.
   assert.match(main, /ipcMain\.on\("tweb-float-resized"/);
-  assert.match(main, /tab\.setContentSize\(width, height\)/);
+  assert.match(main, /applyFullscreenSurface\(tab, \{ width, height \}\)/);
+  assert.match(main, /function applyFullscreenSurface[\s\S]*?tab\.setContentSize\(surface\.width, surface\.height\)/);
   assert.match(main, /sendDisplayPageSize\(tab\)/);
   // Both run in the tab's pane scope — a host serves several, and the wrong scope draws
   // into another pane's terminal. Slice to the next ipcMain handler so the assertion
@@ -1953,7 +1962,7 @@ test("float input IPC intercepts w before relay expansion", () => {
   assert.match(ipc, /kind === "key" && String\(data\?\.key\) === "w"/);
   assert.match(ipc, /toggleFloat\(\)/);
   // The relay loop still exists for non-w keys.
-  assert.match(ipc, /for \(const input of relayInputEvents\(kind, data\)\)/);
+  assert.match(ipc, /for \(const input of relayInputEvents\(kind, scaleRelayInput\(tab, kind, data\)\)\)/);
 });
 
 // `w` from the tmux pane (via `dispatchNamedKey`) must also be intercepted before
