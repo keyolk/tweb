@@ -35,12 +35,15 @@ const { normalizeUrl } = require("./url-normalization.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
 const {
   RELAY_JPEG_QUALITY,
+  fullscreenSurfaceScale,
+  scaledSurfaceSize,
   displayWindowOptions,
   centeredDisplayBounds,
   relayInputEvents,
 } = require("./float-display.cjs");
 const {
   frameRateTiers,
+  floatingFrameRateTiers,
   playbackWindowMs,
   settledFrameRate,
   interactionRate,
@@ -123,6 +126,28 @@ if (process.env.TWEB_DOWNLOAD_DIR) {
 if (process.platform === "darwin") {
   app.setActivationPolicy("prohibited");
 }
+// What `ps`, Activity Monitor and `pkill` call this process.
+//
+// Without it the engine is one of several processes on the machine named "Electron" — Slack and
+// Claude ship their own — and the one that belongs to a terminal pane is indistinguishable from
+// the ones that do not. That matters beyond tidiness: `pkill -f Electron` while debugging a
+// stuck pane takes the user's chat apps with it, and DESIGN.md's orphan sweeper reasons about
+// engines by process, so the name is what a human cross-checks its decisions against.
+//
+// `process.title` rather than `app.setName`. setName looks like the right call and is the wrong
+// one: it also moves `app.getPath("userData")`, which is where every cookie, session and login
+// lives — measured here at 1.5GB under "tweb-electron". Renaming the app silently starts a fresh
+// profile and logs the user out of everything, which is a steep price for a nicer `ps` line.
+// Verified under Electron 43.2.0 that `process.title` alone changes both the `comm` and `args`
+// columns and leaves userData exactly where it was.
+//
+// The helper processes (GPU, renderer, network) keep Chromium's own names: each is a separate
+// exec of `Electron Helper`, not a fork of this one, so nothing set here reaches them. They are
+// still attributable — their parent is this process, and their --user-data-dir names tweb.
+//
+// Set again below once the pane is known, since `ps` shows one engine per pane and "which pane
+// is this one" is the question being asked when someone reaches for `ps` at all.
+process.title = "tweb";
 // Whether a supervisor started this process to host panes. Read once: it cannot change over a
 // process's life, and re-reading it invites two call sites to disagree about which runtime they
 // are in — which is exactly how a hosted pane ends up drawing into a control pipe.
@@ -139,6 +164,11 @@ const hostedRuntime = isHostedRuntime(process.env);
 // call sites falls through to its "not in tmux" branch, which already exists and is already
 // correct. A hosted pane's geometry and visibility arrive over its own connection instead.
 const ownTmuxPane = hostedRuntime ? null : (process.env.TMUX_PANE || null);
+// Now that the pane is known, say which one this is. A host serves many panes and names none of
+// them; a per-pane engine names the pane it belongs to, which is what tells two engines apart in
+// `ps` when two panes are open. The `comm` column truncates to about 15 characters, so the
+// distinguishing part goes early — `tweb %5`, not `tweb (pane %5)`.
+process.title = hostedRuntime ? "tweb host" : (ownTmuxPane ? `tweb ${ownTmuxPane}` : "tweb");
 let quitting = false;
 // Independent toggles: bypass (P) and vimium turn on and off separately.
 //   Ctrl-;  → bypass toggle (whether Cmd-K/A/... go to the page)
@@ -1482,7 +1512,10 @@ function applyActiveFrameRate(rate, windows = currentWindows(), record = current
   const change = applyPaneFrameRate(windows, rate);
   if (!change) return;
   recordFrameTier(record, change.rate);
-  if (windows.win && !windows.win.isDestroyed() && record.visible) {
+  // `record.visible` is about the tmux pane, and a floating tab's surface is the OS window
+  // instead — so a pane scrolled out of view still has someone looking at its page. Without
+  // this the rate reached the tab only when the per-second watchdog got round to it.
+  if (windows.win && !windows.win.isDestroyed() && (record.visible || inputState().floating)) {
     windows.win.webContents.setFrameRate(change.rate);
   }
   if (debugLogging) console.error(`tweb: frame rate ${change.rate}fps`);
@@ -1500,7 +1533,10 @@ function markInteractionActivity() {
   // exists to bound. `invalidate()` below is what makes an interaction feel immediate, and it
   // still runs — the rate only decides what happens after that first paint.
   applyActiveFrameRate(interactionRate(currentWindows().settledPainting, currentPlaybackTiers()));
-  if (wasIdle && currentWindows().win && !currentWindows().win.isDestroyed() && currentPane().visible) currentWindows().win.webContents.invalidate();
+  // Same reason as in `applyActiveFrameRate`: while floating, the viewer is the surface, so the
+  // pane's own visibility says nothing about whether anyone is waiting for this frame.
+  if (wasIdle && currentWindows().win && !currentWindows().win.isDestroyed()
+    && (currentPane().visible || inputState().floating)) currentWindows().win.webContents.invalidate();
   if (currentWindows().frameIdleTimer) clearTimeout(currentWindows().frameIdleTimer);
   // The paints this interaction is about to cause say nothing about whether the page
   // paints on its own, which is the only thing the settle decides — so the count starts
@@ -1549,6 +1585,11 @@ function settleFrameRate() {
 // bounds the bytes. Per pane because a host serves panes of different sizes, and a rate derived
 // from another pane's area is exactly the crossing this engine is careful about elsewhere.
 function currentPlaybackTiers() {
+  // A floating pane's frames never reach the terminal — the `paint` handler skips `queueFrame`
+  // outright — so the byte budget is bounding a cost this pane is not paying. It was bounding it
+  // hard: at dsf2 every floating window, whatever its size, resolved to the 8fps floor, which is
+  // what a 60fps video looked like through the viewer. See `floatingFrameRateTiers`.
+  if (inputState().floating) return floatingFrameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
   const viewport = currentFrames().viewport;
   if (!viewport) return frameRates;
   const size = renderedFrameSize(viewport);
@@ -2223,19 +2264,27 @@ function applySurfacePlan(tab, plan) {
     closeDisplayWindow(tab);
     keepWindowHidden(tab);
   }
+  // A fullscreen float's surface is deliberately smaller than the size the page is laid out at,
+  // so the plan's size is the LAYOUT and this is the surface it asks for. Compared this way the
+  // once-a-second reconciler leaves the compensated surface alone; comparing against the plan
+  // directly had it resize back to 4x the monitor every tick.
+  const compensating = plan.floating && fullscreenScale !== 1 && plan.height > 1;
+  const wanted = compensating ? scaledSurfaceSize(plan, fullscreenScale) : { width: plan.width, height: plan.height };
   const size = tab.getContentSize();
   const current = { width: size[0], height: size[1] };
-  if (!surfaceResizeNeeded(plan, current)) return;
+  if (!surfaceResizeNeeded(wanted, current)) return;
   // Recorded before the resize, and only for the tab that is this pane's active one: the
   // record's `logical` is the size a restore goes back to, and reading it off a collapsed
-  // surface is how the agent API came back with innerHeight=1.
+  // surface is how the agent API came back with innerHeight=1. The plan's size, not the
+  // surface's — what a restore goes back to is the layout.
   if (tab === currentWindows().win) {
     recordSurface(currentPane(), { collapsed: plan.height <= 1, logical: { width: plan.width, height: plan.height } });
   }
-  tab.setContentSize(plan.width, plan.height);
+  tab.setContentSize(wanted.width, wanted.height);
   // Chromium resets the zoom factor on a content resize, and a collapsed tab would come
-  // back at 100% however the user had zoomed it.
-  const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+  // back at 100% however the user had zoomed it. Through `effectiveZoomFactor` so a fullscreen
+  // float's surface compensation survives the reconciler, which runs every second.
+  const zoomFactor = effectiveZoomFactor(tab);
   if (tab.webContents.getZoomFactor() !== zoomFactor) tab.webContents.setZoomFactor(zoomFactor);
 }
 
@@ -2930,7 +2979,7 @@ function activateTab(index) {
   // Zoom is shared per origin in Chromium, so a sibling tab on the same host can
   // have moved it. Only the active tab is ever painted, so restoring this tab's
   // own factor on activation is what makes zoom look per-tab.
-  const zoomFactor = tabZoomFactors.get(currentWindows().win) ?? defaultZoomFactor;
+  const zoomFactor = effectiveZoomFactor(currentWindows().win);
   if (!currentWindows().win.isDestroyed() && currentWindows().win.webContents.getZoomFactor() !== zoomFactor) {
     currentWindows().win.webContents.setZoomFactor(zoomFactor);
   }
@@ -3233,12 +3282,55 @@ let fullscreenFloat = false;
 // otherwise resize the offscreen tab back to the pane's size, clobbering the
 // fullscreen resolution.
 let fullscreenSize = null;
+// How much the fullscreen tab's surface is shrunk below the size the viewer reports, and the
+// zoom that compensates. 1 whenever nothing is being compensated for.
+//
+// WHY. An offscreen window's `deviceScaleFactor` is fixed when the window is constructed
+// (`browserWindowOptions`), from the PRIMARY display — and there is no runtime setter, verified
+// under Electron 43.2.0: `setDeviceScaleFactor` is undefined on both webContents and
+// BrowserWindow. Fullscreen float deliberately opens on a DIFFERENT monitor so the terminal
+// stays visible, and that monitor need not have the primary's scale factor. Here, primary is
+// 1728x1117 @2x and the external is 2560x1440 @1x, so `setContentSize(2560, 1440)` rendered
+// 5120x2880 — four times the pixels the monitor can show, every one of them thrown away by the
+// viewer's canvas. Measured, that alone set the ceiling:
+//
+//   5120x2880  q92  87.4ms  8.51MB   11fps
+//   2560x1440  q92  ~20ms   2.13MB   ~48fps
+//
+// The fix without recreating the window: ask for proportionally fewer DIPs so the fixed dsf
+// lands the frame at the monitor's real pixel count, and divide the zoom by the same factor so
+// the CSS viewport is unchanged. Verified the layout is identical — at contentSize 2560x1440
+// zoom 0.8 the page saw CSS 3200x1800, and at contentSize 1280x720 zoom 0.4 it saw CSS 3200x1800
+// again, with the frame down from 5120x2880 to 2560x1440.
+let fullscreenScale = 1;
+
+/// The surface scale for a fullscreen float shown on `display`.
+function fullscreenScaleFor(display) {
+  return fullscreenSurfaceScale(display?.scaleFactor, renderScaleFactor());
+}
+
+/// The zoom a tab should be at, including any fullscreen surface compensation.
+///
+/// Every site that restores zoom goes through here, so the compensation cannot be undone by the
+/// watchdog, a navigation, or a tab switch putting the user's own factor back.
+function effectiveZoomFactor(tab) {
+  const base = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+  if (fullscreenScale === 1) return base;
+  // Only the tab that is actually floating fullscreen is compensated.
+  if (!floatingTabs.has(tab)) return base;
+  return base * fullscreenScale;
+}
+
 function toggleFloat(fullscreen = false) {
   const state = inputState();
   const wasFullscreen = fullscreenFloat;
   state.floating = !state.floating;
   fullscreenFloat = state.floating ? fullscreen : false;
   if (!state.floating) fullscreenSize = null;
+  // Cleared BEFORE `updatePaintingState`, which reconciles every tab's surface and reads the
+  // scale through `effectiveZoomFactor`. Left set, a pinned tab would go back to the pane at a
+  // zoom divided for a monitor it is no longer on. `enter-full-screen` sets it again.
+  if (!fullscreenFloat) fullscreenScale = 1;
   updatePaintingState();
   updatePaneTitle();
   // When floating, the page leaves the terminal pane — the user sees bare terminal,
@@ -5145,7 +5237,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   let initialZoomApplied = false;
   onContents("did-finish-load", () => {
     showingLoadError = false;
-    const zoomFactor = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+    const zoomFactor = effectiveZoomFactor(tab);
     contents.setZoomFactor(zoomFactor);
     contents.invalidate();
     // Autofocused fields report their caret before this zoom lands.
@@ -5501,8 +5593,10 @@ function setBrowserZoom(action) {
   const next = action === "reset"
     ? defaultZoomFactor
     : Math.min(2, Math.max(0.5, current * (action === "in" ? 1.2 : 1 / 1.2)));
+  // The user's own factor is what is remembered and what a later pin restores; what is applied
+  // carries any fullscreen surface compensation on top of it.
   tabZoomFactors.set(currentWindows().win, next);
-  contents.setZoomFactor(next);
+  contents.setZoomFactor(effectiveZoomFactor(currentWindows().win));
   contents.invalidate();
   broadcastCellMetrics();
   reparkTerminalCaret();
@@ -5656,6 +5750,46 @@ function openDisplayWindow(tab, plan) {
   // own <title>, which is often a site name that says nothing about the view mode.
   const floatLabel = fullscreenFloat ? "TWeb (fullscreen)" : "TWeb (floating)";
   display.setTitle(floatLabel);
+
+  // Registered for the window's whole life rather than once for the transition that opened it.
+  // Fullscreen is also reached by toggling it on a viewer that is ALREADY floating (the
+  // `toggle-fullscreen` shortcut calls `setFullScreen` directly), and a one-shot listener had
+  // been consumed by then — so that path never learned its content size and, now, never
+  // measured the monitor it landed on.
+  display.on("enter-full-screen", () => {
+    if (display.isDestroyed() || tab.isDestroyed()) return;
+    fullscreenFloat = true;
+    const [w, h] = display.getContentSize();
+    fullscreenSize = { width: w, height: h };
+    // Read from where the window ENDED UP, not from the anchor picked before it was shown:
+    // the user can send a fullscreen window to another monitor, and the scale that matters is
+    // the one it is being displayed on.
+    fullscreenScale = fullscreenScaleFor(screen.getDisplayMatching(display.getBounds()));
+    display.setTitle("TWeb (fullscreen)");
+    withPaneScope(tabPanes.get(tab), () => {
+      applyFullscreenSurface(tab, fullscreenSize);
+      sendDisplayPageSize(tab);
+      tab.webContents.invalidate();
+    });
+    updatePaneTitle();
+  });
+
+  // Leaving fullscreen without pinning — the green button, or the shortcut toggled off. The
+  // surface goes back to the pane's own size, which `updatePaintingState` decides, and the
+  // compensation must be gone before it reads the zoom.
+  display.on("leave-full-screen", () => {
+    if (display.isDestroyed()) return;
+    fullscreenFloat = false;
+    fullscreenSize = null;
+    fullscreenScale = 1;
+    display.setTitle("TWeb (floating)");
+    withPaneScope(tabPanes.get(tab), () => {
+      updatePaintingState();
+      sendDisplayPageSize(tab);
+      updatePaneTitle();
+    });
+  });
+
   display.loadFile(path.join(__dirname, "float-viewer.html")).then(() => {
     if (display.isDestroyed()) return;
     // Fullscreen keeps terminal focus: the viewer is on a different monitor and the
@@ -5664,29 +5798,20 @@ function openDisplayWindow(tab, plan) {
     if (fullscreenFloat) {
       display.showInactive();
       display.setFullScreen(true);
-      // macOS fullscreen is an animation — the window's content size settles only after
-      // `enter-full-screen`. The viewer's `resize` event fires then and drives
-      // `tweb-float-resized`, which resizes the offscreen tab to match. But the event
-      // can race the IPC, so we also nudge the page size here once the transition ends.
+      // Sizing is handled by the `enter-full-screen` listener above, which covers this
+      // transition and the one the `toggle-fullscreen` shortcut starts on an already-floating
+      // viewer. What is left here is focus, which is specific to opening straight into
+      // fullscreen: setFullScreen can steal OS focus even after showInactive. Blur the viewer
+      // so macOS hands focus back to the terminal — the user is still driving it. app.hide
+      // withdraws all Electron windows (including the fullscreen viewer, which showInactive
+      // opened), then app.show brings them back. The net effect is that macOS re-evaluates
+      // focus from scratch and gives it to the terminal — the app the user launched tweb from
+      // — rather than to the re-shown viewer.
       display.once("enter-full-screen", () => {
-        if (display.isDestroyed() || tab.isDestroyed()) return;
-        const [w, h] = display.getContentSize();
-        fullscreenSize = { width: w, height: h };
-        withPaneScope(tabPanes.get(tab), () => {
-          tab.setContentSize(Math.max(1, w), Math.max(1, h));
-          sendDisplayPageSize(tab);
-          tab.webContents.invalidate();
-        });
-        // setFullScreen can steal OS focus even after showInactive. Blur the viewer
-        // so macOS hands focus back to the terminal — the user is still driving it.
-        // app.hide withdraws all Electron windows (including the fullscreen viewer,
-        // which showInactive opened), then app.show brings them back. The net effect
-        // is that macOS re-evaluates focus from scratch and gives it to the terminal —
-        // the app the user launched tweb from — rather than to the re-shown viewer.
+        if (display.isDestroyed()) return;
         display.blur();
         app.hide();
         app.show();
-        updatePaneTitle();
       });
     } else {
       display.show();
@@ -5711,6 +5836,7 @@ function openDisplayWindow(tab, plan) {
     const wasFullscreen = fullscreenFloat;
     fullscreenFloat = false;
     fullscreenSize = null;
+    fullscreenScale = 1;
     if (!tab.isDestroyed()) keepWindowHidden(tab);
     updatePaintingState();
     updatePaneTitle();
@@ -5727,12 +5853,33 @@ function closeDisplayWindow(tab) {
   if (!display.isDestroyed()) display.destroy();
 }
 
+/// Sizes a fullscreen float's surface and applies the zoom that keeps the page's layout
+/// unchanged. Both halves belong together: the resize alone would lay the page out at a
+/// fraction of the monitor, and the zoom alone would render the same pixels at a different size.
+function applyFullscreenSurface(tab, logical) {
+  // `scaledSurfaceSize` is identity at scale 1, so there is no branch to keep in step here.
+  const surface = scaledSurfaceSize(logical, fullscreenScale);
+  tab.setContentSize(surface.width, surface.height);
+  // After `setContentSize`, because Chromium resets the zoom factor on a content resize.
+  const zoomFactor = effectiveZoomFactor(tab);
+  if (tab.webContents.getZoomFactor() !== zoomFactor) tab.webContents.setZoomFactor(zoomFactor);
+}
+
 /// The page's logical size, which is the space the viewer maps a click into.
+///
+/// In CSS pixels rather than DIPs. Those are the same number until a fullscreen float shrinks
+/// its surface and zooms to compensate — and then `getContentSize` is the shrunken DIP count
+/// while the document is still laid out at the monitor's size, so sending it raw would put every
+/// click at a fraction of the distance across the page it was aimed at.
 function sendDisplayPageSize(tab) {
   const display = displayWindows.get(tab);
   if (!display || display.isDestroyed() || tab.isDestroyed()) return;
   const size = tab.getContentSize();
-  display.webContents.send("tweb-float-page-size", { width: size[0], height: size[1] });
+  const scale = floatingTabs.has(tab) ? fullscreenScale : 1;
+  display.webContents.send("tweb-float-page-size", {
+    width: Math.max(1, Math.round(size[0] / scale)),
+    height: Math.max(1, Math.round(size[1] / scale)),
+  });
 }
 
 /// Relays one painted frame to a floating tab's viewer.
@@ -5767,9 +5914,40 @@ ipcMain.on("tweb-float-input", (event, kind, data) => {
     return;
   }
   withPaneScope(tabPanes.get(tab), () => {
-    for (const input of relayInputEvents(kind, data)) tab.webContents.sendInputEvent(input);
+    // Input through the viewer is interaction, exactly as input through the pane is. Only the
+    // tmux paths called this, so scrolling or typing in a floating window left the pane at
+    // whatever tier the last settle chose — the one case where the user is unambiguously
+    // looking at the page was the one case that could not raise its own frame rate.
+    // `move` is excluded: the viewer forwards hover continuously (throttled to one per animation
+    // frame), and treating a pointer crossing the window as interaction would hold the maximum
+    // rate for as long as the mouse was anywhere over it.
+    if (kind !== "move") markInteractionActivity();
+    for (const input of relayInputEvents(kind, scaleRelayInput(tab, kind, data))) {
+      tab.webContents.sendInputEvent(input);
+    }
   });
 });
+
+/// Converts a viewer's page coordinates into the DIPs `sendInputEvent` takes.
+///
+/// The viewer maps a click into the page's CSS size (what `sendDisplayPageSize` gives it). That
+/// equals the DIP size except while a fullscreen float is compensating for a coarse monitor, at
+/// which point the surface is deliberately smaller than the layout — so a click at the bottom of
+/// a 1440-tall page would arrive at y=1440 against a 720-DIP surface and be clamped to the
+/// bottom edge. Scaling here rather than in the viewer keeps the compensation entirely inside
+/// the main process, which is the only side that knows the surface was shrunk.
+function scaleRelayInput(tab, kind, data) {
+  const scale = floatingTabs.has(tab) ? fullscreenScale : 1;
+  if (scale === 1 || !data || kind === "key") return data;
+  const scaled = { ...data };
+  if (typeof data.x === "number") scaled.x = Math.round(data.x * scale);
+  if (typeof data.y === "number") scaled.y = Math.round(data.y * scale);
+  // Wheel deltas are a distance in the same space as the coordinates, so they scale too —
+  // otherwise one notch of the wheel scrolls the page twice as far as the pointer moved.
+  if (typeof data.deltaX === "number") scaled.deltaX = data.deltaX * scale;
+  if (typeof data.deltaY === "number") scaled.deltaY = data.deltaY * scale;
+  return scaled;
+}
 
 // A resized viewer window re-lays out the page at its new size. The pane's own surface
 // reconciler owns the offscreen window's size, so this only takes effect while floating —
@@ -5780,10 +5958,14 @@ ipcMain.on("tweb-float-resized", (event, size) => {
   if (!tab || tab.isDestroyed() || !floatingTabs.has(tab)) return;
   const width = Math.max(1, Math.round(size?.width || 1));
   const height = Math.max(1, Math.round(size?.height || 1));
+  // While fullscreen, the surface is deliberately smaller than the size the viewer reports —
+  // so compare against what that size resolves to rather than against the report itself, or
+  // every viewer resize event would undo the compensation and put the surface back to 4x.
+  const wanted = scaledSurfaceSize({ width, height }, fullscreenScale);
   const current = tab.getContentSize();
-  if (current[0] === width && current[1] === height) return;
+  if (current[0] === wanted.width && current[1] === wanted.height) return;
   withPaneScope(tabPanes.get(tab), () => {
-    tab.setContentSize(width, height);
+    applyFullscreenSurface(tab, { width, height });
     sendDisplayPageSize(tab);
     // The pane's cached frames are the old size and `queueFrame` drops mismatched ones, so
     // the viewer would sit on a stale image until the page happened to paint by itself.

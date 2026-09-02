@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   frameRateTiers,
+  floatingFrameRateTiers,
   playbackWindowMs,
   settledFrameRate,
   playbackRateForArea,
@@ -166,4 +167,41 @@ test("fixed mode is untouched by the cap", () => {
   // so painting or not, the answer is the rate the user asked for.
   const tiers = frameRateTiers(30, false, 1680 * 1026);
   assert.equal(interactionRate(true, tiers), 30);
+});
+
+// --- floating panes are not on the Kitty path ------------------------------------------
+
+test("a floating pane keeps its ceiling however large the window is", () => {
+  // The byte budget bounds raw frames written to a file and read back by the terminal. A
+  // floating tab writes none: main.cjs skips `queueFrame` entirely while a tab floats. The
+  // sizes below all resolve to the 8fps floor under the pane policy, which is what a 60fps
+  // video looked like through the viewer.
+  for (const [w, h] of [[1800, 1200], [2800, 1800], [5120, 2880]]) {
+    assert.equal(frameRateTiers(30, true, w * h).playback, PLAYBACK_MIN_RATE,
+      "precondition: the pane policy floors every one of these");
+    assert.equal(floatingFrameRateTiers(30, true).playback, 30);
+  }
+});
+
+test("a floating pane still falls to idle when nothing is painting", () => {
+  // The encode is only free when there is no frame to encode, so a static page in a floating
+  // window drops exactly as it does in a pane.
+  const tiers = floatingFrameRateTiers(30, true);
+  assert.deepEqual(tiers, { max: 30, playback: 30, idle: 4 });
+  assert.deepEqual(settledFrameRate(0, tiers), { rate: 4, painting: false });
+  assert.deepEqual(settledFrameRate(PLAYBACK_MIN_PAINTS, tiers), { rate: 30, painting: true });
+});
+
+test("interaction in a floating window is never capped below the ceiling", () => {
+  // The whole point of wiring the viewer's input into `markInteractionActivity`: while
+  // floating, playback IS the maximum, so a painting page cannot be held down by the cap.
+  const tiers = floatingFrameRateTiers(30, true);
+  assert.equal(interactionRate(true, tiers), 30);
+  assert.equal(interactionRate(false, tiers), 30);
+});
+
+test("a floating pane respects a configured ceiling and fixed mode", () => {
+  // NEGATIVE CONTROL: floating lifts the byte budget, not the user's own setting.
+  assert.equal(floatingFrameRateTiers(10, true).playback, 10);
+  assert.deepEqual(floatingFrameRateTiers(12, false), { max: 12, playback: 12, idle: 12 });
 });

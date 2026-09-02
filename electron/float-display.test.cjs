@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   RELAY_JPEG_QUALITY,
+  fullscreenSurfaceScale,
+  scaledSurfaceSize,
   displayWindowOptions,
   centeredDisplayBounds,
   canvasPointToPage,
@@ -151,4 +153,63 @@ test("a hover forwards a single move", () => {
 test("frames are relayed as JPEG at a quality that stays readable", () => {
   assert.equal(typeof RELAY_JPEG_QUALITY, "number");
   assert.ok(RELAY_JPEG_QUALITY >= 60 && RELAY_JPEG_QUALITY <= 95);
+});
+
+// --- fullscreen on a monitor coarser than the surface ------------------------------------
+
+test("a coarser fullscreen monitor shrinks the surface by the scale ratio", () => {
+  // The measured case: primary 1728x1117 @2x fixes the offscreen dsf at 2, and fullscreen
+  // deliberately moves to the external 2560x1440 @1x. Asking for 2560x1440 DIPs rendered
+  // 5120x2880 — four times what the monitor can show, all discarded by the viewer.
+  assert.equal(fullscreenSurfaceScale(1, 2), 0.5);
+  const surface = scaledSurfaceSize({ width: 2560, height: 1440 }, 0.5);
+  assert.deepEqual(surface, { width: 1280, height: 720 });
+  // dsf2 over those DIPs is exactly the monitor's pixel count: nothing is thrown away, and
+  // nothing is rendered that cannot be shown.
+  assert.deepEqual({ width: surface.width * 2, height: surface.height * 2 },
+    { width: 2560, height: 1440 });
+});
+
+test("a monitor at or above the surface's scale is left alone", () => {
+  // NEGATIVE CONTROL. Shrinking on a retina monitor would throw away pixels the user can see,
+  // which is the opposite of the bug being fixed.
+  assert.equal(fullscreenSurfaceScale(2, 2), 1);
+  assert.equal(fullscreenSurfaceScale(3, 2), 1);
+  assert.equal(fullscreenSurfaceScale(1, 1), 1);
+});
+
+test("an unusable scale factor compensates for nothing", () => {
+  // A display that reports no scale must not silently collapse the surface toward zero.
+  for (const bad of [0, -1, undefined, null, NaN, "x"]) {
+    assert.equal(fullscreenSurfaceScale(bad, 2), 1, `target ${String(bad)}`);
+    assert.equal(fullscreenSurfaceScale(1, bad), 1, `surface ${String(bad)}`);
+  }
+});
+
+test("scale 1 passes the size through unchanged", () => {
+  // Every caller relies on this: it is what lets the sizing path stay branch-free.
+  assert.deepEqual(scaledSurfaceSize({ width: 1401, height: 901 }, 1),
+    { width: 1401, height: 901 });
+});
+
+test("a scaled surface lands on even DIPs so the frame is whole pixels", () => {
+  // An odd DIP count at dsf2 puts the frame half a pixel off the monitor's, which the viewer
+  // resamples for nothing.
+  const surface = scaledSurfaceSize({ width: 2561, height: 1441 }, 0.5);
+  assert.equal(surface.width % 2, 0);
+  assert.equal(surface.height % 2, 0);
+  // And never collapses: a surface of zero is a blank window, not a cheap one.
+  assert.deepEqual(scaledSurfaceSize({ width: 1, height: 1 }, 0.5), { width: 2, height: 2 });
+});
+
+test("the compensating zoom keeps the page's layout identical", () => {
+  // The resize and the zoom are two halves of one change. Verified against Electron 43.2.0:
+  // contentSize 2560x1440 at zoom 0.8 laid the page out at CSS 3200x1800 and rendered
+  // 5120x2880; contentSize 1280x720 at zoom 0.4 laid it out at CSS 3200x1800 — the same
+  // document — and rendered 2560x1440.
+  const scale = fullscreenSurfaceScale(1, 2);
+  const userZoom = 0.8;
+  const surface = scaledSurfaceSize({ width: 2560, height: 1440 }, scale);
+  assert.equal(surface.width / (userZoom * scale), 2560 / userZoom);
+  assert.equal(surface.height / (userZoom * scale), 1440 / userZoom);
 });

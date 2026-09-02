@@ -77,6 +77,38 @@ function playbackRateForArea(area, max) {
 }
 
 /**
+ * Rates for a pane whose frames go to a floating window instead of the terminal.
+ *
+ * The playback budget below bounds bytes that are `width * height * 4`, written to a file and
+ * read back by the terminal. A floating tab pays none of that: `main.cjs` skips `queueFrame`
+ * entirely while a tab floats, so there is no raw frame on disk, no Kitty transfer and no
+ * terminal decoding it. The frames leave as JPEG over IPC inside one process.
+ *
+ * Applying the budget anyway pinned every floating window to the 8fps floor, whatever its size —
+ * at dsf2 even a 900x600 window renders 1800x1200, which is already past the budget. Measured on
+ * Electron 43.2.0 with a 1080p60 video in a 1400x900 dsf2 offscreen window, the decoder running
+ * at 60fps throughout:
+ *
+ *   setFrameRate(60)   57 paints/s   15 frames dropped   relay 8.4MB/s   jpeg 72% of one core
+ *   setFrameRate(30)   30 paints/s    5 frames dropped   relay 4.3MB/s   jpeg 38% of one core
+ *   setFrameRate(8)     7 paints/s  260 frames dropped   relay 1.0MB/s   jpeg  8% of one core
+ *
+ * The pipeline was never the limit — at the floor it used 8% of a core and threw away 260 frames
+ * a second. So a floating pane gets its configured ceiling, and the cost is the JPEG encode,
+ * which is bounded by the ceiling itself rather than by a byte budget for a path it does not use.
+ *
+ * @param {number} maxRate the configured maximum, 1-60
+ * @param {boolean} adaptive false pins everything to the maximum
+ */
+function floatingFrameRateTiers(maxRate, adaptive) {
+  const max = Math.min(60, Math.max(1, Math.round(maxRate) || 1));
+  if (!adaptive) return { max, playback: max, idle: max };
+  // Idle still falls, and for the reason it always did: a static page in a floating window has
+  // nothing new to show either, and the encode is only free when there is no frame to encode.
+  return { max, playback: max, idle: Math.min(max, 4) };
+}
+
+/**
  * Rates for a given configuration.
  *
  * Playback is bounded by bytes, not by a fixed number. It was capped at 15 when this tier was
@@ -160,6 +192,6 @@ function settledFrameRate(paints, tiers) {
 }
 
 module.exports = {
-  frameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea, interactionRate,
-  PLAYBACK_MIN_PAINTS, PLAYBACK_MIN_RATE, PLAYBACK_BYTE_BUDGET,
+  frameRateTiers, floatingFrameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea,
+  interactionRate, PLAYBACK_MIN_PAINTS, PLAYBACK_MIN_RATE, PLAYBACK_BYTE_BUDGET,
 };
