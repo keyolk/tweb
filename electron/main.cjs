@@ -38,6 +38,7 @@ const {
 } = require("./terminal-focus.cjs");
 const {
   RELAY_JPEG_QUALITY,
+  centeredStatusSequence,
   fullscreenSurfaceScale,
   scaledSurfaceSize,
   displayWindowOptions,
@@ -3324,6 +3325,22 @@ function effectiveZoomFactor(tab) {
   return base * fullscreenScale;
 }
 
+/// Draws the pane's float status line, centred.
+///
+/// Written from three places, not one: `toggleFloat` puts it up, and both fullscreen
+/// transitions change which label is CORRECT — `toggle-fullscreen` on an already-floating
+/// viewer used to leave "FLOATING" on screen while the page was fullscreen on another monitor.
+function writeFloatStatus() {
+  if (!inputState().floating || quitting) return;
+  // The Kitty placement goes first: it is the last frame the pane was showing and it sits on
+  // top of the terminal text, so the status line would be drawn behind it.
+  deletePlacement();
+  const label = fullscreenFloat ? "FULLSCREEN  page on another monitor  press w to pin"
+    : "FLOATING  page in an OS window  press w to pin";
+  const cells = currentFrames().cells;
+  writerFor(currentPane()).write(centeredStatusSequence(label, cells.cols, cells.rows));
+}
+
 function toggleFloat(fullscreen = false) {
   const state = inputState();
   const wasFullscreen = fullscreenFloat;
@@ -3344,12 +3361,7 @@ function toggleFloat(fullscreen = false) {
     // Delete the Kitty graphics placement first — it is the last frame the pane was
     // showing, and it sits on top of the terminal text. Without deleting it the
     // status line would be hidden behind the placement.
-    deletePlacement();
-    const label = fullscreenFloat ? "FULLSCREEN  page on another monitor  press w to pin"
-      : "FLOATING  page in an OS window  press w to to pin";
-    // Clear the terminal first, then move the cursor to center and write the label.
-    // ESC[2J clears the screen; ESC[<row>;<col>H moves the cursor.
-    writerFor(currentPane()).write(`\x1b[2J\x1b[12;1H\x1b[1m\x1b[36m${label}\x1b[0m`);
+    writeFloatStatus();
   }
   // On pin: restore focus. Fullscreen never took it (showInactive), so app.hide
   // would only withdraw the terminal that already has it. tmux selection still
@@ -5869,6 +5881,9 @@ function openDisplayWindow(tab, plan) {
       applyFullscreenSurface(tab, fullscreenSize);
       sendDisplayPageSize(tab);
       tab.webContents.invalidate();
+      // The label changes with the mode, and this transition is reachable without going
+      // through `toggleFloat` at all.
+      writeFloatStatus();
     });
     updatePaneTitle();
   });
@@ -5885,6 +5900,7 @@ function openDisplayWindow(tab, plan) {
     withPaneScope(tabPanes.get(tab), () => {
       updatePaintingState();
       sendDisplayPageSize(tab);
+      writeFloatStatus();
       updatePaneTitle();
     });
   });
