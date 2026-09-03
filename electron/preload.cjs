@@ -2056,9 +2056,28 @@ installPrintShim();
       // front of everything. That is the reported smear: three cells of `asdfasdf` blurred
       // out, immediately right of a caret at position 0.
       if ((element.selectionEnd ?? start) !== start) return false;
+      // An empty field is not a place to compose either, and reserving cells in one is pure
+      // loss. Composition is never signalled to this preload — preedit happens in the
+      // terminal and only committed text arrives — so the slot is painted for as long as a
+      // field has focus rather than while something is being composed. In an EMPTY field
+      // that means it covers the placeholder of a search box nobody has typed in: reported
+      // on a Google Drive search whose "Search your Google Drive Docs" read as "arch your
+      // Google Drive Docs", the first two glyphs blurred out under a slot reserved for a
+      // composition that had not started.
+      //
+      // Nothing is lost by withholding it. The slot exists to keep page glyphs from being
+      // legible under preedit, and an empty field has no glyphs to hide — the placeholder
+      // is not text the user is composing over, it is the prompt telling them what to type.
+      // The first committed character puts content in the field and the slot comes back for
+      // the composition that follows it.
+      if (!value) return false;
       return !value.slice(start).trim();
     }
     if (!element.isContentEditable) return false;
+    // Same reason as the empty field above. `textContent` rather than `innerText`: this runs
+    // on every caret report and `innerText` forces a layout, which is the one thing a
+    // per-keystroke path must not do.
+    if (!element.textContent?.trim()) return false;
     const selection = getSelection();
     if (!selection?.rangeCount) return true;
     if (!selection.isCollapsed) return false;

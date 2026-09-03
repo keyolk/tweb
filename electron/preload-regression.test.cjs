@@ -1618,6 +1618,39 @@ test("the IME slot is withheld when the caret is not at the end", () => {
   assert.doesNotMatch(slot, /restorePageCaret/);
 });
 
+// Composition is never signalled to this preload — preedit happens in the terminal and only
+// committed text arrives — so the slot is painted for as long as a field has FOCUS rather than
+// while something is being composed. In an empty field that covers the placeholder: reported on
+// a Google Drive search whose "Search your Google Drive Docs" read as "arch your Google Drive
+// Docs", the first two glyphs blurred out under cells reserved for a composition that had not
+// started.
+//
+// Verified with the real preload in a real window: empty field -> no slot, one character typed
+// -> slot, cleared -> no slot, and the same for an empty contenteditable.
+test("the IME slot is withheld in an empty field", () => {
+  const helper = electron.slice(electron.indexOf("  function caretAtContentEnd()"),
+    electron.indexOf("  function reportCaret()"));
+  // Nothing is lost by withholding it: the slot exists to keep page glyphs from being legible
+  // under preedit, and an empty field has no glyphs to hide. The placeholder is the prompt
+  // telling the user what to type, not text they are composing over.
+  assert.match(helper, /if \(!value\) return false;/);
+  // The check has to come AFTER the range-selection guard and BEFORE the trailing-text test,
+  // or an empty field falls through to `!"".slice(0).trim()` — which is true, which is the bug.
+  const emptyAt = helper.indexOf("if (!value) return false;");
+  const rangeAt = helper.indexOf("if ((element.selectionEnd ?? start) !== start) return false;");
+  const trailingAt = helper.indexOf("return !value.slice(start).trim();");
+  assert.ok(rangeAt >= 0 && emptyAt > rangeAt && trailingAt > emptyAt,
+    "the empty-field guard must sit between the range guard and the trailing-text test");
+  // An empty contenteditable is the same case. `textContent` rather than `innerText`: this
+  // runs on every caret report and `innerText` forces a layout.
+  assert.match(helper, /if \(!element\.textContent\?\.trim\(\)\) return false;/);
+  // Comments stripped first: the comment explaining this choice names the function it
+  // rejects, and reading it as code fails the assertion on prose.
+  const helperCode = helper.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+  assert.doesNotMatch(helperCode, /innerText/,
+    "innerText forces a layout on a per-keystroke path");
+});
+
 // The page keys scrolled the document from inside a focused textarea, because they skipped
 // the caret step the arrows right next to them take. No other editor does that with them.
 test("the page keys move the caret in a field before they scroll", () => {
