@@ -1755,7 +1755,6 @@ installPrintShim();
   // just past the caret, with the terminal cursor parked on its first cell. The
   // composition then lands inside the surface, never on top of page glyphs, and reads
   // as the terminal surface it is.
-  let caretCanvas = null;
   let lastCaretReport = "";
   let cellMetrics = null;
   let imeSlotHost = null;
@@ -1958,6 +1957,48 @@ installPrintShim();
     }
   }
 
+  /// The advance width of `text` under `computed`, as the browser itself lays it out.
+  ///
+  /// A detached span reused across calls: this runs on every caret report, and creating and
+  /// dropping an element per keystroke is measurable where a style write is not. It is inserted
+  /// into `documentElement` rather than the focused field's parent so no page layout depends on
+  /// it, and `visibility:hidden` keeps it off screen while still being measured — `display:none`
+  /// would give a zero-width box.
+  ///
+  /// Deliberately NOT in the document's flow or find surface: it is a bare span with no text
+  /// nodes the user can reach, removed on the first report that does not need it.
+  let caretMirror = null;
+
+  function measuredTextWidth(text, computed) {
+    if (!text) return 0;
+    if (!caretMirror?.isConnected) {
+      caretMirror = document.createElement("span");
+      document.documentElement.append(caretMirror);
+    }
+    caretMirror.style.cssText = "position:fixed;top:0;left:0;visibility:hidden;"
+      + "white-space:pre;pointer-events:none;z-index:-1";
+    // Every property that changes an advance width. The font shorthand covers family, size,
+    // weight, style and variant; the rest are the ones it cannot express.
+    for (const property of ["font", "letterSpacing", "wordSpacing", "textTransform",
+      "fontKerning", "fontFeatureSettings", "fontVariantLigatures", "textRendering"]) {
+      const value = computed[property];
+      if (value) caretMirror.style[property] = value;
+    }
+    caretMirror.textContent = text;
+    const width = caretMirror.getBoundingClientRect().width;
+    // Emptied after measuring. `visibility:hidden` already keeps the mirror out of Chromium's
+    // find — measured on a page with one "zebra": the mirror holding "zebra" hidden still
+    // reported 1 match, and the same mirror without the hiding reported 2. So this is not what
+    // stops the text being findable; the hiding is.
+    //
+    // It is cleared anyway because the mirror holds a copy of whatever is in a focused field,
+    // passwords included, and leaving that in the DOM between keystrokes is a copy of it
+    // sitting where any page script can read it. `getBoundingClientRect` has already forced
+    // the layout the measurement needs, so clearing afterwards costs nothing.
+    caretMirror.textContent = "";
+    return width;
+  }
+
   function caretPoint() {
     const visual = visualCaretPoint();
     if (visual) return visual;
@@ -1989,10 +2030,28 @@ installPrintShim();
 
     try {
       if (isTag(element, "input")) {
-        caretCanvas = caretCanvas || document.createElement("canvas").getContext("2d");
-        caretCanvas.font = computed.font || `${computed.fontSize} ${computed.fontFamily}`;
         const before = element.value.slice(0, element.selectionStart ?? element.value.length);
-        x += caretCanvas.measureText(before).width - element.scrollLeft;
+        // Measured with a DOM mirror rather than canvas `measureText`, and the difference is
+        // not a rounding one. `measureText` applies the FONT and nothing else: it ignores
+        // `letter-spacing` and `text-transform` outright. Measured on Electron 43.2.0 against
+        // the browser's own advance width for "asfasdf":
+        //
+        //   plain                    canvas 42.98   dom 42.98   drift  0.01
+        //   letter-spacing: 1px      canvas 42.98   dom 49.98   drift  7.01
+        //   letter-spacing: 0.08em   canvas 42.98   dom 50.45   drift  7.48
+        //   text-transform: upper    canvas 42.98   dom 60.75   drift 17.77
+        //   20px + letter-spacing 2  canvas 64.48   dom 78.48   drift 14.00
+        //
+        // font-weight, font-stretch, font-variant and word-spacing all agree, so the
+        // shorthand was doing its job — these two are simply outside what a canvas font can
+        // express. Reported as the terminal cursor landing five characters short of the real
+        // caret in a search box: seven characters at 1px of tracking is seven pixels, which is
+        // half a glyph each.
+        //
+        // The mirror is the same technique the textarea branch below already uses, and it is
+        // the browser's own layout rather than a model of it — so a property nobody thought of
+        // cannot drift it either.
+        x += measuredTextWidth(before, computed) - element.scrollLeft;
         y = box.top + Math.max(1, (box.height - height) / 2);
       } else if (isTag(element, "textarea")) {
         // Measure with a mirror: a textarea gives no caret rect of its own.
@@ -4017,13 +4076,69 @@ installPrintShim();
         entry.action();
       });
       list.append(row);
-      return { row, ...entry };
+      return { row, labelSpan, ...entry };
     });
+    // What was typed, shown under the rows. The filter was invisible before: typing narrowed
+    // the selection but left every row on screen, so a query that matched one entry looked
+    // identical to one that matched none.
+    const query = document.createElement("div");
+    query.style.cssText = "display:none;padding:4px 10px;border-top:1px solid #5f6368;color:#9aa0a6;font:11px ui-monospace,SFMono-Regular,Menlo,monospace";
+    list.append(query);
     shadow.append(list);
     document.documentElement.append(host);
     paintNow();
-    commandPaletteState = { host, items, selected: 0, typed: "" };
+    commandPaletteState = { host, items, selected: 0, typed: "", query, matches: items };
+    // Highlight the first row on open. Enter already ran `matches[0]`, so the selection
+    // existed — it simply was not drawn, and a menu with nothing highlighted does not say
+    // what Enter will do.
+    paintCommandPaletteSelection();
     setMode("command", `${entries.length}`);
+  }
+
+  /// Applies the typed filter: hides the rows that do not match, orders the rest by score.
+  ///
+  /// The palette used to filter with `label.includes(typed)`, which fails on exactly the
+  /// abbreviations someone reaches for — measured against the live entries, `ft` for
+  /// "Focus terminal", `fw` for "Focus float window" and `ochr` for "Open in Chrome" all
+  /// matched nothing, while a subsequence match finds each. `fuzzyScore` was already in this
+  /// file for the omnibox; the palette simply was not using it.
+  function filterCommandPalette() {
+    const state = commandPaletteState;
+    if (!state) return;
+    const typed = state.typed;
+    const scored = state.items
+      .map((item) => ({ item, score: typed ? fuzzyScore(typed, item.label) : 0 }))
+      .filter((entry) => Number.isFinite(entry.score))
+      .sort((left, right) => right.score - left.score);
+    state.matches = scored.map((entry) => entry.item);
+    // Reordered in the DOM as well as in the array, so the best match is the top ROW rather
+    // than a highlighted row somewhere in the middle of an unchanged list.
+    for (const item of state.matches) item.row.parentNode?.append(item.row);
+    state.query.parentNode?.append(state.query);
+    for (const item of state.items) {
+      item.row.style.display = state.matches.includes(item) ? "" : "none";
+    }
+    state.query.textContent = typed ? `${typed}${state.matches.length ? "" : "  (no match)"}` : "";
+    state.query.style.display = typed ? "block" : "none";
+    // The selection moves to the best match rather than staying where it was: after a
+    // keystroke the row under it is a different command.
+    state.selected = 0;
+    paintCommandPaletteSelection();
+    setMode("command", typed ? `${state.matches.length}/${state.items.length}` : `${state.items.length}`);
+    paintNow();
+  }
+
+  /// Paints the selection highlight. Split from `selectCommandPaletteIndex` because the filter
+  /// also has to repaint it, and doing that through the index setter would clamp against a
+  /// stale match list.
+  function paintCommandPaletteSelection() {
+    const state = commandPaletteState;
+    if (!state) return;
+    for (const item of state.items) item.row.style.background = "";
+    const selected = state.matches[state.selected];
+    if (!selected) return;
+    selected.row.style.background = "#1a3a5e";
+    selected.row.scrollIntoView({ block: "nearest" });
   }
 
   // Moving the selection is a DOM change like any other, and at the idle rate the pane is
@@ -4032,11 +4147,12 @@ installPrintShim();
   // menu LOOKS like has to do the same. `setMode` is not that nudge: it updates the indicator's
   // DOM and returns, so the overlays that only call it are relying on the frame clock.
   function selectCommandPaletteIndex(index) {
-    const items = commandPaletteState.items;
-    items[commandPaletteState.selected].row.style.background = "";
-    commandPaletteState.selected = Math.min(items.length - 1, Math.max(0, index));
-    items[commandPaletteState.selected].row.style.background = "#1a3a5e";
-    items[commandPaletteState.selected].row.scrollIntoView({ block: "nearest" });
+    const matches = commandPaletteState.matches;
+    if (!matches.length) return;
+    // Clamped to the MATCHES rather than to every entry: with a filter applied, moving into a
+    // hidden row would highlight nothing and Enter would run a command that is not on screen.
+    commandPaletteState.selected = Math.min(matches.length - 1, Math.max(0, index));
+    paintCommandPaletteSelection();
     paintNow();
   }
 
@@ -4044,39 +4160,42 @@ installPrintShim();
     if (!commandPaletteState) return false;
     event.preventDefault();
     event.stopImmediatePropagation();
-    const items = commandPaletteState.items;
+    const state = commandPaletteState;
     if (key === "Escape") {
       cancelCommandPalette(false);
       // The menu coming DOWN is a change to the pane too, and the cancel path has no paint of
       // its own — Escape looked ignored for the same quarter second the moves did.
       paintNow();
     } else if (key === "Enter") {
-      const entry = items[commandPaletteState.selected];
+      const entry = state.matches[state.selected];
+      if (!entry) return true;
       cancelCommandPalette(false);
       entry.action();
       paintNow();
-    } else if (key === "j" || key === "ArrowDown") {
-      selectCommandPaletteIndex(commandPaletteState.selected + 1);
-    } else if (key === "k" || key === "ArrowUp") {
-      selectCommandPaletteIndex(commandPaletteState.selected - 1);
-    } else if (key.length === 1 && /[a-z]/i.test(key)) {
-      // Fuzzy search: filter by typed characters against label. If exactly one
-      // entry matches, run it immediately and close — the palette is a menu,
-      // not a mode, so there is no "confirm" step when the filter is unambiguous.
-      commandPaletteState.typed += key.toLowerCase();
-      const matches = items.filter((item) =>
-        item.label.toLowerCase().includes(commandPaletteState.typed));
-      if (matches.length === 1) {
+    } else if (key === "ArrowDown") {
+      selectCommandPaletteIndex(state.selected + 1);
+    } else if (key === "ArrowUp") {
+      selectCommandPaletteIndex(state.selected - 1);
+    } else if (key === "Backspace") {
+      // Without this a mistyped letter could only be undone by closing the palette and
+      // starting again, since every other key either moves or filters.
+      state.typed = state.typed.slice(0, -1);
+      filterCommandPalette();
+    } else if (key.length === 1 && /[a-z0-9]/i.test(key)) {
+      // Every letter filters, including `j` and `k`. They used to move the selection, which
+      // made them the two letters a query could not contain — `j` is in nothing today but
+      // "float window" has a `k`-less spelling only by luck, and a menu where some letters
+      // type and others navigate has no rule the user can hold. Arrows navigate instead.
+      state.typed += key.toLowerCase();
+      filterCommandPalette();
+      // One match left is unambiguous, so it runs — the palette is a menu, not a mode, and
+      // there is nothing left to confirm. Checked AFTER filtering so the decision is made
+      // against the fuzzy result rather than a substring guess.
+      if (state.matches.length === 1) {
+        const only = state.matches[0];
         cancelCommandPalette(false);
-        matches[0].action();
+        only.action();
         paintNow();
-      } else if (matches.length > 0) {
-        selectCommandPaletteIndex(items.indexOf(matches[0]));
-      } else {
-        // A key that matches nothing still consumed a keystroke. Without a paint the pane is
-        // identical to the frame before it, which reads as the palette having missed the key —
-        // the typed buffer has changed, and the next letter filters against it.
-        commandPaletteState.typed = commandPaletteState.typed.slice(0, -1);
       }
     }
     return true;

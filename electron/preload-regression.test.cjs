@@ -2199,15 +2199,31 @@ test("command palette opens with c and lists actions", () => {
   assert.match(electron, /case "c": startCommandPalette\(\); break;/);
   // `cancelCommandPalette` is in `cancelTransient`.
   assert.match(electron, /cancelCommandPalette\(false\);/);
-  // `handleCommandPaletteKey` handles j/k/Enter/Escape and fuzzy search.
+  // `handleCommandPaletteKey` handles arrows/Enter/Escape/Backspace and the filter.
   assert.match(electron, /function handleCommandPaletteKey/);
-  assert.match(electron, /key === "j" \|\| key === "ArrowDown"/);
-  assert.match(electron, /key === "k" \|\| key === "ArrowUp"/);
+  // Arrows navigate, letters filter. `j`/`k` used to move, which made them the two letters a
+  // query could not contain — a menu where some letters type and others navigate has no rule
+  // the user can hold.
+  assert.match(electron, /key === "ArrowDown"/);
+  assert.match(electron, /key === "ArrowUp"/);
+  const paletteKeys = electron.slice(
+    electron.indexOf("function handleCommandPaletteKey"),
+    electron.indexOf("function enterInspect"),
+  );
+  assert.doesNotMatch(paletteKeys, /key === "j"/,
+    "`j` must filter like every other letter");
+  assert.doesNotMatch(paletteKeys, /key === "k"/);
   assert.match(electron, /key === "Enter"/);
   assert.match(electron, /key === "Escape"/);
-  // Fuzzy search: typed characters filter by label, and a single match runs immediately.
-  assert.match(electron, /commandPaletteState\.typed/);
-  assert.match(electron, /matches\[0\]\.action\(\)/);
+  // Backspace undoes a mistyped letter; without it the only way back was to close and reopen.
+  assert.match(electron, /key === "Backspace"/);
+  // The filter scores with `fuzzyScore` — the same scorer the omnibox uses — rather than
+  // `includes`. Measured against the live labels, `includes` missed `ft` for "Focus terminal",
+  // `fw` for "Focus float window" and `ochr` for "Open in Chrome"; all three are subsequence
+  // matches that the scorer finds.
+  assert.match(electron, /state\.typed/);
+  assert.match(electron, /fuzzyScore\(typed, item\.label\)/);
+  assert.match(electron, /state\.matches\[0\]/);
   // A mouse click is a first-class confirmation.
   assert.match(electron, /row\.addEventListener\("click"/);
   // `emptyPickerReason` has a command entry.
@@ -2229,22 +2245,29 @@ test("every command palette state change asks for a paint", () => {
   );
   assert.notEqual(handler.length, 0);
 
-  // Moving the selection: one helper, so j/k/ArrowDown/ArrowUp and the fuzzy-match jump
+  // Moving the selection: one helper, so both arrows and the filter's jump to the best match
   // cannot drift apart.
   assert.match(handler, /function selectCommandPaletteIndex[\s\S]*?paintNow\(\);\n  \}/);
-  assert.match(handler, /key === "j" \|\| key === "ArrowDown"[\s\S]*?selectCommandPaletteIndex\(commandPaletteState\.selected \+ 1\)/);
-  assert.match(handler, /key === "k" \|\| key === "ArrowUp"[\s\S]*?selectCommandPaletteIndex\(commandPaletteState\.selected - 1\)/);
+  assert.match(handler, /key === "ArrowDown"\)[\s\S]{0,80}selectCommandPaletteIndex\(state\.selected \+ 1\)/);
+  assert.match(handler, /key === "ArrowUp"\)[\s\S]{0,80}selectCommandPaletteIndex\(state\.selected - 1\)/);
+  // Filtering repaints too — it hides rows and reorders them, which nothing else schedules.
+  // Defined above the key handler, so matched against the file rather than the slice.
+  const filter = electron.slice(
+    electron.indexOf("function filterCommandPalette"),
+    electron.indexOf("function paintCommandPaletteSelection"),
+  );
+  assert.match(filter, /paintNow\(\);/);
 
   // The menu coming down is a change to the pane too. Escape and Enter both remove the host,
   // and `cancelCommandPalette` has no paint of its own.
   const escape = handler.slice(handler.indexOf('key === "Escape"'), handler.indexOf('key === "Enter"'));
   assert.match(escape, /paintNow\(\)/);
-  const enter = handler.slice(handler.indexOf('key === "Enter"'), handler.indexOf('key === "j"'));
+  const enter = handler.slice(handler.indexOf('key === "Enter"'), handler.indexOf('key === "ArrowDown"'));
   assert.match(enter, /paintNow\(\)/);
 
   // Running an entry from an unambiguous filter closes the menu the same way Enter does.
-  const fuzzy = handler.slice(handler.indexOf("matches.length === 1"));
-  assert.match(fuzzy, /matches\[0\]\.action\(\);\n\s*paintNow\(\)/);
+  const single = handler.slice(handler.indexOf("state.matches.length === 1"));
+  assert.match(single, /only\.action\(\);\n\s*paintNow\(\)/);
 });
 
 // With two entries, most letters filter to exactly one and run it on the spot — `f` is
@@ -2252,12 +2275,27 @@ test("every command palette state change asks for a paint", () => {
 // looking untouched while still being appended to the filter, so the next letter was matched
 // against a buffer holding a character the user could not see. Typing `x` then `f` matched
 // "xf" and found nothing, and the palette that had just run on a single `f` now did nothing.
-test("a command palette keystroke that matches nothing does not poison the filter", () => {
+// A letter that matches nothing used to be dropped from the buffer silently, which is the
+// only thing that could be done when the filter was invisible: the rows never changed, so a
+// kept letter would have made every later keystroke filter against a query the user could not
+// see. Now the query is drawn under the rows, so the letter stays and the palette says
+// "(no match)" — and Backspace is what takes it back.
+test("a command palette keystroke that matches nothing is shown, not swallowed", () => {
   const handler = electron.slice(
     electron.indexOf("function handleCommandPaletteKey"),
     electron.indexOf("function enterInspect"),
   );
-  assert.match(handler, /commandPaletteState\.typed = commandPaletteState\.typed\.slice\(0, -1\)/);
+  // Backspace is the way back, rather than the filter editing itself behind the user.
+  assert.match(handler, /key === "Backspace"[\s\S]{0,200}state\.typed = state\.typed\.slice\(0, -1\)/);
+  const filter = electron.slice(
+    electron.indexOf("function filterCommandPalette"),
+    electron.indexOf("function paintCommandPaletteSelection"),
+  );
+  // The query is visible, and says when it matches nothing.
+  assert.match(filter, /no match/);
+  assert.match(filter, /state\.query\.style\.display = typed \? "block" : "none"/);
+  // And the count in the mode indicator distinguishes "filtered" from "everything".
+  assert.match(filter, /\$\{state\.matches\.length\}\/\$\{state\.items\.length\}/);
 });
 
 // A floating viewer is a real BrowserWindow, so closing it fires window-all-closed.
@@ -2457,4 +2495,50 @@ test("Tab completes command names from the table `:` executes", () => {
   // A Tab that cannot complete says why rather than looking ignored.
   assert.match(handler, /no matching command/);
   assert.match(handler, /no completion for script/);
+});
+
+
+// The terminal cursor landed five characters short of the real caret in a search box. The
+// input branch measured with canvas `measureText`, which applies the FONT and nothing else —
+// `letter-spacing` and `text-transform` are outside what a canvas font string can express.
+// Measured on Electron 43.2.0 against the browser's own advance width for "asfasdf":
+//
+//   plain                    canvas 42.98   dom 42.98   drift  0.01
+//   letter-spacing: 1px      canvas 42.98   dom 49.98   drift  7.01
+//   text-transform: upper    canvas 42.98   dom 60.75   drift 17.77
+//
+// Seven characters at 1px of tracking is seven pixels, half a glyph each.
+test("the input caret is measured by layout, not by a canvas font", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const caret = preload.slice(
+    preload.indexOf("  function caretPoint()"),
+    preload.indexOf("  function caretAtContentEnd()"),
+  );
+  assert.match(caret, /x \+= measuredTextWidth\(before, computed\) - element\.scrollLeft/);
+  // The canvas path is gone rather than merely unused — a second measurement kept around is
+  // one a later change can pick up again.
+  assert.doesNotMatch(preload, /caretCanvas/);
+  // Scoped to the caret path: the find bar draws itself on a canvas and measures its own
+  // label with `measureText`, which is a legitimate use of it.
+  assert.doesNotMatch(caret, /measureText\(/);
+
+  const mirror = preload.slice(
+    preload.indexOf("  function measuredTextWidth("),
+    preload.indexOf("  function caretPoint()"),
+  );
+  // Every property that changes an advance width and is NOT in the font shorthand. Measured:
+  // font-weight, font-stretch, font-variant and word-spacing all agree with the canvas, so
+  // the shorthand was doing its job; these are the ones outside it.
+  for (const property of ["letterSpacing", "wordSpacing", "textTransform"]) {
+    assert.ok(mirror.includes(property), `${property} changes the advance width`);
+  }
+  // Hidden, which is also what keeps it out of Chromium's find: measured on a page with one
+  // "zebra", the mirror holding "zebra" hidden still reported 1 match and the same mirror
+  // unhidden reported 2.
+  assert.match(mirror, /visibility:hidden/);
+  // Reused rather than rebuilt: this runs on every caret report.
+  assert.match(mirror, /if \(!caretMirror\?\.isConnected\)/);
+  // And emptied afterwards — it holds a copy of whatever is in a focused field, passwords
+  // included, and leaving that in the DOM is a copy any page script can read.
+  assert.match(mirror, /caretMirror\.textContent = "";/);
 });
