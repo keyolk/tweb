@@ -34,6 +34,9 @@ const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibilit
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
 const {
+  findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
+} = require("./terminal-focus.cjs");
+const {
   RELAY_JPEG_QUALITY,
   fullscreenSurfaceScale,
   scaledSurfaceSize,
@@ -3394,10 +3397,106 @@ function restoreFocusFromFloat({ skipHide = false } = {}) {
 }
 
 
+/// Moves OS focus to the terminal showing this pane, WITHOUT closing the floating window.
+///
+/// `restoreFocusFromFloat` cannot do this: it hands focus over by hiding this whole process,
+/// which takes the floating window with it. Keeping the window means naming the app to focus
+/// instead, and that is what `terminal-focus.cjs` resolves — see there for the ancestry walk
+/// and why the terminal is several levels above the client's tty.
+function focusTerminalFromFloat() {
+  const placement = vis().placement;
+  if (!placement?.paneId) {
+    // No pane to go to. A bare-terminal engine has no tmux placement at all, and silently
+    // doing nothing reads as the key being broken.
+    return { ok: false, reason: "this pane is not in tmux" };
+  }
+  // tmux first: the client may be looking at another window, and focusing the terminal app
+  // before selecting the pane would show the user the wrong window for a frame.
+  if (placement.windowId) {
+    try {
+      execFileSync("tmux", ["select-window", "-t", placement.windowId], { timeout: 1000, stdio: "ignore" });
+    } catch (error) { void error; }
+  }
+  try {
+    execFileSync("tmux", ["select-pane", "-t", placement.paneId], { timeout: 1000, stdio: "ignore" });
+  } catch (error) { void error; }
+
+  const bundle = terminalAppForPane(placement);
+  if (!bundle) return { ok: false, reason: "no terminal application found" };
+  // `open -a` rather than AppleScript: it needs no automation permission, which an
+  // osascript `activate` does — and a permission prompt in the middle of a focus key is
+  // worse than the key not working.
+  try {
+    execFile("open", ["-a", bundle], { timeout: 2000 }, () => {});
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  return { ok: true, bundle };
+}
+
+/// The terminal application showing `placement`, or null.
+function terminalAppForPane(placement) {
+  try {
+    const clients = execFileSync(
+      "tmux",
+      ["list-clients", "-F", "#{client_tty}\t#{client_activity}", "-t", placement.session || ""],
+      { encoding: "utf8", timeout: 1000 },
+    );
+    const tty = preferredClientTty(clients);
+    if (!tty) return null;
+    // `ps -t` takes the tty without its /dev/ prefix.
+    const shortTty = tty.replace(/^\/dev\//, "");
+    const ttyPids = parseTtyPids(execFileSync("ps", ["-t", shortTty, "-o", "pid="], {
+      encoding: "utf8", timeout: 1000,
+    }));
+    if (!ttyPids.length) return null;
+    const table = parseProcessTable(execFileSync("ps", ["-Ao", "pid=,ppid=,comm="], {
+      encoding: "utf8", timeout: 2000, maxBuffer: 8 * 1024 * 1024,
+    }));
+    // From the shallowest process on the tty: the deeper ones are its own children and walking
+    // from them reaches the same terminal by a longer path.
+    for (const pid of ttyPids) {
+      const found = findTerminalApp(table, pid);
+      if (found) return found.bundle;
+    }
+    return null;
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: terminal lookup failed: ${error.message}`);
+    return null;
+  }
+}
+
+/// Brings a floating window back to the front and gives it OS focus.
+///
+/// The easy direction — the window belongs to this process. `app.focus({ steal: true })` is
+/// what makes it work when the terminal currently has focus; without the steal, macOS leaves
+/// the window behind the app the user is actually in.
+function focusFloatWindow() {
+  const display = displayWindows.get(currentWindows().win);
+  if (!display || display.isDestroyed()) return { ok: false, reason: "not floating" };
+  app.focus({ steal: true });
+  display.show();
+  display.focus();
+  return { ok: true };
+}
+
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
   // `toggle-float` and `toggle-fullscreen` are view toggles, not browser shortcuts —
   // they work regardless of vimium mode.
   if (action === "toggle-float") { toggleFloat(); return; }
+  // Move focus between the floating window and the pane that spawned it, without changing
+  // which of them exists. Finding one or the other on a busy desktop is the whole point, so
+  // the failure has to be visible rather than a key that does nothing.
+  if (action === "focus-terminal") {
+    const outcome = focusTerminalFromFloat();
+    if (!outcome.ok) console.error(`tweb: focus terminal failed: ${outcome.reason}`);
+    return;
+  }
+  if (action === "focus-float") {
+    const outcome = focusFloatWindow();
+    if (!outcome.ok) console.error(`tweb: focus float failed: ${outcome.reason}`);
+    return;
+  }
   if (action === "toggle-fullscreen") {
     // If already floating, just flip fullscreen on the existing viewer.
     if (inputState().floating) {
@@ -5911,6 +6010,19 @@ ipcMain.on("tweb-float-input", (event, kind, data) => {
     (m) => m === "control" || m === "meta",
   )) {
     withPaneScope(tabPanes.get(tab), () => toggleFloat());
+    return;
+  }
+  // `W` hands focus back to the terminal WITHOUT pinning — the window stays where it is. It is
+  // intercepted here for the same reason `w` is: the relay would otherwise expand it into a
+  // keyDown/char pair and type a literal W into the page. Mirrors the pane's own `W`, which
+  // goes the other way.
+  if (kind === "key" && String(data?.key) === "W" && !(data?.modifiers || []).some(
+    (m) => m === "control" || m === "meta",
+  )) {
+    withPaneScope(tabPanes.get(tab), () => {
+      const outcome = focusTerminalFromFloat();
+      if (!outcome.ok) console.error(`tweb: focus terminal failed: ${outcome.reason}`);
+    });
     return;
   }
   withPaneScope(tabPanes.get(tab), () => {

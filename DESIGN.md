@@ -2200,7 +2200,45 @@ OS window freely, and the page reflows to the window — not to the cell grid. T
 case where the surface budget (§6.5) and the frame rate apply to the OS window's size
 rather than to the tmux pane's cell count.
 
-### 14.5 Why not always float
+### 14.5 Moving focus without moving the page
+
+Floating puts the page in an OS window and leaves the terminal where it was, which means
+two surfaces the user has to find on a desktop that may hold neither of them in view.
+`W` moves focus between them without changing which exists: from the pane it raises the
+floating window, and from the window it hands focus back to the terminal.
+
+The two directions are not symmetrical. Raising the window is one call — it belongs to
+this process. Handing focus to the terminal crosses three boundaries, and each is resolved
+separately:
+
+| | how |
+|---|---|
+| which tmux pane | already known — `vis().placement` carries session/window/pane |
+| which terminal | `tmux list-clients` gives the client's tty; the most recently active one wins |
+| which OS application | the tty's process ancestry, walked up to the first `.app` bundle |
+
+The last one is why this is not simply `app.hide()`. That is how *pinning* hands focus
+back, and it works precisely because it takes the whole process — including the floating
+window — off screen. Keeping the window means naming the application to focus instead.
+
+The terminal is not the tty's own process, nor its parent. Measured here:
+
+```
+92763 /bin/zsh
+92707 zsh (kiro-cli-term)
+92701 /usr/bin/login
+92675 /Applications/Ghostty.app/Contents/MacOS/ghostty
+```
+
+Four levels, because this terminal inserts a login shell and a wrapper of its own. Walking
+until a bundle appears is what makes the same code work for terminals that do not.
+
+`open -a` rather than an AppleScript `activate`: the latter needs an automation permission,
+and a permission prompt in the middle of a focus keystroke is worse than the key not
+working. A pane with no tmux placement — a bare terminal — reports that rather than
+silently doing nothing.
+
+### 14.6 Why not always float
 
 The pane is the better surface for the terminal workflow. The page sits beside the
 shell and the agent, in a layout that survives detach, on the same scrollback as the rest

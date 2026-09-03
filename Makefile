@@ -77,6 +77,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/teardown.cjs
 	node --check electron/float-display.cjs
 	node --check electron/command-line.cjs
+	node --check electron/terminal-focus.cjs
 	node --check electron/float-preload.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)

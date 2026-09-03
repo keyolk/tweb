@@ -1333,7 +1333,48 @@ test("Alt-arrow only navigates when nothing editable has focus", () => {
 // `lastSearch` when no result has landed makes the bar open into the same fresh state
 // as the first ever open — no prefilled query, no inherited match.
 test("find bar reopen with no live result clears the last query", () => {
-  assert.match(electron, /if \(!searchState \|\| !searchState\.result\.textContent\) lastSearch = "";/);
+  // `count` rather than a result span's text: the bar is drawn on a canvas now, so the
+  // match count is state rather than a DOM node.
+  assert.match(electron, /if \(!searchState \|\| !searchState\.count\) lastSearch = "";/);
+});
+
+// The find bar is IN the document, so Chromium's find counted the bar's own text: searching
+// "ZEBRA" on a page with three of them reported 4/4 and stepping stopped on the bar itself.
+// The old fix masked the field with `-webkit-text-security` for the length of each request —
+// and a request goes out on every keystroke, so measured at a realistic 90ms/key the query
+// sat masked 31% of the time and read as a password field.
+//
+// A canvas has no text nodes. Measured with the real preload in a real window: find reports
+// 3 matches with the bar on screen, the mask never appears (0/50 samples), and the bar draws
+// 7516 pixels. Nothing hides, so nothing has to be restored.
+test("the find bar is drawn, not typed into, so find cannot see it", () => {
+  assert.match(electron, /const canvas = document\.createElement\("canvas"\)/);
+  assert.match(electron, /const paintBar = \(\) => \{/);
+  // The query field stays as storage but never enters the document — that is the whole
+  // mechanism. Appending it would put the text back where find walks.
+  const bar = electron.slice(electron.indexOf("function showSearch"), electron.indexOf("function cancelTabList"));
+  assert.match(bar, /box\.append\(canvas\);/);
+  assert.doesNotMatch(bar, /box\.append\(input/,
+    "the input must stay out of the document or find counts it again");
+  // And the mask machinery is gone rather than merely unused: a leftover hide with no
+  // restore is exactly the state the user saw.
+  assert.doesNotMatch(electron, /webkitTextSecurity/,
+    "the mask is what made the bar look like a password field");
+  assert.doesNotMatch(electron, /hideSearchBarText|restoreSearchBarText/);
+});
+
+test("every repaint of the find bar reaches the pane", () => {
+  // A canvas changes no DOM, so nothing schedules a frame on its own. Each of the three
+  // places that changes what the bar says has to ask for one, or the pane shows the bar as
+  // it was one keystroke ago.
+  // handleSearchKey lives above startSearch, so the typing path is checked on its own.
+  const typing = electron.slice(electron.indexOf("function handleSearchKey"), electron.indexOf("function stepSearch"));
+  assert.match(typing, /searchState\.paintBar\(\);\s*\n\s*paintNow\(\);/,
+    "typing must repaint, or the pane shows the bar one keystroke behind");
+  // The result handler lives outside startSearch; check it separately.
+  const resultHandler = electron.slice(electron.indexOf('ipcRenderer.on("tweb-find-result"'), electron.indexOf('ipcRenderer.on("tweb-find-result"') + 1400);
+  assert.match(resultHandler, /searchState\.paintBar\(\);/);
+  assert.match(resultHandler, /paintNow\(\);/);
 });
 
 // `printQueueOutcome` decides what the user is told about a paper job they cannot see in
@@ -2362,4 +2403,25 @@ test("every command in the table targets something that exists", () => {
   for (const [, fn] of table.matchAll(/action: \(\) => (show[A-Za-z]+)\(\)/g)) {
     assert.ok(preload.includes(`function ${fn}`), `${fn} is not defined in preload`);
   }
+});
+
+
+// Tab completion on the command line. Without it every command has to be remembered exactly,
+// which for a surface whose whole point is reaching things you cannot remember the key for is
+// the wrong trade.
+test("Tab completes command names from the table `:` executes", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const handler = preload.slice(
+    preload.indexOf("function startCommandLine"),
+    preload.indexOf("function cancelCommandLine"),
+  );
+  assert.match(handler, /event\.code === "Tab"/);
+  // Completed against the SAME map that runs the command, so what completes and what executes
+  // cannot disagree.
+  assert.match(handler, /completeCommand\(input\.value, \[\.\.\.commandsByName\.keys\(\)\]\)/);
+  // The longest shared prefix is inserted, never a chosen candidate.
+  assert.match(handler, /input\.value = colon \+ completion\.common/);
+  // A Tab that cannot complete says why rather than looking ignored.
+  assert.match(handler, /no matching command/);
+  assert.match(handler, /no completion for script/);
 });

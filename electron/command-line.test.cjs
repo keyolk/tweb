@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
-  parseCommandLine, formatResult, pushHistory, historyStep, RESULT_LIMIT,
+  parseCommandLine, completeCommand, formatResult, pushHistory, historyStep, RESULT_LIMIT,
 } = require("./command-line.cjs");
 
 test("a bare word is a command, never script", () => {
@@ -111,6 +111,59 @@ test("history navigation on an empty history is inert", () => {
   assert.deepEqual(historyStep([], -1, "newer"), { index: -1, line: null });
 });
 
+// --- completion ---------------------------------------------------------------------------
+
+const NAMES = ["back", "chrome", "close", "downloads", "float", "forward", "fullscreen",
+  "history", "open", "print", "reload", "tab", "tabs", "url", "zoom"];
+
+test("Tab completes to the longest unambiguous prefix, never past it", () => {
+  // The shell rule. `t` matches `tab` and `tabs`, so Tab gets to `tab` and stops — choosing
+  // one would run a command the user did not type.
+  assert.deepEqual(completeCommand("t", NAMES), { names: ["tab", "tabs"], common: "tab" });
+  // A prefix with one match completes all the way.
+  assert.deepEqual(completeCommand("rel", NAMES), { names: ["reload"], common: "reload" });
+  // No match completes to nothing rather than to the first name alphabetically.
+  assert.deepEqual(completeCommand("zzz", NAMES), { names: [], common: "" });
+});
+
+test("an exact name still lists itself, so Tab is idempotent", () => {
+  // Pressing Tab on a finished name must not delete it or append anything.
+  assert.deepEqual(completeCommand("reload", NAMES), { names: ["reload"], common: "reload" });
+  // And a name that is also a prefix of another keeps both in view.
+  assert.deepEqual(completeCommand("tab", NAMES), { names: ["tab", "tabs"], common: "tab" });
+});
+
+test("script lines never complete", () => {
+  // Completing JavaScript would mean knowing the page's scope, which the parse deliberately
+  // does not — and a wrong guess inserted into code that then RUNS is worse than no guess.
+  for (const line of ["js doc", "! doc", "js", "!"]) {
+    assert.deepEqual(completeCommand(line, NAMES), { names: [], common: "" }, line);
+  }
+});
+
+test("completion stops once an argument is being typed", () => {
+  // With an argument present the name is decided; re-completing it would rewrite a command the
+  // user has moved on from.
+  assert.deepEqual(completeCommand("open git", NAMES), { names: [], common: "" });
+  assert.deepEqual(completeCommand("js x", NAMES), { names: [], common: "" });
+  // A TRAILING space is not an argument — the line is trimmed before the check, deliberately.
+  // Treating it as one would kill Tab the moment a space was typed after a partial name,
+  // which is exactly when someone reaches for it.
+  assert.deepEqual(completeCommand("t ", NAMES), { names: ["tab", "tabs"], common: "tab" });
+});
+
+test("an empty line offers every command", () => {
+  // `:` then Tab is how someone finds out what exists at all.
+  const all = completeCommand("", NAMES);
+  assert.deepEqual(all.names, [], "an empty line is not a command, so it lists nothing");
+  // But a single colon behaves the same as empty — both are "nothing typed yet".
+  assert.deepEqual(completeCommand(":", NAMES), { names: [], common: "" });
+});
+
+test("the opening colon does not break completion", () => {
+  assert.deepEqual(completeCommand(":rel", NAMES), { names: ["reload"], common: "reload" });
+});
+
 // --- the inlined copy in preload.cjs -------------------------------------------------------
 
 // WHY there are two copies at all. The preload runs SANDBOXED (Electron 20+ default, and
@@ -146,7 +199,7 @@ test("the inlined parse behaves identically to this module's", () => {
   assert.ok(start > 0 && end > start, "the inlined parse should be findable in preload.cjs");
   const source = preload.slice(start, end);
   // eslint-disable-next-line no-new-func
-  const inlined = new Function(`${source}; return { parseCommandLine, formatResult, pushHistory, historyStep };`)();
+  const inlined = new Function(`${source}; return { parseCommandLine, completeCommand, formatResult, pushHistory, historyStep };`)();
 
   for (const line of [
     "reload", "quality 1080", "js document.title", "!document.title", ":reload", ": js 1+1",
@@ -159,6 +212,10 @@ test("the inlined parse behaves identically to this module's", () => {
   for (const value of [undefined, null, "", "x", 0, false, 1.5, { a: 1 }, [1, 2]]) {
     assert.equal(inlined.formatResult(value), formatResult(value),
       `format diverged on ${JSON.stringify(value)}`);
+  }
+  for (const line of ["t", "rel", "f", "zzz", "js doc", ":rel", "", "tab"]) {
+    assert.deepEqual(inlined.completeCommand(line, NAMES), completeCommand(line, NAMES),
+      `completion diverged on ${JSON.stringify(line)}`);
   }
   assert.deepEqual(inlined.pushHistory(["a", "b"], "a"), pushHistory(["a", "b"], "a"));
   assert.deepEqual(inlined.historyStep(["a", "b"], 0, "older"), historyStep(["a", "b"], 0, "older"));

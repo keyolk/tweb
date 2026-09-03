@@ -156,6 +156,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/command-line.cjs"),
     ),
     (
+        "terminal-focus.cjs",
+        include_str!("../../../electron/terminal-focus.cjs"),
+    ),
+    (
         "float-preload.cjs",
         include_str!("../../../electron/float-preload.cjs"),
     ),

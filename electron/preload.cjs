@@ -122,6 +122,10 @@ installPrintShim();
   const commandPaletteEntries = [
     { name: "chrome", label: "Open in Chrome", action: () => send("chrome-current") },
     { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
+    // Moving focus between the floating window and its pane, without closing either. Losing
+    // one of them on a busy desktop is the case these exist for.
+    { name: "terminal", label: "Focus terminal", action: () => send("focus-terminal") },
+    { name: "window", label: "Focus float window", action: () => send("focus-float") },
   ];
   // Commands with no palette row. These are the ones that already have a key — listing them in
   // the palette would duplicate the key (DESIGN.md 15.3), but `:` is reached by name and a name
@@ -197,6 +201,28 @@ installPrintShim();
     }
   }
 
+  function completeCommand(input, names) {
+    const parsed = parseCommandLine(input);
+    if (parsed.kind !== "command") return { names: [], common: "" };
+    const line = String(input == null ? "" : input).trim();
+    const body = line.startsWith(":") ? line.slice(1).trim() : line;
+    if (/\s/.test(body)) return { names: [], common: "" };
+    const matches = names.filter((name) => name.startsWith(parsed.name)).sort();
+    return { names: matches, common: longestCommonPrefix(matches) };
+  }
+
+  function longestCommonPrefix(values) {
+    if (!values.length) return "";
+    let prefix = values[0];
+    for (const value of values.slice(1)) {
+      let index = 0;
+      while (index < prefix.length && index < value.length && prefix[index] === value[index]) index += 1;
+      prefix = prefix.slice(0, index);
+      if (!prefix) break;
+    }
+    return prefix;
+  }
+
   function pushHistory(history, line, limit = 50) {
     const value = String(line == null ? "" : line).trim();
     if (!value) return history.slice(0, limit);
@@ -217,7 +243,7 @@ installPrintShim();
   let promptHost = null;
   let searchState = null;
   // Requests still waiting for a result, and the backstop that un-hides the bar if one
-  // never arrives. See hideSearchBarText for why the bar hides itself while searching.
+  // never arrives, and the backstop that closes a bar whose Enter never landed.
   let searchPending = 0;
   let searchRestoreTimer = null;
   // An `n`/`N` step waiting for its result so it can end the session with the match selected.
@@ -2644,7 +2670,7 @@ installPrintShim();
     input.type = "text";
     input.autocomplete = "off";
     input.spellcheck = false;
-    input.placeholder = "command, or js <expression>";
+    input.placeholder = "command (Tab completes), or js <expression>";
     input.style.cssText = "flex:1;display:block;box-sizing:border-box;padding:8px 4px;border:0;outline:0;background:transparent;color:#e8eaed;font:14px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
     // The result of the last evaluation, kept until dismissed — DESIGN.md 16.4. Hidden until
     // there is something to say, so the line is one row tall in the ordinary case.
@@ -2727,6 +2753,23 @@ installPrintShim();
       } else if (event.code === "Enter") {
         event.preventDefault();
         submit();
+      } else if (event.code === "Tab") {
+        event.preventDefault();
+        // Prefix completion over the same table `:` executes from, so what completes and what
+        // runs cannot disagree. Nothing is chosen for the user: Tab inserts the longest prefix
+        // every match shares and stops there, which for `t` against `tab`/`tabs` is `tab`.
+        const completion = completeCommand(input.value, [...commandsByName.keys()]);
+        if (completion.names.length === 0) {
+          // A Tab that completes nothing still consumed a keystroke, and on a script line it
+          // never will — say which, rather than looking ignored.
+          report(parseCommandLine(input.value).kind === "script"
+            ? "no completion for script" : "no matching command", true);
+          return;
+        }
+        const colon = input.value.trimStart().startsWith(":") ? ":" : "";
+        input.value = colon + completion.common;
+        // The remaining candidates, so a stopped completion says WHY it stopped.
+        report(completion.names.length > 1 ? completion.names.join("  ") : "", false);
       } else if (event.code === "ArrowUp" || event.ctrlKey && event.key.toLowerCase() === "p") {
         event.preventDefault();
         const step = historyStep(commandLineHistory, commandLineState.historyIndex, "older");
@@ -2746,47 +2789,15 @@ installPrintShim();
     if (restoreMode) normalMode();
   }
 
-  // The find bar lives inside the document, so Chromium's find walks it like any other
-  // content and counts the bar's own text: searching "ZEBRA" on a page with three of them
-  // reported 4/4, and stepping stopped on the bar itself (selectionArea y=11, the bar's
-  // own box). Measured, every piece of the bar is searchable — the input's value, the
-  // result span's "1/4", and the "Find in page" placeholder. Chrome does not have this
-  // because its find bar is browser chrome; ours is in the page and has to hide from the
-  // search itself.
-  //
-  // It hides by style rather than by blanking `value`. Blanking was tried first and is
-  // unusable: the field is the one the user is typing into, so a key pressed during the
-  // blank window lands in an empty field — measured in a pane, typing "ZEBRA" left the
-  // field holding "Z". `-webkit-text-security` leaves the value and the caret untouched
-  // and is the only measured exclusion that does not also drop focus.
-  function hideSearchBarText() {
-    if (!searchState || searchState.hidden) return;
-    searchState.hidden = true;
-    searchState.input.style.webkitTextSecurity = "disc";
-    searchState.input.placeholder = "";
-    searchState.result.style.visibility = "hidden";
-  }
-
-  function restoreSearchBarText() {
-    if (!searchState?.hidden) return;
-    searchState.hidden = false;
-    searchState.input.style.webkitTextSecurity = "none";
-    searchState.input.placeholder = FIND_PLACEHOLDER;
-    searchState.result.style.visibility = "visible";
-  }
-
-  // The result event is what normally un-hides the bar. A request that never answers —
-  // the document navigated out from under it — would otherwise leave the bar hidden, so
-  // the timer is the floor rather than the mechanism.
+  // The bar no longer hides itself while a request is out — it is drawn on a canvas, which
+  // find cannot see, so there is nothing to hide. The pending count and its backstop stay:
+  // Enter closes the bar only once the match it asked for has landed, and a request that
+  // never answers (the document navigated out from under it) must not leave it open.
   function sendFind(query, forward) {
-    hideSearchBarText();
     searchPending += 1;
     clearTimeout(searchRestoreTimer);
     searchRestoreTimer = setTimeout(() => {
       searchPending = 0;
-      restoreSearchBarText();
-      // A result that never came must not leave the bar open on a keypress that asked to
-      // close it, so the backstop closes as well as un-hides.
       if (searchState?.closeOnResult) cancelSearch(false);
     }, 700);
     send("find", { query, forward });
@@ -2844,7 +2855,9 @@ installPrintShim();
       return true;
     }
     lastSearch = input.value;
-    searchState.result.textContent = "";
+    searchState.count = "";
+    searchState.paintBar();
+    paintNow();
     if (lastSearch) sendFind(lastSearch, true);
     else send("stop-find", "clearSelection");
     return true;
@@ -2874,31 +2887,87 @@ installPrintShim();
     // holds its text, and reopening the bar with `/` then pressing Enter without retyping
     // would send it as a continuation of a session that no longer exists. The bar
     // should open into a fresh state, same as the first ever open — no query, no match.
-    if (!searchState || !searchState.result.textContent) lastSearch = "";
+    if (!searchState || !searchState.count) lastSearch = "";
     const host = document.createElement("div");
     host.id = "__tweb_search__";
     host.style.cssText = "position:fixed;right:8px;top:8px;z-index:2147483646;pointer-events:none";
     const shadow = host.attachShadow({ mode: "open" });
     const box = document.createElement("div");
     box.style.cssText = "display:flex;align-items:center;gap:6px;padding:5px 7px;border:1px solid #5f6368;border-radius:6px;background:#202124;color:#fff;box-shadow:0 4px 16px #0008;pointer-events:auto";
+    // The bar is DRAWN, not typed into. Chromium's find walks the document, and the bar is
+    // in the document, so a text field here is text find counts: searching "ZEBRA" on a page
+    // with three of them reported 4/4 and stepping stopped on the bar itself.
+    //
+    // The old fix masked the field with `-webkit-text-security` for the length of each
+    // request. That worked and was unreadable: a request goes out on EVERY keystroke, so
+    // measured over a realistic 90ms/key, the query sat masked 31% of the time — it reads as
+    // a password field rather than as a flicker.
+    //
+    // A canvas has no text nodes, so find cannot see it at all. Measured: 3 matches with the
+    // bar on screen (against 4 for a real field) and 9000 lit pixels, i.e. invisible to find
+    // and visible to the reader. Nothing needs hiding, so nothing needs restoring.
+    //
+    // Everything else was measured and rejected: `visibility:hidden` and
+    // `content-visibility:hidden` do exclude the bar from find, and both draw zero pixels —
+    // the computed style says "shown" for the second one, which is why it had to be checked
+    // against the frame rather than the style. `opacity:0`, an off-screen host and
+    // `aria-hidden` are all still counted by find.
+    //
+    // `input` stays as the query's storage, out of the document. The bar never had focus
+    // anyway — keys arrive through the document-level handler — so a detached field is the
+    // same field it always was, minus the part find could see.
     const input = document.createElement("input");
     input.type = "text";
     input.value = lastSearch;
-    input.placeholder = FIND_PLACEHOLDER;
-    input.autocomplete = "off";
-    input.style.cssText = "width:min(320px,55vw);padding:4px 6px;border:0;outline:0;background:#303134;color:#fff;font:13px system-ui";
-    const result = document.createElement("span");
-    result.style.cssText = "min-width:48px;color:#bdc1c6;font:11px ui-monospace,monospace;text-align:right";
+    const canvas = document.createElement("canvas");
+    const BAR_WIDTH = 320;
+    const BAR_HEIGHT = 22;
+    const ratio = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+    canvas.width = Math.round(BAR_WIDTH * ratio);
+    canvas.height = Math.round(BAR_HEIGHT * ratio);
+    canvas.style.cssText = `display:block;width:${BAR_WIDTH}px;height:${BAR_HEIGHT}px`;
+    const paintBar = () => {
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, BAR_WIDTH, BAR_HEIGHT);
+      context.fillStyle = "#303134";
+      context.fillRect(0, 0, BAR_WIDTH, BAR_HEIGHT);
+      const query = searchState?.input.value ?? input.value;
+      const count = searchState?.count || "";
+      // The count is right-aligned in its own gutter, the way the old <span> was.
+      context.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+      context.textBaseline = "middle";
+      context.fillStyle = "#bdc1c6";
+      const countWidth = count ? context.measureText(count).width : 0;
+      if (count) context.fillText(count, BAR_WIDTH - countWidth - 6, BAR_HEIGHT / 2);
+      context.font = "13px system-ui, -apple-system, sans-serif";
+      context.fillStyle = query ? "#fff" : "#9aa0a6";
+      const text = query || FIND_PLACEHOLDER;
+      // Clipped to the space the count is not using, so a long query cannot run under it.
+      context.save();
+      context.beginPath();
+      context.rect(6, 0, BAR_WIDTH - countWidth - 18, BAR_HEIGHT);
+      context.clip();
+      context.fillText(text, 6, BAR_HEIGHT / 2);
+      context.restore();
+      // The caret, so the bar reads as a field being typed into rather than a label.
+      if (query) {
+        const caretX = Math.min(6 + context.measureText(query).width + 1, BAR_WIDTH - countWidth - 12);
+        context.fillStyle = "#8ab4f8";
+        context.fillRect(caretX, 4, 1, BAR_HEIGHT - 8);
+      }
+    };
     // Typing and Enter/Escape are handled document-level in handleSearchKey, because the
     // input does not keep focus once a search runs. The input stays focusable so the caret
     // sits where the user expects, but nothing depends on it receiving keys.
-    box.append(input, result);
+    box.append(canvas);
     shadow.append(box);
     document.documentElement.append(host);
+    searchState = { host, input, canvas, paintBar, count: "", closeOnResult: false };
+    paintBar();
     paintNow();
-    searchState = { host, input, result, hidden: false, closeOnResult: false };
     setMode("search");
-    requestAnimationFrame(() => input.focus());
   }
 
   function cancelTabList(restoreMode = true) {
@@ -4425,6 +4494,9 @@ installPrintShim();
       case "y": send("copy-url"); flash("URL"); break;
       case "r": send("reload"); break;
       case "w": send("toggle-float"); break;
+      // Shift-W raises the floating window without changing whether it exists — `w` still
+      // toggles. Same finger, and the pair reads as "float" / "go to the float".
+      case "W": send("focus-float"); break;
       case "c": startCommandPalette(); break;
       // The command line. Normal mode only — DESIGN.md 16.3 keeps a colon a character the page
       // is entitled to receive in insert mode, and this switch only runs in normal mode.
@@ -4492,15 +4564,17 @@ installPrintShim();
     searchPending = Math.max(0, searchPending - 1);
     if (searchPending === 0) {
       clearTimeout(searchRestoreTimer);
-      restoreSearchBarText();
       // Enter asked to close once the match it requested had actually landed.
       if (searchState.closeOnResult) {
         cancelSearch(false);
         return;
       }
     }
-    searchState.result.textContent = result?.matches ? `${result.activeMatchOrdinal}/${result.matches}` : "0/0";
-    setMode("search", searchState.result.textContent);
+    searchState.count = result?.matches ? `${result.activeMatchOrdinal}/${result.matches}` : "0/0";
+    searchState.paintBar();
+    // The bar is a canvas, so a repaint is the only way its new contents reach the pane.
+    paintNow();
+    setMode("search", searchState.count);
   });
 
   ipcRenderer.on("tweb-audio-state", (_event, state) => {

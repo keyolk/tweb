@@ -71,6 +71,44 @@ function truncate(text) {
   return string.length <= RESULT_LIMIT ? string : `${string.slice(0, RESULT_LIMIT)}… (${string.length} chars)`;
 }
 
+/// What the command line should suggest for a partially typed line.
+///
+/// Only the command half completes. A `:js` line is JavaScript — completing that would mean
+/// knowing the page's scope, which the parse deliberately does not, and a wrong guess inserted
+/// into code the user is about to run is worse than no guess at all.
+///
+/// Returns `{ names, common }`: every command that starts with what was typed, and the longest
+/// prefix they all share. `common` is what Tab inserts — the shell rule, and the one that never
+/// picks for the user: with `t` matching `tab` and `tabs`, Tab gets to `tab` and stops rather
+/// than choosing one.
+///
+/// Prefix rather than fuzzy. A fuzzy match is right for the palette, which shows its candidates
+/// and asks the user to pick; here the completion is inserted into a line that then RUNS, so it
+/// has to be the one the typed characters unambiguously lead to.
+function completeCommand(input, names) {
+  const parsed = parseCommandLine(input);
+  if (parsed.kind !== "command") return { names: [], common: "" };
+  // Only while typing the NAME. Once there is an argument the name is settled, and completing
+  // it again would rewrite a command the user has moved on from.
+  const line = String(input == null ? "" : input).trim();
+  const body = line.startsWith(":") ? line.slice(1).trim() : line;
+  if (/\s/.test(body)) return { names: [], common: "" };
+  const matches = names.filter((name) => name.startsWith(parsed.name)).sort();
+  return { names: matches, common: longestCommonPrefix(matches) };
+}
+
+function longestCommonPrefix(values) {
+  if (!values.length) return "";
+  let prefix = values[0];
+  for (const value of values.slice(1)) {
+    let index = 0;
+    while (index < prefix.length && index < value.length && prefix[index] === value[index]) index += 1;
+    prefix = prefix.slice(0, index);
+    if (!prefix) break;
+  }
+  return prefix;
+}
+
 /// The history a submitted line produces, most recent first.
 ///
 /// Deduplicated: running the same line repeatedly is the measured pattern (read a value, adjust,
@@ -97,6 +135,7 @@ function historyStep(history, index, direction) {
 
 module.exports = {
   parseCommandLine,
+  completeCommand,
   formatResult,
   pushHistory,
   historyStep,
