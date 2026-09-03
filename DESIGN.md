@@ -2200,7 +2200,45 @@ OS window freely, and the page reflows to the window — not to the cell grid. T
 case where the surface budget (§6.5) and the frame rate apply to the OS window's size
 rather than to the tmux pane's cell count.
 
-### 14.5 Why not always float
+### 14.5 Moving focus without moving the page
+
+Floating puts the page in an OS window and leaves the terminal where it was, which means
+two surfaces the user has to find on a desktop that may hold neither of them in view.
+`W` moves focus between them without changing which exists: from the pane it raises the
+floating window, and from the window it hands focus back to the terminal.
+
+The two directions are not symmetrical. Raising the window is one call — it belongs to
+this process. Handing focus to the terminal crosses three boundaries, and each is resolved
+separately:
+
+| | how |
+|---|---|
+| which tmux pane | already known — `vis().placement` carries session/window/pane |
+| which terminal | `tmux list-clients` gives the client's tty; the most recently active one wins |
+| which OS application | the tty's process ancestry, walked up to the first `.app` bundle |
+
+The last one is why this is not simply `app.hide()`. That is how *pinning* hands focus
+back, and it works precisely because it takes the whole process — including the floating
+window — off screen. Keeping the window means naming the application to focus instead.
+
+The terminal is not the tty's own process, nor its parent. Measured here:
+
+```
+92763 /bin/zsh
+92707 zsh (kiro-cli-term)
+92701 /usr/bin/login
+92675 /Applications/Ghostty.app/Contents/MacOS/ghostty
+```
+
+Four levels, because this terminal inserts a login shell and a wrapper of its own. Walking
+until a bundle appears is what makes the same code work for terminals that do not.
+
+`open -a` rather than an AppleScript `activate`: the latter needs an automation permission,
+and a permission prompt in the middle of a focus keystroke is worse than the key not
+working. A pane with no tmux placement — a bare terminal — reports that rather than
+silently doing nothing.
+
+### 14.6 Why not always float
 
 The pane is the better surface for the terminal workflow. The page sits beside the
 shell and the agent, in a layout that survives detach, on the same scrollback as the rest
@@ -2280,7 +2318,114 @@ presents a menu and leaves them unchanged. The keyboard is in normal mode
 before `c` and after `c`, so `Escape` is the only exit and `Enter` is the
 only confirm — no `c`-mode key has a meaning the way `i`-mode keys do.
 
-## 16. Performance goals and measurement
+## 16. The command line
+
+> **Not implemented.** This section is a design target.
+
+`:` opens a command line: a typed input that runs a named tweb command, or —
+behind an explicit prefix — arbitrary JavaScript in the page.
+
+### 16.1 Why a fifth input surface
+
+Section 15.4 draws a line the palette must not cross: it "is not a command
+line", it "takes a selection, and a selection only". That line is right about
+the palette and says nothing about whether a command line should exist. It
+should, and the reason is a case the palette structurally cannot serve.
+
+Measured: YouTube's ABR picked 854x480 for a 4K video, and neither enlarging the
+pane nor `setPlaybackQuality("hd1080")` moved it — `setPlaybackQualityRange`
+does, and nothing in the pane could call it. The fix had to be run from outside
+the pane with `tweb eval`. The palette could not have helped: it holds a static
+list, and no list written in advance contains the call a site needs today.
+
+So the palette answers "which of the things tweb does do I want", and the
+command line answers "do this thing tweb has never heard of". Both are needed;
+neither substitutes.
+
+### 16.2 What `:` accepts
+
+Two namespaces, separated by a prefix rather than by guessing:
+
+```text
+:reload              a named tweb command
+:float
+:quality 1080
+
+:js <expression>     JavaScript, evaluated in the page
+:!  <expression>     the same, short form
+```
+
+A bare word is a command. Only `js`/`!` reach the page. Guessing between the two
+was rejected: `:reload` is a valid JavaScript expression (it reads a label), so
+any heuristic that treats unrecognised words as script turns a typo into a
+silent evaluation.
+
+Named commands are the palette's action table reached by name instead of by
+selection — which is what makes the palette's list an implementation detail
+rather than a ceiling. Every entry there is callable here.
+
+### 16.3 Why arbitrary JavaScript, and the risk it carries
+
+`:js` is the half that solves the measured case, and it is also the half that
+can hurt. One keystroke puts arbitrary code into the current page, in a logged-in
+session, with no origin boundary — the same exposure a browser's devtools
+console has, which is why browsers put a warning in front of theirs. `:` is
+easier to reach than devtools: it is one key in normal mode.
+
+Three things follow from that, and they are requirements rather than polish:
+
+- **The prefix is mandatory.** No heuristic promotes a typed word to script.
+- **Paste is visible before it runs.** The line is submitted with `Enter`, never
+  on paste, so pasted code is on screen and cancellable with `Escape`.
+- **`:` is normal-mode only.** In insert mode a colon is a character the page
+  is entitled to receive.
+
+What is deliberately NOT added: a confirmation prompt per evaluation. It would
+be dismissed reflexively within a day and would make the surface useless for
+the iteration it exists to support.
+
+### 16.4 The result
+
+An evaluation reports back. Running silently was considered and rejected: the
+surface exists to poke at a page and see what happened, and a `:js` that returns
+nothing visible cannot tell "it worked" from "it threw".
+
+The result appears in the same overlay, below the input, and stays until
+dismissed. A thrown error is shown as an error rather than as a value — the
+distinction is the whole diagnostic. Values are stringified with a cap; a
+command line is not an object inspector, and a 5MB DOM dump serialised into a
+pane is a hang, not a result.
+
+### 16.5 History
+
+`Up`/`Down` walk previously submitted lines, most recent first.
+
+This is not a convenience. The measured use is iterative — read a value, adjust,
+run again — and retyping `document.querySelector("#movie_player")
+.setPlaybackQualityRange("hd1080","hd1080")` by hand each time is what makes a
+command line worse than the CLI it saves a trip to.
+
+History is per pane and lives as long as the engine process. It is deliberately
+not persisted: the lines a user types here are page-shaped, often carry values
+read off the page, and writing them to disk would put a log of one-off snippets
+next to the session file for no benefit measured.
+
+### 16.6 What the command line is not
+
+It is not the omnibox. `o`/`O` takes a URL or a search; `:` takes a command.
+Typing a URL into `:` is an error, not a navigation — the two overlap enough
+that quietly accepting either would make neither predictable.
+
+It is not a shell. Nothing here runs a process. `:!` is JavaScript in the page,
+not a command on the machine, and the short form is borrowed from vim's spelling
+rather than its meaning — which is a real risk of confusion and the reason `:js`
+is the primary spelling and `:!` the alias.
+
+It is not a replacement for the agent CLI. `tweb eval` still exists and is still
+the right tool from a script or another pane; `:` is the same capability without
+leaving the keyboard.
+
+## 17. Performance goals and measurement
 
 Exact figures are fixed after a per-hardware baseline measurement, but the following are release gates.
 
@@ -2304,7 +2449,7 @@ The benchmark workloads:
 - video playback
 - Korean input and a long clipboard paste
 
-## 17. The conformance matrix
+## 18. The conformance matrix
 
 Support is declared by capability and validated combination, not by terminal name.
 
@@ -2316,7 +2461,7 @@ Support is declared by capability and validated combination, not by terminal nam
 | Kitty + tmux | native image the goal | the tmux table | pane mouse | client mode | a core target |
 | SSH remote | an inline/video backend | remote input | remote input | client mode | a separate transport |
 
-## 18. Security
+## 19. Security
 
 - Never disable the Chromium sandbox.
 - Separate the browser/renderer/GPU/utility process privileges.
@@ -2329,7 +2474,7 @@ Support is declared by capability and validated combination, not by terminal nam
 - Apply fuzzing to the terminal escape sequence parser.
 - Bound the tmux passthrough payload length and the parser boundary.
 
-## 19. A validation order, not an implementation order
+## 20. A validation order, not an implementation order
 
 > **Where this list now stands, measured 2026-08-16 — see [README Status](README.md#status) for the
 > evidence.** (1) partly: the Kitty path ships and works; the GPU fast path is unbuilt (§7.2).
@@ -2353,7 +2498,7 @@ Rather than scoping a short-term MVP, whether the architecture holds up is valid
 If 1–3 reveal a structural limit in the terminal protocol, the runtime is not discarded;
 `NativeSurfaceTransport` is added instead. The tmux pane/process/profile/automation model stays as it is.
 
-## 20. What to adopt from precedent and what to drop
+## 21. What to adopt from precedent and what to drop
 
 ### Adopted from `awrit`
 
@@ -2413,7 +2558,7 @@ If 1–3 reveal a structural limit in the terminal protocol, the runtime is not 
 an interactive primary renderer its ceiling is clearly lower than the GPU fast path's. It is used only as a
 low-framerate fallback where `RemoteVideoTransport` is unavailable, or as a static snapshot backend.
 
-## 21. The final product definition
+## 22. The final product definition
 
 > **This is the target definition, and two of its clauses are unbuilt.** Resource exchange as typed
 > window-scoped attachments is a 38-line stub (§12.3); the Chrome profile bootstrap and the managed

@@ -152,6 +152,14 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/float-display.cjs"),
     ),
     (
+        "command-line.cjs",
+        include_str!("../../../electron/command-line.cjs"),
+    ),
+    (
+        "terminal-focus.cjs",
+        include_str!("../../../electron/terminal-focus.cjs"),
+    ),
+    (
         "float-preload.cjs",
         include_str!("../../../electron/float-preload.cjs"),
     ),
@@ -401,19 +409,30 @@ mod tests {
     #[test]
     fn the_app_carries_every_file_it_requires() {
         let names: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
-        let main = FILES
-            .iter()
-            .find(|(name, _)| *name == "main.cjs")
-            .expect("main.cjs")
-            .1;
-        // A require the bundle does not carry makes the pane fail at startup, and
-        // only at run time — the compiler cannot see it.
-        for line in main.lines() {
-            if let Some(rest) = line.split_once("require(\"./") {
-                let required = rest.1.split('"').next().unwrap_or_default();
+        // EVERY embedded module, not just main.cjs. This checked main.cjs alone and a
+        // `require` added to preload.cjs walked straight through it: `command-line.cjs` was
+        // written, tested and committed without being embedded, and the failure that produced
+        // is the worst shape available — preload.cjs throws while loading, so the pane loses
+        // EVERY shortcut rather than just the feature that was added. It surfaces only at run
+        // time on a fresh engine, which is why it survived a green `make check`.
+        for (name, body) in FILES {
+            if !name.ends_with(".cjs") {
+                continue;
+            }
+            for line in body.lines() {
+                // Line comments are skipped: the comment in preload.cjs that explains why a
+                // sandboxed preload cannot require a relative path quotes the very form it
+                // warns about, and reading it as a real require fails this test on prose.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let Some((_, rest)) = line.split_once("require(\"./") else {
+                    continue;
+                };
+                let required = rest.split('"').next().unwrap_or_default();
                 assert!(
                     names.contains(&required),
-                    "main.cjs requires {required}, which the bundle does not carry"
+                    "{name} requires {required}, which the bundle does not carry"
                 );
             }
         }

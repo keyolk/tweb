@@ -1333,7 +1333,48 @@ test("Alt-arrow only navigates when nothing editable has focus", () => {
 // `lastSearch` when no result has landed makes the bar open into the same fresh state
 // as the first ever open — no prefilled query, no inherited match.
 test("find bar reopen with no live result clears the last query", () => {
-  assert.match(electron, /if \(!searchState \|\| !searchState\.result\.textContent\) lastSearch = "";/);
+  // `count` rather than a result span's text: the bar is drawn on a canvas now, so the
+  // match count is state rather than a DOM node.
+  assert.match(electron, /if \(!searchState \|\| !searchState\.count\) lastSearch = "";/);
+});
+
+// The find bar is IN the document, so Chromium's find counted the bar's own text: searching
+// "ZEBRA" on a page with three of them reported 4/4 and stepping stopped on the bar itself.
+// The old fix masked the field with `-webkit-text-security` for the length of each request —
+// and a request goes out on every keystroke, so measured at a realistic 90ms/key the query
+// sat masked 31% of the time and read as a password field.
+//
+// A canvas has no text nodes. Measured with the real preload in a real window: find reports
+// 3 matches with the bar on screen, the mask never appears (0/50 samples), and the bar draws
+// 7516 pixels. Nothing hides, so nothing has to be restored.
+test("the find bar is drawn, not typed into, so find cannot see it", () => {
+  assert.match(electron, /const canvas = document\.createElement\("canvas"\)/);
+  assert.match(electron, /const paintBar = \(\) => \{/);
+  // The query field stays as storage but never enters the document — that is the whole
+  // mechanism. Appending it would put the text back where find walks.
+  const bar = electron.slice(electron.indexOf("function showSearch"), electron.indexOf("function cancelTabList"));
+  assert.match(bar, /box\.append\(canvas\);/);
+  assert.doesNotMatch(bar, /box\.append\(input/,
+    "the input must stay out of the document or find counts it again");
+  // And the mask machinery is gone rather than merely unused: a leftover hide with no
+  // restore is exactly the state the user saw.
+  assert.doesNotMatch(electron, /webkitTextSecurity/,
+    "the mask is what made the bar look like a password field");
+  assert.doesNotMatch(electron, /hideSearchBarText|restoreSearchBarText/);
+});
+
+test("every repaint of the find bar reaches the pane", () => {
+  // A canvas changes no DOM, so nothing schedules a frame on its own. Each of the three
+  // places that changes what the bar says has to ask for one, or the pane shows the bar as
+  // it was one keystroke ago.
+  // handleSearchKey lives above startSearch, so the typing path is checked on its own.
+  const typing = electron.slice(electron.indexOf("function handleSearchKey"), electron.indexOf("function stepSearch"));
+  assert.match(typing, /searchState\.paintBar\(\);\s*\n\s*paintNow\(\);/,
+    "typing must repaint, or the pane shows the bar one keystroke behind");
+  // The result handler lives outside startSearch; check it separately.
+  const resultHandler = electron.slice(electron.indexOf('ipcRenderer.on("tweb-find-result"'), electron.indexOf('ipcRenderer.on("tweb-find-result"') + 1400);
+  assert.match(resultHandler, /searchState\.paintBar\(\);/);
+  assert.match(resultHandler, /paintNow\(\);/);
 });
 
 // `printQueueOutcome` decides what the user is told about a paper job they cannot see in
@@ -2071,7 +2112,7 @@ test("viewer window title reflects float state", () => {
 // openDisplayWindow call setFullScreen(true) after show.
 test("command palette has a Fullscreen action that toggle-fullscreen dispatches", () => {
   const electron = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
-  assert.match(electron, /\{ label: "Fullscreen", action: \(\) => send\("toggle-fullscreen"\) \}/);
+  assert.match(electron, /\{ name: "fullscreen", label: "Fullscreen", action: \(\) => send\("toggle-fullscreen"\) \}/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   // handleNativeShortcut handles toggle-fullscreen before the vimium gate.
   assert.match(main, /action === "toggle-fullscreen"/);
@@ -2111,7 +2152,7 @@ test("chrome current hands the active tab to Chrome", () => {
 test("command palette opens with c and lists actions", () => {
   // The entries are a static list — only actions without a keyboard shortcut.
   assert.match(electron, /const commandPaletteEntries = \[/);
-  assert.match(electron, /\{ label: "Open in Chrome", action:/);
+  assert.match(electron, /\{ name: "chrome", label: "Open in Chrome", action:/);
   // Shortcuts like Copy URL (y), Float (w), Tabs (b), History (gh), Downloads (gd),
   // Zoom (0) are deliberately absent — they already work from normal mode, and
   // listing them here would only duplicate them.
@@ -2257,4 +2298,130 @@ test("the engine names its own process rather than answering to Electron", () =>
   for (const title of ["tweb %5", "tweb %138", "tweb host"]) {
     assert.ok(title.length <= 15, `${title} must survive the comm column`);
   }
+});
+
+
+// --- the `:` command line (DESIGN.md 16) ---------------------------------------------------
+
+// `:` is a fifth input surface, and the reason it exists is a case the palette structurally
+// cannot serve: YouTube's ABR picked 854x480 for a 4K video and only `setPlaybackQualityRange`
+// moved it — a call no list written in advance would contain.
+test("colon opens the command line, in normal mode only", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  assert.match(preload, /case ":": startCommandLine\(\); break;/);
+  // The binding lives in the normal-mode switch, beside the palette's `c`. In insert mode a
+  // colon has to stay a character the page receives (DESIGN.md 16.3). Bounded by the palette's
+  // own `case` rather than by a byte count, so the assertion does not drift as the switch grows.
+  const normalKey = preload.indexOf("function handleNormalKey");
+  const paletteCase = preload.indexOf('case "c": startCommandPalette()');
+  assert.ok(normalKey >= 0 && paletteCase > normalKey,
+    "the palette case should sit inside handleNormalKey");
+  assert.match(preload.slice(paletteCase, paletteCase + 400), /case ":": startCommandLine\(\)/,
+    "`:` belongs in the same normal-mode switch as `c`");
+  // `physicalKey` already maps shifted Semicolon, so nothing new is needed there — but if that
+  // mapping ever goes, `:` silently stops opening.
+  assert.match(preload, /Semicolon: event\.shiftKey \? ":" : ";"/);
+});
+
+test("the command line is torn down with every other transient overlay", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const teardown = preload.slice(
+    preload.indexOf("function cancelTransient"),
+    preload.indexOf("function cancelTransient") + 700,
+  );
+  assert.match(teardown, /cancelCommandLine\(false\)/,
+    "an overlay missing from cancelTransient survives Escape and every mode change");
+});
+
+test("script reaches the page only behind an explicit prefix", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const submit = preload.slice(
+    preload.indexOf("function startCommandLine"),
+    preload.indexOf("function cancelCommandLine"),
+  );
+  // The parse decides, and it is a module so the decision is testable without a window —
+  // see command-line.test.cjs for the property itself.
+  assert.match(submit, /parseCommandLine\(input\.value\)/);
+  assert.match(submit, /parsed\.kind === "script"/);
+  // Evaluated IN THE PAGE, not sent to the main process: `:js` is scoped to the document, and
+  // routing it through the engine would hand it the main process's reach instead.
+  assert.match(submit, /window\.eval\(parsed\.source\)/);
+  assert.doesNotMatch(submit, /send\("eval"/,
+    "a script must not be routed through the engine");
+  // Submitted with Enter, never on paste — pasted code has to be visible and cancellable first.
+  assert.match(submit, /event\.code === "Enter"[\s\S]{0,80}submit\(\)/);
+  assert.doesNotMatch(submit, /addEventListener\("paste"/);
+});
+
+test("an evaluation reports back, and an error reports as an error", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const fn = preload.slice(
+    preload.indexOf("function startCommandLine"),
+    preload.indexOf("function cancelCommandLine"),
+  );
+  // Running silently cannot tell "it worked" from "it threw" — DESIGN.md 16.4.
+  assert.match(fn, /report\(formatResult\(value\), false\)/);
+  assert.match(fn, /report\(`\$\{error\?\.name \|\| "Error"\}/);
+  // A promise is awaited rather than printed as [Promise]: async is how half the page APIs
+  // answer, and the wrapper would make those calls look like they returned nothing.
+  assert.match(fn, /typeof value\.then === "function"/);
+});
+
+test("both command tables are reachable by name from one map", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  // A new action must not end up reachable from one surface and not the other.
+  assert.match(preload, /const commandsByName = new Map\(/);
+  assert.match(preload, /\[\.\.\.namedCommands, \.\.\.commandPaletteEntries\]/);
+  // Every palette row carries a name, or `:` cannot reach it.
+  const entries = preload.slice(
+    preload.indexOf("const commandPaletteEntries = ["),
+    preload.indexOf("const namedCommands = ["),
+  );
+  const rows = entries.match(/\{ name:/g) || [];
+  const labels = entries.match(/label:/g) || [];
+  assert.equal(rows.length, labels.length, "every palette row needs a `name` for `:`");
+});
+
+test("every command in the table targets something that exists", () => {
+  // The failure this guards is silent: `:history` sending a shortcut main.cjs has no case for
+  // does nothing at all, and reads as the command line being broken. Caught while writing
+  // this — `history-page` and `downloads-page` were invented and had no handler.
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const table = preload.slice(
+    preload.indexOf("const commandPaletteEntries = ["),
+    preload.indexOf("const commandsByName = new Map("),
+  );
+  const sends = [...table.matchAll(/send\("([a-z-]+)"/g)].map((m) => m[1]);
+  assert.ok(sends.length >= 8, `expected the table to send several actions, saw ${sends.length}`);
+  for (const action of sends) {
+    // `toggle-fullscreen` is handled by an `if` above the switch rather than a `case`.
+    const handled = main.includes(`case "${action}"`) || main.includes(`action === "${action}"`);
+    assert.ok(handled, `${action} has no handler in main.cjs`);
+  }
+  // In-page overlays are called directly rather than sent, so they are checked in preload.
+  for (const [, fn] of table.matchAll(/action: \(\) => (show[A-Za-z]+)\(\)/g)) {
+    assert.ok(preload.includes(`function ${fn}`), `${fn} is not defined in preload`);
+  }
+});
+
+
+// Tab completion on the command line. Without it every command has to be remembered exactly,
+// which for a surface whose whole point is reaching things you cannot remember the key for is
+// the wrong trade.
+test("Tab completes command names from the table `:` executes", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const handler = preload.slice(
+    preload.indexOf("function startCommandLine"),
+    preload.indexOf("function cancelCommandLine"),
+  );
+  assert.match(handler, /event\.code === "Tab"/);
+  // Completed against the SAME map that runs the command, so what completes and what executes
+  // cannot disagree.
+  assert.match(handler, /completeCommand\(input\.value, \[\.\.\.commandsByName\.keys\(\)\]\)/);
+  // The longest shared prefix is inserted, never a chosen candidate.
+  assert.match(handler, /input\.value = colon \+ completion\.common/);
+  // A Tab that cannot complete says why rather than looking ignored.
+  assert.match(handler, /no matching command/);
+  assert.match(handler, /no completion for script/);
 });
