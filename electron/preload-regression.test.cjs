@@ -2071,7 +2071,7 @@ test("viewer window title reflects float state", () => {
 // openDisplayWindow call setFullScreen(true) after show.
 test("command palette has a Fullscreen action that toggle-fullscreen dispatches", () => {
   const electron = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
-  assert.match(electron, /\{ label: "Fullscreen", action: \(\) => send\("toggle-fullscreen"\) \}/);
+  assert.match(electron, /\{ name: "fullscreen", label: "Fullscreen", action: \(\) => send\("toggle-fullscreen"\) \}/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   // handleNativeShortcut handles toggle-fullscreen before the vimium gate.
   assert.match(main, /action === "toggle-fullscreen"/);
@@ -2111,7 +2111,7 @@ test("chrome current hands the active tab to Chrome", () => {
 test("command palette opens with c and lists actions", () => {
   // The entries are a static list — only actions without a keyboard shortcut.
   assert.match(electron, /const commandPaletteEntries = \[/);
-  assert.match(electron, /\{ label: "Open in Chrome", action:/);
+  assert.match(electron, /\{ name: "chrome", label: "Open in Chrome", action:/);
   // Shortcuts like Copy URL (y), Float (w), Tabs (b), History (gh), Downloads (gd),
   // Zoom (0) are deliberately absent — they already work from normal mode, and
   // listing them here would only duplicate them.
@@ -2256,5 +2256,110 @@ test("the engine names its own process rather than answering to Electron", () =>
   // The pane id has to come early enough to survive `comm`, which truncates around 15 chars.
   for (const title of ["tweb %5", "tweb %138", "tweb host"]) {
     assert.ok(title.length <= 15, `${title} must survive the comm column`);
+  }
+});
+
+
+// --- the `:` command line (DESIGN.md 16) ---------------------------------------------------
+
+// `:` is a fifth input surface, and the reason it exists is a case the palette structurally
+// cannot serve: YouTube's ABR picked 854x480 for a 4K video and only `setPlaybackQualityRange`
+// moved it — a call no list written in advance would contain.
+test("colon opens the command line, in normal mode only", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  assert.match(preload, /case ":": startCommandLine\(\); break;/);
+  // The binding lives in the normal-mode switch, beside the palette's `c`. In insert mode a
+  // colon has to stay a character the page receives (DESIGN.md 16.3). Bounded by the palette's
+  // own `case` rather than by a byte count, so the assertion does not drift as the switch grows.
+  const normalKey = preload.indexOf("function handleNormalKey");
+  const paletteCase = preload.indexOf('case "c": startCommandPalette()');
+  assert.ok(normalKey >= 0 && paletteCase > normalKey,
+    "the palette case should sit inside handleNormalKey");
+  assert.match(preload.slice(paletteCase, paletteCase + 400), /case ":": startCommandLine\(\)/,
+    "`:` belongs in the same normal-mode switch as `c`");
+  // `physicalKey` already maps shifted Semicolon, so nothing new is needed there — but if that
+  // mapping ever goes, `:` silently stops opening.
+  assert.match(preload, /Semicolon: event\.shiftKey \? ":" : ";"/);
+});
+
+test("the command line is torn down with every other transient overlay", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const teardown = preload.slice(
+    preload.indexOf("function cancelTransient"),
+    preload.indexOf("function cancelTransient") + 700,
+  );
+  assert.match(teardown, /cancelCommandLine\(false\)/,
+    "an overlay missing from cancelTransient survives Escape and every mode change");
+});
+
+test("script reaches the page only behind an explicit prefix", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const submit = preload.slice(
+    preload.indexOf("function startCommandLine"),
+    preload.indexOf("function cancelCommandLine"),
+  );
+  // The parse decides, and it is a module so the decision is testable without a window —
+  // see command-line.test.cjs for the property itself.
+  assert.match(submit, /parseCommandLine\(input\.value\)/);
+  assert.match(submit, /parsed\.kind === "script"/);
+  // Evaluated IN THE PAGE, not sent to the main process: `:js` is scoped to the document, and
+  // routing it through the engine would hand it the main process's reach instead.
+  assert.match(submit, /window\.eval\(parsed\.source\)/);
+  assert.doesNotMatch(submit, /send\("eval"/,
+    "a script must not be routed through the engine");
+  // Submitted with Enter, never on paste — pasted code has to be visible and cancellable first.
+  assert.match(submit, /event\.code === "Enter"[\s\S]{0,80}submit\(\)/);
+  assert.doesNotMatch(submit, /addEventListener\("paste"/);
+});
+
+test("an evaluation reports back, and an error reports as an error", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const fn = preload.slice(
+    preload.indexOf("function startCommandLine"),
+    preload.indexOf("function cancelCommandLine"),
+  );
+  // Running silently cannot tell "it worked" from "it threw" — DESIGN.md 16.4.
+  assert.match(fn, /report\(formatResult\(value\), false\)/);
+  assert.match(fn, /report\(`\$\{error\?\.name \|\| "Error"\}/);
+  // A promise is awaited rather than printed as [Promise]: async is how half the page APIs
+  // answer, and the wrapper would make those calls look like they returned nothing.
+  assert.match(fn, /typeof value\.then === "function"/);
+});
+
+test("both command tables are reachable by name from one map", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  // A new action must not end up reachable from one surface and not the other.
+  assert.match(preload, /const commandsByName = new Map\(/);
+  assert.match(preload, /\[\.\.\.namedCommands, \.\.\.commandPaletteEntries\]/);
+  // Every palette row carries a name, or `:` cannot reach it.
+  const entries = preload.slice(
+    preload.indexOf("const commandPaletteEntries = ["),
+    preload.indexOf("const namedCommands = ["),
+  );
+  const rows = entries.match(/\{ name:/g) || [];
+  const labels = entries.match(/label:/g) || [];
+  assert.equal(rows.length, labels.length, "every palette row needs a `name` for `:`");
+});
+
+test("every command in the table targets something that exists", () => {
+  // The failure this guards is silent: `:history` sending a shortcut main.cjs has no case for
+  // does nothing at all, and reads as the command line being broken. Caught while writing
+  // this — `history-page` and `downloads-page` were invented and had no handler.
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const table = preload.slice(
+    preload.indexOf("const commandPaletteEntries = ["),
+    preload.indexOf("const commandsByName = new Map("),
+  );
+  const sends = [...table.matchAll(/send\("([a-z-]+)"/g)].map((m) => m[1]);
+  assert.ok(sends.length >= 8, `expected the table to send several actions, saw ${sends.length}`);
+  for (const action of sends) {
+    // `toggle-fullscreen` is handled by an `if` above the switch rather than a `case`.
+    const handled = main.includes(`case "${action}"`) || main.includes(`action === "${action}"`);
+    assert.ok(handled, `${action} has no handler in main.cjs`);
+  }
+  // In-page overlays are called directly rather than sent, so they are checked in preload.
+  for (const [, fn] of table.matchAll(/action: \(\) => (show[A-Za-z]+)\(\)/g)) {
+    assert.ok(preload.includes(`function ${fn}`), `${fn} is not defined in preload`);
   }
 });

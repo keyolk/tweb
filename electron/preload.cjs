@@ -115,10 +115,105 @@ installPrintShim();
   // listing them here would only duplicate them. The palette is for actions
   // that do not have a key: "Open in Chrome" is the reason it exists.
   let commandPaletteState = null;
+  // `name` is what `:` calls the entry. It is on the entry rather than in a second table so a
+  // new action cannot end up reachable from one surface and not the other — DESIGN.md 16.2 makes
+  // the palette's list an implementation detail rather than a ceiling, and that only holds if
+  // both surfaces read the same rows.
   const commandPaletteEntries = [
-    { label: "Open in Chrome", action: () => send("chrome-current") },
-    { label: "Fullscreen", action: () => send("toggle-fullscreen") },
+    { name: "chrome", label: "Open in Chrome", action: () => send("chrome-current") },
+    { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
   ];
+  // Commands with no palette row. These are the ones that already have a key — listing them in
+  // the palette would duplicate the key (DESIGN.md 15.3), but `:` is reached by name and a name
+  // is exactly what someone who cannot remember the key is looking for.
+  const namedCommands = [
+    { name: "reload", action: () => send("reload") },
+    { name: "float", action: () => send("toggle-float") },
+    { name: "back", action: () => send("history-back") },
+    { name: "forward", action: () => send("history-forward") },
+    { name: "tabs", action: () => showTabList() },
+    // In-page overlays, not shortcut sends — `gh`/`gd` reach these same functions.
+    { name: "history", action: () => showHistory() },
+    { name: "downloads", action: () => showDownloads() },
+    { name: "close", action: () => send("close-tab") },
+    { name: "url", action: () => send("copy-url") },
+    { name: "print", action: () => send("print-paper") },
+    { name: "zoom", action: () => send("zoom-reset") },
+    // The two that take a value. They report their own error when it is missing, since
+    // `:open` with nothing to open is a mistake worth naming rather than a silent no-op.
+    { name: "open", argument: "url", action: (value) => send("navigate", value) },
+    { name: "tab", argument: "url", action: (value) => send("new-tab", value) },
+  ];
+  // Both tables, by name. Palette rows win a collision, since a row the user can see is the one
+  // they will expect `:` to reach.
+  const commandsByName = new Map(
+    [...namedCommands, ...commandPaletteEntries]
+      .filter((entry) => entry.name)
+      .map((entry) => [entry.name, entry]),
+  );
+  // The command-line parse, inlined rather than required.
+  //
+  // WHY inlined. The preload runs SANDBOXED — Electron 20+ makes that the default and nothing
+  // here turns it off — and a sandboxed preload resolves no relative `require`. Measured under
+  // Electron 43.2.0: `require("./mod.cjs")` from a preload fails with "module not found" even
+  // when the file sits beside it. The cost of getting this wrong is not the feature failing, it
+  // is the preload throwing WHILE IT LOADS, which takes every shortcut in the pane down with it —
+  // observed live as `Unable to load preload script` with `f`, `w` and `c` all dead.
+  //
+  // The logic is duplicated in command-line.cjs, which is where it is unit-tested; a regression
+  // test compares the two so they cannot drift.
+  const SCRIPT_PREFIXES = ["js", "!"];
+  const RESULT_LIMIT = 2000;
+
+  function parseCommandLine(input) {
+    const line = String(input == null ? "" : input).trim();
+    if (!line) return { kind: "empty" };
+    const body = line.startsWith(":") ? line.slice(1).trim() : line;
+    if (!body) return { kind: "empty" };
+    if (body.startsWith("!")) return { kind: "script", source: body.slice(1).trim() };
+    const separator = body.search(/\s/);
+    const head = (separator === -1 ? body : body.slice(0, separator)).toLowerCase();
+    const rest = separator === -1 ? "" : body.slice(separator + 1).trim();
+    if (SCRIPT_PREFIXES.includes(head)) return { kind: "script", source: rest };
+    return { kind: "command", name: head, argument: rest };
+  }
+
+  function truncateResult(text) {
+    const string = String(text);
+    return string.length <= RESULT_LIMIT ? string : `${string.slice(0, RESULT_LIMIT)}… (${string.length} chars)`;
+  }
+
+  function formatResult(value) {
+    if (value === undefined) return "undefined";
+    if (value === null) return "null";
+    if (typeof value === "string") return truncateResult(value);
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    try {
+      return truncateResult(JSON.stringify(value) ?? String(value));
+    } catch (error) {
+      void error;
+      const name = value?.constructor?.name;
+      return truncateResult(name ? `[${name}]` : String(value));
+    }
+  }
+
+  function pushHistory(history, line, limit = 50) {
+    const value = String(line == null ? "" : line).trim();
+    if (!value) return history.slice(0, limit);
+    return [value, ...history.filter((entry) => entry !== value)].slice(0, limit);
+  }
+
+  function historyStep(history, index, direction) {
+    if (!history.length) return { index: -1, line: null };
+    const next = index + (direction === "older" ? 1 : -1);
+    if (next < 0) return { index: -1, line: "" };
+    if (next >= history.length) return { index: history.length - 1, line: history[history.length - 1] };
+    return { index: next, line: history[next] };
+  }
+
+  let commandLineState = null;
+  // Per pane and per process, deliberately not persisted — DESIGN.md 16.5.
+  let commandLineHistory = [];
   let promptHost = null;
   let searchState = null;
   // Requests still waiting for a result, and the backstop that un-hides the bar if one
@@ -2521,6 +2616,136 @@ installPrintShim();
     requestAnimationFrame(() => input.focus());
   }
 
+  // The `:` command line. DESIGN.md 16.
+  //
+  // Built like the omnibox — a fixed-position shadow-DOM overlay with one input — because it is
+  // the same kind of surface: typed input, `Enter` to submit, `Escape` to cancel. What differs is
+  // what a submission means, and that lives in command-line.cjs rather than here.
+  function startCommandLine() {
+    cancelTransient(false);
+    const host = document.createElement("div");
+    host.id = "__tweb_command_line__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "open" });
+    const box = document.createElement("div");
+    // Bottom-anchored, unlike the omnibox: a command line belongs where a command line belongs,
+    // and the top of the page is where the omnibox already is. Above the mode indicator's row.
+    box.style.cssText = [
+      "position:fixed", "left:8px", "right:8px", "bottom:24px", "box-sizing:border-box",
+      "border:2px solid #7aa2f7", "border-radius:6px", "background:#161b22", "overflow:hidden",
+      "box-shadow:0 6px 22px #000a", "pointer-events:auto",
+    ].join(";");
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:0;padding:0 9px";
+    const sigil = document.createElement("span");
+    sigil.textContent = ":";
+    sigil.style.cssText = "color:#7aa2f7;font:14px/1 ui-monospace,SFMono-Regular,Menlo,monospace;user-select:none";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = "command, or js <expression>";
+    input.style.cssText = "flex:1;display:block;box-sizing:border-box;padding:8px 4px;border:0;outline:0;background:transparent;color:#e8eaed;font:14px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
+    // The result of the last evaluation, kept until dismissed — DESIGN.md 16.4. Hidden until
+    // there is something to say, so the line is one row tall in the ordinary case.
+    const output = document.createElement("div");
+    output.style.cssText = "display:none;max-height:28vh;overflow:auto;padding:6px 10px;border-top:1px solid #30363d;color:#9aa0a6;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word";
+    row.append(sigil, input);
+    box.append(row, output);
+    shadow.append(box);
+    document.documentElement.append(host);
+    paintNow();
+
+    // -1 means "typing a draft"; see historyStep for why stepping off the top returns here.
+    commandLineState = { host, input, output, historyIndex: -1 };
+    setMode("command-line");
+
+    const report = (text, isError) => {
+      output.textContent = text;
+      output.style.display = text ? "block" : "none";
+      // An error is shown AS an error rather than as a value: DESIGN.md 16.4 makes that
+      // distinction the whole diagnostic, and a red string that reads like a return value is
+      // exactly the confusion it is there to prevent.
+      output.style.color = isError ? "#f7768e" : "#9aa0a6";
+      paintNow();
+    };
+
+    const submit = () => {
+      const parsed = parseCommandLine(input.value);
+      if (parsed.kind === "empty") { cancelCommandLine(); return; }
+      commandLineHistory = pushHistory(commandLineHistory, input.value);
+      commandLineState.historyIndex = -1;
+      if (parsed.kind === "script") {
+        if (!parsed.source) { report("nothing to evaluate", true); return; }
+        // Evaluated here in the page, not sent to the main process: `:js` is scoped to the
+        // document the user is looking at, and routing it through the engine would give it the
+        // main process's reach instead — a different and much larger capability than the one
+        // DESIGN.md 16.3 weighed.
+        let value;
+        try {
+          // eslint-disable-next-line no-eval
+          value = window.eval(parsed.source);
+        } catch (error) {
+          report(`${error?.name || "Error"}: ${error?.message || String(error)}`, true);
+          return;
+        }
+        // A promise is awaited rather than printed as [Promise]: async is how half the page APIs
+        // answer, and showing the wrapper would make those calls look like they returned nothing.
+        if (value && typeof value.then === "function") {
+          report("…", false);
+          Promise.resolve(value).then(
+            (settled) => { if (commandLineState?.host === host) report(formatResult(settled), false); },
+            (error) => { if (commandLineState?.host === host) report(`${error?.name || "Error"}: ${error?.message || String(error)}`, true); },
+          );
+          input.select();
+          return;
+        }
+        report(formatResult(value), false);
+        // The line stays open on a script, and closes on a command. A script is the iterative
+        // case — read a value, adjust, run again (DESIGN.md 16.5) — and closing after each one
+        // would make every step a fresh `:` press.
+        input.select();
+        return;
+      }
+      const entry = commandsByName.get(parsed.name);
+      if (!entry) { report(`unknown command: ${parsed.name}`, true); return; }
+      if (entry.argument && !parsed.argument) {
+        report(`${parsed.name} needs a ${entry.argument}`, true);
+        return;
+      }
+      cancelCommandLine();
+      entry.action(parsed.argument);
+    };
+
+    input.addEventListener("keydown", (event) => {
+      // Every key here belongs to the line, so none of them reach the page's own handlers —
+      // the same stopPropagation the omnibox does for the same reason.
+      event.stopPropagation();
+      if (event.code === "Escape") {
+        event.preventDefault();
+        cancelCommandLine();
+      } else if (event.code === "Enter") {
+        event.preventDefault();
+        submit();
+      } else if (event.code === "ArrowUp" || event.ctrlKey && event.key.toLowerCase() === "p") {
+        event.preventDefault();
+        const step = historyStep(commandLineHistory, commandLineState.historyIndex, "older");
+        if (step.line !== null) { commandLineState.historyIndex = step.index; input.value = step.line; }
+      } else if (event.code === "ArrowDown" || event.ctrlKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        const step = historyStep(commandLineHistory, commandLineState.historyIndex, "newer");
+        if (step.line !== null) { commandLineState.historyIndex = step.index; input.value = step.line; }
+      }
+    });
+    requestAnimationFrame(() => input.focus());
+  }
+
+  function cancelCommandLine(restoreMode = true) {
+    commandLineState?.host?.remove();
+    commandLineState = null;
+    if (restoreMode) normalMode();
+  }
+
   // The find bar lives inside the document, so Chromium's find walks it like any other
   // content and counts the bar's own text: searching "ZEBRA" on a page with three of them
   // reported 4/4, and stepping stopped on the bar itself (selectionArea y=11, the bar's
@@ -3984,6 +4209,7 @@ installPrintShim();
   function cancelTransient(restoreMode = true) {
     cancelPicker(false);
     cancelCommandPalette(false);
+    cancelCommandLine(false);
     cancelPrompt(false);
     cancelSearch(true, false);
     cancelVisual(false);
@@ -4200,6 +4426,9 @@ installPrintShim();
       case "r": send("reload"); break;
       case "w": send("toggle-float"); break;
       case "c": startCommandPalette(); break;
+      // The command line. Normal mode only — DESIGN.md 16.3 keeps a colon a character the page
+      // is entitled to receive in insert mode, and this switch only runs in normal mode.
+      case ":": startCommandLine(); break;
       case "Escape":
         // Release a picked scroll or pan surface before bothering the page.
         if (scrollSurface() || panSurface()) {
