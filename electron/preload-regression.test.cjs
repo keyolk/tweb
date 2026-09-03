@@ -2109,15 +2109,16 @@ test("floating applies to the active tab only, not every tab", () => {
 // page's preload, not on the tmux status line. Tmux-independent and per-pane.
 test("float toggle writes status line to the terminal", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  // From `writeFloatStatus` through the end of `toggleFloat`: the label and the placement
+  // delete live in the helper now, since two fullscreen transitions also need them.
   const fn = main.slice(
-    main.indexOf("function toggleFloat"),
+    main.indexOf("function writeFloatStatus()"),
     main.indexOf("function restoreFocusFromFloat"),
   );
-  // toggleFloat writes ANSI clear + cursor home + label to the pane writer.
   assert.match(fn, /writerFor\(currentPane\(\)\)\.write/);
   assert.match(fn, /FLOATING/);
   assert.match(fn, /FULLSCREEN/);
-  // ESC[2J clears the screen so the status is not left behind the returning page.
+  // The clear is part of the centred sequence now; the standalone one is the pin path below.
   assert.match(fn, /\\x1b\[2J/);
   // deletePlacement removes the Kitty graphics placement first — it is the last
   // frame the pane was showing, and it would sit on top of the status text.
@@ -2541,4 +2542,27 @@ test("the input caret is measured by layout, not by a canvas font", () => {
   // And emptied afterwards — it holds a copy of whatever is in a focused field, passwords
   // included, and leaving that in the DOM is a copy any page script can read.
   assert.match(mirror, /caretMirror\.textContent = "";/);
+});
+
+
+// While a tab floats the pane shows bare terminal, so the status line is the only thing telling
+// the user where their page went. It was `\x1b[12;1H` — row 12 whatever the pane's height,
+// column 1 whatever its width.
+test("the float status line is centred and written on every transition", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /centeredStatusSequence\(label, cells\.cols, cells\.rows\)/);
+  assert.doesNotMatch(main, /\\x1b\[12;1H/, "the hardcoded address is the bug");
+  // Three call sites, not one. `toggle-fullscreen` on an already-floating viewer changes which
+  // label is correct without going through `toggleFloat` at all, and used to leave "FLOATING"
+  // on screen while the page was fullscreen on another monitor.
+  const calls = main.match(/writeFloatStatus\(\)/g) || [];
+  assert.ok(calls.length >= 3, `expected the status to be written from three paths, saw ${calls.length}`);
+  const helper = main.slice(main.indexOf("function writeFloatStatus()"), main.indexOf("function toggleFloat("));
+  // Guarded, because two of the three callers fire on transitions that also happen when the
+  // pane is not floating at all.
+  assert.match(helper, /if \(!inputState\(\)\.floating \|\| quitting\) return;/);
+  // The Kitty placement goes first or the line is drawn behind the last frame.
+  assert.ok(helper.indexOf("deletePlacement()") < helper.indexOf("centeredStatusSequence"));
+  // And the label typo is gone: it read "press w to to pin".
+  assert.doesNotMatch(main, /to to pin/);
 });

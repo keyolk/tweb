@@ -96,6 +96,37 @@ function centeredDisplayBounds(displayBounds, width, height) {
   };
 }
 
+/// The ANSI to draw a one-line status centred in a pane of `cols` x `rows` cells.
+///
+/// The pane shows bare terminal while a tab floats — the page is in an OS window — so this line
+/// is the only thing telling the user where their page went and how to get it back. It was
+/// written at a hardcoded `\x1b[12;1H`: row 12 whatever the pane's height, column 1 whatever
+/// its width, which put it against the left edge and above centre on anything but one exact
+/// size.
+///
+/// Centred by cell count rather than by pixels, because that is the unit the cursor address
+/// takes. The label is plain ASCII in both callers, so `length` is its cell width; a label with
+/// wide characters in it would need a width function, and there is none here to mislead a
+/// later reader into thinking one exists.
+///
+/// Clamped to 1 on both axes. A pane one cell wide is not worth a special case, but an address
+/// of `0` or a negative column is one the terminal is entitled to reject outright, and a
+/// status line that silently does not appear is worse than one slightly off centre.
+function centeredStatusSequence(label, cols, rows, escape = "\x1b") {
+  const text = String(label ?? "");
+  const width = Math.max(1, Math.round(cols) || 1);
+  const height = Math.max(1, Math.round(rows) || 1);
+  const row = Math.max(1, Math.ceil(height / 2));
+  // `(width - text.length) / 2 + 1` in cell terms: floor, so a label that cannot be centred
+  // exactly sits one cell left rather than one right — the same bias a terminal's own
+  // wrapping has, and it keeps a label wider than the pane starting at column 1 instead of
+  // off screen to the left.
+  const column = Math.max(1, Math.floor((width - text.length) / 2) + 1);
+  // Clear, address, then bold cyan and a reset. The clear is what removes the frame the pane
+  // was showing; see the caller for why the Kitty placement has to go first.
+  return `${escape}[2J${escape}[${row};${column}H${escape}[1m${escape}[36m${text}${escape}[0m`;
+}
+
 /// How much to shrink a fullscreen float's surface so its frame matches the monitor.
 ///
 /// An offscreen window's `deviceScaleFactor` is fixed when the window is constructed, from the
@@ -204,6 +235,7 @@ function relayInputEvents(kind, data = {}) {
 
 module.exports = {
   RELAY_JPEG_QUALITY,
+  centeredStatusSequence,
   fullscreenSurfaceScale,
   scaledSurfaceSize,
   displayWindowOptions,
