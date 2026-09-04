@@ -2292,9 +2292,15 @@ test("a command palette keystroke that matches nothing is shown, not swallowed",
     electron.indexOf("function filterCommandPalette"),
     electron.indexOf("function paintCommandPaletteSelection"),
   );
-  // The query is visible, and says when it matches nothing.
-  assert.match(filter, /no match/);
-  assert.match(filter, /state\.query\.style\.display = typed \? "block" : "none"/);
+  // The query is drawn by its own renderer, which the filter calls.
+  assert.match(filter, /renderCommandPaletteQuery\(\);/);
+  const render = electron.slice(
+    electron.indexOf("function renderCommandPaletteQuery"),
+    electron.indexOf("function paintCommandPaletteSelection"),
+  );
+  // It says when the query matches nothing — beside the query, since the rows are gone and an
+  // empty box does not distinguish "no match" from "broken".
+  assert.match(render, /no match/);
   // And the count in the mode indicator distinguishes "filtered" from "everything".
   assert.match(filter, /\$\{state\.matches\.length\}\/\$\{state\.items\.length\}/);
 });
@@ -2565,4 +2571,39 @@ test("the float status line is centred and written on every transition", () => {
   assert.ok(helper.indexOf("deletePlacement()") < helper.indexOf("centeredStatusSequence"));
   // And the label typo is gone: it read "press w to to pin".
   assert.doesNotMatch(main, /to to pin/);
+});
+
+
+// A menu that filters as you type needs the field being typed into to be where typing goes.
+// The query started UNDER the rows and hidden until the first keystroke: backwards, and the
+// appearing field pushed every row down by its own height at the moment they were being read.
+test("the palette's search field is above the rows and always present", () => {
+  const open = electron.slice(
+    electron.indexOf("function startCommandPalette"),
+    electron.indexOf("function filterCommandPalette"),
+  );
+  // Prepended, not appended.
+  assert.match(open, /list\.prepend\(query\)/);
+  assert.doesNotMatch(open, /list\.append\(query\)/);
+  // No `display:none` on it: always present is also what says the palette is searchable at
+  // all, since nothing else in the overlay does.
+  assert.doesNotMatch(open, /query\.style\.cssText = "display:none/);
+  // Drawn once on open, before any key.
+  assert.match(open, /renderCommandPaletteQuery\(\);/);
+
+  const render = electron.slice(
+    electron.indexOf("function renderCommandPaletteQuery"),
+    electron.indexOf("function paintCommandPaletteSelection"),
+  );
+  // A placeholder when empty, and a block caret — the palette has no focused input for the
+  // browser to blink one in, and a field with no caret does not read as somewhere to type.
+  assert.match(render, /type to filter/);
+  assert.match(render, /\\u2588/);
+
+  // Re-prepended after the rows are reordered, or appending them would move the field down.
+  const filter = electron.slice(
+    electron.indexOf("function filterCommandPalette"),
+    electron.indexOf("function renderCommandPaletteQuery"),
+  );
+  assert.match(filter, /state\.query\.parentNode\?\.prepend\(state\.query\)/);
 });
