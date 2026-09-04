@@ -4221,15 +4221,19 @@ installPrintShim();
       // type and others navigate has no rule the user can hold. Arrows navigate instead.
       state.typed += key.toLowerCase();
       filterCommandPalette();
-      // One match left is unambiguous, so it runs — the palette is a menu, not a mode, and
-      // there is nothing left to confirm. Checked AFTER filtering so the decision is made
-      // against the fuzzy result rather than a substring guess.
-      if (state.matches.length === 1) {
-        const only = state.matches[0];
-        cancelCommandPalette(false);
-        only.action();
-        paintNow();
-      }
+      // NOTHING runs on a keystroke. A single remaining match used to execute immediately, on
+      // the theory that one match is unambiguous and there is nothing left to confirm. That
+      // was survivable while the filter was a substring test and is not survivable now:
+      // subsequence matching means one letter can narrow four entries to one, and it does.
+      // Measured against the live labels, the FIRST key typed:
+      //
+      //   h -> 1 match, "Open in Chrome"       (the h in "Chrome")
+      //   w -> 1 match, "Focus float window"
+      //   f -> 3, o -> 3, t -> 2, c -> 4
+      //
+      // So `h` opened a browser window before the user had finished thinking of a word, which
+      // is exactly what was reported. Enter confirms; the palette is a menu and a menu that
+      // acts before you choose is a hazard rather than a shortcut.
     }
     return true;
   }

@@ -2224,7 +2224,13 @@ test("command palette opens with c and lists actions", () => {
   // matches that the scorer finds.
   assert.match(electron, /state\.typed/);
   assert.match(electron, /fuzzyScore\(typed, item\.label\)/);
-  assert.match(electron, /state\.matches\[0\]/);
+  // NOTHING runs on a keystroke. A lone remaining match used to execute immediately, which
+  // subsequence matching made a hazard: measured against the live labels, the FIRST key typed,
+  // `h` matches only "Open in Chrome" (the h in Chrome) and `w` only "Focus float window". So
+  // `h` opened a browser window before the user had finished thinking of a word.
+  assert.doesNotMatch(paletteKeys, /matches\.length === 1/,
+    "one fuzzy match is not a confirmation");
+  assert.doesNotMatch(paletteKeys, /only\.action\(\)/);
   // A mouse click is a first-class confirmation.
   assert.match(electron, /row\.addEventListener\("click"/);
   // `emptyPickerReason` has a command entry.
@@ -2266,9 +2272,10 @@ test("every command palette state change asks for a paint", () => {
   const enter = handler.slice(handler.indexOf('key === "Enter"'), handler.indexOf('key === "ArrowDown"'));
   assert.match(enter, /paintNow\(\)/);
 
-  // Running an entry from an unambiguous filter closes the menu the same way Enter does.
-  const single = handler.slice(handler.indexOf("state.matches.length === 1"));
-  assert.match(single, /only\.action\(\);\n\s*paintNow\(\)/);
+  // Enter is the only thing that runs an entry, so it is the only place an action is called
+  // from — the auto-run on a single match is gone, and with it the paint it needed.
+  const actions = handler.match(/\.action\(\)/g) || [];
+  assert.equal(actions.length, 1, "only Enter may run a palette entry");
 });
 
 // With two entries, most letters filter to exactly one and run it on the spot — `f` is
