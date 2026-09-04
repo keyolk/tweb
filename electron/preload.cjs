@@ -4078,12 +4078,22 @@ installPrintShim();
       list.append(row);
       return { row, labelSpan, ...entry };
     });
-    // What was typed, shown under the rows. The filter was invisible before: typing narrowed
-    // the selection but left every row on screen, so a query that matched one entry looked
-    // identical to one that matched none.
+    // The search field, ABOVE the rows and always present.
+    //
+    // It started under them and hidden until the first keystroke, which is backwards for a
+    // menu that filters as you type: the thing being typed into has to be where typing goes,
+    // and a field that appears on the first letter moves every row down by its own height at
+    // the moment the user is reading them. Above and always drawn, the list changes underneath
+    // a fixed field — which is how every filtering menu the user already knows behaves.
+    //
+    // Always present also says the palette IS searchable. Nothing else does: there is no
+    // placeholder anywhere else in the overlay, and a menu that merely responds to letters
+    // teaches that only by accident.
     const query = document.createElement("div");
-    query.style.cssText = "display:none;padding:4px 10px;border-top:1px solid #5f6368;color:#9aa0a6;font:11px ui-monospace,SFMono-Regular,Menlo,monospace";
-    list.append(query);
+    query.style.cssText = "padding:5px 10px;border-bottom:1px solid #5f6368;"
+      + "color:#e8eaed;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;"
+      + "white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+    list.prepend(query);
     shadow.append(list);
     document.documentElement.append(host);
     paintNow();
@@ -4092,6 +4102,7 @@ installPrintShim();
     // existed — it simply was not drawn, and a menu with nothing highlighted does not say
     // what Enter will do.
     paintCommandPaletteSelection();
+    renderCommandPaletteQuery();
     setMode("command", `${entries.length}`);
   }
 
@@ -4112,20 +4123,42 @@ installPrintShim();
       .sort((left, right) => right.score - left.score);
     state.matches = scored.map((entry) => entry.item);
     // Reordered in the DOM as well as in the array, so the best match is the top ROW rather
-    // than a highlighted row somewhere in the middle of an unchanged list.
+    // than a highlighted row somewhere in the middle of an unchanged list. The query field is
+    // put back on top afterwards, since appending the rows moves them past it.
     for (const item of state.matches) item.row.parentNode?.append(item.row);
-    state.query.parentNode?.append(state.query);
+    state.query.parentNode?.prepend(state.query);
     for (const item of state.items) {
       item.row.style.display = state.matches.includes(item) ? "" : "none";
     }
-    state.query.textContent = typed ? `${typed}${state.matches.length ? "" : "  (no match)"}` : "";
-    state.query.style.display = typed ? "block" : "none";
+    renderCommandPaletteQuery();
     // The selection moves to the best match rather than staying where it was: after a
     // keystroke the row under it is a different command.
     state.selected = 0;
     paintCommandPaletteSelection();
     setMode("command", typed ? `${state.matches.length}/${state.items.length}` : `${state.items.length}`);
     paintNow();
+  }
+
+  /// Draws the search field: what has been typed, a caret, and a placeholder when it is empty.
+  ///
+  /// A block caret rather than a real text cursor. The palette has no focused input — keys
+  /// arrive through the document-level handler, the same as every other overlay here — so
+  /// there is nothing for the browser to blink, and a field with no caret at all does not
+  /// read as somewhere you can type.
+  function renderCommandPaletteQuery() {
+    const state = commandPaletteState;
+    if (!state) return;
+    const typed = state.typed;
+    // "no match" belongs beside the query rather than in place of the rows: the rows are gone,
+    // and an empty box with a lone query in it does not say whether the palette is broken or
+    // the query simply matches nothing.
+    const suffix = typed && !state.matches.length ? "   no match" : "";
+    state.query.textContent = `${typed}\u2588${suffix}`;
+    state.query.style.color = typed && !state.matches.length ? "#f28b82" : "#e8eaed";
+    if (!typed) {
+      state.query.textContent = "type to filter\u2588";
+      state.query.style.color = "#9aa0a6";
+    }
   }
 
   /// Paints the selection highlight. Split from `selectCommandPaletteIndex` because the filter
