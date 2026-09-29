@@ -11,6 +11,62 @@ const tauri = fs.readFileSync(path.join(root, "crates/tweb-engine/tauri/src/prel
 
 function assertPreload(source) {
   assert.match(source, /"ㄹ": "f", "ᄅ": "f", "ㅎ": "g", "ᄒ": "g"/);
+
+  // One hint per box, but the box has to go to the CONTROL rather than to whichever
+  // wrapper happened to come first in document order. Keying the cell on the top-left
+  // corner and keeping the first arrival gave every hint to the wrapper, because a
+  // wrapper shares its child's corner and always precedes it: measured on a Google Meet
+  // call, 58 of 503 collected elements were lost that way, including every button in the
+  // control bar, which `snapshot` then reported as "generic".
+  const unique = source.slice(source.indexOf("function uniqueVisibleTargets(elements, classify)"),
+    source.indexOf("// `<form>` exposes its controls as own properties"));
+  assert.match(unique, /const occupied = new Map\(\);/);
+  assert.match(unique, /if \(targetRank\(element\) <= targetRank\(targets\[held\]\.element\)\) continue;/);
+  assert.match(unique, /targets\[held\] = \{ element, rect, \.\.\.\(classify\?\.\(element\) \|\| \{\}\) \};/);
+  assert.doesNotMatch(unique, /if \(occupied\.has\(point\)\) continue;/);
+  // A control outranks a bolted-on handler, which outranks a bare layout box.
+  assert.match(source, /if \(element\.matches\(controlSelector\)\) return 2;/);
+  assert.match(source, /if \(element\.matches\(handlerSelector\)\) return 1;/);
+  // The two halves are the one definition `interactiveSelector` is built from, so the
+  // ranking can never drift away from what the hint pass actually collects.
+  assert.match(source, /const interactiveSelector = \[\s*\n\s*controlSelector, handlerSelector, "audio", "video", "canvas",\s*\n\s*\]\.join\(","\);/);
+
+  // A cross-origin subframe used to be inert: it ignored `f`, and the engine's
+  // `sendToFocusedTabFrame` handed the key back to the main frame on seeing it was not a
+  // shortcut frame. The main frame cannot reach into it either, so an embedded app — a
+  // Google Meet add-on is one whole iframe — was hintable by nobody.
+  assert.match(source, /const shortcutFrame = true;/);
+  assert.doesNotMatch(source, /const shortcutFrame = topFrame \|\| sameOriginFrame;/);
+
+  // Such a frame draws its badges in its own coordinates, but the click point has to be
+  // absolute — and the `frameElement` walk throws at the boundary. A sum that stopped
+  // part way up is worse than none, because it looks like an answer.
+  const toTop = source.slice(source.indexOf("function topViewportPoint(point)"),
+    source.indexOf("function hintClickPoint(item)"));
+  assert.match(toTop, /if \(frameWindow === frameWindow\.top\) return \{ x, y \};/);
+  assert.match(toTop, /return resolvedFrameOffset\s*\n\s*\? \{ x: point\.x \+ resolvedFrameOffset\.x, y: point\.y \+ resolvedFrameOffset\.y \}/);
+
+  // Only the parent can measure a child's box, and `event.source` is what makes the
+  // answer safe to give: it identifies the asking window across origins, so the parent
+  // matches on window identity rather than on a name or URL a page could collide with.
+  assert.match(source, /if \(frame\.contentWindow !== source\) continue;/);
+  // And only the parent's answer is taken — a sibling or an opener saying otherwise is
+  // ignored, which is what keeps another frame from placing this one.
+  assert.match(source, /if \(event\.source !== window\.parent\) return;/);
+  // A child cannot be placed absolutely until we are.
+  assert.match(source, /if \(!resolvedFrameOffset\) \{ requestFrameOffset\(\); return; \}/);
+  // The offset has to be fresh by the time a badge can be picked, and a parent's scroll
+  // or resize moves a child that has no way to notice from the inside.
+  assert.match(source, /function startHints\(newTab\) \{[^]*?requestFrameOffset\(\);/);
+  assert.match(source, /addEventListener\("resize", broadcastFrameOffsets\);/);
+  assert.match(source, /document\.addEventListener\("scroll", broadcastFrameOffsets, true\);/);
+
+  // Focus has to be able to GET into such a frame, or its own pass never runs. The frame
+  // itself is the hint that puts it there — and only when it is opaque, since a
+  // same-origin one is already enumerated control by control.
+  assert.match(source, /\.filter\(\(frame\) => !sameOriginFrameDocument\(frame\)\);/);
+  assert.match(source, /&& \(!item\.element\.matches\("iframe,frame"\) \|\| opaqueFrames\.has\(item\.element\)\)\);/);
+  assert.doesNotMatch(source, /\.filter\(\(item\) => !item\.element\.matches\("video,audio,iframe"\)\);/);
   assert.match(source, /function commandKey\(value, shiftKey = false\)/);
   assert.match(source, /return commandKey\(keys\[event\.code\] \|\| event\.key, event\.shiftKey\)/);
   assert.match(source, /commandKey\(payload\.key, Boolean\(payload\.shiftKey\)\)/);
