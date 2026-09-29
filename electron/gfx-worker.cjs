@@ -14,7 +14,7 @@
 const { mkdirSync, renameSync, unlinkSync, writeFileSync } = require("node:fs");
 const { deflateSync } = require("node:zlib");
 const path = require("node:path");
-const { parentPort } = require("node:worker_threads");
+const { parentPort, workerData } = require("node:worker_threads");
 const os = require("node:os");
 
 const CHUNK = 3072;
@@ -149,16 +149,22 @@ const MIN_RATIO = 4;
 // ratio by under 5% (23x vs 23x on text, 8x vs 9x on mixed) for the same or more time.
 const DEFLATE_LEVEL = 1;
 
-// The escape hatch, matching `TWEB_RAW_FRAMES=0` next door.
+// Whether this terminal may be sent `o=z` at all, decided by the engine before the worker starts
+// — see deflate-policy.cjs, and note that the bug it names does not corrupt a frame, it kills the
+// terminal. The escape hatch it reads, `TWEB_DEFLATE_FRAMES`, matches `TWEB_RAW_FRAMES=0` next
+// door and now works in both directions.
 //
-// `o=z` is verified on both implementations that matter here — Ghostty 1.3.1 and kitty itself,
-// each rejecting a corrupt stream by name rather than merely accepting a valid one — so this is
-// not hedging against a suspected bug. It exists because of how such a bug would present: the
-// sequence carries `q=2`, so a terminal that dislikes `o=z` cannot say so, and
-// `noteRawFrameFailure` never fires because the worker succeeded. The failure would be a blank
-// or corrupt image with nothing in any log, and a user who hits that on some terminal neither
-// probe covered needs a way back that does not involve editing this file.
-const DEFLATE_ENABLED = process.env.TWEB_DEFLATE_FRAMES !== "0";
+// It has to come from there rather than from this file's own environment: inside tmux, `TERM` and
+// `TERM_PROGRAM` here are tmux's, and the terminal that actually receives these bytes is
+// invisible from inside the worker.
+//
+// Defaulting to true when nothing was passed keeps a worker started outside the engine — the
+// bench harnesses do this — on the path it was measured on.
+// Both gates, and either one is enough to refuse: the engine's decision, and this thread's own
+// copy of the environment, which a worker inherits. They can only disagree by someone starting a
+// worker outside the engine, and the safe answer there is the one that does not compress.
+const DEFLATE_ENABLED = (workerData?.deflateFrames ?? true)
+  && process.env.TWEB_DEFLATE_FRAMES !== "0";
 
 /**
  * The payload to transmit, and whether it is deflated.

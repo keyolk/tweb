@@ -36,6 +36,7 @@ const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometr
 const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
+const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const {
   RELAY_JPEG_QUALITY,
   centeredStatusSequence,
@@ -742,7 +743,35 @@ let loggedFrameGeneration = -1;
 // THAT pane's `whole`. As a module-level counter it summed every pane's compressions and reported
 // the sum to each of them: two panes with wildly different content both read 473, which reads as
 // a working ratio for the idle pane and hides the sampling decision for the playing one.
-const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"));
+// The terminal this pane is actually drawn on, by name.
+//
+// Inside tmux, `TERM` and `TERM_PROGRAM` in this process are tmux's own — the outer terminal is
+// simply not in the environment. `#{client_termname}` is the attached client's real TERM, and it
+// is live rather than whatever the server inherited when it started.
+function attachedTerminalName() {
+  try {
+    return execFileSync("tmux", ["display-message", "-p", "#{client_termname}"], {
+      encoding: "utf8", timeout: 1000,
+    }).trim();
+  } catch (error) {
+    // Not in tmux, or no client attached. The environment is then honest about the terminal.
+    if (debugLogging) console.error(`tweb: client termname lookup failed: ${error.message}`);
+    return "";
+  }
+}
+
+// Decided once, here, rather than in the worker: the worker has no tmux and no terminal of its
+// own, and this is the process that knows which one the frames are going to.
+const deflateFrames = deflateFramesAllowed({
+  clientTermname: attachedTerminalName(),
+  term: process.env.TERM,
+  termProgram: process.env.TERM_PROGRAM,
+  override: process.env.TWEB_DEFLATE_FRAMES,
+});
+
+const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"), {
+  workerData: { deflateFrames },
+});
 gfxWorker.unref();
 
 const ESC = "\x1b";
