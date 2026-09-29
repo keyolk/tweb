@@ -1,15 +1,21 @@
 
 {
   const topFrame = window.top === window;
-  let sameOriginFrame = topFrame;
-  if (!topFrame) {
-    try {
-      sameOriginFrame = top.location.origin === location.origin;
-    } catch (_) {
-      sameOriginFrame = false;
-    }
-  }
-  const shortcutFrame = topFrame || sameOriginFrame;
+  // Every frame runs shortcuts, cross-origin ones included.
+  //
+  // This used to be `topFrame || sameOriginFrame`, which left a cross-origin subframe
+  // completely inert: it ignored `f`, and `sendToFocusedTabFrame` saw it was not a
+  // shortcut frame and handed the key back to the main frame. The main frame's own pass
+  // cannot reach into it either — a cross-origin document is not a root `collectRoots`
+  // can read — so between the two, an embedded app was unhintable. Measured on a Google
+  // Meet call: the Whiteboard add-on is `meet.whiteboard.sdix.io` in a nested iframe and
+  // `snapshot` returned not one element of it, only the Meet chrome around it.
+  //
+  // A frame draws its own hints in its own coordinates, which is where its badges belong
+  // and where the boundary clips them anyway. Only the click point has to be absolute,
+  // and `topViewportPoint` gets there by asking the parent rather than by a walk the
+  // boundary blocks.
+  const shortcutFrame = true;
   let shortcutsEnabled = true;
   let insertMode = false;
   let mediaHoverTimer = null;
@@ -571,6 +577,77 @@
   // discarded as off-screen.
   const frameOffsets = new WeakMap();
 
+  // Where THIS frame's viewport sits inside the top frame's, for a frame that cannot
+  // walk up to find out. Null until the parent says, and the top frame is its own origin.
+  //
+  // Only the parent can answer: the child's box is an element in the PARENT's document,
+  // and nothing inside the child can measure it. `event.source` is what makes the answer
+  // safe to give — it identifies the asking window across origins, so comparing it
+  // against each `iframe.contentWindow` is an identity test rather than a match on a
+  // name or a URL that a page could arrange to collide. A frame learns only its own
+  // position, which its parent chose for it.
+  let resolvedFrameOffset = topFrame ? { x: 0, y: 0 } : null;
+
+  const FRAME_OFFSET_ASK = "tweb:where-am-i";
+  const FRAME_OFFSET_TELL = "tweb:you-are-at";
+
+  function requestFrameOffset() {
+    if (topFrame) return;
+    try { parent.postMessage({ __tweb: FRAME_OFFSET_ASK }, "*"); } catch (_) {}
+  }
+
+  function tellFrameOffset(target, box) {
+    try {
+      target.postMessage({
+        __tweb: FRAME_OFFSET_TELL,
+        x: resolvedFrameOffset.x + box.left,
+        y: resolvedFrameOffset.y + box.top,
+      }, "*");
+    } catch (_) {}
+  }
+
+  // Answer one child, identified by the window that asked rather than by anything it said.
+  function answerFrameOffset(source) {
+    // A child cannot be placed absolutely until we are. Chase our own answer; the child
+    // asks again at its next hint pass, and our broadcast below reaches it either way.
+    if (!resolvedFrameOffset) { requestFrameOffset(); return; }
+    if (!source) return;
+    for (const frame of document.querySelectorAll("iframe,frame")) {
+      if (frame.contentWindow !== source) continue;
+      tellFrameOffset(source, frame.getBoundingClientRect());
+      return;
+    }
+  }
+
+  // Push to every child at once — used when our own offset changes, which moves all of
+  // them, and after a scroll or resize, which is the other way a child's box moves
+  // without the child being able to notice.
+  function broadcastFrameOffsets() {
+    if (!resolvedFrameOffset) return;
+    for (const frame of document.querySelectorAll("iframe,frame")) {
+      const target = frame.contentWindow;
+      if (target) tellFrameOffset(target, frame.getBoundingClientRect());
+    }
+  }
+
+  addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (data.__tweb === FRAME_OFFSET_ASK) {
+      answerFrameOffset(event.source);
+      return;
+    }
+    // Only the parent places this frame, so only the parent's answer is taken — a sibling
+    // or an opener saying otherwise is ignored.
+    if (data.__tweb !== FRAME_OFFSET_TELL || topFrame) return;
+    if (event.source !== window.parent) return;
+    if (!Number.isFinite(data.x) || !Number.isFinite(data.y)) return;
+    const moved = !resolvedFrameOffset || resolvedFrameOffset.x !== data.x || resolvedFrameOffset.y !== data.y;
+    resolvedFrameOffset = { x: data.x, y: data.y };
+    // Our children were placed against an offset that has just changed.
+    if (moved) broadcastFrameOffsets();
+  });
+
   function ownerView(element) {
     return element?.ownerDocument?.defaultView || window;
   }
@@ -636,9 +713,39 @@
     return roots;
   }
 
+  // A real control: it carries the role itself, rather than a handler bolted onto a
+  // layout box. `targetRank` uses the split to pick the control out of the wrapper
+  // chain that shares its corner.
+  const controlSelector = [
+    "a[href]", "button", "input:not([type=hidden])", "textarea", "select", "summary", "label[for]",
+    "[contenteditable=true]",
+    "[role=button]", "[role=link]", "[role=menuitem]", "[role=menuitemcheckbox]", "[role=menuitemradio]",
+    "[role=option]", "[role=tab]", "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=treeitem]",
+  ].join(",");
+
+  const handlerSelector = [
+    "[onclick]", "[jsaction]:not([jsaction=''])", "[aria-haspopup]", "[aria-controls]",
+    "[tabindex]:not([tabindex='-1'])",
+  ].join(",");
+
+  const interactiveSelector = [
+    controlSelector, handlerSelector, "audio", "video", "canvas",
+  ].join(",");
+
+  function targetRank(element) {
+    // A selector this engine cannot parse must not take the hint pass down with it.
+    try {
+      if (element.matches(controlSelector)) return 2;
+      if (element.matches(handlerSelector)) return 1;
+    } catch (_) {}
+    return 0;
+  }
+
   function uniqueVisibleTargets(elements, classify) {
     const seen = new Set();
-    const occupied = new Set();
+    // cell -> index into `targets`, so a later element can take a cell over rather
+    // than merely being dropped by it.
+    const occupied = new Map();
     const targets = [];
     for (const element of elements) {
       if (!(isElement(element)) || seen.has(element) || element.matches(":disabled,[aria-disabled=true],[inert]")) continue;
@@ -646,22 +753,30 @@
       if (!rect) continue;
       if (rect.width > innerWidth * 0.98 && rect.height > innerHeight * 0.8) continue;
       const point = `${Math.round(rect.left / 4)},${Math.round(rect.top / 4)}`;
-      if (occupied.has(point)) continue;
       seen.add(element);
-      occupied.add(point);
+      const held = occupied.get(point);
+      // One hint per visual box — but the cell is keyed on the top-left corner, and a
+      // wrapper shares that corner with its child while always coming FIRST in document
+      // order. Keeping the first arrival therefore handed the cell to the wrapper every
+      // time. Measured on a Google Meet call: 58 of 503 collected elements lost, among
+      // them every button in the control bar (mute, share, hand, leave) and the side
+      // panel's own buttons, which `snapshot` then reported as "generic" rather than
+      // "button". The wrapper is also the worse click target, because its box is taller
+      // than the child's and its centre can fall in the gap BETWEEN two children.
+      //
+      // So the cell keeps the strongest candidate instead of the earliest one. A tie
+      // keeps the incumbent, which preserves document order among equals.
+      if (held !== undefined) {
+        if (targetRank(element) <= targetRank(targets[held].element)) continue;
+        targets[held] = { element, rect, ...(classify?.(element) || {}) };
+        continue;
+      }
+      occupied.set(point, targets.length);
       targets.push({ element, rect, ...(classify?.(element) || {}) });
     }
     return targets.sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
-  const interactiveSelector = [
-    "a[href]", "button", "input:not([type=hidden])", "textarea", "select", "summary", "label[for]",
-    "audio", "video", "canvas", "[contenteditable=true]", "[onclick]",
-    "[jsaction]:not([jsaction=''])", "[aria-haspopup]", "[aria-controls]",
-    "[role=button]", "[role=link]", "[role=menuitem]", "[role=menuitemcheckbox]", "[role=menuitemradio]",
-    "[role=option]", "[role=tab]", "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=treeitem]",
-    "[tabindex]:not([tabindex='-1'])",
-  ].join(",");
 
   // `<form>` exposes its controls as own properties, so a form containing
   // `<input name="id">` answers `form.id` with that input rather than a string.
@@ -785,14 +900,28 @@
     }));
   }
 
+  // A cross-origin frame's contents belong to that frame's own hint pass, which runs
+  // once the frame has focus. Hinting the frame itself is how focus gets there: an
+  // embedded app — Meet's whiteboard and app panels, an embedded editor, a checkout —
+  // otherwise offers nothing to aim at and the second `f` never becomes reachable.
+  // Same-origin frames are left out because `collectRoots` already enumerates them, so a
+  // hint on the frame would sit on top of hints for its actual controls.
+  function opaqueFrameTargets(roots) {
+    return roots
+      .flatMap((root) => [...root.querySelectorAll("iframe,frame")])
+      .filter((frame) => !sameOriginFrameDocument(frame));
+  }
+
   function interactiveTargets() {
     const roots = collectRoots();
     const semantic = roots.flatMap((root) => [...root.querySelectorAll(interactiveSelector)]);
     const media = semantic.filter((element) => element.matches("video,audio"));
     const elements = semantic.filter((element) => !element.matches("video,audio"));
-    const targets = uniqueVisibleTargets(hitTestTargets(elements), (element) => ({
+    const opaqueFrames = new Set(opaqueFrameTargets(roots));
+    const targets = uniqueVisibleTargets(hitTestTargets([...elements, ...opaqueFrames]), (element) => ({
       nativeSurface: isTag(element, "canvas"),
-    })).filter((item) => !item.element.matches("video,audio,iframe"));
+    })).filter((item) => !item.element.matches("video,audio")
+      && (!item.element.matches("iframe,frame") || opaqueFrames.has(item.element)));
     return [...targets, ...media.flatMap(mediaControlTargets)]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
@@ -1228,8 +1357,15 @@
         y += rect.top;
         frameWindow = frameWindow.parent;
       }
+      if (frameWindow === frameWindow.top) return { x, y };
     } catch (_) {}
-    return { x, y };
+    // The walk hit a cross-origin boundary, where `frameElement` throws — and a sum that
+    // stopped part way up is worse than no sum at all, because it looks like an answer.
+    // `resolvedFrameOffset` is this frame's absolute position as the parent reported it,
+    // so it replaces the walk rather than continuing it.
+    return resolvedFrameOffset
+      ? { x: point.x + resolvedFrameOffset.x, y: point.y + resolvedFrameOffset.y }
+      : { x: point.x, y: point.y };
   }
 
   function hintClickPoint(item) {
@@ -1264,6 +1400,10 @@
   }
 
   function startHints(newTab) {
+    // Refresh where we are before any of these badges can be picked. The badges
+    // themselves are drawn in this frame's own coordinates and need no answer; only the
+    // click point does, and that is a keystroke away — long enough for the reply.
+    requestFrameOffset();
     const points = mediaHoverPoints();
     const onPick = (item) => {
       const link = item.element.closest("a[href]");
@@ -2491,6 +2631,15 @@
   }
   document.addEventListener("scroll", scheduleCaretUpdate, true);
   addEventListener("resize", scheduleCaretUpdate);
+  // A scroll or a resize here moves every child frame's box, and a child has no way to
+  // notice that from the inside — its own viewport did not change.
+  document.addEventListener("scroll", broadcastFrameOffsets, true);
+  addEventListener("resize", broadcastFrameOffsets);
+  // A frame that has just loaded has not been told where it is yet, and the parent is
+  // the only one that can say. Both ends push: the child asks on startup, the parent
+  // answers each child as it commits.
+  addEventListener("load", broadcastFrameOffsets);
+  requestFrameOffset();
   addEventListener("blur", () => {
     cancelPicker(false);
     resetPendingG();

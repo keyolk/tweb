@@ -36,6 +36,7 @@ const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometr
 const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
+const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const {
   RELAY_JPEG_QUALITY,
   centeredStatusSequence,
@@ -211,6 +212,10 @@ const tabPanes = new Map();
 // Recovery attempts per tab, so a page that crashes its renderer on every load stops being
 // reloaded instead of looping forever. See renderer-recovery.cjs.
 const tabRendererRecoveries = new Map();
+// The disposition of the `window.open` currently being allowed, handed from the open handler to
+// the `did-create-window` that follows it. Electron fires the two synchronously, one after the
+// other on the same stack, so a single slot cannot be raced by a second open.
+let pendingWindowOpen = null;
 // Shared on purpose, and shared BEYOND this process: `historyPath` is one file per user-data
 // directory that every pane and every engine appends to under a lock, because history is the user's,
 // not the pane's. See `historyLockPath`.
@@ -738,7 +743,35 @@ let loggedFrameGeneration = -1;
 // THAT pane's `whole`. As a module-level counter it summed every pane's compressions and reported
 // the sum to each of them: two panes with wildly different content both read 473, which reads as
 // a working ratio for the idle pane and hides the sampling decision for the playing one.
-const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"));
+// The terminal this pane is actually drawn on, by name.
+//
+// Inside tmux, `TERM` and `TERM_PROGRAM` in this process are tmux's own — the outer terminal is
+// simply not in the environment. `#{client_termname}` is the attached client's real TERM, and it
+// is live rather than whatever the server inherited when it started.
+function attachedTerminalName() {
+  try {
+    return execFileSync("tmux", ["display-message", "-p", "#{client_termname}"], {
+      encoding: "utf8", timeout: 1000,
+    }).trim();
+  } catch (error) {
+    // Not in tmux, or no client attached. The environment is then honest about the terminal.
+    if (debugLogging) console.error(`tweb: client termname lookup failed: ${error.message}`);
+    return "";
+  }
+}
+
+// Decided once, here, rather than in the worker: the worker has no tmux and no terminal of its
+// own, and this is the process that knows which one the frames are going to.
+const deflateFrames = deflateFramesAllowed({
+  clientTermname: attachedTerminalName(),
+  term: process.env.TERM,
+  termProgram: process.env.TERM_PROGRAM,
+  override: process.env.TWEB_DEFLATE_FRAMES,
+});
+
+const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"), {
+  workerData: { deflateFrames },
+});
 gfxWorker.unref();
 
 const ESC = "\x1b";
@@ -2885,9 +2918,10 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
     let frame = focused && !focused.isDestroyed() && !focused.detached
       ? focused
       : contents.mainFrame;
-    // Clicking an ad or embed moves focus into a cross-origin subframe, whose
-    // preload ignores every shortcut. Without this fall-back the keys would
-    // simply stop working until focus happened to return to the main frame.
+    // A frame that has not registered yet cannot be handed a key — it would drop it in
+    // silence. Every frame registers as a shortcut frame now, cross-origin ones included
+    // (see the preload's `shortcutFrame`), so this catches a frame mid-navigation rather
+    // than a whole class of frame as it once did.
     if (frame && !shortcutFrameKeys(tab).has(frameKey(frame))) frame = contents.mainFrame;
     const deliverable = frame && readyFrameKeys(tab).has(frameKey(frame));
     if (!deliverable) {
@@ -3709,14 +3743,18 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       if (![from?.x, from?.y, to?.x, to?.y].every(Number.isFinite)) break;
       const start = pageToWindowPoint(contents, from);
       const end = pageToWindowPoint(contents, to);
+      const held = withButtonDown([], "left");
       contents.sendInputEvent({ type: "mouseMove", ...start });
-      contents.sendInputEvent({ type: "mouseDown", ...start, button: "left", clickCount: 1 });
+      contents.sendInputEvent({ type: "mouseDown", ...start, button: "left", clickCount: 1, modifiers: held });
       for (const ratio of [0.34, 0.67, 1]) {
         contents.sendInputEvent({
           type: "mouseMove",
           x: Math.round(start.x + (end.x - start.x) * ratio),
           y: Math.round(start.y + (end.y - start.y) * ratio),
           button: "left",
+          // Same reason as the terminal's own drag: without this the page reads
+          // `buttons: 0` on every move and never sees a drag at all.
+          modifiers: held,
         });
       }
       contents.sendInputEvent({ type: "mouseUp", ...end, button: "left", clickCount: 1 });
@@ -5266,19 +5304,38 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     if (floatingTabs.has(tab)) relayFrameToDisplay(tab, image);
   });
 
-  // Before Electron attaches our custom offscreen child, it can surface the macOS OffScreenView
-  // placeholder as a native popup. Deny the original request and open the URL directly in a
-  // separate TWeb tab, which keeps the native popup from ever being created.
+  // `window.open` has to come back with a live handle, not null.
+  //
+  // This used to deny the request and open a separate tab instead, which kept Electron from
+  // ever surfacing the macOS OffScreenView placeholder as a native popup. It also made
+  // `window.open()` return null to the opener — and an OAuth "sign in in a new window" flow is
+  // exactly the case that cannot survive that: the opener opens a blank popup, then drives it
+  // by assigning to `popup.location` and waits for a `postMessage` back through the handle.
+  // With null it does none of that, and the user sees a click that opened an empty tab and
+  // then nothing. Measured in-page on a live Google Meet add-on: `window.open(...)` returned
+  // null and the sign-in never started.
+  //
+  // So the window is allowed, and created with THIS pane's own offscreen options — the same
+  // hidden, offscreen, opacity-0 window every tab gets. That is what the placeholder popup
+  // needed all along; denying it was treating the symptom. `did-create-window` then adopts it
+  // as an ordinary tab, so it lives in the tab strip exactly as the denied path's tab did.
   setWindowOpenHandler((details) => {
-    const target = details.url || "about:blank";
     // Middle-click and window.open share this path, and Chrome treats them differently:
     // window.open takes you to the new tab, middle-click deliberately does not. The whole
     // point of the gesture is to queue several links off a results page while staying
     // where you are — force-activating the first one lands the rest on the wrong document,
     // which makes the gesture worse than an ordinary click rather than better.
-    const activate = details.disposition !== "background-tab";
-    setImmediate(() => createTab(target, activate));
-    return { action: "deny" };
+    pendingWindowOpen = { activate: details.disposition !== "background-tab" };
+    return { action: "allow", overrideBrowserWindowOptions: browserWindowOptions() };
+  });
+
+  // The window Electron just created for `window.open`. It is already loading the target URL,
+  // so it is adopted rather than created — `createTab` would build a second window and load it
+  // again, and the opener's handle points at this one.
+  onContents("did-create-window", (child, details) => {
+    const activate = pendingWindowOpen?.activate ?? true;
+    pendingWindowOpen = null;
+    adoptTab(child, details.url || "about:blank", activate);
   });
 
   onContents("did-start-navigation", (details) => {
@@ -5678,6 +5735,19 @@ function mouseModifiers(cb) {
   return modifiers;
 }
 
+// The "this button is currently held" modifier, which is the only thing that puts a bit in
+// `MouseEvent.buttons` on the page side. Chromium names them lowercase.
+const BUTTON_DOWN_MODIFIER = {
+  left: "leftbuttondown",
+  middle: "middlebuttondown",
+  right: "rightbuttondown",
+};
+
+function withButtonDown(modifiers, button) {
+  const held = BUTTON_DOWN_MODIFIER[button];
+  return held ? [...modifiers, held] : modifiers;
+}
+
 function logicalMousePoint(rawX, rawY) {
   const vp = currentFrames().viewport || queryViewportSize();
   const logical = logicalContentSize(vp);
@@ -5769,7 +5839,15 @@ function dispatchMouse(cb, rawX, rawY, release) {
     x,
     y,
     button,
-    modifiers,
+    // A page reads a drag off `event.buttons`, and Chromium fills that in from the
+    // modifiers rather than from the button field — with none set, every move during a
+    // drag arrived as `buttons: 0`, which reads as "the pointer is just travelling". So a
+    // drag on any site that implements its own (a canvas, a slider, a whiteboard, a
+    // selection) did nothing at all. The terminal encodes the held button in the motion
+    // report itself, so it needs no state of our own to recover.
+    //
+    // Not on mouseUp: `buttons` there must already exclude the button being released.
+    modifiers: type === "mouseUp" ? modifiers : withButtonDown(modifiers, button),
     clickCount,
   });
   // Some offscreen Chromium paths do not raise contextmenu from a right mouseUp alone.

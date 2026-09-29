@@ -28,6 +28,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/gfx-worker.cjs"),
     ),
     (
+        "deflate-policy.cjs",
+        include_str!("../../../electron/deflate-policy.cjs"),
+    ),
+    (
         "mouse-click-state.cjs",
         include_str!("../../../electron/mouse-click-state.cjs"),
     ),

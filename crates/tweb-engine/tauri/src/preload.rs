@@ -89,8 +89,16 @@ mod tests {
         assert!(script.contains("topViewportPoint"));
         assert!(script.contains("else send(\"native-click\", hintClickPoint(item))"));
         assert!(script.contains("media.requestFullscreen"));
-        assert!(script.contains("top.location.origin === location.origin"));
-        assert!(script.contains("const shortcutFrame = topFrame || sameOriginFrame"));
+        // Every frame runs shortcuts, cross-origin ones included — a subframe that did
+        // not was a subframe nothing could hint, because the top frame cannot read into
+        // it either. What such a frame cannot do is measure its own place in the top
+        // viewport, so it is told by the only party that can see its box: its parent,
+        // answering a `postMessage` it identifies by `event.source`.
+        assert!(script.contains("const shortcutFrame = true"));
+        assert!(!script.contains("top.location.origin === location.origin"));
+        assert!(script.contains("if (frame.contentWindow !== source) continue"));
+        assert!(script.contains("if (event.source !== window.parent) return"));
+        assert!(script.contains("resolvedFrameOffset"));
         assert!(script.contains("fuzzyScore"));
         assert!(script.contains("omnibox-model"));
         assert!(script.contains("if (!shortcutsEnabled || !shortcutFrame) return"));

@@ -83,14 +83,12 @@ const CTRL_C: u8 = 0x03;
 /// `input 1b5b39393b3575` for a keypress a byte-only check ignored, so Ctrl-C did nothing until
 /// the user pressed it enough times to hit something else. A harness that types `0x03` into a
 /// PTY never sees this, because nothing there turned modified keys on.
-const CTRL_C_MODIFIED: &[u8] = b"\x1b[99;5u";
-
-/// The same key with other modifiers alongside control — Ctrl-Shift-C, Ctrl-Alt-C and so on.
-///
-/// The modifier is a bitfield plus one: 5 is control, 6 adds shift, 7 adds alt. Only the control
-/// bit is required, so this matches the prefix and checks the bit rather than listing the
-/// combinations. Ctrl-Shift-C is a copy shortcut in many terminals and never reaches us, but a
-/// pane must not depend on which combinations a terminal happens to intercept.
+/// Other modifiers can ride alongside control — Ctrl-Shift-C, Ctrl-Alt-C and so on. The modifier
+/// is a bitfield plus one: 5 is control, 6 adds shift, 7 adds alt. Only the control bit is
+/// required, so this matches the prefix and checks the bit rather than listing the combinations,
+/// and plain `CSI 99 ; 5 u` is just the case where no other bit is set. Ctrl-Shift-C is a copy
+/// shortcut in many terminals and never reaches us, but a pane must not depend on which
+/// combinations a terminal happens to intercept.
 const CTRL_C_MODIFIED_PREFIX: &[u8] = b"\x1b[99;";
 
 const PASTE_START: &[u8] = b"\x1b[200~";
