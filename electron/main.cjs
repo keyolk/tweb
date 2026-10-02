@@ -40,6 +40,7 @@ const {
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const { mouseEventParams, sessionsUnderPoint } = require("./oopif-input.cjs");
+const { interpolatePoints } = require("./pointer-interpolation.cjs");
 const { cachesToClear, cachePaths, DISPOSABLE: DISPOSABLE_CACHES } = require("./profile-hygiene.cjs");
 const {
   RELAY_JPEG_QUALITY,
@@ -6114,6 +6115,9 @@ function inputState() {
       insertMode: false,
       // Whether this pane's page is shown as an OS desktop window (floating mode).
       floating: false,
+      // The last point a motion report produced, for filling in the gap tmux leaves between
+      // two of them. Null outside a drag; see pointer-interpolation.cjs.
+      lastDragPoint: null,
     };
     paneInputStates.set(record.key, state);
   }
@@ -6244,6 +6248,29 @@ function dispatchMouse(cb, rawX, rawY, release) {
   } else {
     clicks.move(button, x, y);
   }
+
+  // Inside tmux the point just computed is snapped to the cell grid, so a drag arrives as a
+  // staircase — about 11 to 19 CSS px between vertical samples — and anything drawing from it
+  // draws a staircase. The gap is filled here, on the line between this point and the last.
+  //
+  // Only while a button is held: a pointer merely travelling is quantised too, but nothing
+  // reads the path of a hover, and a page doing hit-testing per move would get three times the
+  // work for nothing. Only inside tmux, since elsewhere the coordinates are already pixels.
+  const state = inputState();
+  if (type === "mouseMove" && button && paneIsInTmux()) {
+    const vp = currentFrames().viewport || queryViewportSize();
+    const logical = logicalContentSize(vp);
+    const cell = { x: logical.width / vp.cols, y: logical.height / vp.rows };
+    for (const point of interpolatePoints(state.lastDragPoint, { x, y }, cell)) {
+      sendPointerEvent(currentWindows().win, {
+        type: "mouseMove", x: point.x, y: point.y, button, modifiers, held: true, clickCount: 0,
+      });
+    }
+  }
+  // Remembered for the next report, and cleared when the button is not down: the first motion of
+  // a drag must not be joined to wherever the pointer was before it started.
+  state.lastDragPoint = type === "mouseUp" || !button ? null : { x, y };
+
   sendPointerEvent(currentWindows().win, {
     type,
     x,

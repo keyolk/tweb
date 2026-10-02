@@ -47,6 +47,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/gfx-worker.cjs
 	node --check electron/deflate-policy.cjs
 	node --check electron/oopif-input.cjs
+	node --check electron/pointer-interpolation.cjs
 	node --check electron/profile-hygiene.cjs
 	node --check electron/mouse-click-state.cjs
 	node --check electron/tmux-visibility.cjs

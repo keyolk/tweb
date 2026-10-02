@@ -266,3 +266,46 @@ test("middle-click still does not steal focus, while window.open does", () => {
   const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-create-window"');
   assert.match(handler, /const activate = details\.disposition !== "background-tab";/);
 });
+
+// --- tmux quantises the pointer, so the gap between two reports is filled ---
+//
+// A pane asks for pixel-resolution mouse reporting (`\033[?1016h`) and inside tmux never gets
+// it: tmux 3.5a does not know that mode. `input.c` handles 1000, 1001, 1002, 1003, 1004, 1005,
+// 1006, 1047 and 1049, and the string "1016" appears in none of `tty-keys.c`, `input.c`, `tty.c`
+// or `screen.c`. The request is swallowed rather than forwarded to the outer terminal, so every
+// coordinate arrives snapped to the cell grid — about 5 CSS px across and 11 to 19 down.
+//
+// Horizontally that is fine. Vertically the pointer cannot move until it has crossed a whole
+// cell, so a diagonal drag arrives as a staircase and a whiteboard draws a staircase. Measured
+// in the pane: nothing is LOST — `getCoalescedEvents()` returned exactly as many points as were
+// sent, every one with `buttons: 1` — the samples are simply too far apart.
+
+test("the gap is filled only while a button is held, and only inside tmux", () => {
+  const dispatch = body("function dispatchMouse(cb, rawX, rawY, release)", "const KITTY_KEYS");
+  assert.match(dispatch, /if \(type === "mouseMove" && button && paneIsInTmux\(\)\)/);
+  // A hover is quantised too, and nothing reads the path of one — filling it would be three
+  // times the hit-testing for no visible difference.
+  assert.doesNotMatch(dispatch, /if \(type === "mouseMove" && paneIsInTmux\(\)\)/);
+});
+
+test("the cell size comes from the same numbers that quantised the point", () => {
+  const dispatch = body("function dispatchMouse(cb, rawX, rawY, release)", "const KITTY_KEYS");
+  // `logicalMousePoint`'s tmux branch divides by exactly these, so a cell here is the step the
+  // grid actually takes. Anything else would fill gaps that are not there, or miss real ones.
+  assert.match(dispatch, /const cell = \{ x: logical\.width \/ vp\.cols, y: logical\.height \/ vp\.rows \};/);
+  assert.match(dispatch, /interpolatePoints\(state\.lastDragPoint, \{ x, y \}, cell\)/);
+});
+
+test("the inserted points say the button is held, and carry no click count", () => {
+  const dispatch = body("function dispatchMouse(cb, rawX, rawY, release)", "const KITTY_KEYS");
+  // Without `held` each one reads as `buttons: 0` and the page treats the drag as finished —
+  // the same failure the modifiers fix above addressed, reintroduced one line lower.
+  assert.match(dispatch, /type: "mouseMove", x: point\.x, y: point\.y, button, modifiers, held: true, clickCount: 0,/);
+});
+
+test("a drag does not begin from wherever the pointer was before it", () => {
+  const dispatch = body("function dispatchMouse(cb, rawX, rawY, release)", "const KITTY_KEYS");
+  // Cleared on release and whenever no button is down, so the first motion of a drag has
+  // nothing to interpolate from and the press position is not joined to a stale point.
+  assert.match(dispatch, /state\.lastDragPoint = type === "mouseUp" \|\| !button \? null : \{ x, y \};/);
+});
