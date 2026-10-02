@@ -39,7 +39,7 @@ const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
-const { mouseEventParams, sessionsUnderPoint } = require("./oopif-input.cjs");
+const { mouseEventParams, pointerTarget, nextCapture } = require("./oopif-input.cjs");
 const { interpolatePoints } = require("./pointer-interpolation.cjs");
 const { shareLabels } = require("./hint-labels.cjs");
 const { cachesToClear, cachePaths, DISPOSABLE: DISPOSABLE_CACHES } = require("./profile-hygiene.cjs");
@@ -4879,6 +4879,9 @@ function frameViewportPoint(tab, sourceFrame, point) {
 // the disposition. One at a time: Chromium creates the window synchronously from the handler.
 let pendingWindowOpen = null;
 
+// The frame session holding a drag, per tab — see `nextCapture` in oopif-input.cjs.
+const pointerCaptures = new WeakMap();
+
 const oopifSessionsByTab = new WeakMap();
 
 function oopifSessions(tab) {
@@ -5132,49 +5135,62 @@ function sendPointerEvent(tab, event) {
     // Throttled: reading costs two CDP round trips per frame, and a box does not move between
     // consecutive motion reports.
     if (params.type === "mouseMoved") scheduleOopifRectRefresh(tab);
-    // The root session still gets every event: a point over no subframe has to reach the main
-    // frame exactly as it did before, and that is most points.
-    //
-    // Fire and forget. A pointer event is worth no round trip — the next one is already on its
-    // way, and awaiting each would serialise a drag against the terminal's input rate.
-    contents.debugger.sendCommand("Input.dispatchMouseEvent", params)
-      .catch((error) => {
-        if (debugLogging) console.error(`tweb: cdp mouse failed: ${error.message}`);
-        sendPointerEventDirect(contents, event);
-      });
-    // And each out-of-process frame under the point gets it in ITS OWN coordinates. The root
-    // session does not forward across the boundary — measured: the parent saw the click with
-    // `target` = the `<iframe>`, the child saw nothing at all.
-    for (const hit of sessionsUnderPoint(oopifSessions(tab), { x: params.x, y: params.y })) {
-      contents.debugger.sendCommand(
-        "Input.dispatchMouseEvent",
-        { ...params, x: hit.x, y: hit.y },
-        hit.sessionId,
-      ).then(() => {
-        // A dispatched click does not move focus. Measured: the event reached the child frame
-        // (`sessions=1 hits=1`) and the child still reported `activeElement: body,
-        // hasFocus: false`, so the NEXT `f` ran in the top frame and found nothing of the
-        // embedded app — getting in was the whole point of hinting the frame.
-        //
-        // `setFocusEmulationEnabled` alone does not do it either (measured, same result): it
-        // stops Chromium treating the frame as backgrounded but does not make it the focused
-        // one. The frame has to take focus itself, which it can — `window.focus()` inside it
-        // is same-origin to itself.
-        if (params.type !== "mouseReleased") return;
-        return contents.debugger.sendCommand(
-          "Emulation.setFocusEmulationEnabled", { enabled: true }, hit.sessionId,
-        ).then(() => contents.debugger.sendCommand("Runtime.evaluate", {
-          // The frame takes focus itself. `setFocusEmulationEnabled` alone was measured to leave
-          // it at `hasFocus: false`; this is what makes `webContents.focusedFrame` start naming
-          // it, and that is what routes the next key here.
-          expression: "window.focus()",
-        }, hit.sessionId)).catch((error) => {
-          if (debugLogging) console.error(`tweb: oopif focus failed: ${error.message}`);
+    // ONE destination per event — see `pointerTarget` for why sending to the root as well blurred
+    // the frame under the pointer and broke every drag inside an embedded app.
+    const captured = pointerCaptures.get(tab) || null;
+    const target = pointerTarget(oopifSessions(tab), { x: params.x, y: params.y }, captured);
+    pointerCaptures.set(tab, nextCapture(captured, params.type, target));
+    if (!target) {
+      // No frame under the point and no drag held by one: the main frame, exactly as before.
+      //
+      // Fire and forget. A pointer event is worth no round trip — the next one is already on
+      // its way, and awaiting each would serialise a drag against the terminal's input rate.
+      contents.debugger.sendCommand("Input.dispatchMouseEvent", params)
+        .catch((error) => {
+          if (debugLogging) console.error(`tweb: cdp mouse failed: ${error.message}`);
+          sendPointerEventDirect(contents, event);
         });
-      }).catch((error) => {
-        if (debugLogging) console.error(`tweb: oopif mouse failed: ${error.message}`);
-      });
+      return;
     }
+    // The frame gets it in ITS OWN coordinates; the root session does not forward across the
+    // boundary — measured: the parent saw the click with `target` = the `<iframe>`.
+    contents.debugger.sendCommand(
+      "Input.dispatchMouseEvent",
+      { ...params, x: target.x, y: target.y },
+      target.sessionId,
+    ).then(() => {
+      // A dispatched click does not move focus. Measured: the event reached the child frame and
+      // the child still reported `activeElement: body, hasFocus: false`, so the NEXT `f` ran in
+      // the top frame and found nothing of the embedded app.
+      //
+      // `setFocusEmulationEnabled` alone does not do it either (measured, same result): it stops
+      // Chromium treating the frame as backgrounded but does not make it the focused one. The
+      // frame has to take focus itself, which it can — `window.focus()` inside it is same-origin
+      // to itself.
+      if (params.type !== "mouseReleased") return;
+      return contents.debugger.sendCommand(
+        "Emulation.setFocusEmulationEnabled", { enabled: true }, target.sessionId,
+      ).then(() => contents.debugger.sendCommand("Runtime.evaluate", {
+        // The frame takes focus itself. `setFocusEmulationEnabled` alone was measured to leave it
+        // at `hasFocus: false`; this is what makes `webContents.focusedFrame` start naming it,
+        // and that is what routes the next key here.
+        //
+        // Only when it does not already have it. `document.hasFocus()` is true when focus is
+        // anywhere inside this frame, same-origin children included — and calling `focus()` then
+        // pulls it UP to this window, out of the child that held it. Measured on the Google Meet
+        // whiteboard, whose canvas lives in a same-origin iframe inside the add-on's frame: every
+        // release blurred that iframe, and the next stroke drew nothing until something else
+        // gave the canvas focus back.
+        expression: "document.hasFocus() || window.focus()",
+      }, target.sessionId)).catch((error) => {
+        if (debugLogging) console.error(`tweb: oopif focus failed: ${error.message}`);
+      });
+    }).catch((error) => {
+      // The frame went away mid-gesture. Let the drag go, or every later event would be aimed
+      // at a session that no longer exists.
+      pointerCaptures.delete(tab);
+      if (debugLogging) console.error(`tweb: oopif mouse failed: ${error.message}`);
+    });
     return;
   }
   sendPointerEventDirect(contents, event);

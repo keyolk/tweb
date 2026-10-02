@@ -93,14 +93,18 @@ test("CDP gets CSS pixels, not the window DIPs the direct path takes", () => {
   assert.match(router, /sendPointerEventDirect\(contents, event\)/);
 });
 
-// The root session was not enough. It is sent on every event — a point over no subframe still
-// has to reach the main frame — but the OOPIF needs its own session and its own coordinates.
-test("each out-of-process frame under the point is addressed on its own session", () => {
+// The root session was not enough — but it must not get the event as WELL. Sending to the root and
+// to the frame both made the root page see a click on the `<iframe>`, which focused the parent and
+// blurred the frame: measured on the Google Meet whiteboard, two `blur`s 5ms after every
+// pointerdown, and Excalidraw abandoned the stroke in progress each time.
+test("an event over a frame goes to that frame alone, not to the root as well", () => {
   const router = body("function sendPointerEvent(tab, event)", "// The pre-CDP path");
-  assert.match(router, /for \(const hit of sessionsUnderPoint\(oopifSessions\(tab\), \{ x: params\.x, y: params\.y \}\)\)/);
-  assert.match(router, /\{ \.\.\.params, x: hit\.x, y: hit\.y \},\s*\n\s*hit\.sessionId,/);
-  // And the root still gets the unrewritten event.
-  assert.match(router, /sendCommand\("Input\.dispatchMouseEvent", params\)/);
+  assert.match(router, /const target = pointerTarget\(oopifSessions\(tab\), \{ x: params\.x, y: params\.y \}, captured\);/);
+  // The root only when no frame takes it.
+  assert.match(router, /if \(!target\) \{[^]*?sendCommand\("Input\.dispatchMouseEvent", params\)[^]*?return;\s*\n\s*\}/);
+  assert.match(router, /\{ \.\.\.params, x: target\.x, y: target\.y \},\s*\n\s*target\.sessionId,/);
+  // And the drag stays with the frame that took the press.
+  assert.match(router, /pointerCaptures\.set\(tab, nextCapture\(captured, params\.type, target\)\);/);
 });
 
 test("sessions are flattened onto this connection, with the DOM domain they need", () => {
@@ -149,13 +153,13 @@ test("an agent request goes to the main frame, which is the only one that answer
 // the frame, the pick focuses it, the next `f` runs INSIDE it, and picking there opened the
 // popup — `tab opened 2`. Each assertion below is one of the steps that was broken.
 
-test("a click into an out-of-process frame also gives it focus", () => {
+test("a click into an out-of-process frame also gives it focus, unless it already has it", () => {
   const router = body("function sendPointerEvent(tab, event)", "// The pre-CDP path");
-  // Measured: the event reached the child (`sessions=1 hits=1`) and it still reported
-  // `activeElement: body, hasFocus: false`, so the next key went to the main frame.
   assert.match(router, /Emulation\.setFocusEmulationEnabled/);
-  // And emulation alone was not enough — same result until the frame called `window.focus()`.
-  assert.match(router, /expression: "window\.focus\(\)"/);
+  // `document.hasFocus()` is true while focus is anywhere inside the frame, same-origin children
+  // included. Calling `focus()` then pulls it up out of the child — measured: every release blurred
+  // the whiteboard's same-origin canvas iframe and the next stroke drew nothing.
+  assert.match(router, /expression: "document\.hasFocus\(\) \|\| window\.focus\(\)"/);
 });
 
 test("a subframe's click point is moved into the top frame's viewport", () => {

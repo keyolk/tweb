@@ -124,3 +124,48 @@ test("a point on a frame's own edge counts as inside it", () => {
   const hits = sessionsUnderPoint(new Map([["S1", { rect: RECT }]]), { x: 30, y: 69 });
   assert.deepEqual(hits, [{ sessionId: "S1", x: 0, y: 0 }]);
 });
+
+// --- one destination per event, and a drag stays with its frame ---
+
+const { pointerTarget, nextCapture } = require("./oopif-input.cjs");
+
+const PANEL = new Map([
+  ["outer", { rect: { x: 100, y: 100, width: 400, height: 400 } }],
+  ["inner", { rect: { x: 150, y: 150, width: 200, height: 200 } }],
+]);
+
+test("the innermost frame under the point is the only target", () => {
+  // Sending to the outer one as well would blur the inner one, exactly as the root did.
+  assert.deepEqual(pointerTarget(PANEL, { x: 200, y: 220 }, null), { sessionId: "inner", x: 50, y: 70 });
+  assert.deepEqual(pointerTarget(PANEL, { x: 120, y: 120 }, null), { sessionId: "outer", x: 20, y: 20 });
+});
+
+test("a point over no frame goes to the root", () => {
+  assert.equal(pointerTarget(PANEL, { x: 10, y: 10 }, null), null);
+});
+
+test("while a drag is held, its frame keeps the events even outside its box", () => {
+  // Dragged off the panel to the left, with the button still down in the frame.
+  assert.deepEqual(pointerTarget(PANEL, { x: 20, y: 160 }, "inner"), { sessionId: "inner", x: -130, y: 10 });
+});
+
+test("a capture on a frame that has gone falls back to hit-testing", () => {
+  assert.equal(pointerTarget(PANEL, { x: 10, y: 10 }, "vanished"), null);
+});
+
+test("a press takes the capture for its target and a release gives it back", () => {
+  assert.equal(nextCapture(null, "mousePressed", { sessionId: "inner" }), "inner");
+  assert.equal(nextCapture(null, "mousePressed", null), null);
+  assert.equal(nextCapture("inner", "mouseMoved", { sessionId: "outer" }), "inner");
+  assert.equal(nextCapture("inner", "mouseReleased", { sessionId: "inner" }), null);
+});
+
+// A hardware mouse reports pressure 0.5 while a button is down; CDP's `force` defaults to 0, so
+// every synthetic drag arrived pressed but weightless. A pen that sizes its stroke by pressure —
+// Excalidraw's does — draws nothing visible from that.
+test("a held button carries the pressure a real mouse reports", () => {
+  assert.equal(mouseEventParams({ type: "mouseMove", x: 1, y: 1, button: "left", held: true }).force, 0.5);
+  assert.equal(mouseEventParams({ type: "mouseDown", x: 1, y: 1, button: "left", held: true }).force, 0.5);
+  assert.equal(mouseEventParams({ type: "mouseUp", x: 1, y: 1, button: "left" }).force, 0);
+  assert.equal(mouseEventParams({ type: "mouseMove", x: 1, y: 1 }).force, 0);
+});

@@ -70,6 +70,54 @@ function sessionsUnderPoint(sessions, point) {
   return hits.sort((a, b) => b.area - a.area).map(({ sessionId, x, y }) => ({ sessionId, x, y }));
 }
 
+/**
+ * Where one pointer event should be delivered: a single frame's session, or the root.
+ *
+ * ONE target, never several. Sending to the root as well as to the frame under the point made the
+ * root page see a click on the `<iframe>` element, which focuses the parent document and BLURS the
+ * frame. Measured on the Google Meet whiteboard (Excalidraw): two `blur` events landed 5ms after
+ * every pointerdown, and Excalidraw abandons the stroke in progress when its window loses focus —
+ * `state.newElement` was empty on every move that followed, and each drag left a single dot, which
+ * is the reported "dots instead of a line". A hardware mouse delivers to one frame; so does this.
+ *
+ * The innermost frame under the point, because that frame does its own hit-testing for everything
+ * inside it, same-origin children included. Sending to an intermediate frame too would blur the
+ * inner one the same way.
+ *
+ * And a drag stays with the frame it started in. Between a press and its release the frame that
+ * took the press keeps receiving the moves and the release, even outside its box — that is the
+ * implicit pointer capture a browser gives a pressed mouse, and without it a stroke dragged past
+ * the edge of a panel would end in the page behind it with the button still down in the frame.
+ *
+ * @param {Map<string, {rect?: object}>} sessions attached frame sessions with their boxes
+ * @param {{x: number, y: number}} point top-viewport CSS pixels
+ * @param {string|null} captured the session holding the drag, or null
+ * @returns {{sessionId: string, x: number, y: number}|null} null means the root
+ */
+function pointerTarget(sessions, point, captured) {
+  if (captured) {
+    const rect = sessions.get(captured)?.rect;
+    if (rect && Number.isFinite(rect.x) && Number.isFinite(rect.y)) {
+      return { sessionId: captured, x: Math.round(point.x - rect.x), y: Math.round(point.y - rect.y) };
+    }
+  }
+  const hits = sessionsUnderPoint(sessions, point);
+  return hits.length ? hits[hits.length - 1] : null;
+}
+
+/**
+ * The capture after an event: a press takes it for the target, a release gives it back.
+ *
+ * @param {string|null} captured the session holding the drag before this event
+ * @param {string} type the CDP event type
+ * @param {{sessionId: string}|null} target where the event went
+ */
+function nextCapture(captured, type, target) {
+  if (type === "mousePressed") return target ? target.sessionId : null;
+  if (type === "mouseReleased") return null;
+  return captured;
+}
+
 /** CDP's button names, and the bitmask `buttons` it wants alongside them. */
 const BUTTONS = {
   left: { name: "left", mask: 1 },
@@ -129,6 +177,14 @@ function mouseEventParams(event) {
     // A move carries the mask of what is HELD, a press carries its own button, and a release
     // carries neither — by the time the page sees mouseup, that button is no longer down.
     buttons: event.held && button ? button.mask : 0,
+    // What a real mouse reports while a button is down. CDP's `force` defaults to 0, and Chromium
+    // carries it into `PointerEvent.pressure` as is — so every synthetic drag arrived pressed but
+    // weightless. Measured on the Google Meet whiteboard (Excalidraw): every point of a drag had
+    // `buttons: 1, pressure: 0`, and the pen, which sizes its stroke from pressure, drew a stroke
+    // of width zero — only the starting dot showed, which is the "dots instead of a line" that
+    // was reported. Pointer Events defines 0.5 for a pressed mouse and 0 for a released one, which
+    // is exactly what a hardware mouse produces in the same browser.
+    force: event.held && button ? 0.5 : 0,
   };
   if (event.type === "mouseWheel") {
     params.deltaX = event.deltaX || 0;
@@ -141,4 +197,4 @@ function mouseEventParams(event) {
   return params;
 }
 
-module.exports = { mouseEventParams, modifierMask, sessionsUnderPoint, CDP_TYPES, BUTTONS };
+module.exports = { mouseEventParams, modifierMask, sessionsUnderPoint, pointerTarget, nextCapture, CDP_TYPES, BUTTONS };
