@@ -34,9 +34,22 @@
  * @param {number} [limit] Most points to insert for one gap. A pointer that jumps the width of
  *   the page — re-entering the pane, or a report lost while another window had focus — must not
  *   turn into a hundred events.
+ *
+ *   32, because the cap is what decides whether a FAST stroke is filled. One report of a slow
+ *   stroke spans a few cells and never reaches it; one report of a fast stroke spans dozens, and
+ *   at 8 the fill is as coarse as the staircase it is there to remove. Measured on a 320-cell
+ *   diagonal, in the gap between consecutive delivered points:
+ *
+ *     40 reports (slow), limit 8    6px      the line this exists to produce
+ *      5 reports (fast), limit 8   41px      dots again
+ *      5 reports (fast), limit 32  11px
+ *
+ *   That difference is the "draws, then suddenly goes back to dots" — the same stroke, drawn
+ *   faster. A re-entry jump across the whole pane still ends at 32 events, which is one gesture's
+ *   worth rather than one per cell.
  * @returns {{x: number, y: number}[]}
  */
-function interpolatePoints(from, to, cell, limit = 8) {
+function interpolatePoints(from, to, cell, limit = 32) {
   if (!from) return [];
   const dx = to.x - from.x;
   const dy = to.y - from.y;
