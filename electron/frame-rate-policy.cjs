@@ -69,12 +69,56 @@ const BYTES_PER_PIXEL = 4;
  * @param {number} area width * height in device pixels
  * @param {number} max the pane's configured ceiling
  */
-function playbackRateForArea(area, max) {
+function playbackRateForArea(area, max, headroom = 1) {
   const pixels = Number(area);
   if (!Number.isFinite(pixels) || pixels <= 0) return max;
-  const affordable = Math.round(PLAYBACK_BYTE_BUDGET / (pixels * BYTES_PER_PIXEL));
+  const budget = PLAYBACK_BYTE_BUDGET * (Number.isFinite(headroom) && headroom >= 1 ? headroom : 1);
+  const affordable = Math.round(budget / (pixels * BYTES_PER_PIXEL));
   return Math.min(max, Math.max(Math.min(PLAYBACK_MIN_RATE, max), affordable));
 }
+
+/**
+ * How much of the byte budget this pane has earned the right to spend.
+ *
+ * The budget is a guess about the machine, and it has to be: the engine cannot know what the
+ * terminal, the GPU and the disk on the other end will take. 60MB/s was measured on one machine
+ * and is deliberately conservative, which on a faster one leaves the picture far choppier than
+ * it needs to be — measured on a 1340x1320 pane in a video call, the budget allowed 8fps while
+ * the same pane ran at 21fps with ZERO dropped frames once the budget was raised.
+ *
+ * But the engine does not have to guess, because it already knows when the far end cannot keep
+ * up: a frame that arrives while the last one is still in flight is dropped, and counted. So the
+ * budget is treated as a floor and the headroom above it is found by trying — raised a step at a
+ * time while nothing is dropping, and cut back hard the moment something does.
+ *
+ * Asymmetric for the same reason the costs are: spending too much shows up as a pane that lags
+ * behind reality, and spending too little only shows up as a picture that could have been
+ * smoother. So it climbs slowly and retreats at once.
+ *
+ * @param {number} previous the headroom in force, 1 at startup
+ * @param {number} droppedSince frames dropped to backpressure since the last judgement
+ * @returns {number} the new headroom, a multiplier on the budget
+ */
+function playbackHeadroom(previous, droppedSince) {
+  const held = Number.isFinite(previous) && previous >= 1 ? previous : 1;
+  if (Number(droppedSince) > 0) return Math.max(1, held * HEADROOM_RETREAT);
+  return Math.min(HEADROOM_MAX, held + HEADROOM_STEP);
+}
+
+// Additive increase, multiplicative decrease — and both deliberately gentle.
+//
+// The first try used +0.5 and a halving, and it sawtoothed: the rate climbed 8 -> 13 -> 17 ->
+// 21 -> 25 -> 30fps, dropped 86 frames at the top, and fell all the way back to the floor
+// before starting again. A pane that swings between 8 and 30fps every few seconds is worse to
+// watch than one held at 8, which is the opposite of the point.
+//
+// At +0.25 against 0.75 the band is narrow: from a capacity near 2.5x the floor, the search
+// settles between roughly 2.2x and 2.8x — 18 to 21fps on the pane measured here, which ran at
+// 21fps with zero drops when the budget was raised by hand.
+const HEADROOM_STEP = 0.25;
+const HEADROOM_RETREAT = 0.75;
+// Bounded so a pane that never drops does not wander off into a rate nothing else constrains.
+const HEADROOM_MAX = 4;
 
 /**
  * Rates for a pane whose frames go to a floating window instead of the terminal.
@@ -132,12 +176,12 @@ function floatingFrameRateTiers(maxRate, adaptive) {
  * @param {boolean} adaptive false pins everything to the maximum
  * @param {number} [area] the pane's frame size in device pixels, when known
  */
-function frameRateTiers(maxRate, adaptive, area) {
+function frameRateTiers(maxRate, adaptive, area, headroom = 1) {
   const max = Math.min(60, Math.max(1, Math.round(maxRate) || 1));
   if (!adaptive) return { max, playback: max, idle: max };
   return {
     max,
-    playback: area === undefined ? max : playbackRateForArea(area, max),
+    playback: area === undefined ? max : playbackRateForArea(area, max, headroom),
     idle: Math.min(max, 4),
   };
 }
@@ -192,6 +236,7 @@ function settledFrameRate(paints, tiers) {
 }
 
 module.exports = {
+  playbackHeadroom,
   frameRateTiers, floatingFrameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea,
   interactionRate, PLAYBACK_MIN_PAINTS, PLAYBACK_MIN_RATE, PLAYBACK_BYTE_BUDGET,
 };
