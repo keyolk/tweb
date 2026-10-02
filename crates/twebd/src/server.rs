@@ -538,12 +538,24 @@ async fn handle_connection(
     our_uid: u32,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<()> {
-    let peer_uid = stream
-        .peer_cred()
-        .map(|cred| cred.uid())
-        .unwrap_or(u32::MAX);
+    // `peer_cred` can fail for reasons that have nothing to do with who is calling — it is a
+    // syscall on a socket that may already be half-closed. Folding that failure into `u32::MAX`
+    // made it indistinguishable from a real foreign uid, and the refusal that followed was
+    // reported as "a connection from another user" either way.
+    //
+    // Measured: a frontend that could not be told apart from an intruder was refused in silence
+    // and then waited forever — `tweb open` sat there with no pane, no error, and one more
+    // `refusing a connection from another user` in a log nobody was reading. The two cases are
+    // separated here so the second one says what actually happened.
+    let peer_uid = match stream.peer_cred() {
+        Ok(cred) => cred.uid(),
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the peer's credentials; refusing the connection");
+            return Ok(());
+        }
+    };
     if !paths::peer_allowed(peer_uid, our_uid) {
-        tracing::warn!(peer_uid, "refusing a connection from another user");
+        tracing::warn!(peer_uid, our_uid, "refusing a connection from another user");
         return Ok(());
     }
 
