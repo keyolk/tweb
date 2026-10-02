@@ -44,6 +44,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/pointer-interpolation.cjs"),
     ),
     (
+        "hint-labels.cjs",
+        include_str!("../../../electron/hint-labels.cjs"),
+    ),
+    (
         "mouse-click-state.cjs",
         include_str!("../../../electron/mouse-click-state.cjs"),
     ),

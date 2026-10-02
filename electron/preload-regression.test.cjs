@@ -102,16 +102,19 @@ function assertPreload(source) {
   // what stops any previous loop.
   assert.match(source, /mediaHoverTimer = setInterval\(\(\) => nudgeMediaPointer\(points\), 700\)/);
   assert.match(source, /pickerState = null;\s*\n\s*stopMediaHover\(\);/);
-  // The function body ends at the first closing brace back at two-space indent.
-  const hintsAt = source.indexOf("function startHints(newTab)");
-  const startHints = source.slice(hintsAt, source.indexOf("\n  }\n", hintsAt));
+  // The badges are drawn by `drawHints`, which runs when the engine has divided the round's
+  // labels between every frame; `startHints` only asks for a share. The function body ends at
+  // the first closing brace back at two-space indent.
+  const drawAt = source.indexOf("function drawHints(space)");
+  assert.notEqual(drawAt, -1, "drawHints is gone");
+  const drawHints = source.slice(drawAt, source.indexOf("\n  }\n", drawAt));
   assert.ok(
-    startHints.indexOf("startMediaHoverLoop(points)") > startHints.indexOf("startPicker("),
+    drawHints.indexOf("startMediaHoverLoop(points)") > drawHints.indexOf("startPicker("),
     "the hover loop must start after startPicker, or cancelTransient kills it"
   );
   // Deferring the first draw makes `f` feel dead and invites a second press.
   assert.ok(
-    startHints.indexOf("collect();") < startHints.indexOf("setTimeout("),
+    drawHints.indexOf("collect();") < drawHints.indexOf("setTimeout("),
     "hints must be drawn before waiting on the control bar"
   );
   // Synthetic control targets are for UA shadow-DOM controls only.
@@ -133,8 +136,8 @@ function assertPreload(source) {
   assert.match(source, /send\("native-escape"\)/);
   assert.match(source, /if \(key === "Escape" && passThroughEscape\)/);
   assert.doesNotMatch(source, /outsideClickPoint/);
-  const dismiss = source.slice(source.indexOf("function dismissPageOverlay()"),
-    source.indexOf("function startHints(newTab)"));
+  const dismissAt = source.indexOf("function dismissPageOverlay()");
+  const dismiss = source.slice(dismissAt, source.indexOf("\n  }\n", dismissAt));
   assert.doesNotMatch(dismiss, /blur\(\)[\s\S]*send\("native-escape"\)/,
     "blurring before the page sees Escape makes the key meaningless");
 }
@@ -380,8 +383,10 @@ test("agent bridge exposes snapshot, act and query to the socket", () => {
   assert.match(electron, /function agentSnapshot\(params = \{\}\)/);
   assert.match(electron, /function agentAct\(params\)/);
   assert.match(electron, /ipcRenderer\.on\("tweb-agent-request"/);
-  // Refs are hint labels so the agent and the human name the same element.
-  assert.match(electron, /const labels = hintLabels\(targets\.length\);\s*\n\s*agentTargets = new Map/);
+  // Refs are hint labels so the agent and the human name the same element. The snapshot is
+  // answered by the main frame alone, so it numbers from zero over its own targets rather
+  // than taking a share of a round the way `f` does.
+  assert.match(electron, /const labels = targets\.map\(\(_, index\) => hintLabel\(index, targets\.length\)\);\s*\n\s*agentTargets = new Map/);
 });
 
 // A page that half-loaded is a network question, and Chromium keeps no history of the

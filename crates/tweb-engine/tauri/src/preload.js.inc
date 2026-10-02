@@ -1149,18 +1149,18 @@
     return uniqueVisibleTargets(elements).slice(0, 300);
   }
 
-  function hintLabels(count) {
+  // The label for one index in a space of `total`. Width comes from the whole space, not from
+  // this frame's share: with "a" and "ab" both live the first keystroke would be ambiguous.
+  function hintLabel(index, total) {
     let width = 1;
-    while (hintAlphabet.length ** width < count) width += 1;
-    return Array.from({ length: count }, (_, index) => {
-      let value = index;
-      let label = "";
-      for (let position = 0; position < width; position += 1) {
-        label = hintAlphabet[value % hintAlphabet.length] + label;
-        value = Math.floor(value / hintAlphabet.length);
-      }
-      return label.padStart(width, hintAlphabet[0]);
-    });
+    while (hintAlphabet.length ** width < Math.max(1, total)) width += 1;
+    let value = index;
+    let label = "";
+    for (let position = 0; position < width; position += 1) {
+      label = hintAlphabet[value % hintAlphabet.length] + label;
+      value = Math.floor(value / hintAlphabet.length);
+    }
+    return label.padStart(width, hintAlphabet[0]);
   }
 
   function cancelPicker(restoreMode = true) {
@@ -1265,14 +1265,18 @@
     inspect: "no target",
   };
 
-  function startPicker(targets, mode, onPick) {
+  // `space` is this frame's share of a round every frame draws badges in at once:
+  // `{ offset, total }`. Absent, this frame is the only one hinting and numbers from zero.
+  function startPicker(targets, mode, onPick, space = null) {
     cancelTransient(false);
     if (targets.length === 0) {
       setMode(mode, emptyPickerReason[mode] || "0");
       setTimeout(normalMode, 1100);
       return;
     }
-    const labels = hintLabels(targets.length);
+    const offset = space ? space.offset : 0;
+    const total = space ? space.total : targets.length;
+    const labels = Array.from({ length: targets.length }, (_, i) => hintLabel(offset + i, total));
     const host = document.createElement("div");
     host.id = "__tweb_picker__";
     host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
@@ -1411,21 +1415,34 @@
     return true;
   }
 
+  // `f` hints every frame at once. A frame can only collect its OWN targets, so an embedded
+  // app used to be hinted as one badge over the whole panel and took a second `f` to get
+  // inside. The engine divides one label space between the frames (see hint-labels.cjs) and
+  // `drawHints` is called with this frame's share; `startHints` only asks for one.
+  let pendingHintNewTab = false;
+
   function startHints(newTab) {
     // Refresh where we are before any of these badges can be picked. The badges
     // themselves are drawn in this frame's own coordinates and need no answer; only the
     // click point does, and that is a keystroke away — long enough for the reply.
     requestFrameOffset();
+    pendingHintNewTab = newTab;
+    send("hint-round", { count: interactiveTargets().length });
+  }
+
+  function drawHints(space) {
+    const newTab = pendingHintNewTab;
     const points = mediaHoverPoints();
     const onPick = (item) => {
       const link = item.element.closest("a[href]");
       if (newTab && link?.href) send("new-tab", link.href);
       else if (performMediaControl(item)) {}
       else send("native-click", hintClickPoint(item));
+      send("hint-done");
       normalMode();
     };
     const collect = () => {
-      startPicker(interactiveTargets(), "hint", onPick);
+      startPicker(interactiveTargets(), "hint", onPick, space);
       // Start the loop only now: startPicker cancels transient state first, and
       // that cancellation is what stops a previously running hover loop.
       startMediaHoverLoop(points);
@@ -1435,8 +1452,11 @@
     // Draw hints immediately — waiting on the control bar to animate in makes `f`
     // feel unresponsive and invites a second press. A revealed bar adds targets a
     // moment later, so re-collect once, and only while nothing has been typed.
+    //
+    // Not re-collected during a shared round: a frame that found more targets would need a
+    // wider block, and widening one renumbers every frame after it.
     collect();
-    if (points.length === 0) return;
+    if (space || points.length === 0) return;
     setTimeout(() => {
       if (!pickerState || pickerState.mode !== "hint" || pickerState.typed) return;
       if (interactiveTargets().length === pickerState.items.length) return;
