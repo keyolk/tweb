@@ -309,3 +309,59 @@ test("a drag does not begin from wherever the pointer was before it", () => {
   // nothing to interpolate from and the press position is not joined to a stale point.
   assert.match(dispatch, /state\.lastDragPoint = type === "mouseUp" \|\| !button \? null : \{ x, y \};/);
 });
+
+// --- `f` hints every frame at once ---
+//
+// A frame can only collect its OWN targets: a cross-origin frame's contents are unreachable
+// from the parent by construction. So an embedded app — a Google Meet add-on panel — was
+// hinted as ONE badge over the whole panel, and reaching a button inside it took a second `f`
+// after picking that badge. Two steps for one intention, and the first step put a badge over a
+// panel rather than over its controls.
+//
+// Every frame draws its own badges simultaneously now. Measured on a three-deep chain of
+// differing sites: one `f` lit 2 badges in the top frame, 1 in the middle and 2 in the
+// innermost, with labels `s,d` / `a` / `f,g` — no collision — and `f` then `g` clicked the
+// innermost button directly.
+
+test("the engine opens a round and asks every ready frame, not just the focused one", () => {
+  assert.match(main, /function startHintRound\(tab\)/);
+  // Every frame in the subtree that has registered, rather than `focusedFrame`.
+  assert.match(main, /const frames = \[mainFrame, \.\.\.\(mainFrame\?\.framesInSubtree \|\| \[\]\)\]/);
+  assert.match(main, /if \(ready\.has\(key\)\) expected\.add\(key\)/);
+  // And `f` itself reaches all of them, since each has to answer with its own count.
+  const key = body("  // `f`/`F` open a round before the key is delivered.", "const text = eventKind");
+  assert.match(key, /startHintRound\(currentWindows\(\)\.win\);/);
+  assert.match(key, /sendToTabFrames\(currentWindows\(\)\.win, "tweb-terminal-key"/);
+});
+
+test("the labels are divided so no two frames produce the same one", () => {
+  assert.match(main, /const \{ shareLabels \} = require\("\.\/hint-labels\.cjs"\)/);
+  const close = body("function closeHintRound(tab)", "// `f`. Ask every frame");
+  assert.match(close, /shareLabels\(entries\.map\(/);
+  assert.match(close, /entry\.frame\.send\("tweb-hint-space", \{ offset: offsets\[key\], total \}\)/);
+  // A round nobody has targets for ends rather than leaving every frame waiting.
+  assert.match(close, /if \(total === 0\) \{/);
+});
+
+test("a key during a round goes to every frame, because the badge may be in any of them", () => {
+  const route = body("function routeHintKey(tab, key)", "// --- agent bridge ---");
+  assert.match(route, /sendToTabFrames\(tab, "tweb-hint-key", key\)/);
+  assert.match(route, /if \(key === "Escape"\) \{\s*\n\s*endHintRound\(tab\);/);
+  assert.doesNotMatch(route, /sendToFocusedTabFrame/);
+});
+
+// A frame whose block does not match what has been typed is the ORDINARY case — the label
+// belongs to another frame. Cancelling on it would tear that frame's badges down mid-round,
+// so the frame reports the miss and the engine ends the round only when every frame has.
+test("a miss ends the round only when no frame matched", () => {
+  const miss = body('    case "hint-miss": {', 'case "native-hover":');
+  assert.match(miss, /round\.misses = \(round\.misses \|\| 0\) \+ 1;/);
+  assert.match(miss, /if \(round\.misses >= round\.counts\.size\) endHintRound\(tab\)/);
+  // And the badges come down everywhere at once, not just where the pick happened.
+  assert.match(main, /sendToTabFrames\(tab, "tweb-hint-end"\)/);
+});
+
+test("a frame that answers late is left out rather than holding the hints back", () => {
+  assert.match(main, /const HINT_ROUND_WAIT_MS = 120;/);
+  assert.match(main, /round\.timer = setTimeout\(\(\) => closeHintRound\(tab\), HINT_ROUND_WAIT_MS\)/);
+});

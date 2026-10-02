@@ -1647,18 +1647,20 @@ installPrintShim();
     return uniqueVisibleTargets(elements).slice(0, 300);
   }
 
-  function hintLabels(count) {
+  // The label for one index in a space of `total`. Width is chosen for the whole space, not
+  // for this frame's share of it: with "a" and "ab" both live the first keystroke would be
+  // ambiguous. Mirrors electron/hint-labels.cjs, which the engine uses to divide the space —
+  // a sandboxed preload cannot require a relative path, so the rule is stated in both.
+  function hintLabel(index, total) {
     let width = 1;
-    while (hintAlphabet.length ** width < count) width += 1;
-    return Array.from({ length: count }, (_, index) => {
-      let value = index;
-      let label = "";
-      for (let position = 0; position < width; position += 1) {
-        label = hintAlphabet[value % hintAlphabet.length] + label;
-        value = Math.floor(value / hintAlphabet.length);
-      }
-      return label.padStart(width, hintAlphabet[0]);
-    });
+    while (hintAlphabet.length ** width < Math.max(1, total)) width += 1;
+    let value = index;
+    let label = "";
+    for (let position = 0; position < width; position += 1) {
+      label = hintAlphabet[value % hintAlphabet.length] + label;
+      value = Math.floor(value / hintAlphabet.length);
+    }
+    return label.padStart(width, hintAlphabet[0]);
   }
 
   function cancelPicker(restoreMode = true) {
@@ -1764,14 +1766,24 @@ installPrintShim();
     command: "no command to run",
   };
 
-  function startPicker(targets, mode, onPick) {
+  // `space` shares one round of labels out between every frame drawing badges at once:
+  // `{ offset, total }`, where this frame's targets number from `offset` in a space of
+  // `total`. Absent, this frame is the only one hinting and numbers from zero — which is
+  // every picker but `f`.
+  function startPicker(targets, mode, onPick, space = null) {
     cancelTransient(false);
     if (targets.length === 0) {
-      setMode(mode, emptyPickerReason[mode] || "0");
-      setTimeout(normalMode, 1100);
+      // A frame with nothing to hint must not report "0 hints" over a round where another
+      // frame does have some: the mode line belongs to the round, not to this frame.
+      if (!space) {
+        setMode(mode, emptyPickerReason[mode] || "0");
+        setTimeout(normalMode, 1100);
+      }
       return;
     }
-    const labels = hintLabels(targets.length);
+    const offset = space ? space.offset : 0;
+    const total = space ? space.total : targets.length;
+    const labels = Array.from({ length: targets.length }, (_, i) => hintLabel(offset + i, total));
     const host = document.createElement("div");
     host.id = "__tweb_picker__";
     host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
@@ -1791,8 +1803,8 @@ installPrintShim();
     });
     document.documentElement.append(host);
     paintNow();
-    pickerState = { host, items, typed: "", mode, onPick };
-    setMode(mode, `${targets.length}`);
+    pickerState = { host, items, typed: "", mode, onPick, shared: Boolean(space) };
+    setMode(mode, `${space ? space.total : targets.length}`);
   }
 
   function updatePicker() {
@@ -1810,6 +1822,14 @@ installPrintShim();
       cancelPicker(false);
       onPick(selected);
     } else if (matches.length === 0) {
+      // In a shared round, "no match here" is the ordinary case: the label being typed
+      // belongs to another frame's block, and this frame simply has nothing lit. Cancelling
+      // on it would tear this frame's badges down mid-round — the engine ends the round for
+      // everyone when NO frame matches, which is the only party that can know that.
+      if (pickerState.shared) {
+        send("hint-miss");
+        return;
+      }
       cancelPicker();
     }
   }
@@ -2353,21 +2373,42 @@ installPrintShim();
     return true;
   }
 
+  // `f` hints every frame at once, so the round is opened by the engine rather than here.
+  //
+  // A frame can only collect its OWN targets — a cross-origin frame's contents are
+  // unreachable from the parent by construction, which is why an embedded app used to be
+  // hinted as one badge over the whole panel and took a second `f` to get inside. Every
+  // frame draws its own badges instead, and the only thing that has to be agreed between
+  // them is the labels: the engine asks each frame how many targets it has, adds them up,
+  // and hands each one the offset to number from.
+  //
+  // `newTab` is remembered here because the engine's reply carries only the label space.
+  let pendingHintNewTab = false;
+
   function startHints(newTab) {
     // Refresh where we are before any of these badges can be picked. The badges
     // themselves are drawn in this frame's own coordinates and need no answer; only the
     // click point does, and that is a keystroke away — long enough for the reply.
     requestFrameOffset();
+    pendingHintNewTab = newTab;
+    send("hint-round", { count: interactiveTargets().length });
+  }
+
+  // The engine's reply: this frame's share of the round. Every frame that answered gets one,
+  // including the ones with nothing to hint — they draw nothing and simply hold no labels.
+  function drawHints(space) {
+    const newTab = pendingHintNewTab;
     const points = mediaHoverPoints();
     const onPick = (item) => {
       const link = item.element.closest("a[href]");
       if (newTab && link?.href) send("new-tab", link.href);
       else if (performMediaControl(item)) {}
       else send("native-click", hintClickPoint(item));
+      send("hint-done");
       normalMode();
     };
     const collect = () => {
-      startPicker(interactiveTargets(), "hint", onPick);
+      startPicker(interactiveTargets(), "hint", onPick, space);
       // Start the loop only now: startPicker cancels transient state first, and
       // that cancellation is what stops a previously running hover loop.
       startMediaHoverLoop(points);
@@ -2377,8 +2418,11 @@ installPrintShim();
     // Draw hints immediately — waiting on the control bar to animate in makes `f`
     // feel unresponsive and invites a second press. A revealed bar adds targets a
     // moment later, so re-collect once, and only while nothing has been typed.
+    //
+    // Not re-collected during a shared round: a frame that found more targets would need a
+    // wider block, and widening one frame's block renumbers every frame after it.
     collect();
-    if (points.length === 0) return;
+    if (space || points.length === 0) return;
     setTimeout(() => {
       if (!pickerState || pickerState.mode !== "hint" || pickerState.typed) return;
       if (interactiveTargets().length === pickerState.items.length) return;
@@ -2483,7 +2527,9 @@ installPrintShim();
 
   function agentSnapshot(params = {}) {
     const targets = params.mode === "text" ? visualTargets() : interactiveTargets();
-    const labels = hintLabels(targets.length);
+    // The agent snapshot is answered by the main frame alone, so it numbers from zero over
+    // its own targets — it is not part of a shared round.
+    const labels = targets.map((_, index) => hintLabel(index, targets.length));
     agentTargets = new Map(targets.map((target, index) => [labels[index], target]));
     const nodes = targets.map((target, index) => {
       const node = agentNode(target, labels[index]);
@@ -2604,7 +2650,13 @@ installPrintShim();
           vimiumEnabled,
           bypassEnabled,
           insertMode,
-          picker: pickerState ? { mode: pickerState.mode, items: pickerState.items.length, typed: pickerState.typed } : null,
+          picker: pickerState ? {
+            mode: pickerState.mode, items: pickerState.items.length, typed: pickerState.typed,
+            // Whether this frame is part of a shared round, and the labels it was given —
+            // a collision between two frames is invisible from either one alone.
+            shared: Boolean(pickerState.shared),
+            labels: pickerState.items.map((item) => item.label).join(","),
+          } : null,
           visual: visualState ? { kind: visualState.kind, caret: Boolean(visualState.caret) } : null,
           scrollSurface: surface
             ? { tag: surface.localName, id: ownId(surface) || null, inFrame: surface.ownerDocument !== document,
@@ -4845,6 +4897,29 @@ installPrintShim();
       event.stopImmediatePropagation();
     }
   }
+
+  // This frame's share of a hint round the engine has just divided up.
+  ipcRenderer.on("tweb-hint-space", (_event, space) => {
+    drawHints(space && Number.isFinite(space.total) ? space : null);
+  });
+
+  // The round ended somewhere — a pick, an Escape, or a key no frame's block matched. Every
+  // frame's badges go at once, or the ones that did not own the pick would stay on screen.
+  ipcRenderer.on("tweb-hint-end", () => {
+    if (pickerState?.mode === "hint") cancelPicker();
+  });
+
+  // A key typed during a shared round. It arrives here rather than through this frame's own
+  // key handler because only ONE frame has focus and the badge being typed may be in another.
+  ipcRenderer.on("tweb-hint-key", (_event, key) => {
+    if (pickerState?.mode !== "hint") return;
+    if (key === "Backspace") {
+      pickerState.typed = pickerState.typed.slice(0, -1);
+    } else {
+      pickerState.typed += String(key).toLowerCase();
+    }
+    updatePicker();
+  });
 
   ipcRenderer.on("tweb-shortcuts-mode", (_event, mode) => {
     const next = mode || {};

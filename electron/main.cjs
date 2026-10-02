@@ -41,6 +41,7 @@ const {
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const { mouseEventParams, sessionsUnderPoint } = require("./oopif-input.cjs");
 const { interpolatePoints } = require("./pointer-interpolation.cjs");
+const { shareLabels } = require("./hint-labels.cjs");
 const { cachesToClear, cachePaths, DISPOSABLE: DISPOSABLE_CACHES } = require("./profile-hygiene.cjs");
 const {
   RELAY_JPEG_QUALITY,
@@ -3724,6 +3725,24 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "native-escape":
       dispatchNativeKey(contents, "Escape", "", [], 1);
       break;
+    // A frame reporting how many targets it has for the round `f` just opened.
+    case "hint-round":
+      noteHintCount(tab, sourceFrame, value?.count);
+      break;
+    // The frame that owned the pick has run it. Every other frame still has badges up.
+    case "hint-done":
+      endHintRound(tab);
+      break;
+    // No label in this frame's block starts with what has been typed. That is the ordinary
+    // case — the label belongs to another frame — so the round only ends once EVERY frame
+    // has said it, which is something only the engine can count.
+    case "hint-miss": {
+      const round = hintRound(tab);
+      if (!round || !round.open) break;
+      round.misses = (round.misses || 0) + 1;
+      if (round.misses >= round.counts.size) endHintRound(tab);
+      break;
+    }
     case "native-hover":
       if ([value?.x, value?.y].every(Number.isFinite)) {
         const { x, y } = pageToWindowPoint(contents, value);
@@ -3809,6 +3828,117 @@ ipcMain.on("tweb-shortcut", bindPane(
   if (!tab) return;
   handleNativeShortcut(tab, message.action, message.value, event.senderFrame);
 }));
+
+// --- hint rounds across every frame ---
+//
+// `f` used to hint one frame: whichever had focus. A cross-origin frame's contents are
+// unreachable from the parent by construction, so an embedded app — a Google Meet add-on
+// panel, say — was hinted as ONE badge over the whole panel, and getting at a button inside
+// took a second `f` after picking it. Two steps for one intention, and the first step put a
+// badge over a panel rather than over its controls.
+//
+// Every frame draws its own badges at the same time now. The only thing that has to be agreed
+// between them is the labels, since two frames each numbering from zero would both produce
+// "a". The engine is the only party that sees every frame, so it collects the counts, divides
+// one label space between them (hint-labels.cjs), and hands each frame its offset.
+//
+// A round is per tab, and there is at most one: a new `f` replaces whatever was open.
+const hintRounds = new WeakMap();
+
+// How long to wait for the frames to answer. A frame that has not replied by then is left out
+// of the round rather than holding the hints back — the common case for a slow one is an ad
+// iframe nobody wants to hint anyway.
+const HINT_ROUND_WAIT_MS = 120;
+
+function hintRound(tab) {
+  return hintRounds.get(tab) || null;
+}
+
+function endHintRound(tab, notify = true) {
+  const round = hintRounds.get(tab);
+  if (!round) return;
+  clearTimeout(round.timer);
+  hintRounds.delete(tab);
+  if (notify) sendToTabFrames(tab, "tweb-hint-end");
+}
+
+// A frame has reported how many targets it has. The round closes when every frame that was
+// asked has answered, or when the wait runs out.
+function noteHintCount(tab, frame, count) {
+  const round = hintRounds.get(tab);
+  if (!round) return;
+  const key = frameKey(frame);
+  if (!round.expected.has(key) || round.counts.has(key)) return;
+  round.counts.set(key, { frame, count: Number(count) || 0 });
+  if (debugLogging) {
+    console.error(`tweb: hint count ${round.counts.size}/${round.expected.size}`
+      + ` ${String(frame.url || "").slice(0, 36)} = ${Number(count) || 0}`);
+  }
+  if (round.counts.size >= round.expected.size) closeHintRound(tab);
+}
+
+function closeHintRound(tab) {
+  const round = hintRounds.get(tab);
+  if (!round || round.open) return;
+  clearTimeout(round.timer);
+  round.open = true;
+  // A fixed order, so the same page produces the same labels twice running: frames arrive
+  // from `framesInSubtree` in tree order, and the counts map preserves insertion.
+  const entries = [...round.counts.entries()];
+  const { total, offsets } = shareLabels(entries.map(([key, entry]) => ({ key, count: entry.count })));
+  round.total = total;
+  if (total === 0) {
+    endHintRound(tab);
+    return;
+  }
+  for (const [key, entry] of entries) {
+    if (entry.frame.isDestroyed() || entry.frame.detached) continue;
+    entry.frame.send("tweb-hint-space", { offset: offsets[key], total });
+  }
+}
+
+// `f`. Ask every frame that can answer, then divide the space between the ones that do.
+function startHintRound(tab) {
+  endHintRound(tab);
+  const contents = tab.webContents;
+  const mainFrame = contents.mainFrame;
+  const frames = [mainFrame, ...(mainFrame?.framesInSubtree || [])].filter(Boolean);
+  const ready = readyFrameKeys(tab);
+  const expected = new Set();
+  for (const frame of frames) {
+    if (frame.isDestroyed() || frame.detached) continue;
+    const key = frameKey(frame);
+    if (ready.has(key)) expected.add(key);
+  }
+  if (debugLogging) {
+    const detail = frames.map((f) => {
+      const ok = ready.has(frameKey(f)) ? "+" : "-";
+      return `${ok}${String(f.url || "about:blank").slice(0, 34)}`;
+    }).join(" | ");
+    console.error(`tweb: hint round asked=${expected.size}/${frames.length} ${detail}`);
+  }
+  if (expected.size === 0) return;
+  const round = { expected, counts: new Map(), open: false, total: 0, timer: null, typed: "" };
+  round.timer = setTimeout(() => closeHintRound(tab), HINT_ROUND_WAIT_MS);
+  hintRounds.set(tab, round);
+}
+
+// A key typed while a round is open. It cannot go to the focused frame alone: only one frame
+// has focus and the badge being typed is as likely to be in another. So it goes to all of
+// them, and each decides whether the label is in its own block.
+function routeHintKey(tab, key) {
+  const round = hintRounds.get(tab);
+  if (!round || !round.open) return false;
+  if (key === "Escape") {
+    endHintRound(tab);
+    return true;
+  }
+  if (key === "Backspace") round.typed = round.typed.slice(0, -1);
+  else round.typed += key.toLowerCase();
+  round.misses = 0;
+  sendToTabFrames(tab, "tweb-hint-key", key);
+  return true;
+}
 
 // --- agent bridge ---
 
@@ -4013,6 +4143,22 @@ function agentDiagnostics() {
       visibleClientTtys: [...vis().clientTtys],
       tmuxPlacement: vis().placement,
       shortcutFrames: tab ? shortcutFrameKeys(tab).size : 0,
+      // Which frame a key would be delivered to, and whether it could be. `f` runs inside
+      // whichever frame gets the key, so "the hints do not show the panel's contents" and
+      // "the key never reached the panel" look identical from outside — this separates them.
+      focusedFrame: (() => {
+        if (!tab) return null;
+        try {
+          const frame = tab.webContents.focusedFrame;
+          if (!frame || frame.isDestroyed()) return { url: null, main: null };
+          return {
+            url: String(frame.url || "").slice(0, 80),
+            main: frame === tab.webContents.mainFrame,
+            shortcut: shortcutFrameKeys(tab).has(frameKey(frame)),
+            ready: readyFrameKeys(tab).has(frameKey(frame)),
+          };
+        } catch (error) { return { error: String(error?.message || error) }; }
+      })(),
       // Where IME preedit will land. Comparing cell against point is the only way
       // to tell "caret parked on the wrong line" from "page never reported one".
       caret: { cell: inputState().caretCell, point: inputState().caretPoint },
@@ -4036,6 +4182,12 @@ function agentDiagnostics() {
         url: info.url,
         depth,
         rect: info.rect,
+        // The badges this frame is showing, and their labels — filled in by
+        // `refreshOopifPickers`. Every frame draws its own, so "the panel has no hints" and
+        // "the hints are there but the labels collide with another frame's" are different
+        // faults, and neither is visible from the main frame, which is the only one
+        // `snapshot` can ask.
+        hints: info.hints === undefined ? null : info.hints,
       };
     }) : [],
     // Which pane owns the speakers, and whether this one is making noise. `audible` is
@@ -4399,6 +4551,8 @@ async function dispatchAgentCommand(method, params) {
     case "query":
       return agentPageRequest(method, params);
     case "diag": {
+      // Read each out-of-process frame's picker state first, so `agentDiagnostics` reports it.
+      await refreshOopifPickers(agentTab());
       const engine = agentDiagnostics();
       // The shortcut runtime's own state is only reachable through the preload.
       // A page that cannot answer is worth reporting, not worth failing over.
@@ -4781,6 +4935,32 @@ function scheduleOopifRectRefresh(tab) {
   if (now - (oopifRectRefreshAt.get(tab) || 0) < 250) return;
   oopifRectRefreshAt.set(tab, now);
   void refreshOopifRects(tab);
+}
+
+// How many hint badges each attached frame is showing.
+//
+// `f` runs inside whichever frame has focus and renders its badges there, so a panel whose
+// hints never appear and a panel the hints simply do not cover look the same from the main
+// frame — which is the only frame `snapshot` can ask. Read on the diag path only: it is a
+// round trip per frame and nothing else needs it.
+async function refreshOopifPickers(tab) {
+  const sessions = oopifSessions(tab);
+  if (!sessions.size || !ensureDebugger(tab)) return;
+  const contents = tab.webContents;
+  for (const [sessionId, info] of sessions) {
+    try {
+      const seen = await contents.debugger.sendCommand("Runtime.evaluate", {
+        expression: "(() => { const h = document.getElementById('__tweb_picker__');"
+          + " if (!h || !h.shadowRoot) return null;"
+          + " return { count: h.shadowRoot.childElementCount,"
+          + " labels: [...h.shadowRoot.children].map((e) => e.textContent).join(',') }; })()",
+        returnByValue: true,
+      }, sessionId);
+      sessions.set(sessionId, { ...sessions.get(sessionId), hints: seen?.result?.value ?? null });
+    } catch (error) {
+      if (debugLogging) console.error(`tweb: oopif picker read failed: ${error.message}`);
+    }
+  }
 }
 
 async function refreshOopifRects(tab) {
@@ -6784,6 +6964,30 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // passthrough and the vimium key paths below would deliver into an empty document.
   // Only the press is routed: the viewer has no notion of a key being held.
   if (pressed && routePdfKey(key, modifiers)) return;
+
+  // A hint round has badges up in several frames at once, and only one of them has focus —
+  // so the key cannot go to the focused frame alone or a label in any other frame would be
+  // untypeable. While a round is open every keystroke goes to every frame instead.
+  if (pressed && inputState().vimium && !inputState().insertMode && !modifiers.includes("meta")
+    && (key.length === 1 || key === "Escape" || key === "Backspace")
+    && routeHintKey(currentWindows().win, key)) {
+    return;
+  }
+
+  // `f`/`F` open a round before the key is delivered. The round has to exist first: the key
+  // then reaches EVERY frame (below), each answers with its count, and the engine divides the
+  // labels once they are all in. Opening it afterwards would drop the counts of whichever
+  // frames answered quickest.
+  if (pressed && inputState().vimium && !inputState().insertMode
+    && (key === "f" || key === "F") && !modifiers.includes("control") && !modifiers.includes("meta")) {
+    startHintRound(currentWindows().win);
+    sendToTabFrames(currentWindows().win, "tweb-terminal-key", {
+      key, code: "", event: "keydown", text: key,
+      shiftKey: modifiers.includes("shift"), altKey: false, ctrlKey: false, metaKey: false,
+      synthesizeKeyUp: true,
+    });
+    return;
+  }
 
   const text = eventKind !== 3
     ? textCodepoints.length > 0
