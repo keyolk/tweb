@@ -39,10 +39,23 @@
 // 22 MB/s, against a 60 MB/s budget — the old limit was spending nearly three times the
 // budget to avoid a patch that costs a third of it.
 //
-// 0.85 rather than 1.0: a patch covering the whole pane and a whole frame are the same
-// picture, and the whole-frame path is the one with the simpler failure mode — no placement
-// arithmetic, no stale sliver. The band this opens is the one real pages actually produce.
-const PATCH_AREA_LIMIT = Number.parseFloat(process.env.TWEB_PATCH_AREA_LIMIT || "") || 0.85;
+// AND YET IT IS 0.2, because bytes are not the only cost. `toPNG()` is SYNCHRONOUS and runs on
+// the main thread, and the encode scales with the area it is given. Raising the limit to 0.85
+// and measuring the encode directly:
+//
+//                        encode p50   encode p90   paint gap p90   paint gap max
+//     limit 0.85             15ms        422ms          239ms          8453ms
+//     limit 0.2              23ms         24ms          150ms          2477ms
+//
+// A 422ms encode is 422ms during which no other frame can go out, so the pane stalls for longer
+// than the bytes it saved would ever have taken to send. The user reported it as a severe frame
+// drop, which is exactly what those numbers are.
+//
+// So the band stays closed until a patch that large can be encoded OFF the main thread. The
+// byte argument above is still correct and still worth acting on — it is the encoder, not the
+// comparison, that has to change first. The override is left in place so the measurement can be
+// repeated: `TWEB_PATCH_AREA_LIMIT=0.85`.
+const PATCH_AREA_LIMIT = Number.parseFloat(process.env.TWEB_PATCH_AREA_LIMIT || "") || 0.2;
 
 // Damage this small still costs a whole placement command, so it is not worth a patch of
 // its own; it is also what a sub-pixel caret artifact looks like.
