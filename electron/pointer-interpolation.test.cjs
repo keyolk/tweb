@@ -49,9 +49,22 @@ test("the first motion of a drag has nothing to interpolate from", () => {
 // never happened as a drag.
 test("an enormous jump is capped", () => {
   const points = interpolatePoints({ x: 0, y: 0 }, { x: 0, y: 1100 }, CELL);
-  assert.ok(points.length <= 8, `${points.length} points for one jump`);
+  assert.ok(points.length <= 32, `${points.length} points for one jump`);
   const custom = interpolatePoints({ x: 0, y: 0 }, { x: 0, y: 1100 }, CELL, 3);
   assert.ok(custom.length <= 3);
+});
+
+// The cap is what decides whether a FAST stroke is filled at all, which is why it is 32 rather
+// than something smaller. A slow stroke reports every few cells and never reaches it; a fast one
+// reports every few DOZEN, and a cap of 8 leaves that fill as coarse as the staircase it is there
+// to remove. Measured end to end on a 320-cell diagonal: 41px between delivered points at 8,
+// 11px at 32, against the 6px a slow stroke produces either way.
+test("one report of a fast stroke is still filled to about a cell", () => {
+  // 64 cells in one report, which is what a quick diagonal across the pane produces.
+  const points = interpolatePoints({ x: 0, y: 0 }, { x: 64 * CELL.x, y: 0 }, CELL);
+  assert.ok(points.length >= 30, `only ${points.length} points for a 64-cell jump`);
+  const step = (64 * CELL.x) / (points.length + 1);
+  assert.ok(step <= 2.5 * CELL.x, `${step.toFixed(1)}px between points is still a staircase`);
 });
 
 test("a degenerate cell size does not divide by zero", () => {
