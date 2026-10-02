@@ -67,6 +67,13 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // reason: as a module-level counter it summed every pane's compressions and reported the sum
     // to each of them.
     compressedWholeFrames: 0,
+    // How much of the byte budget this pane has earned above the default, found by trying
+    // rather than guessed: raised while nothing is dropping, cut back the moment something
+    // does. See `playbackHeadroom` in frame-rate-policy.cjs.
+    playbackHeadroom: 1,
+    // Frames dropped to backpressure as of the last judgement, so the next one can tell
+    // whether anything was dropped SINCE rather than ever.
+    droppedAtLastSettle: 0,
 
     frameRate,
     framesSentCount: 0,

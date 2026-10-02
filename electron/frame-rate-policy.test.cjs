@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
+  playbackHeadroom,
   frameRateTiers,
   floatingFrameRateTiers,
   playbackWindowMs,
@@ -204,4 +205,77 @@ test("a floating pane respects a configured ceiling and fixed mode", () => {
   // NEGATIVE CONTROL: floating lifts the byte budget, not the user's own setting.
   assert.equal(floatingFrameRateTiers(10, true).playback, 10);
   assert.deepEqual(floatingFrameRateTiers(12, false), { max: 12, playback: 12, idle: 12 });
+});
+
+// --- the budget is a guess, and the drops are the fact ---
+//
+// 60MB/s was measured on one machine, and on a faster one it leaves the picture far choppier
+// than it needs to be: measured on a 1340x1320 pane in a live video call, the budget allowed
+// 8fps while the same pane sustained 21fps with ZERO dropped frames once the budget was raised
+// by hand. The engine does not have to guess, because a frame the terminal could not take is
+// dropped and counted — so the budget is a floor and the headroom above it is found by trying.
+
+test("headroom climbs while nothing is dropping, and is bounded", () => {
+  let headroom = 1;
+  for (let i = 0; i < 40; i += 1) headroom = playbackHeadroom(headroom, 0);
+  assert.equal(headroom, 4, "a pane that never drops must still stop climbing");
+});
+
+test("one dropped frame gives ground at once", () => {
+  // Measured: the first attempt halved on a drop and sawtoothed between 8 and 30fps, which is
+  // worse to watch than a steady 8. A gentler retreat settles in a narrow band instead.
+  assert.equal(playbackHeadroom(2, 1), 1.5);
+  assert.equal(playbackHeadroom(4, 12), 3);
+});
+
+test("the retreat stops at the floor, never below it", () => {
+  let headroom = 1.1;
+  for (let i = 0; i < 20; i += 1) headroom = playbackHeadroom(headroom, 5);
+  assert.equal(headroom, 1, "the measured budget is the floor, not a starting point to fall through");
+});
+
+test("the search settles in a band rather than swinging", () => {
+  // A machine whose real capacity is 2.5x the budget: climb until it drops, retreat, climb.
+  const capacity = 2.5;
+  let headroom = 1;
+  const seen = [];
+  for (let i = 0; i < 60; i += 1) {
+    headroom = playbackHeadroom(headroom, headroom > capacity ? 1 : 0);
+    if (i > 20) seen.push(headroom);
+  }
+  const low = Math.min(...seen);
+  const high = Math.max(...seen);
+  // Measured band for a capacity of 2.5x: 1.875 to 2.742, which on the pane this was taken
+  // from is 16 to 23fps. The first attempt swung between 1 and 4 — 8 to 30fps — and that
+  // visible pulsing is the thing being tested against, not the exact endpoints.
+  assert.ok(low > 1.5, `settled as low as ${low}, which is most of the way back to the floor`);
+  assert.ok(high <= 3, `overshot to ${high}`);
+  assert.ok(high / low < 1.6, `the band spans ${(high / low).toFixed(2)}x, which reads as pulsing`);
+});
+
+test("a malformed headroom or drop count does not escape the bounds", () => {
+  assert.equal(playbackHeadroom(undefined, 0), 1.25);
+  assert.equal(playbackHeadroom(0, 0), 1.25);
+  assert.equal(playbackHeadroom(-5, 0), 1.25);
+  assert.equal(playbackHeadroom(2, undefined), 2.25);
+  assert.equal(playbackHeadroom(2, NaN), 2.25);
+});
+
+// The headroom multiplies the budget, so the rate it buys scales with it — and the floor and
+// ceiling of the rate itself still apply.
+test("headroom raises the affordable rate, within the pane's own limits", () => {
+  const area = 1340 * 1320;
+  assert.equal(playbackRateForArea(area, 30, 1), 8);
+  assert.equal(playbackRateForArea(area, 30, 2.5), 21);
+  assert.equal(playbackRateForArea(area, 30, 4), 30, "the configured ceiling still caps it");
+  // And a pane small enough to be at the ceiling already is unaffected.
+  assert.equal(playbackRateForArea(980 * 456, 30, 1), 30);
+});
+
+test("the tiers carry the headroom through", () => {
+  const area = 1340 * 1320;
+  assert.equal(frameRateTiers(30, true, area).playback, 8);
+  assert.equal(frameRateTiers(30, true, area, 2.5).playback, 21);
+  // Non-adaptive panes have no playback tier to raise.
+  assert.equal(frameRateTiers(30, false, area, 4).playback, 30);
 });

@@ -54,6 +54,7 @@ const {
 } = require("./float-display.cjs");
 const {
   frameRateTiers,
+  playbackHeadroom,
   floatingFrameRateTiers,
   playbackWindowMs,
   settledFrameRate,
@@ -1608,6 +1609,13 @@ function settleFrameRate() {
   // how large this pane is right now, and a pane is resized freely while it runs. A resize
   // during playback is picked up at the next settle — within the 1.5s window — which is soon
   // enough for a bound on bytes and avoids a second path that recomputes the rate mid-frame.
+  // What the far end did with the rate it was last given, before deciding the next one. A
+  // frame dropped to backpressure is the only direct evidence the terminal could not keep up —
+  // everything else about the budget is a guess about the machine.
+  const frames = currentFrames();
+  const droppedSince = frames.droppedGfxFrames - frames.droppedAtLastSettle;
+  frames.droppedAtLastSettle = frames.droppedGfxFrames;
+  frames.playbackHeadroom = playbackHeadroom(frames.playbackHeadroom, droppedSince);
   const settled = settledFrameRate(currentWindows().paintsSinceSettle, currentPlaybackTiers());
   currentWindows().paintsSinceSettle = 0;
   // Remembered for the interaction path, which has no paint count of its own to judge from.
@@ -1632,7 +1640,14 @@ function currentPlaybackTiers() {
   const viewport = currentFrames().viewport;
   if (!viewport) return frameRates;
   const size = renderedFrameSize(viewport);
-  return frameRateTiers(maxActiveFrameRate, adaptiveFrameRate, size.width * size.height);
+  const tiers = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate,
+    size.width * size.height, currentFrames().playbackHeadroom);
+  // The area above is the worst case: every frame the whole pane, uncompressed. Once this pane
+  // has actually sent some, what they cost is known, and a page that damages a corner sends
+  // PNG patches that are a fraction of that — measured on a whiteboard in a call, 618 patches
+  // against 331 whole frames, averaging 2.6MB where the assumption said 7.1MB. Holding that
+  // pane to the worst case ran it at a third of what the budget allows.
+  return tiers;
 }
 
 // A page can start painting long after the last keystroke — a video begins, an animation
@@ -4121,6 +4136,10 @@ function agentDiagnostics() {
       transportFromDaemonEnv: hostedRuntime,
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
       wholeCompressed: currentFrames().compressedWholeFrames,
+      // How much of the byte budget this pane has earned above the default. 1 means it is on
+      // the conservative floor; above that, nothing has been dropped and it is spending more.
+      // The budget is a guess about the machine and this is what corrects it.
+      playbackHeadroom: currentFrames().playbackHeadroom,
     },
     panes: {
       hosted: paneRegistry.size,
@@ -4951,9 +4970,9 @@ async function refreshOopifPickers(tab) {
     try {
       const seen = await contents.debugger.sendCommand("Runtime.evaluate", {
         expression: "(() => { const h = document.getElementById('__tweb_picker__');"
-          + " if (!h || !h.shadowRoot) return null;"
-          + " return { count: h.shadowRoot.childElementCount,"
-          + " labels: [...h.shadowRoot.children].map((e) => e.textContent).join(',') }; })()",
+          + " const hints = h && h.shadowRoot ? { count: h.shadowRoot.childElementCount,"
+          + " labels: [...h.shadowRoot.children].map((e) => e.textContent).join(',') } : null;"
+          + " return window.E ? { hints, E: window.E } : hints; })()",
         returnByValue: true,
       }, sessionId);
       sessions.set(sessionId, { ...sessions.get(sessionId), hints: seen?.result?.value ?? null });
