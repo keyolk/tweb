@@ -18,11 +18,31 @@
 // disagreement between them shifts the patch on screen by up to a cell, which reads as a
 // smear that only appears while typing. So both come from one function.
 
-// A patch only pays off while the damage stays small. Above this share of the pane the
-// whole-frame path wins anyway, and the measurements behind DETAIL.md section 8.1 show
-// damage is bimodal — a caret is ~0.03% of the pane, a scroll is 100% — so nothing real
-// lands near the threshold and there is no point tuning it.
-const PATCH_AREA_LIMIT = 0.2;
+// How much of the pane a patch may cover before the whole-frame path takes over.
+//
+// This was 0.2, on the reasoning that damage is bimodal — a caret is ~0.03% of the pane, a
+// scroll is 100% — so nothing real would land near the threshold. That holds for a page of
+// text. It does NOT hold for a page with two live regions far apart: Chromium reports ONE
+// damage rect per paint, so a video tile on the left and a panel on the right arrive as the
+// box that contains both. Measured on a Google Meet call with the add-on panel open, 258 of
+// 331 paints reported exactly `123,102 2631x1480` — 75.1% of the pane, which is neither
+// region but the span between them. Every one of those fell back to a whole frame, which is
+// why that call ran at `whole: 287, patches: 6` while YouTube on the same pane managed 25.
+//
+// A whole frame is raw pixels; a patch is PNG. So the comparison that decides this is bytes,
+// not area, and at that size the two are nothing alike — measured on the same call:
+//
+//     whole frame         20.7 MB   (2880x1800x4, uncompressed)
+//     75.1% patch          2.8 MB   (PNG, 346x88 cells)      14% of a whole frame
+//
+// 86% fewer bytes for the same picture. At the 8fps playback floor that is 166 MB/s against
+// 22 MB/s, against a 60 MB/s budget — the old limit was spending nearly three times the
+// budget to avoid a patch that costs a third of it.
+//
+// 0.85 rather than 1.0: a patch covering the whole pane and a whole frame are the same
+// picture, and the whole-frame path is the one with the simpler failure mode — no placement
+// arithmetic, no stale sliver. The band this opens is the one real pages actually produce.
+const PATCH_AREA_LIMIT = Number.parseFloat(process.env.TWEB_PATCH_AREA_LIMIT || "") || 0.85;
 
 // Damage this small still costs a whole placement command, so it is not worth a patch of
 // its own; it is also what a sub-pixel caret artifact looks like.

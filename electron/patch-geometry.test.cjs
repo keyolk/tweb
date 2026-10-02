@@ -54,12 +54,26 @@ test("the patch never runs past the pane", () => {
 });
 
 test("large damage falls through to the whole-frame path", () => {
-  // A scroll damages everything: no patch.
+  // A scroll damages everything: no patch. A patch covering the whole pane is the same
+  // picture as a whole frame, and the whole-frame path has the simpler failure mode.
   assert.equal(patchGeometry({ x: 0, y: 0, width: 800, height: 480 }, CELLS, FRAME), null);
   // Over the area limit, even when not the full pane.
-  assert.equal(patchGeometry({ x: 0, y: 0, width: 800, height: 240 }, CELLS, FRAME), null);
+  assert.equal(patchGeometry({ x: 0, y: 0, width: 800, height: 432 }, CELLS, FRAME), null);
   // Just under it still patches, so the limit is what decides and not some other guard.
-  assert.ok(patchGeometry({ x: 0, y: 0, width: 800, height: 80 }, CELLS, FRAME));
+  assert.ok(patchGeometry({ x: 0, y: 0, width: 800, height: 400 }, CELLS, FRAME));
+});
+
+// The band between the old limit and the new one is where real pages live, and it was all
+// going out as whole frames. Chromium reports ONE damage rect per paint, so two live regions
+// far apart arrive as the box containing both — measured on a Google Meet call with the
+// add-on panel open, 258 of 331 paints were `123,102 2631x1480`, 75.1% of the pane. That is
+// 2.8MB as a PNG patch against 20.7MB as a raw whole frame.
+test("a rect spanning two distant regions is patched, not sent whole", () => {
+  // 75.1% of the pane, the shape that call produced on every paint.
+  const spanning = patchGeometry({ x: 0, y: 0, width: 800, height: 361 }, CELLS, FRAME);
+  assert.ok(spanning, "75% damage must take the patch path");
+  assert.ok(spanning.place.cols * spanning.place.rows < CELLS.cols * CELLS.rows,
+    "a patch must still be smaller than the pane");
 });
 
 test("degenerate input yields no patch rather than a bad placement", () => {
