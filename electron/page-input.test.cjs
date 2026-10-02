@@ -365,3 +365,47 @@ test("a frame that answers late is left out rather than holding the hints back",
   assert.match(main, /const HINT_ROUND_WAIT_MS = 120;/);
   assert.match(main, /round\.timer = setTimeout\(\(\) => closeHintRound\(tab\), HINT_ROUND_WAIT_MS\)/);
 });
+
+// --- a frame that does not answer must not hold the engine ---
+//
+// A frame that is still being created, or has just navigated, can leave a CDP command
+// unanswered rather than failing it. Measured on a Google Meet add-on panel: one
+// `Runtime.evaluate` never came back, and because the read that issued it was awaited with no
+// bound, `diag` never returned — every later call queued behind it.
+
+test("every command on a frame's session is bounded", () => {
+  assert.match(main, /const OOPIF_COMMAND_TIMEOUT_MS = 800;/);
+  const helper = body("function sessionCommand(contents, method, params, sessionId)", "// How many hint badges");
+  assert.match(helper, /Promise\.race\(\[contents\.debugger\.sendCommand\(method, params, sessionId \|\| undefined\), deadline\]\)/);
+  // A timeout rejects; a caller must not mistake "no answer" for "nothing there".
+  assert.match(helper, /reject\(new Error\(/);
+  assert.match(helper, /\.finally\(\(\) => clearTimeout\(timer\)\)/);
+});
+
+test("the picker read and the rect refresh both go through the bound", () => {
+  const pickers = body("async function refreshOopifPickers(tab)", "async function refreshOopifRects");
+  assert.match(pickers, /sessionCommand\(contents, "Runtime\.evaluate"/);
+  assert.doesNotMatch(pickers, /contents\.debugger\.sendCommand\(/);
+  // And in parallel, so one slow frame does not add its timeout to every other frame's.
+  assert.match(pickers, /await Promise\.all\(/);
+  const rects = body("async function refreshOopifRects(tab)", "function sendPointerEvent");
+  assert.match(rects, /const send = \(method, params, sessionId\) => sessionCommand\(contents, method, params, sessionId\);/);
+});
+
+// --- a large patch must not block the main thread ---
+//
+// The immediate patch path is unpaced and writes synchronously to the pane's tty. That is right
+// for a caret — a few KB, the moment it is painted. A whiteboard being drawn on paints 360-430KB
+// of damage just as often; the tty could not drain it, the write blocked in the kernel, and the
+// engine's main thread stopped with it. Sampled while stuck: 100% of the main thread was a timer
+// callback inside `write()`. The board greyed out and every agent call timed out.
+
+test("a patch over the immediate limit is handed to the paced path", () => {
+  assert.match(main, /const IMMEDIATE_PATCH_MAX_BYTES = 64 \* 1024;/);
+  const patch = body("function sendPatch(image, dirty, generation", "  return true;\n}");
+  // Checked after the encode — the size is only known then — and before anything is written.
+  const check = patch.indexOf("if (png.length > IMMEDIATE_PATCH_MAX_BYTES) return false;");
+  const write = patch.indexOf("writeGfxChunked(");
+  assert.ok(check > 0, "the size check is gone");
+  assert.ok(check < write, "the size check must come before the write, or the write has already blocked");
+});

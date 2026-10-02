@@ -1734,6 +1734,11 @@ function patchPlacementSequence(id, place, frames = currentFrames()) {
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
 
+// The largest patch the immediate path will send, in encoded bytes. A caret or a typed word is a
+// few KB; the whiteboard damage that blocked the main thread was 360KB and up. 64KB keeps every
+// keystroke on the immediate path with a wide margin while sending nothing that size unpaced.
+const IMMEDIATE_PATCH_MAX_BYTES = 64 * 1024;
+
 // Returns true when the damage was sent as a patch, false when the caller should fall back
 // to transferring the whole frame.
 function sendPatch(image, dirty, generation, frames = currentFrames(), record = currentPane()) {
@@ -1765,6 +1770,22 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
     return false;
   }
   if (!png || png.length === 0) return false;
+  // A patch this large goes the paced way instead, because this path is not paced and its write
+  // is synchronous on the main thread.
+  //
+  // The immediate path exists for a caret keeping up with the keyboard — a few KB, sent the
+  // moment it is painted. A whiteboard being drawn on paints far larger damage just as often:
+  // measured on a Google Meet whiteboard, patches of 360-430KB going out back to back with no
+  // pacing at all. The pane's tty cannot drain that, the write blocks in the kernel, and the
+  // engine's whole main thread stops with it — sampled while stuck, 100% of the main thread's
+  // time was a timer callback sitting in `write()`. Every agent call timed out, the page stopped
+  // painting, and the user saw the board grey out and stop taking input.
+  //
+  // Nothing upstream could see it coming. The backpressure counter only counts whole frames,
+  // which go through the worker; a patch never waits for anything, so it is never dropped and
+  // never counted. Declining here hands the damage to the whole-frame path, which is paced to
+  // the frame rate and drops rather than blocks when the terminal falls behind.
+  if (png.length > IMMEDIATE_PATCH_MAX_BYTES) return false;
   const patchEncoded = frameProbeMark();
 
   const id = takeNextPatchId(frames);
@@ -4956,6 +4977,27 @@ function scheduleOopifRectRefresh(tab) {
   void refreshOopifRects(tab);
 }
 
+// One CDP command on an out-of-process frame's session, bounded.
+//
+// A frame that is still being created, or has just navigated, can leave a command unanswered
+// rather than failing it — measured on a Google Meet add-on panel: one `Runtime.evaluate` never
+// came back, and because the read that issued it was awaited, `diag` never returned either. A
+// read that cannot finish has to give up, or one slow frame holds every caller behind it.
+//
+// Rejecting rather than resolving null, so a caller that wanted the answer finds out it does not
+// have one instead of carrying on with a value that looks like "nothing there".
+const OOPIF_COMMAND_TIMEOUT_MS = 800;
+
+function sessionCommand(contents, method, params, sessionId) {
+  let timer = null;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${method} timed out after ${OOPIF_COMMAND_TIMEOUT_MS}ms`)),
+      OOPIF_COMMAND_TIMEOUT_MS);
+  });
+  return Promise.race([contents.debugger.sendCommand(method, params, sessionId || undefined), deadline])
+    .finally(() => clearTimeout(timer));
+}
+
 // How many hint badges each attached frame is showing.
 //
 // `f` runs inside whichever frame has focus and renders its badges there, so a panel whose
@@ -4966,28 +5008,32 @@ async function refreshOopifPickers(tab) {
   const sessions = oopifSessions(tab);
   if (!sessions.size || !ensureDebugger(tab)) return;
   const contents = tab.webContents;
-  for (const [sessionId, info] of sessions) {
+  // In parallel: each frame answers on its own, and one that does not must not hold the rest.
+  await Promise.all([...sessions.keys()].map(async (sessionId) => {
     try {
-      const seen = await contents.debugger.sendCommand("Runtime.evaluate", {
+      const seen = await sessionCommand(contents, "Runtime.evaluate", {
         expression: "(() => { const h = document.getElementById('__tweb_picker__');"
-          + " const hints = h && h.shadowRoot ? { count: h.shadowRoot.childElementCount,"
-          + " labels: [...h.shadowRoot.children].map((e) => e.textContent).join(',') } : null;"
-          + " return window.E ? { hints, E: window.E } : hints; })()",
+          + " if (!h || !h.shadowRoot) return null;"
+          + " return { count: h.shadowRoot.childElementCount,"
+          + " labels: [...h.shadowRoot.children].map((e) => e.textContent).join(',') }; })()",
         returnByValue: true,
       }, sessionId);
-      sessions.set(sessionId, { ...sessions.get(sessionId), hints: seen?.result?.value ?? null });
+      if (sessions.has(sessionId)) {
+        sessions.set(sessionId, { ...sessions.get(sessionId), hints: seen?.result?.value ?? null });
+      }
     } catch (error) {
       if (debugLogging) console.error(`tweb: oopif picker read failed: ${error.message}`);
     }
-  }
+  }));
 }
 
 async function refreshOopifRects(tab) {
   const sessions = oopifSessions(tab);
   if (!sessions.size) return;
   const contents = tab.webContents;
-  const send = (method, params, sessionId) =>
-    contents.debugger.sendCommand(method, params, sessionId || undefined);
+  // Bounded for the same reason the picker read is: a frame mid-creation can leave a command
+  // unanswered, and this runs on every pointer move.
+  const send = (method, params, sessionId) => sessionCommand(contents, method, params, sessionId);
 
   // Where one frame's box sits, measured by the session that holds its `<iframe>`.
   //
