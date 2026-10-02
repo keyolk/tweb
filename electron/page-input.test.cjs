@@ -221,38 +221,48 @@ test("the file chooser no longer treats 'attached' as 'wired up'", () => {
   assert.match(main, /chooserWiredTabs\.delete\(tab\);/);
 });
 
-// --- window.open opens a tab, and that is deliberate ---
+// --- a script-opened popup keeps its opener; a link-opened one does not ---
 //
-// Allowing the window instead was tried and reverted. Measured on a live Google Meet add-on's
-// sign-in popup: the adopted tab came up `innerWidth: 0, innerHeight: 0` with `screen: 0x0` and
-// so had no display attached. It painted nothing, and as the ACTIVE tab it froze the whole pane
-// on its last frame. `f` then found nothing to hint, because it hints the active tab. The page
-// answered `eval` normally throughout, which is what made it read as a hang rather than as a
-// broken tab.
-//
-// `setContentSize` did not fix it (the window was already the right size) and neither did the
-// page's own `resizeTo`. A minimal repro could not reproduce it: an allowed popup to a real URL,
-// opened from a cross-origin iframe, came up correctly at the pane's size. So the condition that
-// produces a display-less window is not known, and until it is, the window is not allowed.
-//
-// The cost is real: the opener gets null, so an OAuth flow that drives a blank popup does not
-// start. A broken sign-in is one feature; a frozen pane is the whole browser.
+// Denying every `window.open` breaks every popup-based sign-in twice over: the opener gets null
+// so the flow cannot start, and a popup that runs anyway cannot deliver its result. Measured on
+// the live Google Meet Whiteboard add-on, which signs in through Google Identity Services — the
+// callback `accounts.google.com/gsi/transform` is a UI-less page that posts the credential to
+// its opener and closes itself, so with a null opener it throws and stays a blank white tab.
+// That was the whole of "로그인 진행하니까 그냥 빈 흰색 화면".
 
-test("window.open is denied, and the URL opens as a tab", () => {
-  const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-start-navigation"');
-  assert.match(handler, /action: "deny"/);
+test("a script-opened popup is allowed, and gets this pane's window options", () => {
+  const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-create-window"');
+  assert.match(handler, /if \(details\.disposition === "new-window"\) \{/);
+  // The overrides are the point. An Electron popup with none is not an offscreen window, so it
+  // has no display to paint into — that is the `innerWidth: 0, screen: 0x0` tab that froze the
+  // pane when allowing was tried before. With them: `inner=1800x1125 screen=1440x900`.
+  assert.match(handler, /action: "allow", overrideBrowserWindowOptions: browserWindowOptions\(\)/);
+  // Everything else still opens as a fresh tab.
   assert.match(handler, /setImmediate\(\(\) => createTab\(target, activate\)\)/);
-  assert.doesNotMatch(handler, /action: "allow"/);
+  assert.match(handler, /action: "deny"/);
 });
 
-// Nothing may adopt a window Electron made for an opener: that is the path that produced the
-// display-less tab. Pinned so it is not re-attempted blind.
-test("no window is adopted from an opener", () => {
-  assert.doesNotMatch(main, /onContents\("did-create-window"/);
-  assert.doesNotMatch(main, /pendingWindowOpen/);
+// A plain `<a target="_blank">` and `window.open(url, "_blank")` with no features both arrive as
+// `foreground-tab` with identical details — measured, they cannot be told apart. Chrome gives the
+// link no opener (implicit `noopener`) and the script call one, so allowing that disposition
+// would hand an opener to every link on a guess, which is reverse tabnabbing. A popup-based
+// sign-in always passes features (GSI passes `toolbar=no,location=no,...`), so nothing is lost.
+test("the ambiguous disposition is not allowed through", () => {
+  const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-create-window"');
+  assert.doesNotMatch(handler, /foreground-tab/);
+});
+
+test("the window Electron made for an opener is taken into the tab list", () => {
+  // Created hidden and offscreen like every tab here, so unadopted it is a window the user can
+  // neither see nor close.
+  const adopt = body('onContents("did-create-window", (child, details) => {', 'onContents("did-start-navigation"');
+  assert.match(adopt, /adoptTab\(child, details\.url \|\| want\?\.url \|\| "about:blank"/);
+  // Sized here rather than left to the reconciler a second later: the first frames of a wrongly
+  // sized window are dropped, and this is the active tab by then.
+  assert.match(adopt, /child\.setContentSize\(logical\.width, logical\.height\)/);
 });
 
 test("middle-click still does not steal focus, while window.open does", () => {
-  const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-start-navigation"');
+  const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-create-window"');
   assert.match(handler, /const activate = details\.disposition !== "background-tab";/);
 });

@@ -4680,6 +4680,10 @@ function frameViewportPoint(tab, sourceFrame, point) {
 // from the child — a frame cannot measure its own box, since the box is an element in its
 // parent's document — so it is read from the page whose document holds the `<iframe>`, keyed by
 // the frame id CDP hands out at attach time.
+// Set by the window-open handler and consumed by `did-create-window`, which is not told
+// the disposition. One at a time: Chromium creates the window synchronously from the handler.
+let pendingWindowOpen = null;
+
 const oopifSessionsByTab = new WeakMap();
 
 function oopifSessions(tab) {
@@ -5663,28 +5667,38 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     if (floatingTabs.has(tab)) relayFrameToDisplay(tab, image);
   });
 
-  // `window.open` opens a tab, and the opener gets null back.
+  // A script-opened popup becomes a tab that KEEPS ITS OPENER. A link-opened one does not.
   //
-  // Denying the request is what keeps Electron from surfacing the macOS OffScreenView
-  // placeholder as a native popup, and the URL still opens — as a tab, which is the only kind of
-  // window this browser has.
+  // Every window this browser has is a tab, so a popup has to become one either way. The
+  // question is only whether Electron makes the window (and wires up `window.opener`) or
+  // whether the request is denied and a fresh tab opened in its place.
   //
-  // WHAT THIS COSTS, and why it is paid anyway. The opener gets null, so a flow that opens a
-  // blank popup and then drives it — `popup.location = ...`, `postMessage` back through the
-  // handle, which is how an OAuth "sign in in a new window" works — does not start at all.
+  // Denying is what the whole handler used to do, and it breaks every popup-based sign-in.
+  // `window.open` returns null, so the flow does not start; and when a site ignores the null
+  // and lets the popup run, the popup's callback page cannot deliver. Measured on the live
+  // Google Meet Whiteboard add-on, which signs in through Google Identity Services: the
+  // callback is `accounts.google.com/gsi/transform`, a page with no UI whose entire job is
+  // `opener.postMessage(credential)` then `window.close()`. With a null opener it throws,
+  // never closes, and sits there as a blank white tab — which is exactly what it looked like.
   //
-  // Allowing the window instead was tried, and it is worse. Measured on a live Google Meet
-  // add-on's sign-in: the adopted tab came up with `innerWidth: 0, innerHeight: 0` and
-  // `screen: 0x0` — no display attached — so it painted nothing, and because it was the ACTIVE
-  // tab the whole pane froze on its last frame. The page answered `eval` perfectly well while
-  // the pane looked hung, `f` found nothing to hint, and only closing the tab recovered it.
-  // `setContentSize` did not fix it (the window was already the right size), nor did the page's
-  // own `resizeTo`. A minimal repro could not reproduce it — an allowed popup to a real URL,
-  // opened from a cross-origin iframe, came up correctly at the pane's size — so the condition
-  // that produces a display-less window is not yet known.
+  // So `new-window` is allowed through, with this pane's own window options. That is what
+  // was missing when allowing was tried before and produced a tab with `innerWidth: 0` and
+  // `screen: 0x0`: an Electron-made popup with no overrides is not an offscreen window at
+  // all, so it has no display to paint into, and as the active tab it took the pane's last
+  // frame down with it. Given `browserWindowOptions()` it comes up at the pane's size
+  // (measured: `inner=1800x1125 screen=1440x900`), paints, hints, and answers the agent.
   //
-  // A broken sign-in is a feature that does not work. A frozen pane is a browser that does not
-  // work, and it takes every other tab with it.
+  // ONLY `new-window`. A plain `<a target="_blank">` and `window.open(url, "_blank")` with no
+  // features both arrive here as `foreground-tab` with identical details — measured, they
+  // cannot be told apart. Chrome gives the link no opener (implicit `noopener`) and the script
+  // call one, and handing an opener to every link would be reverse tabnabbing on a guess. A
+  // popup-based sign-in passes features, because it wants a popup; GSI passes
+  // `toolbar=no,location=no,...`. So the ambiguous case keeps the old behaviour.
+  //
+  // End to end on the real add-on: the GSI button opens the chooser with `opener: true`,
+  // picking the account reaches the consent page and then the callback, and the popup closes
+  // itself — `tab active 1/1 Meet`, back where it started, signed in. Reopening the panel
+  // afterwards shows no sign-in frame at all.
   setWindowOpenHandler((details) => {
     const target = details.url || "about:blank";
     // Middle-click and window.open share this path, and Chrome treats them differently:
@@ -5693,8 +5707,34 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     // where you are — force-activating the first one lands the rest on the wrong document,
     // which makes the gesture worse than an ordinary click rather than better.
     const activate = details.disposition !== "background-tab";
+    if (debugLogging) {
+      console.error(`tweb: window-open ${details.disposition} features=${JSON.stringify(details.features || "")} ${target}`);
+    }
+    if (details.disposition === "new-window") {
+      pendingWindowOpen = { url: target, activate };
+      return { action: "allow", overrideBrowserWindowOptions: browserWindowOptions() };
+    }
     setImmediate(() => createTab(target, activate));
     return { action: "deny" };
+  });
+
+  // The window Electron just made for an opener, taken into the tab list.
+  //
+  // Nothing else would ever show it: it is created hidden and offscreen like every tab here,
+  // so left unadopted it would be a window the user cannot see and cannot close.
+  onContents("did-create-window", (child, details) => {
+    const want = pendingWindowOpen;
+    pendingWindowOpen = null;
+    // Sized explicitly rather than left to the reconciler's next tick. The reconciler does
+    // correct it a second later, but the first frames of a wrongly sized window are dropped
+    // (`frame dropped got=0x0 want=2880x1800`), and this is the active tab by then.
+    try {
+      const logical = logicalContentSize(currentFrames().viewport || queryViewportSize());
+      child.setContentSize(logical.width, logical.height);
+    } catch (error) {
+      if (debugLogging) console.error(`tweb: popup sizing failed: ${error.message}`);
+    }
+    adoptTab(child, details.url || want?.url || "about:blank", want ? want.activate : true);
   });
 
   onContents("did-start-navigation", (details) => {
