@@ -18,10 +18,9 @@ function assertPreload(source) {
   // wrapper shares its child's corner and always precedes it: measured on a Google Meet
   // call, 58 of 503 collected elements were lost that way, including every button in the
   // control bar, which `snapshot` then reported as "generic".
-  const unique = source.slice(source.indexOf("function uniqueVisibleTargets(elements, classify)"),
+  const unique = source.slice(source.indexOf("function uniqueVisibleTargets(elements, classify, opaqueFrames)"),
     source.indexOf("// `<form>` exposes its controls as own properties"));
   assert.match(unique, /const occupied = new Map\(\);/);
-  assert.match(unique, /if \(targetRank\(element\) <= targetRank\(targets\[held\]\.element\)\) continue;/);
   assert.match(unique, /targets\[held\] = \{ element, rect, \.\.\.\(classify\?\.\(element\) \|\| \{\}\) \};/);
   assert.doesNotMatch(unique, /if \(occupied\.has\(point\)\) continue;/);
   // A control outranks a bolted-on handler, which outranks a bare layout box.
@@ -60,6 +59,16 @@ function assertPreload(source) {
   assert.match(source, /function startHints\(newTab\) \{[^]*?requestFrameOffset\(\);/);
   assert.match(source, /addEventListener\("resize", broadcastFrameOffsets\);/);
   assert.match(source, /document\.addEventListener\("scroll", broadcastFrameOffsets, true\);/);
+
+  // An opaque frame is the only way INTO the page it holds, so it may not lose its cell to a box
+  // that merely shares its corner. Measured on a Google Meet add-on: the Whiteboard panel is
+  // `meet.whiteboard.sdix.io` nested inside a same-origin `about:blank` iframe with the SAME box,
+  // and the outer one won the cell on document order alone — leaving the panel unhintable while
+  // the frame around it had a badge. Ranked above a bare layout box, below a real control.
+  assert.match(source, /if \(opaqueFrames\?\.has\(element\)\) return 3;/);
+  assert.match(source, /function targetRank\(element, opaqueFrames\)/);
+  assert.match(source, /function uniqueVisibleTargets\(elements, classify, opaqueFrames\)/);
+  assert.match(source, /targetRank\(element, opaqueFrames\) <= targetRank\(targets\[held\]\.element, opaqueFrames\)/);
 
   // Focus has to be able to GET into such a frame, or its own pass never runs. The frame
   // itself is the hint that puts it there — and only when it is opaque, since a
@@ -350,7 +359,9 @@ test("synthetic pointer events are scaled by the zoom factor", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /function pageToWindowPoint\(contents, point\)/);
   assert.match(main, /const zoom = contents\.getZoomFactor\(\) \|\| 1/);
-  const pointerEvents = main.match(/sendInputEvent\(\{\s*type: "mouse(?:Move|Down|Up)"[^}]*\}/g) || [];
+  // Pointer events now go through `sendPointerEvent`, which routes them into out-of-process
+  // frames; the scaling question is the same either way.
+  const pointerEvents = main.match(/sendPointerEvent\([^,]+, \{\s*type: "mouse(?:Move|Down|Up)"[^}]*\}/g) || [];
   assert.ok(pointerEvents.length > 0, "expected synthetic pointer events");
   for (const call of pointerEvents) {
     assert.doesNotMatch(

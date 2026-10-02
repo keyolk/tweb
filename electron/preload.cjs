@@ -1132,7 +1132,19 @@ installPrintShim();
     controlSelector, handlerSelector, "audio", "video", "canvas",
   ].join(",");
 
-  function targetRank(element) {
+  function targetRank(element, opaqueFrames) {
+    // An opaque frame outranks everything, including a control.
+    //
+    // It is the only way INTO the page it holds — nothing inside is reachable from here, and
+    // without a badge on the frame itself the second `f` never becomes possible. Everything it
+    // competes with is reachable some other way, so losing one of those badges costs a shortcut
+    // while losing this one costs the whole embedded app.
+    //
+    // Measured on a Google Meet add-on: the Whiteboard panel is `meet.whiteboard.sdix.io` inside
+    // a same-origin `about:blank` iframe, and BOTH share their box with the layout `<div>` that
+    // wraps them. Ranked merely above a layout box it still lost, because that wrapper carries a
+    // `jsaction` and ranks as a handler.
+    if (opaqueFrames?.has(element)) return 3;
     // A selector this engine cannot parse must not take the hint pass down with it.
     try {
       if (element.matches(controlSelector)) return 2;
@@ -1141,7 +1153,7 @@ installPrintShim();
     return 0;
   }
 
-  function uniqueVisibleTargets(elements, classify) {
+  function uniqueVisibleTargets(elements, classify, opaqueFrames) {
     const seen = new Set();
     // cell -> index into `targets`, so a later element can take a cell over rather
     // than merely being dropped by it.
@@ -1167,7 +1179,7 @@ installPrintShim();
       // So the cell keeps the strongest candidate instead of the earliest one. A tie
       // keeps the incumbent, which preserves document order among equals.
       if (held !== undefined) {
-        if (targetRank(element) <= targetRank(targets[held].element)) continue;
+        if (targetRank(element, opaqueFrames) <= targetRank(targets[held].element, opaqueFrames)) continue;
         targets[held] = { element, rect, ...(classify?.(element) || {}) };
         continue;
       }
@@ -1418,7 +1430,7 @@ installPrintShim();
     const opaqueFrames = new Set(opaqueFrameTargets(roots));
     const targets = uniqueVisibleTargets(hitTestTargets([...elements, ...opaqueFrames]), (element) => ({
       nativeSurface: isTag(element, "canvas"),
-    })).filter((item) => !item.element.matches("video,audio")
+    }), opaqueFrames).filter((item) => !item.element.matches("video,audio")
       && (!item.element.matches("iframe,frame") || opaqueFrames.has(item.element)));
     return [...targets, ...media.flatMap(mediaControlTargets)]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);

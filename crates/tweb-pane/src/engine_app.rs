@@ -32,6 +32,14 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/deflate-policy.cjs"),
     ),
     (
+        "profile-hygiene.cjs",
+        include_str!("../../../electron/profile-hygiene.cjs"),
+    ),
+    (
+        "oopif-input.cjs",
+        include_str!("../../../electron/oopif-input.cjs"),
+    ),
+    (
         "mouse-click-state.cjs",
         include_str!("../../../electron/mouse-click-state.cjs"),
     ),

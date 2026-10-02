@@ -15,6 +15,8 @@ const {
   openSync,
   readdirSync,
   readFileSync,
+  rmSync,
+  statSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -37,6 +39,8 @@ const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
+const { mouseEventParams, sessionsUnderPoint } = require("./oopif-input.cjs");
+const { cachesToClear, cachePaths, DISPOSABLE: DISPOSABLE_CACHES } = require("./profile-hygiene.cjs");
 const {
   RELAY_JPEG_QUALITY,
   centeredStatusSequence,
@@ -212,10 +216,6 @@ const tabPanes = new Map();
 // Recovery attempts per tab, so a page that crashes its renderer on every load stops being
 // reloaded instead of looping forever. See renderer-recovery.cjs.
 const tabRendererRecoveries = new Map();
-// The disposition of the `window.open` currently being allowed, handed from the open handler to
-// the `did-create-window` that follows it. Electron fires the two synchronously, one after the
-// other on the same stack, so a single slot cannot be raced by a second open.
-let pendingWindowOpen = null;
 // Shared on purpose, and shared BEYOND this process: `historyPath` is one file per user-data
 // directory that every pane and every engine appends to under a lock, because history is the user's,
 // not the pane's. See `historyLockPath`.
@@ -3726,15 +3726,15 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "native-hover":
       if ([value?.x, value?.y].every(Number.isFinite)) {
         const { x, y } = pageToWindowPoint(contents, value);
-        contents.sendInputEvent({ type: "mouseMove", x, y });
+        sendPointerEvent(tab, { type: "mouseMove", x, y });
       }
       break;
     case "native-click":
       if ([value?.x, value?.y].every(Number.isFinite)) {
-        const { x, y } = pageToWindowPoint(contents, value);
-        contents.sendInputEvent({ type: "mouseMove", x, y });
-        contents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
-        contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+        const { x, y } = pageToWindowPoint(contents, frameViewportPoint(tab, sourceFrame, value));
+        sendPointerEvent(tab, { type: "mouseMove", x, y });
+        sendPointerEvent(tab, { type: "mouseDown", x, y, button: "left", clickCount: 1, held: true });
+        sendPointerEvent(tab, { type: "mouseUp", x, y, button: "left", clickCount: 1 });
       }
       break;
     case "native-drag": {
@@ -3743,21 +3743,20 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       if (![from?.x, from?.y, to?.x, to?.y].every(Number.isFinite)) break;
       const start = pageToWindowPoint(contents, from);
       const end = pageToWindowPoint(contents, to);
-      const held = withButtonDown([], "left");
-      contents.sendInputEvent({ type: "mouseMove", ...start });
-      contents.sendInputEvent({ type: "mouseDown", ...start, button: "left", clickCount: 1, modifiers: held });
+      sendPointerEvent(tab, { type: "mouseMove", ...start });
+      sendPointerEvent(tab, { type: "mouseDown", ...start, button: "left", clickCount: 1, held: true });
       for (const ratio of [0.34, 0.67, 1]) {
-        contents.sendInputEvent({
+        sendPointerEvent(tab, {
           type: "mouseMove",
           x: Math.round(start.x + (end.x - start.x) * ratio),
           y: Math.round(start.y + (end.y - start.y) * ratio),
           button: "left",
-          // Same reason as the terminal's own drag: without this the page reads
-          // `buttons: 0` on every move and never sees a drag at all.
-          modifiers: held,
+          // Without the held button the page reads `buttons: 0` on every move and never sees a
+          // drag at all — the same reason the terminal's own drag carries it.
+          held: true,
         });
       }
-      contents.sendInputEvent({ type: "mouseUp", ...end, button: "left", clickCount: 1 });
+      sendPointerEvent(tab, { type: "mouseUp", ...end, button: "left", clickCount: 1 });
       break;
     }
     case "frame-mode":
@@ -3905,7 +3904,16 @@ function agentPageRequest(method, params, timeoutMs = 10000) {
       reject(new Error(`page did not answer ${method} within ${timeoutMs}ms`));
     }, timeoutMs);
     agentPending.set(id, { resolve, reject, timer });
-    sendToFocusedTabFrame(tab, "tweb-agent-request", { id, method, params });
+    // The MAIN frame, not the focused one. Only the top frame answers an agent request — refs
+    // are the `f` hint labels and a subframe's would collide — so sending to whichever frame
+    // happens to hold focus means no reply at all when that is a subframe.
+    //
+    // This was survivable while a cross-origin subframe could not be a shortcut frame: delivery
+    // fell back to the main frame on its own. Once every frame registers (see the preload's
+    // `shortcutFrame`), focus inside an embedded app silently killed every agent call —
+    // measured on a Google Meet add-on panel: `snapshot` timed out at 10s, `page-diag` at 3s,
+    // while the page answered `eval` normally, because `eval` does not go through this path.
+    sendToMainTabFrame(tab, "tweb-agent-request", { id, method, params });
   });
 }
 
@@ -4009,6 +4017,26 @@ function agentDiagnostics() {
       caret: { cell: inputState().caretCell, point: inputState().caretPoint },
     },
     tabs: { active: currentWindows().activeTabIndex, count: currentWindows().tabs.length },
+    // Every out-of-process frame CDP has handed us a session for, and where it sits.
+    //
+    // Reported because a frame with no `rect` is a frame no click can be routed into, and
+    // nothing else says so: the page looks alive, the hints appear, and the click silently
+    // lands on whatever is behind the panel. That is the exact shape of "clicking the add-on
+    // does nothing", and it went undiagnosed until this was readable. `depth` counts the
+    // sessions above it, so a two-deep embed is distinguishable from a flat one.
+    oopif: tab ? [...oopifSessions(tab).entries()].map(([sessionId, info]) => {
+      let depth = 0;
+      for (let at = info.parent; at; at = oopifSessions(tab).get(at)?.parent) {
+        depth += 1;
+        if (depth > 16) break;
+      }
+      return {
+        session: String(sessionId).slice(0, 8),
+        url: info.url,
+        depth,
+        rect: info.rect,
+      };
+    }) : [],
     // Which pane owns the speakers, and whether this one is making noise. `audible` is
     // read live rather than cached because Chromium is the only thing that knows, and
     // "muted but still playing" is exactly the state this feature has to produce.
@@ -4022,17 +4050,21 @@ function agentDiagnostics() {
   };
 }
 
-function agentContents() {
+function agentTab() {
   if (!currentWindows().win || currentWindows().win.isDestroyed()) throw new Error("no active tab");
-  return currentWindows().win.webContents;
+  return currentWindows().win;
+}
+
+function agentContents() {
+  return agentTab().webContents;
 }
 
 function agentNativeClick(point) {
-  const contents = agentContents();
-  const { x, y } = pageToWindowPoint(contents, point);
-  contents.sendInputEvent({ type: "mouseMove", x, y });
-  contents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
-  contents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+  const tab = agentTab();
+  const { x, y } = pageToWindowPoint(tab.webContents, point);
+  sendPointerEvent(tab, { type: "mouseMove", x, y });
+  sendPointerEvent(tab, { type: "mouseDown", x, y, button: "left", clickCount: 1, held: true });
+  sendPointerEvent(tab, { type: "mouseUp", x, y, button: "left", clickCount: 1 });
 }
 
 // The rules live in electron/agent-key.cjs, next to the cases that were measured against
@@ -4392,8 +4424,8 @@ async function dispatchAgentCommand(method, params) {
         return { ok: true, clicked: result.click };
       }
       if (result.hover) {
-        const contents = agentContents();
-        contents.sendInputEvent({ type: "mouseMove", ...pageToWindowPoint(contents, result.hover) });
+        const tab = agentTab();
+        sendPointerEvent(tab, { type: "mouseMove", ...pageToWindowPoint(tab.webContents, result.hover) });
         return { ok: true, hovered: result.hover };
       }
       return { ok: true, ...result };
@@ -4606,6 +4638,314 @@ function pageToWindowPoint(contents, point) {
     x: Math.max(0, Math.round(point.x * zoom)),
     y: Math.max(0, Math.round(point.y * zoom)),
   };
+}
+
+// A click point reported by a subframe, moved into the top frame's viewport.
+//
+// A frame hints in its own coordinates and `topViewportPoint` walks up to convert — but that
+// walk throws at a cross-origin boundary, and the preload's `postMessage` fallback needs every
+// frame in the chain to relay. Measured with an embedded app two frames deep: the child reported
+// `255,508` for a button that is at `723,637` on screen, so the click landed on the page behind
+// the panel. The engine already knows where each out-of-process frame sits — it reads those
+// boxes to route pointer events — so the correction is free and needs nobody to relay anything.
+function frameViewportPoint(tab, sourceFrame, point) {
+  if (!sourceFrame || sourceFrame === tab.webContents.mainFrame) return point;
+  const url = String(sourceFrame.url || "");
+  for (const info of oopifSessions(tab).values()) {
+    if (!info.rect || String(info.url || "") !== url) continue;
+    return { x: point.x + info.rect.x, y: point.y + info.rect.y };
+  }
+  return point;
+}
+
+// Send one pointer event, by the route that can reach every frame.
+//
+// `sendInputEvent` delivers into the root frame's widget and stops at a process boundary, so a
+// click over a cross-site iframe lands on the `<iframe>` element rather than in the page it
+// holds. CDP's input router owns the hit-test data for the whole frame tree and forwards to
+// whichever process owns the pixels — the route a real mouse takes. See oopif-input.cjs for the
+// measurement that established this.
+//
+// The debugger can be unavailable (devtools or an extension host owns it), so `sendInputEvent`
+// stays as the fallback rather than being replaced: it is right for everything except an OOPIF,
+// and an OOPIF is unreachable either way when CDP cannot be had.
+//
+// `event.x`/`event.y` are WINDOW coordinates — unzoomed DIPs, what `sendInputEvent` takes and
+// what every caller here already produces. CDP wants CSS pixels in the top frame's viewport,
+// which is the same point divided by the zoom factor. This pane runs at 0.8 by default, so
+// skipping that conversion puts every click a fifth of the way off target.
+// Attached OOPIF sessions, per tab: sessionId -> { frameId, url, rect }.
+//
+// `rect` is where that frame sits in the TOP frame's viewport, in CSS pixels. It cannot come
+// from the child — a frame cannot measure its own box, since the box is an element in its
+// parent's document — so it is read from the page whose document holds the `<iframe>`, keyed by
+// the frame id CDP hands out at attach time.
+const oopifSessionsByTab = new WeakMap();
+
+function oopifSessions(tab) {
+  let sessions = oopifSessionsByTab.get(tab);
+  if (!sessions) {
+    sessions = new Map();
+    oopifSessionsByTab.set(tab, sessions);
+  }
+  return sessions;
+}
+
+const autoAttachedTabs = new WeakSet();
+
+// Ask CDP to hand us a session for every out-of-process frame as it appears.
+//
+// `flatten: true` is what makes those sessions addressable on this same debugger connection —
+// without it each would need its own transport. Attaching is idempotent per tab and cheap: the
+// sessions exist whether or not we use them, and this only asks to be told about them.
+function watchOopifSessions(tab) {
+  if (autoAttachedTabs.has(tab)) return;
+  autoAttachedTabs.add(tab);
+  const contents = tab.webContents;
+  const sessions = oopifSessions(tab);
+  contents.debugger.on("message", bindPane(() => tabPanes.get(tab), (_event, method, params, parentSessionId) => {
+    if (method === "Target.attachedToTarget") {
+      // Only iframes. A worker or a service worker has a session too and no place on screen.
+      if (params?.targetInfo?.type !== "iframe") return;
+      sessions.set(params.sessionId, {
+        frameId: params.targetInfo.targetId,
+        url: String(params.targetInfo.url || ""),
+        // The session this attachment was announced on owns the document that holds the
+        // `<iframe>`, and is therefore the only session that can measure where it sits. Empty
+        // means the root. Without it a frame nested inside another out-of-process frame could
+        // not be placed at all — see refreshOopifRects.
+        parent: String(parentSessionId || ""),
+        rect: null,
+      });
+      // A child session needs both domains of its own: `Runtime` or every evaluate on it
+      // answers `Cannot find default execution context`, and `DOM` or it cannot resolve the
+      // owner of a frame nested below it.
+      for (const domain of ["Runtime.enable", "DOM.enable"]) {
+        void contents.debugger.sendCommand(domain, {}, params.sessionId).catch((error) => {
+          if (debugLogging) console.error(`tweb: oopif ${domain} failed: ${error.message}`);
+        });
+      }
+      // And it has to be asked for ITS children in turn. An auto-attach covers one level: the
+      // targets below a child are announced on that child's session or not at all. Measured on
+      // a two-deep embed — the shape a Google Meet add-on has, where the vendor's frame sits
+      // inside the add-on host's — the inner frame never attached, so it had no session, no
+      // box, and no click could be routed into it. That is the whole bug.
+      void contents.debugger.sendCommand("Target.setAutoAttach", {
+        autoAttach: true, waitForDebuggerOnStart: false, flatten: true,
+      }, params.sessionId).catch((error) => {
+        if (debugLogging) console.error(`tweb: oopif setAutoAttach failed: ${error.message}`);
+      });
+      void refreshOopifRects(tab);
+    } else if (method === "Target.detachedFromTarget") {
+      sessions.delete(params?.sessionId);
+    }
+  }));
+  contents.debugger.on("detach", () => {
+    autoAttachedTabs.delete(tab);
+    sessions.clear();
+  });
+  // `DOM.getFrameOwner` and `DOM.getBoxModel` answer nothing until the DOM domain is enabled;
+  // without it every rect stays null and no frame is ever aimed at.
+  void contents.debugger.sendCommand("DOM.enable").catch((error) => {
+    if (debugLogging) console.error(`tweb: DOM.enable failed: ${error.message}`);
+  });
+  void contents.debugger.sendCommand("Target.setAutoAttach", {
+    autoAttach: true, waitForDebuggerOnStart: false, flatten: true,
+  }).catch((error) => {
+    if (debugLogging) console.error(`tweb: setAutoAttach failed: ${error.message}`);
+  });
+}
+
+// Where each attached OOPIF's `<iframe>` sits, read from the page that holds it.
+//
+// The frame id is the link: CDP names the target by it, and `window.frameElement` is not
+// reachable across the boundary, so the parent document is asked instead. Every same-origin
+// document in the tree is walked, which is exactly the set the top frame can read — a chain of
+// cross-origin frames nested inside each other is out of reach, and such a frame keeps a null
+// rect and is simply not aimed at.
+//
+// Refreshed on attach and before a press, not on every move: reading it costs a round trip into
+// the page, and a frame's box changes on scroll and resize, not between a down and the up that
+// follows it.
+const oopifRectRefreshAt = new WeakMap();
+
+// At most one refresh per 250ms per tab. A frame's box moves when the page scrolls or resizes,
+// neither of which happens between two motion reports.
+function scheduleOopifRectRefresh(tab) {
+  const now = Date.now();
+  if (now - (oopifRectRefreshAt.get(tab) || 0) < 250) return;
+  oopifRectRefreshAt.set(tab, now);
+  void refreshOopifRects(tab);
+}
+
+async function refreshOopifRects(tab) {
+  const sessions = oopifSessions(tab);
+  if (!sessions.size) return;
+  const contents = tab.webContents;
+  const send = (method, params, sessionId) =>
+    contents.debugger.sendCommand(method, params, sessionId || undefined);
+
+  // Where one frame's box sits, measured by the session that holds its `<iframe>`.
+  //
+  // Three steps because only the last one is viewport-relative: CDP names the owner by backend
+  // node id, that id has to become a JS object to be called on, and `getBoundingClientRect` is
+  // what the mouse router's coordinates are in. The walk up `frameElement` afterwards adds the
+  // same-origin frames in between — an add-on panel sits inside a plain `<iframe>` with no src,
+  // and a box measured in THAT document is off by wherever the panel is on screen.
+  async function ownBox(info) {
+    const owner = await send("DOM.getFrameOwner", { frameId: info.frameId }, info.parent);
+    const node = await send("DOM.resolveNode", { backendNodeId: owner.backendNodeId }, info.parent);
+    const measured = await send("Runtime.callFunctionOn", {
+      objectId: node.object.objectId,
+      returnByValue: true,
+      functionDeclaration: `function () {
+        const r = this.getBoundingClientRect();
+        let x = r.left, y = r.top;
+        let win = this.ownerDocument.defaultView;
+        while (win && win !== win.top && win.frameElement) {
+          const outer = win.frameElement.getBoundingClientRect();
+          x += outer.left; y += outer.top;
+          win = win.parent;
+        }
+        return JSON.stringify({ x, y, width: r.width, height: r.height, atTop: !!win && win === win.top });
+      }`,
+    }, info.parent);
+    const box = JSON.parse(String(measured?.result?.value || "null"));
+    if (!box) throw new Error("the owner element did not measure itself");
+    return box;
+  }
+
+  // The box is relative to whatever the walk above stopped at. If that was not the top frame it
+  // stopped at a process boundary, and the frame on the far side of it is the parent session —
+  // whose own rect is already in top-viewport coordinates. So the two add.
+  const placed = new Map();
+  async function place(sessionId) {
+    if (placed.has(sessionId)) return placed.get(sessionId);
+    const info = sessions.get(sessionId);
+    if (!info) return null;
+    placed.set(sessionId, null); // breaks a cycle, which a malformed tree could present
+    const box = await ownBox(info);
+    let rect = { x: box.x, y: box.y, width: box.width, height: box.height };
+    if (!box.atTop) {
+      const outer = info.parent ? await place(info.parent) : null;
+      if (!outer) throw new Error("the frame holding it has no box of its own yet");
+      rect = { ...rect, x: rect.x + outer.x, y: rect.y + outer.y };
+    }
+    placed.set(sessionId, rect);
+    return rect;
+  }
+
+  for (const [sessionId, info] of sessions) {
+    try {
+      const rect = await place(sessionId);
+      if (!rect) throw new Error("the frame could not be placed");
+      // `Target.attachedToTarget` fires before the frame has navigated, so the URL recorded
+      // then is usually empty — and that URL is what a hint click is matched on.
+      let url = info.url;
+      try {
+        const seen = await send("Runtime.evaluate", {
+          expression: "location.href", returnByValue: true,
+        }, sessionId);
+        if (seen?.result?.value) url = String(seen.result.value);
+      } catch (error) { void error; }
+      sessions.set(sessionId, { ...sessions.get(sessionId), url, rect });
+    } catch (error) {
+      // A frame that has not finished loading has no execution context yet, which is the
+      // ordinary case right after it attaches — the next refresh (every move, throttled) gets
+      // it. A frame that has gone keeps its old rect rather than being dropped: a stale box is
+      // likelier to be right than none.
+      if (debugLogging) console.error(`tweb: oopif rect failed: ${error.message}`);
+    }
+  }
+}
+
+function sendPointerEvent(tab, event) {
+  const contents = tab?.webContents;
+  if (!contents || contents.isDestroyed()) return;
+  const zoom = contents.getZoomFactor() || 1;
+  const params = mouseEventParams({
+    ...event,
+    x: Math.round(event.x / zoom),
+    y: Math.round(event.y / zoom),
+  });
+  // A type CDP has no equivalent for (`contextMenu`) goes the direct way rather than being
+  // turned into something the protocol rejects.
+  if (params && ensureDebugger(tab)) {
+    watchOopifSessions(tab);
+    // A frame's box moves with a scroll or a resize, so it is re-read as the pointer travels —
+    // but on the MOVE, not on the press. `sendPointerEvent` is synchronous (the terminal
+    // delivers motion reports faster than a round trip) and cannot await the read, so a refresh
+    // started at the press would still be in flight when the press is routed. Measured: the
+    // first click of a session went out against a null rect and reached nobody, the second
+    // landed. The move that precedes every real click is what makes the box current in time.
+    //
+    // Throttled: reading costs two CDP round trips per frame, and a box does not move between
+    // consecutive motion reports.
+    if (params.type === "mouseMoved") scheduleOopifRectRefresh(tab);
+    // The root session still gets every event: a point over no subframe has to reach the main
+    // frame exactly as it did before, and that is most points.
+    //
+    // Fire and forget. A pointer event is worth no round trip — the next one is already on its
+    // way, and awaiting each would serialise a drag against the terminal's input rate.
+    contents.debugger.sendCommand("Input.dispatchMouseEvent", params)
+      .catch((error) => {
+        if (debugLogging) console.error(`tweb: cdp mouse failed: ${error.message}`);
+        sendPointerEventDirect(contents, event);
+      });
+    // And each out-of-process frame under the point gets it in ITS OWN coordinates. The root
+    // session does not forward across the boundary — measured: the parent saw the click with
+    // `target` = the `<iframe>`, the child saw nothing at all.
+    for (const hit of sessionsUnderPoint(oopifSessions(tab), { x: params.x, y: params.y })) {
+      contents.debugger.sendCommand(
+        "Input.dispatchMouseEvent",
+        { ...params, x: hit.x, y: hit.y },
+        hit.sessionId,
+      ).then(() => {
+        // A dispatched click does not move focus. Measured: the event reached the child frame
+        // (`sessions=1 hits=1`) and the child still reported `activeElement: body,
+        // hasFocus: false`, so the NEXT `f` ran in the top frame and found nothing of the
+        // embedded app — getting in was the whole point of hinting the frame.
+        //
+        // `setFocusEmulationEnabled` alone does not do it either (measured, same result): it
+        // stops Chromium treating the frame as backgrounded but does not make it the focused
+        // one. The frame has to take focus itself, which it can — `window.focus()` inside it
+        // is same-origin to itself.
+        if (params.type !== "mouseReleased") return;
+        return contents.debugger.sendCommand(
+          "Emulation.setFocusEmulationEnabled", { enabled: true }, hit.sessionId,
+        ).then(() => contents.debugger.sendCommand("Runtime.evaluate", {
+          // The frame takes focus itself. `setFocusEmulationEnabled` alone was measured to leave
+          // it at `hasFocus: false`; this is what makes `webContents.focusedFrame` start naming
+          // it, and that is what routes the next key here.
+          expression: "window.focus()",
+        }, hit.sessionId)).catch((error) => {
+          if (debugLogging) console.error(`tweb: oopif focus failed: ${error.message}`);
+        });
+      }).catch((error) => {
+        if (debugLogging) console.error(`tweb: oopif mouse failed: ${error.message}`);
+      });
+    }
+    return;
+  }
+  sendPointerEventDirect(contents, event);
+}
+
+// The pre-CDP path, kept whole: correct for everything that is not an out-of-process frame.
+function sendPointerEventDirect(contents, event) {
+  const base = { type: event.type, x: event.x, y: event.y, modifiers: event.modifiers || [] };
+  if (event.type === "mouseWheel") {
+    contents.sendInputEvent({ ...base, ...event.wheel });
+    return;
+  }
+  contents.sendInputEvent({
+    ...base,
+    button: event.button,
+    clickCount: event.clickCount || 0,
+    // `MouseEvent.buttons` on the page comes from the modifiers, not from `button`.
+    modifiers: event.held && event.button
+      ? withButtonDown(base.modifiers, event.button)
+      : base.modifiers,
+  });
 }
 
 function isDownloadableUrl(value) {
@@ -4846,24 +5186,43 @@ function configureDownloads() {
 // exist in a terminal and cannot be made to.
 const fileChooserByTab = new WeakMap();
 
-function attachChooserDebugger(tab) {
+// One debugger per webContents, shared by every feature that needs CDP.
+//
+// `debugger.attach` throws if it is already attached, and two features asking independently is
+// exactly the case — so attaching is a single function that answers "is it mine to use".
+function ensureDebugger(tab) {
   const contents = tab.webContents;
   if (contents.debugger.isAttached()) return true;
   try {
     contents.debugger.attach("1.3");
+    return true;
   } catch (error) {
-    // Something else owns the debugger (devtools, an extension host). The chooser cannot
-    // be intercepted then, and saying so beats a prompt that would never deliver.
-    if (debugLogging) console.error(`tweb: chooser debugger attach failed: ${error.message}`);
+    // Something else owns it (devtools, an extension host). Every caller has a fallback.
+    if (debugLogging) console.error(`tweb: debugger attach failed: ${error.message}`);
     return false;
   }
+}
+
+// Tabs whose chooser interception is already wired. Not `debugger.isAttached()`, which used to
+// serve as this flag: the mouse router attaches the same debugger now, so "attached" no longer
+// implies "the chooser listeners are registered".
+const chooserWiredTabs = new WeakSet();
+
+function attachChooserDebugger(tab) {
+  const contents = tab.webContents;
+  if (chooserWiredTabs.has(tab)) return true;
+  if (!ensureDebugger(tab)) return false;
+  chooserWiredTabs.add(tab);
   // Bound like configureTab's handlers and for the same reason: the chooser prompt is drawn into
   // the pane, so it has to be drawn into THIS tab's pane.
   contents.debugger.on("message", bindPane(() => tabPanes.get(tab), (_event, method, params) => {
     if (method !== "Page.fileChooserOpened") return;
     openFileChooser(tab, params);
   }));
-  contents.debugger.on("detach", () => fileChooserByTab.delete(tab));
+  contents.debugger.on("detach", () => {
+    fileChooserByTab.delete(tab);
+    chooserWiredTabs.delete(tab);
+  });
   void contents.debugger.sendCommand("Page.enable")
     .then(() => contents.debugger.sendCommand("Page.setInterceptFileChooserDialog", { enabled: true }))
     .catch((error) => {
@@ -5304,38 +5663,38 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
     if (floatingTabs.has(tab)) relayFrameToDisplay(tab, image);
   });
 
-  // `window.open` has to come back with a live handle, not null.
+  // `window.open` opens a tab, and the opener gets null back.
   //
-  // This used to deny the request and open a separate tab instead, which kept Electron from
-  // ever surfacing the macOS OffScreenView placeholder as a native popup. It also made
-  // `window.open()` return null to the opener — and an OAuth "sign in in a new window" flow is
-  // exactly the case that cannot survive that: the opener opens a blank popup, then drives it
-  // by assigning to `popup.location` and waits for a `postMessage` back through the handle.
-  // With null it does none of that, and the user sees a click that opened an empty tab and
-  // then nothing. Measured in-page on a live Google Meet add-on: `window.open(...)` returned
-  // null and the sign-in never started.
+  // Denying the request is what keeps Electron from surfacing the macOS OffScreenView
+  // placeholder as a native popup, and the URL still opens — as a tab, which is the only kind of
+  // window this browser has.
   //
-  // So the window is allowed, and created with THIS pane's own offscreen options — the same
-  // hidden, offscreen, opacity-0 window every tab gets. That is what the placeholder popup
-  // needed all along; denying it was treating the symptom. `did-create-window` then adopts it
-  // as an ordinary tab, so it lives in the tab strip exactly as the denied path's tab did.
+  // WHAT THIS COSTS, and why it is paid anyway. The opener gets null, so a flow that opens a
+  // blank popup and then drives it — `popup.location = ...`, `postMessage` back through the
+  // handle, which is how an OAuth "sign in in a new window" works — does not start at all.
+  //
+  // Allowing the window instead was tried, and it is worse. Measured on a live Google Meet
+  // add-on's sign-in: the adopted tab came up with `innerWidth: 0, innerHeight: 0` and
+  // `screen: 0x0` — no display attached — so it painted nothing, and because it was the ACTIVE
+  // tab the whole pane froze on its last frame. The page answered `eval` perfectly well while
+  // the pane looked hung, `f` found nothing to hint, and only closing the tab recovered it.
+  // `setContentSize` did not fix it (the window was already the right size), nor did the page's
+  // own `resizeTo`. A minimal repro could not reproduce it — an allowed popup to a real URL,
+  // opened from a cross-origin iframe, came up correctly at the pane's size — so the condition
+  // that produces a display-less window is not yet known.
+  //
+  // A broken sign-in is a feature that does not work. A frozen pane is a browser that does not
+  // work, and it takes every other tab with it.
   setWindowOpenHandler((details) => {
+    const target = details.url || "about:blank";
     // Middle-click and window.open share this path, and Chrome treats them differently:
     // window.open takes you to the new tab, middle-click deliberately does not. The whole
     // point of the gesture is to queue several links off a results page while staying
     // where you are — force-activating the first one lands the rest on the wrong document,
     // which makes the gesture worse than an ordinary click rather than better.
-    pendingWindowOpen = { activate: details.disposition !== "background-tab" };
-    return { action: "allow", overrideBrowserWindowOptions: browserWindowOptions() };
-  });
-
-  // The window Electron just created for `window.open`. It is already loading the target URL,
-  // so it is adopted rather than created — `createTab` would build a second window and load it
-  // again, and the opener's handle points at this one.
-  onContents("did-create-window", (child, details) => {
-    const activate = pendingWindowOpen?.activate ?? true;
-    pendingWindowOpen = null;
-    adoptTab(child, details.url || "about:blank", activate);
+    const activate = details.disposition !== "background-tab";
+    setImmediate(() => createTab(target, activate));
+    return { action: "deny" };
   });
 
   onContents("did-start-navigation", (details) => {
@@ -5384,6 +5743,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   onContents("dom-ready", () => {
     if (loadingTimersByTab.has(tab)) scheduleLoadingProgress(tab, 0.7);
     else sendLoadingProgress(tab, 0.7);
+    // Attach to out-of-process frames as soon as the document can have one, rather than when the
+    // first click arrives. Waiting for the click meant that click went out before any session
+    // existed and reached nobody — measured: the second click landed, the first never did.
+    if (ensureDebugger(tab)) watchOopifSessions(tab);
   });
   // Gone on the way out, whether the load worked or not. `did-stop-loading` covers the
   // ordinary end, a stop, and a failure alike — a bar left behind by an error page would be
@@ -5806,19 +6169,26 @@ function dispatchMouse(cb, rawX, rawY, release) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
-    contents.sendInputEvent({
+    const deltaX = buttonCode === 2 ? -100 : buttonCode === 3 ? 100 : 0;
+    const deltaY = direction * 100;
+    sendPointerEvent(currentWindows().win, {
       type: "mouseWheel",
       x,
       y,
-      deltaX: buttonCode === 2 ? -100 : buttonCode === 3 ? 100 : 0,
-      deltaY: direction * 100,
-      wheelTicksX: buttonCode === 2 ? -1 : buttonCode === 3 ? 1 : 0,
-      wheelTicksY: direction,
-      accelerationRatioX: 0.5,
-      accelerationRatioY: 0.5,
-      hasPreciseScrollingDeltas: false,
-      canScroll: true,
+      deltaX,
+      deltaY,
       modifiers,
+      // What the direct path needs on top; CDP takes the deltas alone.
+      wheel: {
+        deltaX,
+        deltaY,
+        wheelTicksX: buttonCode === 2 ? -1 : buttonCode === 3 ? 1 : 0,
+        wheelTicksY: direction,
+        accelerationRatioX: 0.5,
+        accelerationRatioY: 0.5,
+        hasPreciseScrollingDeltas: false,
+        canScroll: true,
+      },
     });
     return;
   }
@@ -5834,20 +6204,20 @@ function dispatchMouse(cb, rawX, rawY, release) {
   } else {
     clicks.move(button, x, y);
   }
-  contents.sendInputEvent({
+  sendPointerEvent(currentWindows().win, {
     type,
     x,
     y,
     button,
-    // A page reads a drag off `event.buttons`, and Chromium fills that in from the
-    // modifiers rather than from the button field — with none set, every move during a
-    // drag arrived as `buttons: 0`, which reads as "the pointer is just travelling". So a
-    // drag on any site that implements its own (a canvas, a slider, a whiteboard, a
-    // selection) did nothing at all. The terminal encodes the held button in the motion
-    // report itself, so it needs no state of our own to recover.
+    modifiers,
+    // A page tells a drag from a travelling pointer by `event.buttons`, which is filled in from
+    // the held-button state rather than from the event's `button` field. With none set, every
+    // move during a drag arrived as `buttons: 0` and any site implementing its own drag — a
+    // canvas, a slider, a whiteboard, a text selection — saw nothing at all. The terminal
+    // encodes the held button in the motion report itself, so no state of ours is needed.
     //
-    // Not on mouseUp: `buttons` there must already exclude the button being released.
-    modifiers: type === "mouseUp" ? modifiers : withButtonDown(modifiers, button),
+    // Not on mouseUp: by then that button is no longer down.
+    held: type !== "mouseUp",
     clickCount,
   });
   // Some offscreen Chromium paths do not raise contextmenu from a right mouseUp alone.
@@ -6129,7 +6499,19 @@ ipcMain.on("tweb-float-input", (event, kind, data) => {
     // rate for as long as the mouse was anywhere over it.
     if (kind !== "move") markInteractionActivity();
     for (const input of relayInputEvents(kind, scaleRelayInput(tab, kind, data))) {
-      tab.webContents.sendInputEvent(input);
+      // A pointer event goes by the route that reaches an out-of-process frame; a key event
+      // has no such problem and keeps the direct path. The viewer is a real window over the
+      // same page, so a click through it has to land where a click through the pane does.
+      if (input.type === "mouseMove" || input.type === "mouseDown" || input.type === "mouseUp") {
+        sendPointerEvent(tab, {
+          ...input,
+          held: input.type === "mouseDown" || (input.type === "mouseMove" && Boolean(input.button)),
+        });
+      } else if (input.type === "mouseWheel") {
+        sendPointerEvent(tab, { ...input, wheel: input });
+      } else {
+        tab.webContents.sendInputEvent(input);
+      }
     }
   });
 });
@@ -7032,8 +7414,49 @@ app.on("browser-window-created", (_event, window) => {
     if (!isDisplayWindow(window)) keepWindowHidden(window);
   });
 
+// Clear the regenerable half of the profile when it has grown past what any amount of ordinary
+// use explains. See profile-hygiene.cjs for the hang this exists to prevent; the short version is
+// that a 1.9GB profile came up, failed to open its quota database, and stopped without painting.
+//
+// Runs before any window exists, because Chromium opens these directories when one does.
+function sweepOversizedCaches() {
+  const userData = app.getPath("userData");
+  const sizes = {};
+  for (const name of DISPOSABLE_CACHES) {
+    try { sizes[name] = directorySize(path.join(userData, name)); } catch (error) { void error; }
+  }
+  const { clear, total } = cachesToClear(sizes);
+  if (!clear.length) return;
+  for (const target of cachePaths(userData, clear)) {
+    try { rmSync(target, { recursive: true, force: true }); } catch (error) {
+      // A cache we cannot remove is not worth failing startup over; the next run tries again.
+      if (debugLogging) console.error(`tweb: cache sweep failed for ${target}: ${error.message}`);
+    }
+  }
+  console.error(`tweb: cleared ${clear.length} oversized caches (${Math.round(total / 1e6)}MB);`
+    + " cookies and local storage kept");
+}
+
+// Recursive, and deliberately not `du`: this runs before the first window and a subprocess here
+// would add startup latency to every pane for a check that is almost always a no-op.
+function directorySize(directory) {
+  let total = 0;
+  let entries;
+  try { entries = readdirSync(directory, { withFileTypes: true }); } catch (error) { return 0; }
+  for (const entry of entries) {
+    const full = path.join(directory, entry.name);
+    try {
+      if (entry.isDirectory()) total += directorySize(full);
+      else if (entry.isFile()) total += statSync(full).size;
+    } catch (error) { void error; }
+  }
+  return total;
+}
+
 app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock?.hide();
+  // Before any window exists, because this deletes directories Chromium opens when one does.
+  sweepOversizedCaches();
   // A supervisor started this process to host panes and this build cannot. Say so and stop, rather
   // than doing what a per-pane engine would do next.
   //
