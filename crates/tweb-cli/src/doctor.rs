@@ -116,6 +116,63 @@ const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[
     ("super+shift+down", 5031, 131),
 ];
 
+/// The pre-Cmd private shortcuts GHOSTTY_MANAGED_BASE emits, as (private code,
+/// tmux user-keys slot, the key a non-tweb pane should get instead).
+///
+/// Ghostty sends these bytes from every pane, not just tweb's, so tmux must
+/// recognise them everywhere: an unregistered `ESC[5008~` has its ESC folded
+/// into `ESC[91;3u` (Alt-`[`) and the shell or Claude Code prints the trailing
+/// `5008~` as text. tweb unfolds that on its side, which is why the garbage only
+/// ever showed up outside it.
+///
+/// Registering the sequence alone would swap the garbage for a raw private code,
+/// so the root binding branches on the `@tweb_browser` pane marker: a tweb pane
+/// gets the private code, any other pane the real key — re-encoded by tmux for
+/// whatever keyboard mode that pane asked for, so Shift-Enter reaches Claude
+/// Code as Shift-Enter. A `None` fallback keeps the code everywhere; that is
+/// Ctrl-;, whose key name needs escaping tmux would parse twice inside if-shell
+/// and which the engine also binds directly as `C-\;`.
+///
+/// The slots match the ones the engine claims at runtime
+/// (configureTmuxRootBindings in main.cjs); this makes them survive a tmux
+/// server that has not run tweb yet. Slot 112 (Ctrl-: → detach-client) is the
+/// engine's alone and deliberately absent.
+const PRIVATE_SHORTCUT_KEYS: &[(u16, u16, Option<&str>)] = &[
+    (5001, 110, None),
+    (5009, 111, Some("C-,")),
+    (5002, 113, Some("C-=")),
+    (5003, 114, Some("C--")),
+    (5004, 115, Some("C-0")),
+    (5007, 116, Some("C-+")),
+    (5014, 117, Some("C-/")),
+    (5008, 118, Some("S-Enter")),
+];
+
+/// Format tested by the root binding: is the pane the key goes to a tweb browser.
+const TWEB_PANE_FORMAT: &str = "#{==:#{@tweb_browser},1}";
+
+fn private_shortcut_tmux_config() -> String {
+    let mut config = String::new();
+    for (code, slot, _) in PRIVATE_SHORTCUT_KEYS {
+        config.push_str(&format!(
+            "set-option -s user-keys[{slot}] \"\\e[{code}~\"\n"
+        ));
+    }
+    for (code, slot, fallback) in PRIVATE_SHORTCUT_KEYS {
+        let hex = private_sequence_hex(*code);
+        match fallback {
+            Some(key) => config.push_str(&format!(
+                "bind-key -T root User{slot} if-shell -F '{TWEB_PANE_FORMAT}' 'send-keys -H {hex}' 'send-keys {key}'\n"
+            )),
+            None => config.push_str(&format!("bind-key -T root User{slot} send-keys -H {hex}\n")),
+        }
+        config.push_str(&format!(
+            "bind-key -T tweb-pass User{slot} send-keys -H {hex} \\; switch-client -T tweb-pass\n"
+        ));
+    }
+    config
+}
+
 fn cmd_passthrough_ghostty_bindings() -> String {
     // Root only. No tweb table binding — the table is gone (see GHOSTTY_MANAGED_BASE),
     // and a table-scoped binding would be unreachable without it.
@@ -162,7 +219,8 @@ fn ghostty_managed_config() -> String {
 
 fn tmux_managed_config() -> String {
     format!(
-        "{TMUX_MANAGED_BASE}\n# Teach tmux the private sequences Ghostty emits for Cmd keys.\n{}",
+        "{TMUX_MANAGED_BASE}\n# Teach tmux the private sequences Ghostty emits for its shortcuts.\n{}\n# Teach tmux the private sequences Ghostty emits for Cmd keys.\n{}",
+        private_shortcut_tmux_config(),
         cmd_passthrough_tmux_config()
     )
 }
@@ -573,35 +631,37 @@ fn check_kitty_graphics_probe() -> Check {
     }
 }
 
-/// Whether the tmux `user-keys` slots tweb's Cmd caret motions need are registered.
+/// Whether the tmux `user-keys` slots tweb's private sequences need are registered.
 ///
-/// Those motions (#64) bind tmux user-keys 100-101 and 124-131. A missing slot means
-/// Cmd-Left and friends are swallowed by tmux rather than reaching the engine,
-/// and the failure is silent — the key just does nothing. This names the slots
-/// so a "not configured" tells the user what to fix.
+/// The Cmd caret motions (#64) bind tmux user-keys 100-101 and 124-131, and the
+/// older shortcuts 110-118. A missing slot means the key is either swallowed by
+/// tmux before reaching the engine, or — for a shortcut Ghostty sends from every
+/// pane, like Shift-Enter — leaks into other panes as literal `5008~`. This names
+/// the slots so a "not configured" tells the user what to fix.
 fn check_tmux_user_keys() -> Check {
-    let slots = [100, 101, 124, 125, 126, 127, 128, 129, 130, 131];
+    let slots = [
+        100, 101, 110, 111, 113, 114, 115, 116, 117, 118, 124, 125, 126, 127, 128, 129, 130,
+        131,
+    ];
     let mut missing = Vec::new();
     for slot in slots {
         let value = command_output(
             "tmux",
             &["show-options", "-s", &format!("user-keys[{slot}]")],
         );
-        // An unset tmux option prints the name with an empty value. A set one prints
-        // `name "value"`, so the presence of a quote means it is configured.
-        if value.as_deref().map(|v| !v.contains('"')).unwrap_or(true) {
+        if !user_key_is_set(value.as_deref(), slot) {
             missing.push(slot);
         }
     }
     if missing.is_empty() {
         return Check {
-            name: "tmux user-keys (Cmd caret motions)",
+            name: "tmux user-keys (private shortcuts)",
             status: CheckStatus::Ok,
-            detail: "slots 100-101, 124-131 registered".to_string(),
+            detail: "slots 100-101, 110-111, 113-118, 124-131 registered".to_string(),
         };
     }
     Check {
-        name: "tmux user-keys (Cmd caret motions)",
+        name: "tmux user-keys (private shortcuts)",
         status: CheckStatus::Warn,
         detail: format!(
             "slots {} not configured; run `tweb doctor --fix` to install them",
@@ -612,6 +672,26 @@ fn check_tmux_user_keys() -> Check {
                 .join(", ")
         ),
     }
+}
+
+/// Whether `show-options -s user-keys[N]` output carries a value.
+///
+/// tmux quotes a value only when it needs to, and an escape sequence does not:
+/// a registered slot prints as `user-keys[118] \033[5008~`. Testing for a quote
+/// reported every slot missing on a server where all of them were set.
+fn user_key_is_set(output: Option<&str>, slot: u16) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    let name = format!("user-keys[{slot}]");
+    output
+        .trim()
+        .strip_prefix(&name)
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "\"\"" && value != "''"
+        })
+        .unwrap_or(false)
 }
 
 /// Whether tweb is running inside tmux.
@@ -715,6 +795,36 @@ fn apply_tmux_fix() -> Result<String> {
     }
     // The config file only takes effect on a fresh server, and the Cmd keys are
     // useless until tmux knows them, so apply them to the running one as well.
+    for (code, slot, fallback) in PRIVATE_SHORTCUT_KEYS {
+        // Real ESC byte for the same reason as the Cmd loop below.
+        let sequence = format!("\u{1b}[{code}~");
+        live &= run_tmux(&["set-option", "-s", &format!("user-keys[{slot}]"), &sequence]);
+        let hex = private_sequence_hex(*code);
+        let user_key = format!("User{slot}");
+        let send_private = format!("send-keys -H {hex}");
+        live &= match fallback {
+            Some(key) => run_tmux(&[
+                "bind-key",
+                "-T",
+                "root",
+                &user_key,
+                "if-shell",
+                "-F",
+                TWEB_PANE_FORMAT,
+                &send_private,
+                &format!("send-keys {key}"),
+            ]),
+            None => {
+                let mut root = vec!["bind-key", "-T", "root", &user_key, "send-keys", "-H"];
+                root.extend(hex.split(' '));
+                run_tmux(&root)
+            }
+        };
+        let mut pass = vec!["bind-key", "-T", "tweb-pass", &user_key, "send-keys", "-H"];
+        pass.extend(hex.split(' '));
+        pass.extend(["\\;", "switch-client", "-T", "tweb-pass"]);
+        live &= run_tmux(&pass);
+    }
     for (_, code, slot) in CMD_PASSTHROUGH_KEYS {
         // A real ESC byte, not the "\033" spelling: tmux expands that escape
         // when parsing a config file but stores a CLI argument verbatim, so the
@@ -1185,7 +1295,7 @@ mod tests {
         ghostty_version_supported, managed_block, migrate_legacy_ghostty_config,
         migrate_legacy_tmux_config, private_sequence_hex, select_ghostty_config_candidate,
         terminal_check, tmux_include_block, tmux_managed_config, upsert_managed_block, CheckStatus,
-        CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END,
+        user_key_is_set, CMD_PASSTHROUGH_KEYS, PRIVATE_SHORTCUT_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END,
         TMUX_BEGIN, TMUX_END,
     };
 
@@ -1232,7 +1342,59 @@ mod tests {
         }
     }
 
-    /// Mirrors the `50(?:0[1-9]|1[0-2]|[2-9][0-9])` alternation in main.cjs.
+    #[test]
+    fn user_key_check_reads_unquoted_tmux_output() {
+        // Verbatim from tmux 3.5a.
+        assert!(user_key_is_set(Some("user-keys[118] \\033[5008~\n"), 118));
+        assert!(user_key_is_set(Some("user-keys[118] \"\\033[5008~\"\n"), 118));
+        assert!(!user_key_is_set(Some("user-keys[118]\n"), 118));
+        assert!(!user_key_is_set(Some("user-keys[118] \"\"\n"), 118));
+        assert!(!user_key_is_set(None, 118));
+    }
+
+    #[test]
+    fn every_private_shortcut_is_registered_with_tmux_and_the_engine() {
+        // Ghostty emits these from every pane, so an unregistered one leaks as
+        // literal `5008~` into the shell or Claude Code next to tweb.
+        let ghostty = ghostty_managed_config();
+        let tmux = tmux_managed_config();
+        let engine = include_str!("../../../electron/main.cjs");
+        for (code, slot, fallback) in PRIVATE_SHORTCUT_KEYS {
+            assert!(
+                ghostty.contains(&format!("=text:\\x1b[{code}~")),
+                "{code} is not emitted by Ghostty, so it needs no slot"
+            );
+            assert!(
+                tmux.contains(&format!("user-keys[{slot}] \"\\e[{code}~\"")),
+                "{code} missing its tmux user-key"
+            );
+            assert!(
+                tmux.contains(&format!("bind-key -T tweb-pass User{slot} send-keys -H")),
+                "{code} missing its passthrough binding"
+            );
+            if let Some(key) = fallback {
+                assert!(
+                    tmux.contains(&format!("'send-keys {key}'")),
+                    "{code} sends its private code to non-tweb panes"
+                );
+            }
+            // The engine claims the same slot at runtime; disagreeing would
+            // leave whichever ran last owning a different sequence.
+            assert!(
+                engine.contains(&format!("user-keys[{slot}]\", \"\\x1b[{code}~\""))
+                    || engine.contains(&format!("[{slot}, \"User{slot}\", {code}]")),
+                "engine registers a different sequence in slot {slot}"
+            );
+            assert!(engine_parses_private_code(*code));
+        }
+        let slots: std::collections::HashSet<_> =
+            PRIVATE_SHORTCUT_KEYS.iter().map(|(_, slot, _)| slot).collect();
+        for (_, _, slot) in CMD_PASSTHROUGH_KEYS {
+            assert!(!slots.contains(slot), "slot {slot} claimed twice");
+        }
+    }
+
+    /// Mirrors the `50(?:0[1-9]|1[0-9]|[2-9][0-9])` alternation in main.cjs.
     fn engine_parses_private_code(code: u16) -> bool {
         let text = code.to_string();
         let Some(tail) = text.strip_prefix("50") else {
@@ -1244,7 +1406,7 @@ mod tests {
         };
         match first {
             '0' => ('1'..='9').contains(&second),
-            '1' => ('0'..='2').contains(&second),
+            '1' => second.is_ascii_digit(),
             '2'..='9' => second.is_ascii_digit(),
             _ => false,
         }
