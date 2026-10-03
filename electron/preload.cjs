@@ -1491,7 +1491,7 @@ installPrintShim();
       "h1", "h2", "h3", "h4", "h5", "h6", "figcaption", "article", "[role=article]", "[role=img]",
       "input:not([type=hidden])", "textarea", "[contenteditable=true]",
     ].join(",");
-    return uniqueVisibleTargets(collectRoots().flatMap((root) => [...root.querySelectorAll(selector)]), (element) => {
+    const blocks = uniqueVisibleTargets(collectRoots().flatMap((root) => [...root.querySelectorAll(selector)]), (element) => {
       const link = element.closest("a[href]");
       const image = element.matches("img,picture,canvas,svg,video,[role=img]")
         ? element.querySelector?.("img,canvas,svg,video") || element
@@ -1503,12 +1503,21 @@ installPrintShim();
         imageURL: imageSource(image),
       };
     }).filter((item) => item.kind !== "text" || item.element.innerText?.trim());
+    // Inner scroll and drag-pan areas share this picker: like every other `v` target, picking
+    // one points the next keys at it rather than clicking it — `j`/`k` scroll that area until
+    // `Esc` hands them back to the page. The page entry `scrollableTargets` adds is left out
+    // for that reason. Merged by position so the content labels keep their usual order.
+    const areas = scrollableTargets()
+      .filter((item) => !item.page)
+      .map((item) => ({ ...item, kind: "scroll" }));
+    return [...blocks, ...areas]
+      .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
   // Comment panels, sidebars and chat logs scroll independently of the page and
   // only react to a wheel while the pointer is over them, so `j`/`k` on the
   // document does nothing. Large canvas/SVG apps often pan only by mouse drag;
-  // expose both kinds through the same `s` picker.
+  // expose both kinds through the `v` picker.
   function scrollableTargets() {
     const roots = collectRoots();
     const scrollable = roots
@@ -1657,15 +1666,13 @@ installPrintShim();
     return scrollSurface()?.scrollHeight ?? document.documentElement.scrollHeight;
   }
 
-  function startScrollPicker() {
-    startPicker(scrollableTargets(), "scroll", (item) => {
-      // The page entry means "no inner surface", which is what null already is.
-      scrollTarget = item.page || item.pan ? null : item.element;
-      panTarget = item.pan ? item.element : null;
-      // Some panels also gate their wheel handling on hover, so move the pointer.
-      send("native-hover", hintClickPoint(item));
-      normalMode();
-    });
+  // Point the scroll keys at an inner area picked from `v`.
+  function holdScrollArea(item) {
+    scrollTarget = item.pan ? null : item.element;
+    panTarget = item.pan ? item.element : null;
+    // Some panels also gate their wheel handling on hover, so move the pointer.
+    send("native-hover", hintClickPoint(item));
+    normalMode();
   }
 
   function inspectTargets() {
@@ -1789,8 +1796,7 @@ installPrintShim();
   // stay up long enough to be read.
   const emptyPickerReason = {
     hint: "no clickable target",
-    visual: "no text·link·image",
-    scroll: "no inner scroll area",
+    visual: "no text·link·image·scroll area",
     inspect: "no target",
     command: "no command to run",
   };
@@ -1821,12 +1827,18 @@ installPrintShim();
     const shadow = host.attachShadow({ mode: "open" });
     const items = targets.map((target, index) => {
       const badge = document.createElement("span");
-      const badgeLeft = target.mediaControl ? target.nativePoint.x - 10 : target.rect.left;
+      // A scroll area is a big panel whose top-left corner is where its first paragraph's badge
+      // sits, so its own badge goes to the top-right, and in teal: the colour says "this picks
+      // an area to scroll", not "this picks content".
+      const area = target.kind === "scroll";
+      const badgeLeft = target.mediaControl ? target.nativePoint.x - 10
+        : area ? target.rect.left + target.rect.width - 8 * labels[index].length - 14 : target.rect.left;
       const badgeTop = target.mediaControl ? target.nativePoint.y - 39 : target.rect.top;
       badge.textContent = labels[index];
       badge.style.cssText = [
         "position:fixed", `left:${Math.max(0, badgeLeft)}px`, `top:${Math.max(0, badgeTop)}px`,
-        "padding:1px 4px", "border:1px solid #9b6b00", "border-radius:3px", "background:#ffd75f",
+        "padding:1px 4px", `border:1px solid ${area ? "#00796b" : "#9b6b00"}`, "border-radius:3px",
+        `background:${area ? "#64ffda" : "#ffd75f"}`,
         "color:#161616", "box-shadow:0 1px 4px #0008", "font:700 12px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace",
       ].join(";");
       shadow.append(badge);
@@ -2774,7 +2786,6 @@ installPrintShim();
       ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
       ["r · gi", "reload · focus first input", { r: () => send("reload") }],
       ["y", "copy the page URL", { y: () => { send("copy-url"); flash("URL"); } }],
-      ["s", "pick a scroll/drag-pan area (Esc or s returns to page)", { s: () => startScrollPicker() }],
     ]],
     ["Search and selection", [
       ["/ · n · N", "search · next · previous match", {
@@ -2782,7 +2793,7 @@ installPrintShim();
         n: () => { if (!lastSearch) return false; stepSearch(true); },
         N: () => { if (!lastSearch) return false; stepSearch(false); },
       }],
-      ["v · V", "visual picker · select whole page", { v: () => startVisual(), V: () => selectPageText() }],
+      ["v · V", "visual picker — teal labels pick an area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisual(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
@@ -4240,6 +4251,10 @@ installPrintShim();
   }
 
   function enterVisual(item) {
+    if (item.kind === "scroll") {
+      holdScrollArea(item);
+      return;
+    }
     const outline = makeOutline(item.rect, "#fdd663");
     let selectionMade = false;
     if (item.kind === "text") {
