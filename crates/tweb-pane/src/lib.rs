@@ -33,6 +33,9 @@ use tokio::process::Command;
 pub enum BrowserEngine {
     #[default]
     Electron,
+    /// Pages in the user's Google Chrome over CDP, hosted by the Electron engine
+    /// (`TWEB_BROWSER=chrome`, see electron/cdp/backend.cjs).
+    Chrome,
     Tauri,
 }
 
@@ -477,7 +480,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     }
 
     let (mut command, engine_description) = match options.engine {
-        BrowserEngine::Electron => {
+        BrowserEngine::Electron | BrowserEngine::Chrome => {
             let (electron_path, electron_dir) = find_electron()?;
             tracing::debug!(path = %electron_path.display(), dir = %electron_dir.display(),
                 "resolved electron engine");
@@ -499,6 +502,9 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 })
                 .arg(url)
                 .current_dir(electron_dir);
+            if options.engine == BrowserEngine::Chrome {
+                command.env("TWEB_BROWSER", "chrome");
+            }
             (command, description)
         }
         BrowserEngine::Tauri => {
@@ -786,6 +792,11 @@ enum HostedOutcome {
 async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
     let socket = twebd::paths::socket_path_in(&twebd::paths::runtime_dir());
     let flag = std::env::var(attach::DAEMON_FLAG).ok();
+    // A Chrome pane drives a browser that is already shared across panes; the supervisor hosts
+    // Electron pages only, so it is not consulted.
+    if options.engine == BrowserEngine::Chrome {
+        return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
+    }
     // Decided BEFORE the daemon is started or consulted: a pane that opted out, or one asking for
     // something a host cannot do, must cost nothing — no binary lookup, no process spawn, no wait.
     if let Err(reason) = attach::initial_route(flag.as_deref()) {

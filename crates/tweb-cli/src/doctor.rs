@@ -287,6 +287,7 @@ pub async fn run(fix: bool) -> Result<()> {
         check_kitty_graphics_probe(),
         check_tmux_user_keys(),
         check_tmux_environment(),
+        check_chrome_engine(),
     ];
 
     // Output.
@@ -330,6 +331,82 @@ fn needs_fix(check: &Check) -> bool {
         check.name,
         "tmux allow-passthrough" | "tmux extended keys" | "tmux mouse" | "Ghostty Cmd passthrough"
     ) && !matches!(check.status, CheckStatus::Ok)
+}
+
+/// Chrome candidates `--engine chrome` looks for, in the same order as electron/cdp/connection.cjs.
+const CHROME_CANDIDATES: &[&str] = &[
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+];
+
+/// `--engine chrome` drives the user's own Chrome over the DevTools protocol, which a managed
+/// Chrome can forbid by policy. Optional, so never a FAIL: the Electron engine works regardless.
+fn check_chrome_engine() -> Check {
+    let binary = std::env::var("TWEB_CHROME").ok().or_else(|| {
+        CHROME_CANDIDATES
+            .iter()
+            .find(|candidate| std::path::Path::new(candidate).exists())
+            .map(|candidate| candidate.to_string())
+    });
+    let policy = std::process::Command::new("defaults")
+        .args(["read", "/Library/Managed Preferences/com.google.Chrome"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    chrome_engine_check(binary.as_deref(), policy.as_deref())
+}
+
+/// The verdict for `check_chrome_engine`, from what was found. `policy` is `defaults read` output
+/// of Chrome's managed preferences, `None` when Chrome is not managed.
+fn chrome_engine_check(binary: Option<&str>, policy: Option<&str>) -> Check {
+    let name = "Chrome engine (--engine chrome)";
+    let Some(binary) = binary else {
+        return Check {
+            name,
+            status: CheckStatus::Warn,
+            detail: "Google Chrome not found; set TWEB_CHROME to use --engine chrome".to_string(),
+        };
+    };
+    if let Some(policy) = policy {
+        // `RemoteDebuggingAllowed = 0` blocks the DevTools port outright; developer tools disabled
+        // (`DeveloperToolsAvailability = 2`) blocks it as well.
+        let setting = |key: &str| {
+            policy.lines().find_map(|line| {
+                let (left, right) = line.split_once('=')?;
+                (left.trim() == key).then(|| right.trim().trim_end_matches(';').trim().to_string())
+            })
+        };
+        if setting("RemoteDebuggingAllowed").as_deref() == Some("0") {
+            return Check {
+                name,
+                status: CheckStatus::Warn,
+                detail: "managed policy RemoteDebuggingAllowed=false blocks it".to_string(),
+            };
+        }
+        if setting("DeveloperToolsAvailability").as_deref() == Some("2") {
+            return Check {
+                name,
+                status: CheckStatus::Warn,
+                detail: "managed policy DeveloperToolsAvailability=2 blocks it".to_string(),
+            };
+        }
+    }
+    Check {
+        name,
+        status: CheckStatus::Ok,
+        detail: format!(
+            "{binary}{}",
+            if policy.is_some() {
+                " (managed; policy allows remote debugging)"
+            } else {
+                ""
+            }
+        ),
+    }
 }
 
 fn check_terminal() -> Check {
@@ -1297,6 +1374,33 @@ mod tests {
         user_key_is_set, CheckStatus, CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN, GHOSTTY_END,
         LEGACY_TMUX_BEGIN, LEGACY_TMUX_END, PRIVATE_SHORTCUT_KEYS, TMUX_BEGIN, TMUX_END,
     };
+
+    #[test]
+    fn chrome_engine_check_reports_missing_chrome_as_a_warning() {
+        let check = super::chrome_engine_check(None, None);
+        assert!(matches!(check.status, super::CheckStatus::Warn));
+        assert!(check.detail.contains("TWEB_CHROME"));
+    }
+
+    #[test]
+    fn chrome_engine_check_honours_a_policy_that_blocks_remote_debugging() {
+        let policy = "{\n    RemoteDebuggingAllowed = 0;\n    ExtensionSettings = {};\n}";
+        let check = super::chrome_engine_check(Some("/x/Google Chrome"), Some(policy));
+        assert!(matches!(check.status, super::CheckStatus::Warn));
+        assert!(check.detail.contains("RemoteDebuggingAllowed"));
+        let tools = "{\n    DeveloperToolsAvailability = 2;\n}";
+        let check = super::chrome_engine_check(Some("/x/Google Chrome"), Some(tools));
+        assert!(matches!(check.status, super::CheckStatus::Warn));
+    }
+
+    #[test]
+    fn chrome_engine_check_passes_a_managed_chrome_that_allows_it() {
+        let policy =
+            "{\n    CloudManagementEnrollmentToken = \"t\";\n    RemoteDebuggingAllowed = 1;\n}";
+        let check = super::chrome_engine_check(Some("/x/Google Chrome"), Some(policy));
+        assert!(matches!(check.status, super::CheckStatus::Ok));
+        assert!(check.detail.contains("managed"));
+    }
 
     fn ghostty_include() -> String {
         ghostty_include_block(Path::new("/home/user/.config/tweb/ghostty.conf"))

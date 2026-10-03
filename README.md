@@ -1,6 +1,6 @@
 # TWeb
 
-TWeb is a terminal-native browser runtime that runs Chromium (Electron) or macOS WebKit (Tauri) pages as pane processes on top of Ghostty/Kitty and tmux.
+TWeb is a terminal-native browser runtime that runs Chromium (Electron), the user's own Google Chrome (over CDP) or macOS WebKit (Tauri) pages as pane processes on top of Ghostty/Kitty and tmux.
 
 ```text
 Ghostty / Kitty
@@ -67,6 +67,9 @@ tweb split https://localhost:5173
 
 # Open on the macOS Tauri/WebKit engine
 tweb split --engine tauri https://localhost:5173
+
+# Run the pages in your own (managed) Google Chrome — Okta device trust, Endpoint Verification
+tweb split --engine chrome https://sendbird.okta.com/
 
 # Tune the active maximum frame rate
 # adaptive uses the given value while active and drops to at most 4fps when idle
@@ -195,7 +198,22 @@ otherwise, and DESIGN.md names both shortcuts in its non-goals:
 > - Do not imitate Google Chrome by spoofing the User-Agent.
 > - Do not replicate Okta session cookies automatically or continuously.
 
-What TWeb offers instead is a manual handoff:
+What TWeb offers instead is the real thing. `--engine chrome` runs the pane's pages in the user's
+own Google Chrome, driven over the DevTools protocol, so Chrome answers the check itself:
+
+```bash
+tweb open --engine chrome https://argocd.example.com/
+tweb split --engine chrome https://sendbird.okta.com/
+```
+
+Measured on a managed Mac (Chrome 154): the pane landed on the Okta dashboard without a password
+prompt — macOS Extensible SSO answers Chrome and not Electron — and Chrome's machine policy
+force-installed the managed extensions (Endpoint Verification, Cyberhaven) into TWeb's Chrome
+profile within seconds. See [Browser engines](#browser-engines-and-frame-policy) for what that engine
+is and how it compares.
+
+When Chrome cannot be driven — a policy that forbids remote debugging, which `tweb doctor` checks —
+the fallback is a manual handoff:
 
 ```bash
 tweb chrome open https://argocd.example.com/    # the whole site, in Chrome
@@ -278,15 +296,42 @@ human-operated paths only.
 
 ## Browser engines and frame policy
 
-`open` and `split` both accept `--engine electron|tauri`. The default is `electron`, which provides
-every existing feature.
+`open` and `split` both accept `--engine electron|chrome|tauri`. The default is `electron`, which
+provides every existing feature.
 
 - **Electron**: built on Chromium offscreen paint. Provides all current TWeb browser features — Vimium-style modes, tabs/omnibox, visual/inspect, smart copy, detached DevTools. This is the engine every measurement in [Status](#status) was taken on.
+- **Chrome**: the pages run in the installed Google Chrome, headless, on a profile of TWeb's own (`<userData>/chrome-profile`, or `TWEB_CHROME_PROFILE`), driven over CDP. Use it for sites that only work in managed Chrome — see [Sites that need real Chrome](#sites-that-need-real-chrome). The Electron process stays the host and the pane logic is the same code: `electron/cdp/` presents each Chrome tab to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, is injected into each frame's isolated world. One Chrome serves every pane on the profile and exits with the last of them. `TWEB_CHROME` picks the binary, `TWEB_CHROME_HEADED=1` runs it with a (hidden) window, `TWEB_CDP_TRACE=1` logs the protocol.
 - **Tauri (macOS experimental)**: sends native snapshots of the system `WKWebView` as Kitty PNG frames, so there is no separate Electron/Chromium startup cost. Supports resize, UTF-8/CSI-u/navigation keys, SGR mouse, adaptive frame transfer and terminal lifecycle. It shares the same preload as Electron, so Vimium-style modal shortcuts, hint/visual/inspect, the tab list, omnibox and multi-tab, find-in-page, zoom, smart copy/paste, and the browser shortcut ↔ web passthrough toggle all work too. DevTools opens as the Safari Web Inspector, and the Chromium-only `inspectElement` coordinate targeting has limited support.
 
 > The Tauri parity list above is **claimed by construction — a shared preload — and was not exercised
 > in the capability audit behind [Status](#status).** Every measured verdict in this README is
 > Electron. Treat Tauri as unvalidated until somebody drives it the same way.
+
+The Chrome engine was driven through the same scenarios as Electron, side by side in bare PTYs at
+2880x1800, through the real key and SGR-mouse paths and the agent socket:
+
+| Area | Chrome vs Electron |
+|---|---|
+| Keyboard modes | same: scroll, `gg`/`G`, `/` search, `?`, zoom, omnibox, tabs (`t` `J` `K` `x` `X`), `H`/`L`, `r`, insert mode, `f` hints across a cross-origin iframe |
+| Mouse | same: hint click, terminal click, drag, wheel distance, clicks inside an out-of-process iframe, context menu and its actions |
+| Agent | same: snapshot, fill, select, press, wait, console, errors, network, screenshot, full-screenshot, pdf, device, capture, tabs |
+| Page features | same: downloads, alert/confirm answered, print to PDF, popups keeping `window.opener`, resize, audio ownership, paste |
+| Frames | idle page sends nothing; a caret blink goes out as a patch; a full-rate canvas ran 23fps (Electron 27) with none dropped |
+| Better | Cmd-C reaches the system clipboard (Electron's offscreen copy does not); tab titles follow `document.title` live |
+| Startup | first frame 1.6–2.1s when Chrome is launched, 0.8–1.7s when it is already running (Electron 0.6–0.8s) |
+
+Differences that remain: TWeb's unpacked-extension directory is not loaded (Chrome has its own,
+managed extensions); audio is detected from media elements and `AudioContext`, not from Chrome's
+tab state; JavaScript dialogs are answered the way Electron's offscreen window answers them.
+
+Chrome has no damage reporting and no offscreen paint event, so the engine builds both: the
+screencast is a change signal only (it is CSS-pixel sized, half resolution on a Retina pane), each
+change is answered with a device-pixel `captureScreenshot`, and the dirty rect is recovered by
+comparing the frame with the last one. One Chrome defect is worked around, and measured rather than
+assumed: once a tab has been both screencast and captured, Chrome routes mouse input as if it were in
+device pixels, so every point lands at `(x, y) / deviceScaleFactor`. The engine measures that with one
+probe move and undoes it; `tweb engine-log` shows `chrome input skew … measured, correcting` when it
+applies.
 
 
 Electron and Tauri both persist the open tab URLs, the active tab and each tab's zoom per tmux window.

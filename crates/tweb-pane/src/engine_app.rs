@@ -195,6 +195,34 @@ const FILES: &[(&str, &str)] = &[
         "float-viewer.html",
         include_str!("../../../electron/float-viewer.html"),
     ),
+    (
+        "cdp/backend.cjs",
+        include_str!("../../../electron/cdp/backend.cjs"),
+    ),
+    (
+        "cdp/connection.cjs",
+        include_str!("../../../electron/cdp/connection.cjs"),
+    ),
+    (
+        "cdp/damage.cjs",
+        include_str!("../../../electron/cdp/damage.cjs"),
+    ),
+    (
+        "cdp/engine.cjs",
+        include_str!("../../../electron/cdp/engine.cjs"),
+    ),
+    (
+        "cdp/input.cjs",
+        include_str!("../../../electron/cdp/input.cjs"),
+    ),
+    (
+        "cdp/preload-bridge.cjs",
+        include_str!("../../../electron/cdp/preload-bridge.cjs"),
+    ),
+    (
+        "cdp/web-contents.cjs",
+        include_str!("../../../electron/cdp/web-contents.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.
@@ -227,6 +255,11 @@ fn write_app(directory: &Path) -> Result<()> {
         .with_context(|| format!("cannot create {}", directory.display()))?;
     for (name, body) in FILES {
         let path = directory.join(name);
+        // `cdp/…` and any other subdirectory the app keeps.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
         std::fs::write(&path, body).with_context(|| format!("cannot write {}", path.display()))?;
     }
     Ok(())
@@ -457,9 +490,14 @@ mod tests {
                 let Some((_, rest)) = line.split_once("require(\"./") else {
                     continue;
                 };
-                let required = rest.split('"').next().unwrap_or_default();
+                let relative = rest.split('"').next().unwrap_or_default();
+                // Resolved against the requiring file's own directory, as node does.
+                let required = match name.rsplit_once('/') {
+                    Some((directory, _)) => format!("{directory}/{relative}"),
+                    None => relative.to_string(),
+                };
                 assert!(
-                    names.contains(&required),
+                    names.contains(&required.as_str()),
                     "{name} requires {required}, which the bundle does not carry"
                 );
             }
