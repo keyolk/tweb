@@ -375,9 +375,19 @@ test("a miss ends the round only when no frame matched", () => {
   assert.match(main, /sendToTabFrames\(tab, "tweb-hint-end"\)/);
 });
 
-test("a frame that answers late is left out rather than holding the hints back", () => {
+test("a subframe that answers late is left out rather than holding the hints back", () => {
   assert.match(main, /const HINT_ROUND_WAIT_MS = 120;/);
-  assert.match(main, /round\.timer = setTimeout\(\(\) => closeHintRound\(tab\), HINT_ROUND_WAIT_MS\)/);
+  assert.match(main, /round\.timer = setTimeout\(\(\) => hintRoundWaitElapsed\(tab\), HINT_ROUND_WAIT_MS\)/);
+});
+
+test("the main frame is waited for, since a round without it draws nothing", () => {
+  // On YouTube the main frame took 225ms to count while a video played; the round closed at
+  // 120ms with only an ad frame's 0 and `f` showed nothing.
+  const elapsed = body("function hintRoundWaitElapsed(tab)", "function closeHintRound(tab)");
+  assert.match(elapsed, /if \(!round\.mainKey \|\| round\.counts\.has\(round\.mainKey\)\) \{\s*\n\s*closeHintRound\(tab\);/);
+  assert.match(elapsed, /setTimeout\(\(\) => closeHintRound\(tab\),\s*\n?\s*HINT_ROUND_MAIN_FRAME_CAP_MS - HINT_ROUND_WAIT_MS\)/);
+  const note = body("function noteHintCount(tab, frame, count)", "function hintRoundWaitElapsed(tab)");
+  assert.match(note, /else if \(round\.waitElapsed && key === round\.mainKey\) closeHintRound\(tab\);/);
 });
 
 // --- a frame that does not answer must not hold the engine ---
