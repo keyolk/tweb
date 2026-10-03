@@ -3896,10 +3896,17 @@ ipcMain.on("tweb-shortcut", bindPane(
 // A round is per tab, and there is at most one: a new `f` replaces whatever was open.
 const hintRounds = new WeakMap();
 
-// How long to wait for the frames to answer. A frame that has not replied by then is left out
-// of the round rather than holding the hints back — the common case for a slow one is an ad
+// How long to wait for the frames to answer. A SUBFRAME that has not replied by then is left
+// out of the round rather than holding the hints back — the common case for a slow one is an ad
 // iframe nobody wants to hint anyway.
+//
+// The main frame is never left out: it holds nearly every target, and a round closed without it
+// draws nothing at all. On YouTube its collection takes longer than this wait while a video
+// plays — measured 225ms against 120 — so the round closed with only an ad frame's 0, ended as
+// empty, and `f` showed no hints; pressing again sometimes landed in a quicker moment, which
+// read as "`f` works after a few presses". The cap only guards a main frame that never answers.
 const HINT_ROUND_WAIT_MS = 120;
+const HINT_ROUND_MAIN_FRAME_CAP_MS = 1500;
 
 function hintRound(tab) {
   return hintRounds.get(tab) || null;
@@ -3926,6 +3933,21 @@ function noteHintCount(tab, frame, count) {
       + ` ${String(frame.url || "").slice(0, 36)} = ${Number(count) || 0}`);
   }
   if (round.counts.size >= round.expected.size) closeHintRound(tab);
+  else if (round.waitElapsed && key === round.mainKey) closeHintRound(tab);
+}
+
+// The subframe wait ran out. Close now unless the main frame is still collecting, in which case
+// its own answer closes the round (noteHintCount) — or the cap does, if it never comes.
+function hintRoundWaitElapsed(tab) {
+  const round = hintRounds.get(tab);
+  if (!round || round.open) return;
+  round.waitElapsed = true;
+  if (!round.mainKey || round.counts.has(round.mainKey)) {
+    closeHintRound(tab);
+    return;
+  }
+  round.timer = setTimeout(() => closeHintRound(tab),
+    HINT_ROUND_MAIN_FRAME_CAP_MS - HINT_ROUND_WAIT_MS);
 }
 
 function closeHintRound(tab) {
@@ -3971,8 +3993,12 @@ function startHintRound(tab) {
     console.error(`tweb: hint round asked=${expected.size}/${frames.length} ${detail}`);
   }
   if (expected.size === 0) return;
-  const round = { expected, counts: new Map(), open: false, total: 0, drawn: 0, missed: new Set(), timer: null, typed: "" };
-  round.timer = setTimeout(() => closeHintRound(tab), HINT_ROUND_WAIT_MS);
+  const mainKey = mainFrame && expected.has(frameKey(mainFrame)) ? frameKey(mainFrame) : null;
+  const round = {
+    expected, mainKey, counts: new Map(), open: false, waitElapsed: false,
+    total: 0, drawn: 0, missed: new Set(), timer: null, typed: "",
+  };
+  round.timer = setTimeout(() => hintRoundWaitElapsed(tab), HINT_ROUND_WAIT_MS);
   hintRounds.set(tab, round);
 }
 
