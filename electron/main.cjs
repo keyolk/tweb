@@ -3772,11 +3772,20 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     // No label in this frame's block starts with what has been typed. That is the ordinary
     // case — the label belongs to another frame — so the round only ends once EVERY frame
     // has said it, which is something only the engine can count.
+    //
+    // Counted against the frames that DREW badges, not every frame asked. A frame with nothing
+    // to hint draws no picker and so never reports a miss — and on Google Meet two of the three
+    // frames are like that. Counting them meant a wrong letter could never end the round: every
+    // badge hid, the round stayed open, and each following `f` was appended to the typed label
+    // (`zf`, `zff`) instead of starting new hints. Measured exactly that; it read as "`f` stopped
+    // working" until Escape.
     case "hint-miss": {
       const round = hintRound(tab);
       if (!round || !round.open) break;
-      round.misses = (round.misses || 0) + 1;
-      if (round.misses >= round.counts.size) endHintRound(tab);
+      // A miss for a prefix that is no longer the one being typed is stale.
+      if (String(value?.typed ?? "") !== round.typed) break;
+      round.missed.add(frameKey(sourceFrame));
+      if (round.missed.size >= round.drawn) endHintRound(tab);
       break;
     }
     case "native-hover":
@@ -3930,6 +3939,8 @@ function closeHintRound(tab) {
   for (const [key, entry] of entries) {
     if (entry.frame.isDestroyed() || entry.frame.detached) continue;
     entry.frame.send("tweb-hint-space", { offset: offsets[key], total });
+    // Only these frames will report misses; see `hint-miss`.
+    if (entry.count > 0) round.drawn += 1;
   }
 }
 
@@ -3954,7 +3965,7 @@ function startHintRound(tab) {
     console.error(`tweb: hint round asked=${expected.size}/${frames.length} ${detail}`);
   }
   if (expected.size === 0) return;
-  const round = { expected, counts: new Map(), open: false, total: 0, timer: null, typed: "" };
+  const round = { expected, counts: new Map(), open: false, total: 0, drawn: 0, missed: new Set(), timer: null, typed: "" };
   round.timer = setTimeout(() => closeHintRound(tab), HINT_ROUND_WAIT_MS);
   hintRounds.set(tab, round);
 }
@@ -3971,7 +3982,7 @@ function routeHintKey(tab, key) {
   }
   if (key === "Backspace") round.typed = round.typed.slice(0, -1);
   else round.typed += key.toLowerCase();
-  round.misses = 0;
+  round.missed.clear();
   sendToTabFrames(tab, "tweb-hint-key", key);
   return true;
 }
@@ -4204,6 +4215,15 @@ function agentDiagnostics() {
       caret: { cell: inputState().caretCell, point: inputState().caretPoint },
     },
     tabs: { active: currentWindows().activeTabIndex, count: currentWindows().tabs.length },
+    // The `f` round the engine is holding, if any. The frames show badges either way, so "the
+    // labels are on screen but typing them does nothing" is only visible here: badges up and no
+    // open round means keys are going to the focused frame alone.
+    hintRound: (() => {
+      const round = tab ? hintRound(tab) : null;
+      if (!round) return null;
+      return { open: round.open, asked: round.expected.size, answered: round.counts.size,
+        total: round.total, typed: round.typed, drawn: round.drawn, missed: round.missed.size };
+    })(),
     // Every out-of-process frame CDP has handed us a session for, and where it sits.
     //
     // Reported because a frame with no `rect` is a frame no click can be routed into, and

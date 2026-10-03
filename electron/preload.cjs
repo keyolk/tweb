@@ -1827,7 +1827,9 @@ installPrintShim();
       // on it would tear this frame's badges down mid-round — the engine ends the round for
       // everyone when NO frame matches, which is the only party that can know that.
       if (pickerState.shared) {
-        send("hint-miss");
+        // Says WHICH prefix missed: misses for an earlier keystroke can arrive after the next
+        // one was typed, and counting those against it would end a round that still has a match.
+        send("hint-miss", { typed: pickerState.typed });
         return;
       }
       cancelPicker();

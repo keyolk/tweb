@@ -359,8 +359,18 @@ test("a key during a round goes to every frame, because the badge may be in any 
 // so the frame reports the miss and the engine ends the round only when every frame has.
 test("a miss ends the round only when no frame matched", () => {
   const miss = body('    case "hint-miss": {', 'case "native-hover":');
-  assert.match(miss, /round\.misses = \(round\.misses \|\| 0\) \+ 1;/);
-  assert.match(miss, /if \(round\.misses >= round\.counts\.size\) endHintRound\(tab\)/);
+  // Counted against the frames that DREW badges. Counting every frame asked meant a frame with
+  // nothing to hint — two of three on Google Meet — could never report, so a wrong letter left the
+  // round open with every badge hidden and each later `f` was appended to the label (`zf`, `zff`).
+  assert.match(miss, /round\.missed\.add\(frameKey\(sourceFrame\)\);/);
+  assert.match(miss, /if \(round\.missed\.size >= round\.drawn\) endHintRound\(tab\);/);
+  assert.doesNotMatch(miss, /round\.counts\.size/);
+  // A miss for a prefix that is no longer the one typed is stale and must not count.
+  assert.match(miss, /if \(String\(value\?\.typed \?\? ""\) !== round\.typed\) break;/);
+  // Only frames that will report are counted as drawing.
+  assert.match(main, /if \(entry\.count > 0\) round\.drawn \+= 1;/);
+  // Each keystroke starts the tally over.
+  assert.match(main, /round\.missed\.clear\(\);/);
   // And the badges come down everywhere at once, not just where the pick happened.
   assert.match(main, /sendToTabFrames\(tab, "tweb-hint-end"\)/);
 });
