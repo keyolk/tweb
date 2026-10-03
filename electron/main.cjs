@@ -925,6 +925,17 @@ function configureTmuxRootBindings() {
   privateKey("User114", "5003");
   privateKey("User115", "5004");
   privateKey("User116", "5007");
+  // Shift-Enter is bound from every Ghostty pane, so the root binding cannot just forward the
+  // private code: in Claude Code or a shell next to tweb it would arrive as noise. Only a tweb
+  // pane gets the code; any other gets a real S-Enter, encoded by tmux for that pane's mode.
+  ensureTmuxRootBinding(
+    "User118",
+    [
+      "if-shell", "-F", "#{==:#{@tweb_browser},1}",
+      "send-keys -H 1b 5b 35 30 30 38 7e", "send-keys S-Enter",
+    ],
+    (binding) => binding.includes("send-keys -H 1b 5b 35 30 30 38 7e"),
+  );
   // Ctrl-; → 5001 (bypass toggle). Ctrl-/ → 5014 (vimium toggle).
   privateKey("C-\\;", "5001");
   privateKey("C-/", "5014");
@@ -950,6 +961,7 @@ function ensureTmuxPassthroughTable() {
     ["set-option", "-s", "user-keys[111]", "\x1b[5009~"],
     ["set-option", "-s", "user-keys[112]", "\x1b[5010~"],
     ["set-option", "-s", "user-keys[117]", "\x1b[5014~"],
+    ["set-option", "-s", "user-keys[118]", "\x1b[5008~"],
     [
       "bind-key", "-T", passthroughTable, "User110",
       "send-keys", "-H", "1b", "5b", "35", "30", "30", "31", "7e",
@@ -980,6 +992,7 @@ function ensureTmuxPassthroughTable() {
     ["User101", "35", "30", "30", "36"],
     ["User111", "35", "30", "30", "39"],
     ["User117", "35", "30", "31", "34"],
+    ["User118", "35", "30", "30", "38"],
   ]) {
     commands.push([
       "bind-key", "-T", passthroughTable, key,
