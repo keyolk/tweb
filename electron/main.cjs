@@ -6539,7 +6539,12 @@ function dispatchMouse(cb, rawX, rawY, release) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
-    const deltaX = buttonCode === 2 ? -100 : buttonCode === 3 ? 100 : 0;
+    // Both deltas in `sendInputEvent`'s sign, a positive delta being the way the CONTENT moves:
+    // wheel up (64) is +deltaY and wheel left (66) is +deltaX. xterm numbers the horizontal
+    // buttons 6 = left, 7 = right. The CDP route converts this to the DOM's sign in one place
+    // (mouseEventParams), so both axes have to be stated the same way here.
+    const horizontal = buttonCode === 2 ? 1 : buttonCode === 3 ? -1 : 0;
+    const deltaX = horizontal * 100;
     const deltaY = direction * 100;
     sendPointerEvent(currentWindows().win, {
       type: "mouseWheel",
@@ -6552,7 +6557,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
       wheel: {
         deltaX,
         deltaY,
-        wheelTicksX: buttonCode === 2 ? -1 : buttonCode === 3 ? 1 : 0,
+        wheelTicksX: horizontal,
         wheelTicksY: direction,
         accelerationRatioX: 0.5,
         accelerationRatioY: 0.5,

@@ -187,8 +187,13 @@ function mouseEventParams(event) {
     force: event.held && button ? 0.5 : 0,
   };
   if (event.type === "mouseWheel") {
-    params.deltaX = event.deltaX || 0;
-    params.deltaY = event.deltaY || 0;
+    // Callers speak `sendInputEvent`'s convention, where a positive delta is the distance the
+    // content moves — a wheel turned up is +deltaY. CDP takes the DOM's convention, a positive
+    // deltaY scrolls DOWN. Passing the number through unchanged turned every wheel round once
+    // routing moved to CDP: measured on a long page, two notches down scrolled 2000 -> 1750.
+    // `|| 0` first, so a missing delta stays 0 rather than becoming -0.
+    params.deltaX = -(event.deltaX || 0) || 0;
+    params.deltaY = -(event.deltaY || 0) || 0;
   } else if (event.type === "mouseDown" || event.type === "mouseUp") {
     // Only a press or a release has a click count. A move with a button held down is part of a
     // drag, not a click, and giving it one would make each move read as a fresh press.
