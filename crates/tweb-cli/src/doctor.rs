@@ -649,9 +649,7 @@ fn check_tmux_user_keys() -> Check {
             "tmux",
             &["show-options", "-s", &format!("user-keys[{slot}]")],
         );
-        // An unset tmux option prints the name with an empty value. A set one prints
-        // `name "value"`, so the presence of a quote means it is configured.
-        if value.as_deref().map(|v| !v.contains('"')).unwrap_or(true) {
+        if !user_key_is_set(value.as_deref(), slot) {
             missing.push(slot);
         }
     }
@@ -674,6 +672,26 @@ fn check_tmux_user_keys() -> Check {
                 .join(", ")
         ),
     }
+}
+
+/// Whether `show-options -s user-keys[N]` output carries a value.
+///
+/// tmux quotes a value only when it needs to, and an escape sequence does not:
+/// a registered slot prints as `user-keys[118] \033[5008~`. Testing for a quote
+/// reported every slot missing on a server where all of them were set.
+fn user_key_is_set(output: Option<&str>, slot: u16) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    let name = format!("user-keys[{slot}]");
+    output
+        .trim()
+        .strip_prefix(&name)
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "\"\"" && value != "''"
+        })
+        .unwrap_or(false)
 }
 
 /// Whether tweb is running inside tmux.
@@ -1277,7 +1295,7 @@ mod tests {
         ghostty_version_supported, managed_block, migrate_legacy_ghostty_config,
         migrate_legacy_tmux_config, private_sequence_hex, select_ghostty_config_candidate,
         terminal_check, tmux_include_block, tmux_managed_config, upsert_managed_block, CheckStatus,
-        CMD_PASSTHROUGH_KEYS, PRIVATE_SHORTCUT_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END,
+        user_key_is_set, CMD_PASSTHROUGH_KEYS, PRIVATE_SHORTCUT_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END,
         TMUX_BEGIN, TMUX_END,
     };
 
@@ -1322,6 +1340,16 @@ mod tests {
                 "the engine's private-sequence regex does not cover {code}"
             );
         }
+    }
+
+    #[test]
+    fn user_key_check_reads_unquoted_tmux_output() {
+        // Verbatim from tmux 3.5a.
+        assert!(user_key_is_set(Some("user-keys[118] \\033[5008~\n"), 118));
+        assert!(user_key_is_set(Some("user-keys[118] \"\\033[5008~\"\n"), 118));
+        assert!(!user_key_is_set(Some("user-keys[118]\n"), 118));
+        assert!(!user_key_is_set(Some("user-keys[118] \"\"\n"), 118));
+        assert!(!user_key_is_set(None, 118));
     }
 
     #[test]
