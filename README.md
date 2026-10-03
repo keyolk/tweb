@@ -119,6 +119,36 @@ subsystems** — each one parses its arguments and then exits with
 `command not yet implemented`. They are listed here so nobody discovers it mid-migration; see
 [Status](#status). `chrome` is built — see [Sites that need real Chrome](#sites-that-need-real-chrome).
 
+## Settings
+
+Preferences live in `config.toml`, next to the files `tweb doctor --fix` writes
+(`${TWEB_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/tweb}/config.toml`).
+
+```sh
+tweb config                          # every setting, its value, and where it came from
+tweb config set scroll.invert true   # write one value (validated against the schema)
+tweb config unset scroll.invert      # back to the default
+tweb config edit                     # $EDITOR; a new file lists every setting commented out
+```
+
+| Setting | Default | Takes effect |
+|---|---|---|
+| `scroll.invert` | `false` | live |
+| `scroll.distance` | `100` | live |
+| `zoom.default` | `0.8` | next new tab |
+| `frame_rate.max` | `30` | next `tweb open` |
+| `frame_rate.adaptive` | `true` | next `tweb open` |
+| `downloads.dir` | system Downloads | next engine start |
+| `ime.slot_cells` | `3` | live |
+
+"Live" means a running pane picks the change up within a second, no restart. An environment variable
+that already set one of these (`TWEB_DEFAULT_ZOOM`, `TWEB_FRAME_RATE`, `TWEB_ADAPTIVE_FRAME_RATE`,
+`TWEB_DOWNLOAD_DIR`, `TWEB_IME_SLOT_CELLS`) still wins over the file, and a flag on `tweb open` wins
+over both. The list itself is `electron/settings-schema.json`, shared by the CLI and the engine.
+
+Wheel direction needs no setting to match macOS: the terminal has already applied natural scrolling
+when it reports the wheel, and TWeb follows the report. `scroll.invert` is for wanting it the other way.
+
 ## Extensions
 
 TWeb loads **unpacked** extensions from its managed source directory at engine startup:

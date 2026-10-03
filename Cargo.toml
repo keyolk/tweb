@@ -24,6 +24,7 @@ async-trait = "0.1"
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml_edit = "0.25"
 # error
 thiserror = "1"
 anyhow = "1"

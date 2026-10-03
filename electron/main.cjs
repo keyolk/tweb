@@ -29,6 +29,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
+const settings = require("./settings.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
 const { startAgentServer, runtimeDir } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
@@ -131,9 +132,11 @@ const {
 if (process.env.TWEB_USER_DATA_DIR) {
   app.setPath("userData", process.env.TWEB_USER_DATA_DIR);
 }
-if (process.env.TWEB_DOWNLOAD_DIR) {
-  mkdirSync(process.env.TWEB_DOWNLOAD_DIR, { recursive: true });
-  app.setPath("downloads", process.env.TWEB_DOWNLOAD_DIR);
+// `downloads.dir` in config.toml, or TWEB_DOWNLOAD_DIR over it. Read once: Electron takes the
+// downloads path at startup, so a change applies from the next engine start.
+if (settings.get("downloads.dir")) {
+  mkdirSync(settings.get("downloads.dir"), { recursive: true });
+  app.setPath("downloads", settings.get("downloads.dir"));
 }
 if (process.platform === "darwin") {
   app.setActivationPolicy("prohibited");
@@ -272,8 +275,10 @@ function commandLineUrl() {
   return undefined;
 }
 
+// The CLI resolves `frame_rate.*` from config.toml and passes the result as a flag; the setting is
+// the fallback for an engine started some other way.
 const configuredFrameRate = Number.parseInt(
-  commandLineValue("--tweb-frame-rate") || process.env.TWEB_FRAME_RATE || "",
+  commandLineValue("--tweb-frame-rate") || String(settings.get("frame_rate.max")),
   10
 );
 const maxActiveFrameRate = Number.isFinite(configuredFrameRate)
@@ -282,7 +287,7 @@ const maxActiveFrameRate = Number.isFinite(configuredFrameRate)
 const configuredAdaptiveFrameRate = commandLineValue("--tweb-adaptive-frame-rate");
 const adaptiveFrameRate = configuredAdaptiveFrameRate !== undefined
   ? configuredAdaptiveFrameRate !== "0"
-  : process.env.TWEB_ADAPTIVE_FRAME_RATE !== "0";
+  : settings.get("frame_rate.adaptive");
 const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxActiveFrameRate;
 // See frame-rate-policy.cjs for why playback is its own tier and how it is detected.
 const frameRates = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
@@ -330,10 +335,11 @@ function windowsFor(record) {
 function currentWindows() {
   return windowsFor(currentPane());
 }
-const configuredDefaultZoom = Number.parseFloat(process.env.TWEB_DEFAULT_ZOOM || "");
-const defaultZoomFactor = Number.isFinite(configuredDefaultZoom)
-  ? Math.min(2, Math.max(0.5, configuredDefaultZoom))
-  : 0.8;
+// `zoom.default`, clamped to 0.5..2 by the schema. A function, not a constant, so an edit to
+// config.toml reaches the next tab without restarting the engine.
+function defaultZoomFactor() {
+  return settings.get("zoom.default");
+}
 const configuredDeviceScaleFactor = Number.parseFloat(process.env.TWEB_DEVICE_SCALE_FACTOR || "");
 // A Kitty placement with z >= 0 covers the terminal's own text — including the
 // cell the terminal paints IME preedit into, and the cursor we park on the web
@@ -353,6 +359,14 @@ const engineLog = [];
 // it. Now that engine stderr goes to a file rather than over the page, they can
 // always be recorded; TWEB_DEBUG only decides whether stderr is inherited.
 const debugLogging = true;
+
+// A `live` setting is read where it is used, so re-reading the file is all a change needs; this
+// only reports it, and the warnings that would otherwise be invisible.
+settings.watch((changed, resolved) => {
+  console.error(`tweb: settings changed: ${changed.join(", ")}`);
+  for (const warning of resolved.warnings) console.error(`tweb: config.toml: ${warning}`);
+});
+for (const warning of settings.snapshot().warnings) console.error(`tweb: config.toml: ${warning}`);
 
 // --- frame latency probe -------------------------------------------------------------
 //
@@ -2177,7 +2191,7 @@ function readWindowSession() {
     try {
       const session = normalizeWindowSession(
         JSON.parse(readFileSync(candidate, "utf8")),
-        defaultZoomFactor
+        defaultZoomFactor()
       );
       if (!session) continue;
       if (candidate !== sess().path) {
@@ -2200,9 +2214,9 @@ function writeWindowSession() {
     if (tab.isDestroyed()) return [];
     return [{
       url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
-      zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor,
+      zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor(),
     }];
-  }), currentWindows().activeTabIndex, defaultZoomFactor);
+  }), currentWindows().activeTabIndex, defaultZoomFactor());
   // A bare startup used to replace the last useful session with about:blank
   // after 100 ms. Preserve the existing file until a real page commits.
   writeWindowSessionState(state);
@@ -3403,7 +3417,7 @@ function fullscreenScaleFor(display) {
 /// Every site that restores zoom goes through here, so the compensation cannot be undone by the
 /// watchdog, a navigation, or a tab switch putting the user's own factor back.
 function effectiveZoomFactor(tab) {
-  const base = tabZoomFactors.get(tab) ?? defaultZoomFactor;
+  const base = tabZoomFactors.get(tab) ?? defaultZoomFactor();
   if (fullscreenScale === 1) return base;
   // Only the tab that is actually floating fullscreen is compensated.
   if (!floatingTabs.has(tab)) return base;
@@ -4158,9 +4172,11 @@ function agentDiagnostics() {
     window: {
       contentSize: size ? { width: size[0], height: size[1] } : null,
       zoomFactor: tab ? tab.webContents.getZoomFactor() : null,
-      defaultZoomFactor,
+      defaultZoomFactor: defaultZoomFactor(),
       visible: tab ? tab.isVisible() : null,
     },
+    // What config.toml resolved to and where each value came from (env / file / default).
+    settings: settings.snapshot(),
     frames: {
       generation: currentFrames().generation,
       lastSentMsAgo: currentFrames().lastFrameSentAt ? Date.now() - currentFrames().lastFrameSentAt : null,
@@ -4811,12 +4827,8 @@ function unparkTerminalCaret() {
 // The page draws the IME composition surface on the cell grid, which only main can measure: the
 // image fills the pane's cell box exactly, so a cell is the logical content size
 // over the cell count — in CSS pixels once the zoom factor is divided out.
-const configuredImeSlotCells = Number.parseInt(process.env.TWEB_IME_SLOT_CELLS || "", 10);
-// A Korean preedit is one syllable, which is two cells wide; the third is slack.
-// Longer preedits (Japanese, pinyin) want a wider surface — hence the override.
-const imeSlotCells = Number.isSafeInteger(configuredImeSlotCells) && configuredImeSlotCells > 0
-  ? configuredImeSlotCells
-  : 3;
+// `ime.slot_cells` (default 3). A Korean preedit is one syllable, which is two cells wide; the
+// third is slack. Longer preedits (Japanese, pinyin) want a wider surface — hence the setting.
 
 function cellMetrics() {
   if (!currentFrames().viewport || !currentWindows().win || currentWindows().win.isDestroyed()) return null;
@@ -4825,7 +4837,7 @@ function cellMetrics() {
   return {
     width: logical.width / Math.max(1, currentFrames().cells.cols) / zoom,
     height: logical.height / Math.max(1, currentFrames().cells.rows) / zoom,
-    columns: imeSlotCells,
+    columns: settings.get("ime.slot_cells"),
   };
 }
 
@@ -5917,7 +5929,7 @@ function enforceHiddenWindows() {
   forEachPane(() => updatePaintingState());
 }
 
-function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
+function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
   // Every handler registered below runs as work belonging to this tab's pane.
   //
   // Registration cannot capture the pane: verified under Electron 43 that a `paint` handler
@@ -6190,7 +6202,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor) {
   });
 }
 
-function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor) {
+function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor()) {
   // The pane whose scope we were called in — `attachPane` establishes it, and a tab opened from an
   // existing tab inherits it through that tab's bound handlers. Recorded before `configureTab` so
   // the handlers it registers can resolve this tab the first time they fire.
@@ -6257,7 +6269,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
 function createTab(
   url = "about:blank",
   activate = true,
-  initialZoomFactor = defaultZoomFactor,
+  initialZoomFactor = defaultZoomFactor(),
   showInitialPlaceholder = currentWindows().tabs.length === 0
 ) {
   const tab = adoptTab(
@@ -6505,7 +6517,7 @@ function setBrowserZoom(action) {
   // tab on the same host last set. Step from this tab's own remembered value.
   const current = tabZoomFactors.get(currentWindows().win) ?? contents.getZoomFactor();
   const next = action === "reset"
-    ? defaultZoomFactor
+    ? defaultZoomFactor()
     : Math.min(2, Math.max(0.5, current * (action === "in" ? 1.2 : 1 / 1.2)));
   // The user's own factor is what is remembered and what a later pin restores; what is applied
   // carries any fullscreen surface compensation on top of it.
@@ -6543,9 +6555,13 @@ function dispatchMouse(cb, rawX, rawY, release) {
     // wheel up (64) is +deltaY and wheel left (66) is +deltaX. xterm numbers the horizontal
     // buttons 6 = left, 7 = right. The CDP route converts this to the DOM's sign in one place
     // (mouseEventParams), so both axes have to be stated the same way here.
-    const horizontal = buttonCode === 2 ? 1 : buttonCode === 3 ? -1 : 0;
-    const deltaX = horizontal * 100;
-    const deltaY = direction * 100;
+    // `scroll.invert` flips both axes, as macOS's own setting does; `scroll.distance` is one notch.
+    const sign = settings.get("scroll.invert") ? -1 : 1;
+    const distance = settings.get("scroll.distance");
+    const horizontal = (buttonCode === 2 ? 1 : buttonCode === 3 ? -1 : 0) * sign;
+    const vertical = direction * sign;
+    const deltaX = horizontal * distance;
+    const deltaY = vertical * distance;
     sendPointerEvent(currentWindows().win, {
       type: "mouseWheel",
       x,
@@ -6558,7 +6574,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
         deltaX,
         deltaY,
         wheelTicksX: horizontal,
-        wheelTicksY: direction,
+        wheelTicksY: vertical,
         accelerationRatioX: 0.5,
         accelerationRatioY: 0.5,
         hasPreciseScrollingDeltas: false,
@@ -8002,7 +8018,7 @@ app.whenReady().then(async () => {
     ? `adaptive ${idleFrameRate}/≤${maxActiveFrameRate} (playback ≤${
       Math.round(PLAYBACK_BYTE_BUDGET / 1e6)}MB/s)`
     : `fixed ${maxActiveFrameRate}`}fps`
-    + ` · zoom ${Math.round(defaultZoomFactor * 100)}%`);
+    + ` · zoom ${Math.round(defaultZoomFactor() * 100)}%`);
 });
 
 // The frame files a set of panes owns, as paths. The naming rule and the enumeration live in
