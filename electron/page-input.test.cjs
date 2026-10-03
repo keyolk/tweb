@@ -342,7 +342,7 @@ test("the labels are divided so no two frames produce the same one", () => {
   assert.match(main, /const \{ shareLabels \} = require\("\.\/hint-labels\.cjs"\)/);
   const close = body("function closeHintRound(tab)", "// `f`. Ask every frame");
   assert.match(close, /shareLabels\(entries\.map\(/);
-  assert.match(close, /entry\.frame\.send\("tweb-hint-space", \{ offset: offsets\[key\], total \}\)/);
+  assert.match(close, /entry\.frame\.send\("tweb-hint-space", \{ offset: offsets\[key\], count: entry\.count, total \}\)/);
   // A round nobody has targets for ends rather than leaving every frame waiting.
   assert.match(close, /if \(total === 0\) \{/);
 });

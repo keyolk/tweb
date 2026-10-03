@@ -36,6 +36,7 @@
   let inspectState = null;
   let tabListState = null;
   let helpHost = null;
+  let helpScroller = null;
   let indicatorHost = null;
   let indicatorLabel = null;
   let tabBadge = null;
@@ -1274,6 +1275,8 @@
       setTimeout(normalMode, 1100);
       return;
     }
+    // Never more badges than the block this frame was given, whatever the caller passed.
+    if (space && Number.isFinite(space.count)) targets = targets.slice(0, space.count);
     const offset = space ? space.offset : 0;
     const total = space ? space.total : targets.length;
     const labels = Array.from({ length: targets.length }, (_, i) => hintLabel(offset + i, total));
@@ -1308,7 +1311,12 @@
       item.badge.style.opacity = item.label === pickerState.typed ? "1" : ".9";
     }
     const exact = matches.find((item) => item.label === pickerState.typed);
-    if (exact || matches.length === 1 && pickerState.typed.length > 0) {
+    // A unique prefix is a pick only when this frame holds every label. In a shared round it
+    // is unique HERE, not in the round: an ad frame holding the single label `aa` saw `a` match
+    // once and clicked, ending the round before the page's own `aj` could be typed — every
+    // label sharing a first letter with an ad's was unreachable.
+    const uniquePrefix = !pickerState.shared && matches.length === 1 && pickerState.typed.length > 0;
+    if (exact || uniquePrefix) {
       const selected = exact || matches[0];
       const onPick = pickerState.onPick;
       showHintFeedback(selected);
@@ -1420,6 +1428,14 @@
   // inside. The engine divides one label space between the frames (see hint-labels.cjs) and
   // `drawHints` is called with this frame's share; `startHints` only asks for one.
   let pendingHintNewTab = false;
+  // The targets this frame reported to the engine. The round's labels are shared out by those
+  // counts, so the badges have to be drawn over exactly this list: collecting again when the
+  // reply arrives can find more — a hover reveals a video's control bar, a late script adds a
+  // button — and the extra badges run on into the NEXT frame's block. Two frames then wear the
+  // same label and whichever answers first takes the click. Measured on dogdrip.net: the page
+  // reported 40 and drew 41, an ad frame drew the 41st label too, and typing it clicked the
+  // ad's position instead of the link.
+  let pendingHintTargets = null;
 
   function startHints(newTab) {
     // Refresh where we are before any of these badges can be picked. The badges
@@ -1427,11 +1443,14 @@
     // click point does, and that is a keystroke away — long enough for the reply.
     requestFrameOffset();
     pendingHintNewTab = newTab;
-    send("hint-round", { count: interactiveTargets().length });
+    pendingHintTargets = interactiveTargets();
+    send("hint-round", { count: pendingHintTargets.length });
   }
 
   function drawHints(space) {
     const newTab = pendingHintNewTab;
+    const counted = space ? pendingHintTargets : null;
+    pendingHintTargets = null;
     const points = mediaHoverPoints();
     const onPick = (item) => {
       const link = item.element.closest("a[href]");
@@ -1442,7 +1461,8 @@
       normalMode();
     };
     const collect = () => {
-      startPicker(interactiveTargets(), "hint", onPick, space);
+      const targets = counted ? counted.filter((target) => target.element.isConnected) : interactiveTargets();
+      startPicker(targets, "hint", onPick, space);
       // Start the loop only now: startPicker cancels transient state first, and
       // that cancellation is what stops a previously running hover loop.
       startMediaHoverLoop(points);
@@ -1504,6 +1524,7 @@
   function cancelHelp(restoreMode = true) {
     helpHost?.remove();
     helpHost = null;
+    helpScroller = null;
     if (restoreMode) normalMode();
   }
 
@@ -1523,7 +1544,21 @@
     const header = document.createElement("header");
     header.style.cssText = "display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px";
     const heading = document.createElement("div");
-    heading.innerHTML = '<strong style="display:block;font-size:19px;color:#fff">TWeb shortcuts</strong><span style="color:#9aa0a6">Shortcuts mode · close with <kbd>?</kbd> or <kbd>Esc</kbd></span>';
+    // Built node by node, never from an HTML string. A page that enforces Trusted Types —
+    // Google Meet sends `require-trusted-types-for 'script'` — makes assigning a plain string to
+    // `innerHTML` throw, and this used to do exactly that: `showHelp` died here, before the
+    // overlay was attached, so `?` did nothing at all on those pages and worked everywhere else.
+    const headingTitle = document.createElement("strong");
+    headingTitle.textContent = "TWeb shortcuts";
+    headingTitle.style.cssText = "display:block;font-size:19px;color:#fff";
+    const headingHint = document.createElement("span");
+    headingHint.style.color = "#9aa0a6";
+    const helpKey = document.createElement("kbd");
+    helpKey.textContent = "?";
+    const escKey = document.createElement("kbd");
+    escKey.textContent = "Esc";
+    headingHint.append("Shortcuts mode · close with ", helpKey, " or ", escKey);
+    heading.append(headingTitle, headingHint);
     const close = document.createElement("button");
     close.type = "button";
     close.textContent = "close  Esc";
@@ -1561,6 +1596,7 @@
     document.documentElement.append(host);
     paintNow();
     helpHost = host;
+    helpScroller = backdrop;
     setMode("help", "?·Esc close");
     requestAnimationFrame(() => close.focus({ preventScroll: true }));
   }
@@ -1570,7 +1606,28 @@
     event.preventDefault();
     event.stopImmediatePropagation();
     if (key === "?" || key === "Escape") cancelHelp();
+    else scrollHelp(key, event);
     return true;
+  }
+
+  // The help panel is taller than a small pane, and every key is swallowed while it is open
+  // (so a stray letter cannot reach the page underneath), so the overlay has to scroll itself
+  // with the same keys the page uses.
+  function scrollHelp(key, event) {
+    const scroller = helpScroller;
+    if (!scroller) return;
+    const page = Math.max(60, scroller.clientHeight - 60);
+    const line = 60;
+    let top = null;
+    if (key === "j" || key === "ArrowDown") top = scroller.scrollTop + line;
+    else if (key === "k" || key === "ArrowUp") top = scroller.scrollTop - line;
+    else if (key === "d" || key === "PageDown" || (key === " " && !event.shiftKey)) top = scroller.scrollTop + (key === "d" ? page / 2 : page);
+    else if (key === "u" || key === "PageUp" || key === " ") top = scroller.scrollTop - (key === "u" ? page / 2 : page);
+    else if (key === "g" || key === "Home") top = 0;
+    else if (key === "G" || key === "End") top = scroller.scrollHeight;
+    if (top === null) return;
+    scroller.scrollTop = Math.max(0, Math.min(top, scroller.scrollHeight - scroller.clientHeight));
+    paintNow();
   }
 
   function cancelPrompt(restoreMode = true) {
