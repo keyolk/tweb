@@ -895,8 +895,12 @@ test("a picked scroll surface survives use and can be left", () => {
     assert.match(targets, /page: true/, `${name} offers no page candidate`);
     assert.match(targets, /if \(picked\) targets\.unshift\(entry\)/,
       `${name} does not put the way out first`);
-    assert.match(source, /scrollTarget = item\.page \|\| item\.pan \? null : item\.element;/,
-      `${name} does not release the surface when the page is picked`);
+    // The preload picks areas from `v`, which offers no page entry — Escape is the way back.
+    // The Tauri copy still has the `s` picker and its page entry.
+    assert.match(source, name === "preload"
+      ? /scrollTarget = item\.pan \? null : item\.element;/
+      : /scrollTarget = item\.page \|\| item\.pan \? null : item\.element;/,
+      `${name} does not hold the picked surface`);
     // Escape is the other way out.
     assert.match(source, /if \(scrollSurface\(\) \|\| panSurface\(\)\) \{\n\s+scrollTarget = null;\n\s+panTarget = null;/,
       `${name} does not release the surface on Escape`);
@@ -1056,7 +1060,15 @@ test("scroll keys can target a picked inner surface", () => {
   const scrollable = electron.slice(electron.indexOf("function scrollableTargets()"),
     electron.indexOf("function scrollSurface()"));
   assert.doesNotMatch(scrollable, /uniqueVisibleTargets\(/);
-  assert.match(electron, /\{ s: \(\) => startScrollPicker\(\) \}/);
+  // The `s` picker is gone: inner areas are teal targets in `v`, whose pick holds them.
+  assert.doesNotMatch(electron, /startScrollPicker/);
+  const visual = electron.slice(electron.indexOf("function visualTargets()"),
+    electron.indexOf("function scrollableTargets()"));
+  assert.match(visual, /scrollableTargets\(\)\s*\.filter\(\(item\) => !item\.page\)/);
+  assert.match(visual, /kind: "scroll"/);
+  const enter = electron.slice(electron.indexOf("function enterVisual(item)"),
+    electron.indexOf("function startVisual()"));
+  assert.match(enter, /item\.kind === "scroll"[\s\S]*?holdScrollArea\(item\)/);
   for (const key of ["h", "j", "k", "l"]) {
     assert.match(electron, new RegExp(`\\n\\s+${key}: \\(\\) => scrollSurfaceBy\\(`),
       `${key} must scroll the picked surface`);
@@ -1072,7 +1084,7 @@ test("large canvas and SVG surfaces can be panned with scroll keys", () => {
     assert.match(source, /rect\.width < 320 \|\| rect\.height < 220/);
     assert.match(source, /function panSurfaceBy\(left, top\)/);
     assert.match(source, /send\("native-drag", \{/);
-    assert.match(source, /scrollTarget = item\.page \|\| item\.pan \? null : item\.element/);
+    assert.match(source, /scrollTarget = (?:item\.page \|\| )?item\.pan \? null : item\.element/);
     assert.match(source, /panTarget = item\.pan \? item\.element : null/);
   }
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");

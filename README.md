@@ -293,7 +293,7 @@ previously meant relaunching the pane under a separate harness.
 
 `diag`'s `page` is the shortcut runtime's own state — the current mode and its detail, the kind of
 picker open with its candidate count and the label being typed, the visual/caret state, the scroll
-surface currently held (including which frame it is in), and how many targets `f`/`s`/`v` would find
+surface currently held (including which frame it is in), and how many targets `f`/`v` would find
 right now. The preload runs in an isolated world and cannot be reached via `eval`, so this path is
 the only window into it. If `targets.frames` is 1 but `visual` is 0, for instance, the frame was
 recognized but there is nothing inside it to pick.
@@ -547,10 +547,9 @@ composition area and the terminal cursor are removed with it.
 | `?` | Open the supported-shortcut help (`?` or `Esc` closes it) |
 | `f` / `F` | Hint the clickable elements on screen / open the link in a new tab |
 | `/`, `n`, `N` | Find in page (`Enter` confirms) / next / previous match — **broken, see [Status](#status): the bar opens and accepts typing but matches nothing** |
-| `v` / `V` | Pick a target with the visual picker / open the whole page's text as a Visual selection (inside visual, `c` enters caret mode; from caret, `v` selects from that point) |
+| `v` / `V` | Pick a target with the visual picker / open the whole page's text as a Visual selection (inside visual, `c` enters caret mode; from caret, `v` selects from that point). Teal labels in `v` are inner scroll or drag-pan areas: picking one points `h`/`j`/`k`/`l` at it — the mode indicator gains a `⇅` — and `Esc` hands them back to the page |
 | `b` | The open browser tab list (`j`/`k`, `1`–`9`, `Enter`, `x` closes, `Esc`) |
 | `I` | inspect picker: check element info and selectors |
-| `s` | Pick an inner area to scroll — with an inner area held, the mode indicator gains a `⇅`, and `Esc` or `s`'s first candidate (the page) returns |
 | `h` / `l` | Scroll left / right |
 | `j` / `k` | Scroll down / up |
 | `d` / `u` | Scroll half a page down / up |
@@ -679,7 +678,7 @@ contradict them, but most of their mechanics were not re-exercised.
 | Capability | Note |
 |---|---|
 | Page rendering, resize, zoom | The default path is damage-aware Kitty graphics on stock Ghostty/Kitty. |
-| Modal shortcuts (`f`/`v`/`I`/`s`/`b`/`o`…) | TWeb's own preload, not a Vimium extension. |
+| Modal shortcuts (`f`/`v`/`I`/`b`/`o`…) | TWeb's own preload, not a Vimium extension. |
 | Back / forward (`H`/`L`) | Measured, and fast. But `Alt-Left`, `Alt-Right` and `Backspace` — the keys a Chrome user's hands already know, and all three deliverable through tmux — are simply unbound and fail silently. The capability is there; only the muscle memory is missing. |
 | History (`gh`) | Measured: 343 real visits, live incremental search, `Enter` opens, `Ctrl-D` deletes. |
 | Tabs, close and reopen (`x`/`X`) | Measured: `X` restores the tab at its original strip position. |
