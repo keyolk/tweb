@@ -20,6 +20,9 @@ use serde_json::json;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum BrowserEngineArg {
     Electron,
+    /// The user's real Google Chrome over CDP, for sites that need managed Chrome: Okta device
+    /// trust, Endpoint Verification, policy-installed extensions. Hosted by the Electron engine.
+    Chrome,
     Tauri,
 }
 
@@ -64,6 +67,7 @@ impl BrowserOptions {
             "--engine {} --frame-rate {}",
             match self.engine {
                 BrowserEngineArg::Electron => "electron",
+                BrowserEngineArg::Chrome => "chrome",
                 BrowserEngineArg::Tauri => "tauri",
             },
             self.max_frame_rate()
@@ -797,6 +801,7 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
     let options = tweb_pane::PaneOptions {
         engine: match browser.engine {
             BrowserEngineArg::Electron => tweb_pane::BrowserEngine::Electron,
+            BrowserEngineArg::Chrome => tweb_pane::BrowserEngine::Chrome,
             BrowserEngineArg::Tauri => tweb_pane::BrowserEngine::Tauri,
         },
         frame_rate: browser.max_frame_rate(),
@@ -833,7 +838,7 @@ async fn split_and_run_pane(
     // Pass the chosen engine binary to the split pane explicitly.
     let mut env_str = String::new();
     match browser.engine {
-        BrowserEngineArg::Electron => {
+        BrowserEngineArg::Electron | BrowserEngineArg::Chrome => {
             if let Some(path) = find_electron_binary() {
                 env_str.push_str(&format!(
                     "TWEB_ELECTRON={} ",

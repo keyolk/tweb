@@ -6,7 +6,13 @@
 // - frame files avoid flooding the terminal with bytes; direct transfer is the fallback
 // - alternate screen and raw mode are handled by tweb-pane (Rust)
 
-const { app, BrowserWindow, clipboard, ipcMain, nativeImage, screen, session } = require("electron");
+const electron = require("electron");
+const { app, clipboard, nativeImage, screen } = electron;
+// `TWEB_BROWSER=chrome` puts the tabs in the user's real, managed Chrome over CDP; see
+// cdp/backend.cjs. Unset, these are Electron's own objects and nothing below changes.
+// Its diagnostics are always recorded, like every other engine line (see `debugLogging`).
+const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug: true });
+const { BrowserWindow, ipcMain, session } = pageBackend;
 const {
   appendFileSync,
   closeSync,
@@ -4753,7 +4759,9 @@ async function dispatchAgentCommand(method, params) {
       createTab(normalizeUrl(String(params.url || "about:blank")), true);
       return agentTabList();
     case "tab-close":
-      closeTab(params.index === undefined ? currentWindows().activeTabIndex : Number(params.index));
+      // `null` as well as absent: the CLI sends `{"index": null}` for a bare `tweb tab close`, and
+      // `Number(null)` is 0 — so "close this tab" closed the FIRST tab instead.
+      closeTab(params.index == null ? currentWindows().activeTabIndex : Number(params.index));
       return agentTabList();
     case "console":
       return { messages: params.clear ? consoleLog.splice(0) : consoleLog.slice(-(params.limit || 100)) };
@@ -5451,6 +5459,8 @@ let extensionsDirectory = null;
 // the interface — see `extension-policy.cjs` for which manifests are accepted and why an
 // unsupported one is refused with a reason rather than loaded and left inert.
 async function setUpExtensions() {
+  // Chrome brings its own extensions — the managed, policy-installed ones it is used for.
+  if (pageBackend.kind === "chrome") return;
   const dir = extensionsDir(process.env, app.getPath("userData"));
   extensionsDirectory = dir;
   watchServiceWorkers(session.defaultSession, {
@@ -7978,6 +7988,16 @@ app.whenReady().then(async () => {
   }
 
   terminalSetup();
+  // Chrome has to be up before the first tab asks it for a target. A Chrome that cannot start
+  // is not something to fall back from silently — the user chose it for a site Electron cannot
+  // open — so it is reported and the engine stops.
+  try {
+    await pageBackend.start();
+  } catch (error) {
+    console.error(`tweb: chrome engine failed to start: ${error.message}`);
+    app.quit();
+    return;
+  }
   // Before the first navigation, not after: a DNR rule enabled once a page has begun loading
   // does not retroactively block that page's requests, so an ad blocker wired up after
   // `createWindow` would miss the very first page the user opens. The await is why
@@ -8123,6 +8143,24 @@ function sweepAbandonedClaimFiles() {
   if (removed > 0) console.error(`tweb: swept ${removed} claim files from dead engines`);
 }
 
+// The Chrome engine's tabs live in another process, which an exit does not take with it. Quitting is
+// held once — long enough to close this engine's tabs, and Chrome too when no other pane uses it —
+// then let go. Bounded, because a wedged Chrome must not keep a dead pane's engine alive.
+let pageBackendStopped = pageBackend.kind !== "chrome";
+app.on("will-quit", (event) => {
+  if (pageBackendStopped) return;
+  pageBackendStopped = true;
+  event.preventDefault();
+  const done = () => app.quit();
+  const timer = setTimeout(done, 1500);
+  pageBackend.engine.stop().catch((error) => {
+    console.error(`tweb: chrome engine stop failed: ${error.message}`);
+  }).finally(() => {
+    clearTimeout(timer);
+    done();
+  });
+});
+
 app.on("window-all-closed", () => {
   // A floating viewer is a real BrowserWindow, so closing it fires window-all-closed.
   // But the offscreen tab window is still alive — quitting here takes down the
@@ -8142,7 +8180,12 @@ app.on("window-all-closed", () => {
 // inside the process, so the failure is logged rather than swallowed. The steps are independent
 // effects on different surfaces, so each is attempted whether or not the one before it worked; see
 // `teardown.cjs`.
+let teardownRan = false;
 app.on("before-quit", () => {
+  // Once. The Chrome engine holds the quit in `will-quit` and quits again, which raises this a
+  // second time; the teardown has already written its deletes and must not write them twice.
+  if (teardownRan) return;
+  teardownRan = true;
   runTeardown([
     ["agent server", () => {
       if (agentServer) {

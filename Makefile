@@ -42,6 +42,13 @@ electron-test: ## Run the Electron unit tests
 
 electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/main.cjs
+	node --check electron/cdp/backend.cjs
+	node --check electron/cdp/connection.cjs
+	node --check electron/cdp/damage.cjs
+	node --check electron/cdp/engine.cjs
+	node --check electron/cdp/input.cjs
+	node --check electron/cdp/preload-bridge.cjs
+	node --check electron/cdp/web-contents.cjs
 	node --check electron/context-menu.cjs
 	node --check electron/preload.cjs
 	node --check electron/gfx-worker.cjs
