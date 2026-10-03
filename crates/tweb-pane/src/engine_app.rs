@@ -48,6 +48,14 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/hint-labels.cjs"),
     ),
     (
+        "settings.cjs",
+        include_str!("../../../electron/settings.cjs"),
+    ),
+    (
+        "settings-schema.json",
+        include_str!("../../../electron/settings-schema.json"),
+    ),
+    (
         "mouse-click-state.cjs",
         include_str!("../../../electron/mouse-click-state.cjs"),
     ),

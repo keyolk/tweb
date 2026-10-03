@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod chrome;
+pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod mcp;
@@ -28,9 +29,9 @@ pub struct BrowserOptions {
     #[arg(long, value_enum, default_value_t = BrowserEngineArg::Electron)]
     pub engine: BrowserEngineArg,
 
-    /// Maximum active frame rate.
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u16).range(1..=60))]
-    pub frame_rate: u16,
+    /// Maximum active frame rate. Default: `frame_rate.max` in config.toml (30).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=60))]
+    pub frame_rate: Option<u16>,
 
     /// Explicitly enable activity-aware frame-rate adaptation (default).
     #[arg(long, overrides_with = "no_adaptive_frame_rate")]
@@ -42,8 +43,20 @@ pub struct BrowserOptions {
 }
 
 impl BrowserOptions {
+    /// A flag on this command line wins; otherwise `frame_rate.adaptive` from config.toml.
     fn adaptive(&self) -> bool {
-        self.adaptive_frame_rate || !self.no_adaptive_frame_rate
+        if self.adaptive_frame_rate {
+            true
+        } else if self.no_adaptive_frame_rate {
+            false
+        } else {
+            config::frame_rate_adaptive()
+        }
+    }
+
+    /// A flag on this command line wins; otherwise `frame_rate.max` from config.toml.
+    fn max_frame_rate(&self) -> u16 {
+        self.frame_rate.unwrap_or_else(config::frame_rate_max)
     }
 
     fn shell_args(&self) -> String {
@@ -53,7 +66,7 @@ impl BrowserOptions {
                 BrowserEngineArg::Electron => "electron",
                 BrowserEngineArg::Tauri => "tauri",
             },
-            self.frame_rate
+            self.max_frame_rate()
         );
         value.push_str(if self.adaptive() {
             " --adaptive-frame-rate"
@@ -336,6 +349,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Settings in config.toml: list, get, set, unset, edit, path.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
     /// Manage the managed-Chrome handoff and bridge.
     Chrome {
         #[command(subcommand)]
@@ -446,6 +464,25 @@ pub enum ProfileAction {
     Bootstrap { source: String },
     /// List profiles.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Every setting, its value, and where the value came from (the default with no subcommand).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// One setting's value as it is in effect now.
+    Get { key: String },
+    /// Write one setting to config.toml.
+    Set { key: String, value: String },
+    /// Remove one setting from config.toml, back to its default.
+    Unset { key: String },
+    /// Open config.toml in $VISUAL / $EDITOR (created with every setting commented out).
+    Edit,
+    /// Print where config.toml is.
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
@@ -564,6 +601,14 @@ pub async fn run() -> Result<()> {
         Command::Doctor { fix } => {
             doctor::run(fix).await?;
         }
+        Command::Config { action } => match action.unwrap_or(ConfigAction::List { json: false }) {
+            ConfigAction::List { json } => config::list(json)?,
+            ConfigAction::Get { key } => config::get(&key)?,
+            ConfigAction::Set { key, value } => config::set(&key, &value)?,
+            ConfigAction::Unset { key } => config::unset(&key)?,
+            ConfigAction::Edit => config::edit()?,
+            ConfigAction::Path => println!("{}", config::path().display()),
+        },
         Command::Chrome { action } => match action {
             ChromeAction::Open { url } => {
                 let url = resolve_url_argument(&url, &working_directory);
@@ -754,7 +799,7 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
             BrowserEngineArg::Electron => tweb_pane::BrowserEngine::Electron,
             BrowserEngineArg::Tauri => tweb_pane::BrowserEngine::Tauri,
         },
-        frame_rate: browser.frame_rate,
+        frame_rate: browser.max_frame_rate(),
         adaptive_frame_rate: browser.adaptive(),
         restore_session: url.is_none(),
     };
@@ -928,8 +973,9 @@ mod tests {
         match cli.command {
             Command::Open { browser, url } => {
                 assert!(url.is_none());
-                assert_eq!(browser.frame_rate, 30);
-                assert!(browser.adaptive());
+                // Unset on the command line, so config.toml (or its default) decides.
+                assert_eq!(browser.frame_rate, None);
+                assert!(!browser.no_adaptive_frame_rate);
             }
             other => panic!("bare tweb parsed as {other:?}"),
         }

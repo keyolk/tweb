@@ -640,8 +640,7 @@ fn check_kitty_graphics_probe() -> Check {
 /// the slots so a "not configured" tells the user what to fix.
 fn check_tmux_user_keys() -> Check {
     let slots = [
-        100, 101, 110, 111, 113, 114, 115, 116, 117, 118, 124, 125, 126, 127, 128, 129, 130,
-        131,
+        100, 101, 110, 111, 113, 114, 115, 116, 117, 118, 124, 125, 126, 127, 128, 129, 130, 131,
     ];
     let mut missing = Vec::new();
     for slot in slots {
@@ -1023,7 +1022,7 @@ fn tmux_config_path() -> PathBuf {
     }
 }
 
-fn managed_config_dir() -> PathBuf {
+pub(crate) fn managed_config_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("TWEB_CONFIG_DIR") {
         return PathBuf::from(path);
     }
@@ -1294,9 +1293,9 @@ mod tests {
         ghostty_copy_on_select_enabled, ghostty_include_block, ghostty_managed_config,
         ghostty_version_supported, managed_block, migrate_legacy_ghostty_config,
         migrate_legacy_tmux_config, private_sequence_hex, select_ghostty_config_candidate,
-        terminal_check, tmux_include_block, tmux_managed_config, upsert_managed_block, CheckStatus,
-        user_key_is_set, CMD_PASSTHROUGH_KEYS, PRIVATE_SHORTCUT_KEYS, GHOSTTY_BEGIN, GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END,
-        TMUX_BEGIN, TMUX_END,
+        terminal_check, tmux_include_block, tmux_managed_config, upsert_managed_block,
+        user_key_is_set, CheckStatus, CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN, GHOSTTY_END,
+        LEGACY_TMUX_BEGIN, LEGACY_TMUX_END, PRIVATE_SHORTCUT_KEYS, TMUX_BEGIN, TMUX_END,
     };
 
     fn ghostty_include() -> String {
@@ -1346,7 +1345,10 @@ mod tests {
     fn user_key_check_reads_unquoted_tmux_output() {
         // Verbatim from tmux 3.5a.
         assert!(user_key_is_set(Some("user-keys[118] \\033[5008~\n"), 118));
-        assert!(user_key_is_set(Some("user-keys[118] \"\\033[5008~\"\n"), 118));
+        assert!(user_key_is_set(
+            Some("user-keys[118] \"\\033[5008~\"\n"),
+            118
+        ));
         assert!(!user_key_is_set(Some("user-keys[118]\n"), 118));
         assert!(!user_key_is_set(Some("user-keys[118] \"\"\n"), 118));
         assert!(!user_key_is_set(None, 118));
@@ -1387,8 +1389,10 @@ mod tests {
             );
             assert!(engine_parses_private_code(*code));
         }
-        let slots: std::collections::HashSet<_> =
-            PRIVATE_SHORTCUT_KEYS.iter().map(|(_, slot, _)| slot).collect();
+        let slots: std::collections::HashSet<_> = PRIVATE_SHORTCUT_KEYS
+            .iter()
+            .map(|(_, slot, _)| slot)
+            .collect();
         for (_, _, slot) in CMD_PASSTHROUGH_KEYS {
             assert!(!slots.contains(slot), "slot {slot} claimed twice");
         }

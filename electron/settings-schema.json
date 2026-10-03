@@ -1,0 +1,67 @@
+{
+  "_comment": "The one list of user settings. Read by the engine (electron/settings.cjs) and by the CLI (crates/tweb-core/src/settings.rs) so the two cannot disagree on a name, a type or a default. `env` is the variable that already set this before the file existed; it still wins over the file. `applies` says when a change is picked up: live (within a second, no restart), new-tab, engine (next engine start), pane (next `tweb open`).",
+  "settings": [
+    {
+      "key": "scroll.invert",
+      "type": "bool",
+      "default": false,
+      "applies": "live",
+      "description": "Reverse the terminal wheel. Off follows the terminal, which already applies macOS natural scrolling."
+    },
+    {
+      "key": "scroll.distance",
+      "type": "int",
+      "default": 100,
+      "min": 10,
+      "max": 1000,
+      "applies": "live",
+      "description": "Pixels one wheel notch scrolls."
+    },
+    {
+      "key": "zoom.default",
+      "type": "float",
+      "default": 0.8,
+      "min": 0.5,
+      "max": 2,
+      "env": "TWEB_DEFAULT_ZOOM",
+      "applies": "new-tab",
+      "description": "Page zoom a new tab starts at."
+    },
+    {
+      "key": "frame_rate.max",
+      "type": "int",
+      "default": 30,
+      "min": 1,
+      "max": 60,
+      "env": "TWEB_FRAME_RATE",
+      "applies": "pane",
+      "description": "Highest frame rate a pane draws at. `tweb open --frame-rate` overrides it."
+    },
+    {
+      "key": "frame_rate.adaptive",
+      "type": "bool",
+      "default": true,
+      "env": "TWEB_ADAPTIVE_FRAME_RATE",
+      "applies": "pane",
+      "description": "Drop to a low idle rate when nothing moves. `--no-adaptive-frame-rate` overrides it."
+    },
+    {
+      "key": "downloads.dir",
+      "type": "path",
+      "default": "",
+      "env": "TWEB_DOWNLOAD_DIR",
+      "applies": "engine",
+      "description": "Where downloads are saved. Empty means the system Downloads folder."
+    },
+    {
+      "key": "ime.slot_cells",
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 40,
+      "env": "TWEB_IME_SLOT_CELLS",
+      "applies": "live",
+      "description": "Width in cells of the box an IME composition is drawn in."
+    }
+  ]
+}
