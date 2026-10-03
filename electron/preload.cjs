@@ -2733,48 +2733,93 @@ installPrintShim();
     }
   }
 
+  // Every normal-mode shortcut and its line in `?`, in one place. A row is `[keys, description]`
+  // or `[keys, description, { key: action }]`; the third part is what the key handler runs, so
+  // a single-key binding cannot exist without the help text that names it. `w`/`W` (the float
+  // window), `:` and `y` were all bound for a while with no line here, and the float mode read
+  // as removed. Rows without bindings are keys handled elsewhere — chords after `g`/`z`, the
+  // pickers' own keys, and the ones the engine intercepts before the page sees them.
   const shortcutHelpSections = [
     ["Motion", [
-      ["h · j · k · l", "scroll left · down · up · right"],
-      ["d · u", "half page down · up"],
-      ["gg · G", "top · bottom of page"],
-      ["H · L", "history back · forward"],
+      ["h · j · k · l", "scroll left · down · up · right", {
+        h: () => scrollSurfaceBy(-90, 0),
+        j: () => scrollSurfaceBy(0, 90),
+        k: () => scrollSurfaceBy(0, -90),
+        l: () => scrollSurfaceBy(90, 0),
+      }],
+      ["d · u", "half page down · up", {
+        d: () => scrollSurfaceBy(0, scrollSurfaceHeight() * 0.5),
+        u: () => scrollSurfaceBy(0, -scrollSurfaceHeight() * 0.5),
+      }],
+      ["gg · G", "top · bottom of page", {
+        g: () => { pendingG = true; pendingGTimer = setTimeout(resetPendingG, 800); setMode("normal", "g"); },
+        G: () => scrollSurfaceTo(scrollSurfaceEnd()),
+      }],
+      ["H · L", "history back · forward", {
+        H: () => send("history-back"),
+        L: () => send("history-forward"),
+      }],
       ["Alt-← · Alt-→ · Backspace", "history back · forward — the Chrome keys"],
     ]],
     ["Opening and tabs", [
-      ["f · F", "open via hint · open in new tab"],
-      ["o · O / t", "omnibox in current tab · new tab"],
-      ["b", "list open tabs"],
+      ["f · F", "open via hint · open in new tab", { f: () => startHints(false), F: () => startHints(true) }],
+      ["o · O / t", "omnibox in current tab · new tab", {
+        o: () => showPrompt(false),
+        O: () => showPrompt(true),
+        t: () => showPrompt(true),
+      }],
+      ["b", "list open tabs", { b: () => showTabList() }],
       ["gh · gd", "history page · downloads — search, copy the path, open"],
-      ["J · K", "previous · next tab"],
-      ["x · X", "close tab · restore recent tab"],
-      ["r · gi", "reload · focus first input"],
-      ["s", "pick a scroll/drag-pan area (Esc or s returns to page)"],
+      ["J · K", "previous · next tab", { J: () => send("previous-tab"), K: () => send("next-tab") }],
+      ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
+      ["r · gi", "reload · focus first input", { r: () => send("reload") }],
+      ["y", "copy the page URL", { y: () => { send("copy-url"); flash("URL"); } }],
+      ["s", "pick a scroll/drag-pan area (Esc or s returns to page)", { s: () => startScrollPicker() }],
     ]],
     ["Search and selection", [
-      ["/ · n · N", "search · next · previous match"],
-      ["v · V", "visual picker · select whole page"],
+      ["/ · n · N", "search · next · previous match", {
+        "/": () => showSearch(),
+        n: () => { if (!lastSearch) return false; stepSearch(true); },
+        N: () => { if (!lastSearch) return false; stepSearch(false); },
+      }],
+      ["v · V", "visual picker · select whole page", { v: () => startVisual(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
       ["D · o/O · p · d", "image download · open target · paste · inspect"],
-      ["I", "inspect picker"],
+      ["I", "inspect picker", { I: () => startInspect() }],
     ]],
     ["Browser and modes", [
-      ["zi · zo · zz", "zoom in · out · reset"],
+      ["zi · zo · zz", "zoom in · out · reset", {
+        z: () => { pendingZ = true; pendingZTimer = setTimeout(resetPendingZ, 800); setMode("normal", "z"); },
+      }],
       ["Ctrl + / - / 0", "browser zoom"],
       ["Ctrl-Tab / PgUp / PgDn", "switch browser tab"],
       ["Ctrl-W", "close current browser tab"],
       ["Ctrl-P", "save the page as a PDF in ~/Downloads (a terminal cannot draw a print dialog)"],
       ["gp", "save the PDF, then send it to the printer with lpr"],
       ["Ctrl-D", "cancel the running download"],
-      ["i", "insert mode — page's own shortcuts, Esc returns"],
-      ["m", "take audio back — only one pane plays at a time"],
+      // Shift-W raises the floating window without changing whether it exists — `w` still
+      // toggles. Same finger, and the pair reads as "float" / "go to the float".
+      ["w · W", "float the page into a desktop window (again to return) · raise it", {
+        w: () => send("toggle-float"),
+        W: () => send("focus-float"),
+      }],
+      ["c", "command palette", { c: () => startCommandPalette() }],
+      // The command line. Normal mode only — DESIGN.md 16.3 keeps a colon a character the page
+      // is entitled to receive in insert mode, and this table only runs in normal mode.
+      [":", "command line", { ":": () => startCommandLine() }],
+      ["i", "insert mode — page's own shortcuts, Esc returns", { i: () => enterInsertMode() }],
+      ["m", "take audio back — only one pane plays at a time", { m: () => { send("reclaim-audio"); flash("audio"); } }],
+      ["?", "this help", { "?": () => showHelp() }],
       ["Ctrl-;", "Shortcuts ↔ web passthrough"],
       ["Ctrl-C", "quit TWeb from Shortcuts mode"],
       ["Esc", "clear current mode · fullscreen · input focus"],
     ]],
   ];
+
+  const normalKeyActions = new Map(shortcutHelpSections.flatMap(([, entries]) =>
+    entries.flatMap(([, , bindings]) => Object.entries(bindings || {}))));
 
   function cancelHelp(restoreMode = true) {
     helpHost?.remove();
@@ -4924,49 +4969,13 @@ installPrintShim();
       return;
     }
 
+    // Single-key shortcuts come from `shortcutHelpSections`, the same table `?` renders, so a key cannot
+    // be bound without a line in the help. An action returning `false` declines the key.
     let handled = true;
-    switch (key) {
-      case "?": showHelp(); break;
-      case "i": enterInsertMode(); break;
-      case "f": startHints(false); break;
-      case "F": startHints(true); break;
-      case "v": startVisual(); break;
-      case "V": selectPageText(); break;
-      case "b": showTabList(); break;
-      case "I": startInspect(); break;
-      case "/": showSearch(); break;
-      case "n": if (lastSearch) stepSearch(true); else handled = false; break;
-      case "N": if (lastSearch) stepSearch(false); else handled = false; break;
-      case "h": scrollSurfaceBy(-90, 0); break;
-      case "j": scrollSurfaceBy(0, 90); break;
-      case "k": scrollSurfaceBy(0, -90); break;
-      case "l": scrollSurfaceBy(90, 0); break;
-      case "d": scrollSurfaceBy(0, scrollSurfaceHeight() * 0.5); break;
-      case "u": scrollSurfaceBy(0, -scrollSurfaceHeight() * 0.5); break;
-      case "s": startScrollPicker(); break;
-      case "m": send("reclaim-audio"); flash("audio"); break;
-      case "G": scrollSurfaceTo(scrollSurfaceEnd()); break;
-      case "g": pendingG = true; pendingGTimer = setTimeout(resetPendingG, 800); setMode("normal", "g"); break;
-      case "z": pendingZ = true; pendingZTimer = setTimeout(resetPendingZ, 800); setMode("normal", "z"); break;
-      case "H": send("history-back"); break;
-      case "L": send("history-forward"); break;
-      case "J": send("previous-tab"); break;
-      case "K": send("next-tab"); break;
-      case "t": showPrompt(true); break;
-      case "o": showPrompt(false); break;
-      case "O": showPrompt(true); break;
-      case "x": send("close-tab"); break;
-      case "X": send("restore-tab"); break;
-      case "y": send("copy-url"); flash("URL"); break;
-      case "r": send("reload"); break;
-      case "w": send("toggle-float"); break;
-      // Shift-W raises the floating window without changing whether it exists — `w` still
-      // toggles. Same finger, and the pair reads as "float" / "go to the float".
-      case "W": send("focus-float"); break;
-      case "c": startCommandPalette(); break;
-      // The command line. Normal mode only — DESIGN.md 16.3 keeps a colon a character the page
-      // is entitled to receive in insert mode, and this switch only runs in normal mode.
-      case ":": startCommandLine(); break;
+    const action = normalKeyActions.get(key);
+    if (action) {
+      handled = action.call(null) !== false;
+    } else switch (key) {
       case "Escape":
         // Release a picked scroll or pan surface before bothering the page.
         if (scrollSurface() || panSurface()) {

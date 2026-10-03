@@ -123,7 +123,7 @@ function assertPreload(source) {
   // Insert mode pauses TWeb keys for a page's own shortcuts; Escape comes back
   // and also leaves fullscreen, which an offscreen window never does by itself.
   assert.match(source, /function enterInsertMode\(\)/);
-  assert.match(source, /case "i": enterInsertMode\(\); break;/);
+  assert.match(source, /\{ i: \(\) => enterInsertMode\(\) \}/);
   assert.match(source, /if \(insertMode\) \{\s*\n\s*if \(key !== "Escape"\) return;/);
   assert.match(source, /if \(key === "Escape" && document\.fullscreenElement\)/);
   assert.match(source, /!editable && !insertMode/);
@@ -247,7 +247,7 @@ test("page keys scroll by the surface, not by a line", () => {
   assert.doesNotMatch(pageKeys, /scrollSurfaceBy\(0, key === "PageUp" \? -?\d+ : \d+\)/);
 
   // Measured against the same surface `d`/`u` use, so an inner pane pages by its own height.
-  const halfPage = source.slice(source.indexOf('case "d": '), source.indexOf('case "G": '));
+  const halfPage = source.slice(source.indexOf('["d · u", '), source.indexOf('["gg · G", '));
   assert.match(halfPage, /scrollSurfaceHeight\(\)/);
 });
 
@@ -735,6 +735,37 @@ test("the tab badge list closes a tab in place", () => {
   assert.match(main, /case "close-tab-from-badge":\s*\n\s*if \(Number\.isInteger\(value\)\) closeTab\(value\);/);
 });
 
+test("the shortcut help lists the float window and the command palette", () => {
+  // `w` existed with no entry in `?`, so the float mode looked like it had been removed.
+  assert.match(electron, /\["w · W", "float the page into a desktop window/);
+  assert.match(electron, /\["c", "command palette", \{ c: /);
+  assert.match(electron, /w: \(\) => send\("toggle-float"\),/);
+});
+
+test("a normal-mode shortcut cannot be bound without a help line", () => {
+  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+    const normal = source.slice(source.indexOf("function handleNormalKey"));
+    const dispatch = normal.slice(normal.indexOf("let handled = true;"), normal.indexOf("if (handled) {"));
+    // The only key left in the switch is Escape, which has no single action to name.
+    assert.deepEqual([...dispatch.matchAll(/case "([^"]+)":/g)].map((m) => m[1]), ["Escape"],
+      `${name} binds a normal-mode key outside shortcutHelpSections`);
+    assert.match(dispatch, /const action = normalKeyActions\.get\(key\);/);
+    // Evaluate the table: every bound key must sit in a row whose key column names it.
+    const start = source.indexOf("  const shortcutHelpSections = [");
+    const end = source.indexOf("\n", source.indexOf("entries.flatMap(([, , bindings])", start)) + 1;
+    const sections = new Function(`${source.slice(start, end)}\nreturn shortcutHelpSections;`)();
+    for (const [, entries] of sections) {
+      for (const [keys, description, bindings] of entries) {
+        assert.ok(description, `${name}: ${keys} has no description`);
+        for (const key of Object.keys(bindings || {})) {
+          assert.ok(keys.split(/[\s·]+/).some((label) => label.split("/").includes(key) || label.includes(key)),
+            `${name}: ${key} is bound under a row that does not name it ("${keys}")`);
+        }
+      }
+    }
+  }
+});
+
 test("the shortcut help opens under Trusted Types and scrolls from the keyboard", () => {
   for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
     const help = source.slice(source.indexOf("function showHelp()"), source.indexOf("function handleHelpKey("));
@@ -1025,12 +1056,12 @@ test("scroll keys can target a picked inner surface", () => {
   const scrollable = electron.slice(electron.indexOf("function scrollableTargets()"),
     electron.indexOf("function scrollSurface()"));
   assert.doesNotMatch(scrollable, /uniqueVisibleTargets\(/);
-  assert.match(electron, /case "s": startScrollPicker\(\); break;/);
+  assert.match(electron, /\{ s: \(\) => startScrollPicker\(\) \}/);
   for (const key of ["h", "j", "k", "l"]) {
-    assert.match(electron, new RegExp(`case "${key}": scrollSurfaceBy\\(`),
+    assert.match(electron, new RegExp(`\\n\\s+${key}: \\(\\) => scrollSurfaceBy\\(`),
       `${key} must scroll the picked surface`);
   }
-  assert.doesNotMatch(electron, /case "j": scrollBy\(/);
+  assert.doesNotMatch(electron, /j: \(\) => scrollBy\(/);
   // The surface, not the step: how far a page key moves is pinned by its own test.
   assert.match(electron, /if \(key === "PageUp" \|\| key === "PageDown"\) \{[\s\S]*?scrollSurfaceBy\(0, /);
 });
@@ -2103,7 +2134,7 @@ test("viewer input and resize are routed back to the tab they mirror", () => {
 // separate CLI command. The key sends a `toggle-float` shortcut that flips
 // `inputState().floating` and re-runs `updatePaintingState`.
 test("w key toggles floating mode from the browser", () => {
-  assert.match(electron, /case "w": send\("toggle-float"\)/);
+  assert.match(electron, /w: \(\) => send\("toggle-float"\)/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "toggle-float": toggleFloat\(\)/);
   assert.match(main, /function toggleFloat\(fullscreen = false\)/);
@@ -2309,7 +2340,7 @@ test("command palette opens with c and lists actions", () => {
   assert.doesNotMatch(electron, /\{ label: "Downloads"/);
   assert.doesNotMatch(electron, /\{ label: "Zoom to fit"/);
   // `c` enters the palette from normal mode.
-  assert.match(electron, /case "c": startCommandPalette\(\); break;/);
+  assert.match(electron, /\{ c: \(\) => startCommandPalette\(\) \}/);
   // `cancelCommandPalette` is in `cancelTransient`.
   assert.match(electron, /cancelCommandPalette\(false\);/);
   // `handleCommandPaletteKey` handles arrows/Enter/Escape/Backspace and the filter.
@@ -2505,16 +2536,18 @@ test("the engine names its own process rather than answering to Electron", () =>
 // moved it — a call no list written in advance would contain.
 test("colon opens the command line, in normal mode only", () => {
   const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
-  assert.match(preload, /case ":": startCommandLine\(\); break;/);
-  // The binding lives in the normal-mode switch, beside the palette's `c`. In insert mode a
-  // colon has to stay a character the page receives (DESIGN.md 16.3). Bounded by the palette's
-  // own `case` rather than by a byte count, so the assertion does not drift as the switch grows.
+  assert.match(preload, /\{ ":": \(\) => startCommandLine\(\) \}/);
+  // The binding lives in the normal-mode key table, beside the palette's `c`. In insert mode a
+  // colon has to stay a character the page receives (DESIGN.md 16.3), and that table is only
+  // consulted from handleNormalKey.
   const normalKey = preload.indexOf("function handleNormalKey");
-  const paletteCase = preload.indexOf('case "c": startCommandPalette()');
-  assert.ok(normalKey >= 0 && paletteCase > normalKey,
-    "the palette case should sit inside handleNormalKey");
-  assert.match(preload.slice(paletteCase, paletteCase + 400), /case ":": startCommandLine\(\)/,
-    "`:` belongs in the same normal-mode switch as `c`");
+  const lookup = preload.indexOf("normalKeyActions.get(key)");
+  assert.ok(normalKey >= 0 && lookup > normalKey, "the key table should be read inside handleNormalKey");
+  const table = preload.slice(preload.indexOf("const shortcutHelpSections = ["),
+    preload.indexOf("const normalKeyActions"));
+  assert.match(table, /\{ c: \(\) => startCommandPalette\(\) \}/);
+  assert.match(table, /\{ ":": \(\) => startCommandLine\(\) \}/,
+    "`:` belongs in the same normal-mode table as `c`");
   // `physicalKey` already maps shifted Semicolon, so nothing new is needed there — but if that
   // mapping ever goes, `:` silently stops opening.
   assert.match(preload, /Semicolon: event\.shiftKey \? ":" : ";"/);
