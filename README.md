@@ -212,6 +212,23 @@ force-installed the managed extensions (Endpoint Verification, Cyberhaven) into 
 profile within seconds. See [Browser engines](#browser-engines-and-frame-policy) for what that engine
 is and how it compares.
 
+**Signing in to Google.** Google refuses sign-in inside the engine — "Couldn't sign you in. This
+browser or app may not be secure." — and it is right to: the engine's Chrome is headless
+(`HeadlessChrome` in its user agent) and driven over CDP (`navigator.webdriver` is `true`), which is
+what that check exists to stop. TWeb does not hide either. Sign in once in an ordinary Chrome window
+on the same profile instead:
+
+```bash
+tweb chrome login                      # opens accounts.google.com; sign in, then Cmd-Q that window
+tweb chrome login https://example.com  # any other site that blocks automated browsers
+```
+
+That window has no DevTools port and no automation flags, so it is a plain Chrome; the session it
+stores lands in the profile every `--engine chrome` pane uses (measured: a cookie survives a
+normal-window run and is read back by the engine). It refuses to start while an `--engine chrome`
+pane holds the profile, because Chrome cannot open one profile twice. Nothing is copied from your own
+Chrome.
+
 When Chrome cannot be driven — a policy that forbids remote debugging, which `tweb doctor` checks —
 the fallback is a manual handoff:
 

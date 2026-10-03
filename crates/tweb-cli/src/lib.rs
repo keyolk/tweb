@@ -497,6 +497,12 @@ pub enum ChromeAction {
     Current,
     /// Bridge status.
     Status,
+    /// Open the `--engine chrome` profile in a normal Chrome window to sign in (Google refuses
+    /// sign-in inside the engine's automated Chrome). Quit that window when done.
+    Login {
+        #[arg(default_value = "https://accounts.google.com/")]
+        url: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -624,6 +630,7 @@ pub async fn run() -> Result<()> {
                 }
             }
             ChromeAction::Status => println!("{}", chrome::status().report()),
+            ChromeAction::Login { url } => chrome::login(&url)?,
             ChromeAction::Current => {
                 // Ask the pane for the URL it is showing, then hand it to Chrome.
                 // `agent::run` prints the rendered result, so call `request` directly
