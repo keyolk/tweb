@@ -74,10 +74,18 @@ test("modifiers become CDP's bitmask, by every name sendInputEvent accepts", () 
 });
 
 test("a wheel carries deltas and no click count", () => {
+  // In: sendInputEvent's sign (a wheel turned up is +deltaY). Out: CDP's DOM sign (+ is down).
   const p = mouseEventParams({ type: "mouseWheel", x: 1, y: 2, deltaX: -10, deltaY: 100 });
-  assert.equal(p.deltaX, -10);
-  assert.equal(p.deltaY, 100);
+  assert.equal(p.deltaX, 10);
+  assert.equal(p.deltaY, -100);
   assert.ok(!("clickCount" in p));
+});
+
+test("a wheel turned down scrolls the page down", () => {
+  // The terminal's wheel-down arrives as deltaY -100 (dispatchMouse) and the float viewer's as
+  // the negated DOM delta (float-display.cjs). Both must reach CDP as a positive deltaY.
+  assert.equal(mouseEventParams({ type: "mouseWheel", x: 0, y: 0, deltaY: -100 }).deltaY, 100);
+  assert.ok(Object.is(mouseEventParams({ type: "mouseWheel", x: 0, y: 0 }).deltaY, 0));
 });
 
 // --- addressing the frame the point is actually over ---
