@@ -3653,6 +3653,12 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       refreshTabListAfterClose = Number.isInteger(value);
       closeTab(Number.isInteger(value) ? value : currentWindows().activeTabIndex);
       break;
+    // The × in the tab badge's popover. Separate from `close-tab` because that one sets
+    // `refreshTabListAfterClose`, which pushes the full `b` list model and would pop the big list
+    // open over the popover. The popover redraws from the ordinary tab state instead.
+    case "close-tab-from-badge":
+      if (Number.isInteger(value)) closeTab(value);
+      break;
     case "restore-tab": restoreClosedTab(); break;
     case "reload": contents.reload(); break;
     case "zoom-in": setBrowserZoom("in"); break;
@@ -3938,7 +3944,7 @@ function closeHintRound(tab) {
   }
   for (const [key, entry] of entries) {
     if (entry.frame.isDestroyed() || entry.frame.detached) continue;
-    entry.frame.send("tweb-hint-space", { offset: offsets[key], total });
+    entry.frame.send("tweb-hint-space", { offset: offsets[key], count: entry.count, total });
     // Only these frames will report misses; see `hint-miss`.
     if (entry.count > 0) round.drawn += 1;
   }

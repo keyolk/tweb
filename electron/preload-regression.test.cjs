@@ -709,6 +709,46 @@ test("each pane owns an interactive tab badge instead of publishing tabs in tmux
   assert.match(tauriBrowser, /fn sync_title\(&self\)[\s\S]*self\.tmux\.update_title\("tweb"\)/);
 });
 
+test("a frame draws exactly the targets it counted for a shared round", () => {
+  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+    // Collecting again at draw time found more targets on a video page and pushed this
+    // frame's labels into the next frame's block, so one label clicked in two places.
+    assert.match(source, /pendingHintTargets = interactiveTargets\(\);\s*\n\s*send\("hint-round", \{ count: pendingHintTargets\.length \}\);/,
+      `${name} counts one list and draws another`);
+    assert.match(source, /const targets = counted \? counted\.filter\(\(target\) => target\.element\.isConnected\) : interactiveTargets\(\);/,
+      `${name} re-collects hint targets after counting them`);
+    assert.match(source, /if \(space && Number\.isFinite\(space\.count\)\) targets = targets\.slice\(0, space\.count\);/,
+      `${name} can draw past its label block`);
+    // A prefix unique within one frame is not unique within the round.
+    assert.match(source, /const uniquePrefix = !pickerState\.shared && matches\.length === 1 && pickerState\.typed\.length > 0;/,
+      `${name} picks on a frame-local unique prefix during a shared round`);
+  }
+});
+
+test("the tab badge list closes a tab in place", () => {
+  const popover = electron.slice(electron.indexOf("function showTabPopover(pinned = false)"));
+  // Its own message, not `close-tab`: that one re-opens the full `b` list afterwards, which
+  // would replace the small badge list the click came from.
+  assert.match(popover, /close\.onclick = \(event\) => \{[\s\S]*event\.stopPropagation\(\);[\s\S]*send\("close-tab-from-badge", tab\.index\)/);
+  assert.match(electron, /if \(tabPopover && tabPopover\.style\.display === "block"\) showTabPopover\(tabPopoverPinned\);/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "close-tab-from-badge":\s*\n\s*if \(Number\.isInteger\(value\)\) closeTab\(value\);/);
+});
+
+test("the shortcut help opens under Trusted Types and scrolls from the keyboard", () => {
+  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+    const help = source.slice(source.indexOf("function showHelp()"), source.indexOf("function handleHelpKey("));
+    // Meet enforces Trusted Types; a string assigned to innerHTML throws and `?` did nothing.
+    assert.doesNotMatch(help, /\.innerHTML\s*=/, `${name} help builds markup from a string`);
+    assert.match(help, /helpScroller = backdrop;/, `${name} help does not record its scroller`);
+    const keys = source.slice(source.indexOf("function handleHelpKey("), source.indexOf("function cancelPrompt("));
+    assert.match(keys, /else scrollHelp\(key, event\);/, `${name} help swallows scroll keys`);
+    for (const key of ['"j"', '"k"', '"PageDown"', '"PageUp"', '"G"', '"End"']) {
+      assert.ok(keys.includes(key), `${name} help ignores ${key}`);
+    }
+  }
+});
+
 test("visual image actions copy pixels, copy current source, and download", () => {
   for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
     assert.match(source, /function imageSource\(image\)/, `${name} has no image source resolver`);
