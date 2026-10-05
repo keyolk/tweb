@@ -842,20 +842,16 @@ async fn split_and_run_pane(
     let executable = std::env::current_exe().context("cannot resolve the running tweb binary")?;
     let pane_bin_str = executable.to_string_lossy().to_string();
 
-    // Pass the chosen engine binary to the split pane explicitly.
+    // The split pane is this same executable, so it resolves the Electron engine and its app code
+    // by the same rules — from where the binary lives, not from the directory `tweb split` was run
+    // in. Resolving them here instead looked for `electron/` under the cwd, so a split opened from
+    // inside a checkout ran that checkout's older app code. Only an explicit override is passed on.
     let mut env_str = String::new();
     match browser.engine {
         BrowserEngineArg::Electron | BrowserEngineArg::Chrome => {
-            if let Some(path) = find_electron_binary() {
-                env_str.push_str(&format!(
-                    "TWEB_ELECTRON={} ",
-                    shell_quote(&path.to_string_lossy())
-                ));
-                if let Some(directory) = electron_app_dir(&path) {
-                    env_str.push_str(&format!(
-                        "TWEB_ELECTRON_DIR={} ",
-                        shell_quote(&directory.to_string_lossy())
-                    ));
+            for name in ["TWEB_ELECTRON", "TWEB_ELECTRON_DIR"] {
+                if let Ok(value) = std::env::var(name) {
+                    env_str.push_str(&format!("{name}={} ", shell_quote(&value)));
                 }
             }
         }
@@ -918,50 +914,6 @@ fn find_tauri_binary() -> Option<std::path::PathBuf> {
     which::which("tweb-tauri").ok()
 }
 
-fn find_electron_binary() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("TWEB_ELECTRON") {
-        return Some(std::path::PathBuf::from(p));
-    }
-    let candidates = [
-        "electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
-        "../electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
-        "electron/node_modules/.bin/electron",
-        "../electron/node_modules/.bin/electron",
-    ];
-    for c in &candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.exists() {
-            return Some(p.canonicalize().unwrap_or(p));
-        }
-    }
-    // An installed tweb runs from outside the workspace, so the relative
-    // candidates above never match; the engine sits next to the binary instead.
-    if let Some(binary) = tweb_pane::installed_electron_dir()
-        .as_deref()
-        .and_then(tweb_pane::electron_binary_in)
-    {
-        return Some(binary);
-    }
-    which::which("electron").ok()
-}
-
-/// The app directory Electron loads as `.`.
-///
-/// `node_modules/electron` carries a package.json of its own, so simply picking the nearest
-/// package.json would run the Electron package itself as the app and nothing would appear on
-/// screen. Anything under node_modules is skipped.
-fn electron_app_dir(binary: &std::path::Path) -> Option<std::path::PathBuf> {
-    binary
-        .ancestors()
-        .filter(|ancestor| {
-            !ancestor
-                .components()
-                .any(|part| part.as_os_str() == "node_modules")
-        })
-        .find(|ancestor| ancestor.join("package.json").exists())
-        .map(std::path::Path::to_path_buf)
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -974,8 +926,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        default_open_args, electron_app_dir, resolve_output_path, resolve_url_argument,
-        split_window_args, Cli, Command,
+        default_open_args, resolve_output_path, resolve_url_argument, split_window_args, Cli,
+        Command,
     };
 
     #[test]
@@ -1067,19 +1019,5 @@ mod tests {
             resolve_output_path("/tmp/a/../shot.png", directory),
             "/tmp/shot.png"
         );
-    }
-
-    #[test]
-    fn app_dir_skips_the_electron_package() {
-        let root = std::env::temp_dir().join(format!("tweb-appdir-{}", std::process::id()));
-        let package = root.join("electron/node_modules/electron");
-        let binary = package.join("dist/Electron.app/Contents/MacOS");
-        std::fs::create_dir_all(&binary).expect("temp tree");
-        std::fs::write(root.join("electron/package.json"), "{}").expect("app manifest");
-        std::fs::write(package.join("package.json"), "{}").expect("package manifest");
-
-        let found = electron_app_dir(&binary.join("Electron"));
-        let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(found, Some(root.join("electron")));
     }
 }

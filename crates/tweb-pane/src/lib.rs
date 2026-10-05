@@ -1074,18 +1074,31 @@ pub fn electron_binary_in(directory: &std::path::Path) -> Option<std::path::Path
 }
 
 /// `electron/` candidates for when we are running from the workspace.
+/// The workspace's `electron/`, when THIS binary was built in that workspace.
+///
+/// Decided by where the executable lives, never by the current directory. It used to also try
+/// `electron` and `../electron` relative to the cwd, so an installed `tweb` started anywhere inside
+/// a checkout ran that checkout's app code instead of the code embedded in it — measured: after
+/// installing a release, a pane opened from `~/src/keyolk/tweb` reported
+/// `engineApp: …/tweb/electron` and ran the older checkout, so none of the installed fixes showed.
+/// A development binary (`<root>/target/<profile>/tweb`) still uses `<root>/electron`, which is
+/// what makes an edited preload take effect without a rebuild.
 fn workspace_electron_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        // target/release/tweb → target/release → target → workspace root.
-        if let Some(target) = exe.parent().and_then(|p| p.parent()) {
-            let root = target.parent().unwrap_or(target);
-            dirs.push(root.join("electron"));
-        }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| workspace_electron_dir_for(&exe))
+        .into_iter()
+        .collect()
+}
+
+/// `<root>/electron` for an executable at `<root>/target/<profile>/<name>`, else `None`.
+fn workspace_electron_dir_for(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let profile = exe.parent()?;
+    let target = profile.parent()?;
+    if target.file_name()? != "target" {
+        return None;
     }
-    dirs.push(std::path::PathBuf::from("electron"));
-    dirs.push(std::path::PathBuf::from("../electron"));
-    dirs
+    Some(target.parent()?.join("electron"))
 }
 
 /// The app directory Electron loads as `.`.
@@ -1196,8 +1209,31 @@ fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
 mod tests {
     use super::{
         changed_geometry_message, host_geometry, matching_client_ttys, raw_kitty_delete,
-        resolve_electron_paths, tmux_passthrough, PasteTracker, PATCH_ID_COUNT,
+        resolve_electron_paths, tmux_passthrough, workspace_electron_dir_for, PasteTracker,
+        PATCH_ID_COUNT,
     };
+
+    #[test]
+    fn only_a_binary_built_in_a_workspace_uses_its_electron_dir() {
+        use std::path::Path;
+        assert_eq!(
+            workspace_electron_dir_for(Path::new("/src/tweb/target/release/tweb")),
+            Some(Path::new("/src/tweb/electron").to_path_buf())
+        );
+        assert_eq!(
+            workspace_electron_dir_for(Path::new("/src/tweb/target/debug/tweb")),
+            Some(Path::new("/src/tweb/electron").to_path_buf())
+        );
+        // An installed binary embeds its app code; where it is started from must not matter.
+        assert_eq!(
+            workspace_electron_dir_for(Path::new("/Users/me/.local/bin/tweb")),
+            None
+        );
+        assert_eq!(
+            workspace_electron_dir_for(Path::new("/usr/local/bin/tweb")),
+            None
+        );
+    }
     use crate::terminal::{WindowGeometry, WindowSize};
 
     // A pane that has not been measured must not claim a size, and above all must not claim an
