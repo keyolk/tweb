@@ -13,6 +13,7 @@ const { app, clipboard, nativeImage, screen } = electron;
 // Its diagnostics are always recorded, like every other engine line (see `debugLogging`).
 const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug: true });
 const { BrowserWindow, ipcMain, session } = pageBackend;
+const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
 const {
   appendFileSync,
   closeSync,
@@ -6149,7 +6150,17 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     recordNavigationHistory(url, contents.getTitle());
     scheduleWindowSessionSave();
   };
-  onContents("did-navigate", (_event, url) => { recordNavigation(url); updatePaneTitle(); });
+  onContents("did-navigate", (_event, url) => {
+    // The Chrome engine cannot sign in to Google (see cdp/sign-in-block.cjs); replace the refusal,
+    // whose only button fails the same way, with what to do instead.
+    if (pageBackend.kind === "chrome" && isGoogleSignInRejection(url)) {
+      console.error("tweb: google sign-in refused in the chrome engine; pointing at `tweb chrome login`");
+      void contents.loadURL(signInNoticePage(url));
+      return;
+    }
+    recordNavigation(url);
+    updatePaneTitle();
+  });
   onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
     if (isMainFrame) { recordNavigation(url); updatePaneTitle(); }
   });

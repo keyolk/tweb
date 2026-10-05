@@ -32,6 +32,27 @@ let nextContentsId = 1000;
 
 const CAPTURE_TIMEOUT_MS = 1000;
 const INPUT_SCALE_RECHECK_MS = 3000;
+// Quiet time after the last screencast frame before a device-pixel capture sharpens the picture.
+const SETTLE_MS = 150;
+// The screencast is now what motion is drawn from, so its quality is visible; 90 keeps text legible
+// mid-scroll at a fraction of the bytes of 100.
+const SCREENCAST_QUALITY = 90;
+
+// `TWEB_CDP_PROFILE=1`: every 5s, where a frame's time went — the screenshot round trip, the PNG
+// decode, the bitmap copy, the damage diff — and how many screencast signals arrived per capture.
+const PROFILE = process.env.TWEB_CDP_PROFILE === "1";
+function profileCapture(contents, sample) {
+  const p = contents.profile || (contents.profile = { n: 0, at: Date.now(), sum: {} });
+  p.n += 1;
+  for (const [key, value] of Object.entries(sample)) p.sum[key] = (p.sum[key] || 0) + Number(value);
+  if (Date.now() - p.at < 5000) return;
+  const avg = (key) => (p.sum[key] / p.n).toFixed(key === "bytes" ? 0 : 1);
+  console.error(`tweb: cdp profile ${p.n} captures/${((Date.now() - p.at) / 1000).toFixed(1)}s`
+    + ` capture=${avg("capture")}ms decode=${avg("decode")}ms bitmap=${avg("bitmap")}ms diff=${avg("diff")}ms`
+    + ` png=${Math.round(avg("bytes") / 1024)}KiB changed=${p.sum.changed}/${p.n} signals=${contents.signals || 0}`);
+  contents.profile = null;
+  contents.signals = 0;
+}
 
 // main.cjs never sees a NativeImage constructor of its own here; it is injected so this file has
 // no hard dependency on Electron and the pure parts stay testable under plain node.
@@ -546,7 +567,9 @@ class CdpWebContents extends EventEmitter {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
-    if (this.capture.timer) clearTimeout(this.capture.timer);
+    for (const key of ["timer", "castTimer", "settleTimer"]) {
+      if (this.capture[key]) clearTimeout(this.capture[key]);
+    }
     this.debugger.detach();
     this.emit("destroyed");
   }
@@ -938,7 +961,7 @@ class CdpWebContents extends EventEmitter {
     this.capture.screencast = true;
     this.capture.lastSignal = null;
     await this.session.send("Page.startScreencast", {
-      format: "jpeg", quality: 100, everyNthFrame: 1,
+      format: "jpeg", quality: SCREENCAST_QUALITY, everyNthFrame: 1,
     }).catch(() => { this.capture.screencast = false; });
   }
 
@@ -948,11 +971,63 @@ class CdpWebContents extends EventEmitter {
     await this.session.send("Page.stopScreencast").catch(() => {});
   }
 
+  // While the page moves, the screencast IS the picture; once it stops, one device-pixel capture
+  // replaces it.
+  //
+  // A device-pixel `captureScreenshot` of a busy page is slow: measured on a playing YouTube video,
+  // 272–300ms per frame (2–3MB PNGs) with the screencast running beside it — 6.4 frames/s in the
+  // pane against Electron's 9.6, and 140–190% CPU against Electron's 7%. The screencast pushes the
+  // same picture at 60fps but only at CSS-pixel size (half resolution on a Retina pane, whatever
+  // `maxWidth` or `scale` says — measured). So motion is drawn from the screencast, scaled to the
+  // frame size, and sharpness is restored by one capture `SETTLE_MS` after the last change. A page
+  // of text is still on screen at full resolution almost all the time; only a scroll in progress
+  // or a video is drawn at half.
   onScreencastFrame(params) {
     void this.session.send("Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+    if (PROFILE) this.signals = (this.signals || 0) + 1;
+    // An unchanged frame is the echo of a capture (see `startScreencast`), not a change.
     if (params.data === this.capture.lastSignal) return;
     this.capture.lastSignal = params.data;
-    this.requestCapture();
+    this.capture.generation = (this.capture.generation || 0) + 1;
+    this.scheduleSettle();
+    this.presentScreencastFrame(params.data);
+  }
+
+  // Paced to the pane's frame rate; a frame that arrives inside the interval waits as `pendingCast`
+  // and only the newest is kept — older ones are already stale.
+  presentScreencastFrame(data) {
+    const capture = this.capture;
+    capture.pendingCast = data;
+    if (capture.castTimer || this.destroyed || !this.painting) return;
+    const wait = (capture.lastAt || 0) + 1000 / Math.max(1, this.frameRate) - Date.now();
+    capture.castTimer = setTimeout(() => {
+      capture.castTimer = null;
+      const next = capture.pendingCast;
+      capture.pendingCast = null;
+      if (!next || this.destroyed || !this.painting || !nativeImage) return;
+      capture.lastAt = Date.now();
+      const decoded = nativeImage.createFromBuffer(Buffer.from(next, "base64"));
+      const want = this.frameSize || decoded.getSize();
+      const image = decoded.getSize().width === want.width && decoded.getSize().height === want.height
+        ? decoded
+        : decoded.resize({ width: want.width, height: want.height, quality: "good" });
+      // The damage diff is skipped: a frame arriving here differs from the last by construction,
+      // and its pixels are about to be replaced by the settled capture anyway.
+      this.lastBitmap = null;
+      this.capture.forceNext = false;
+      const size = image.getSize();
+      this.emit("paint", {}, { x: 0, y: 0, width: size.width, height: size.height }, image);
+    }, Math.max(0, wait));
+  }
+
+  scheduleSettle() {
+    const capture = this.capture;
+    if (capture.settleTimer) clearTimeout(capture.settleTimer);
+    capture.settleTimer = setTimeout(() => {
+      capture.settleTimer = null;
+      capture.forceNext = true;
+      this.requestCapture();
+    }, SETTLE_MS);
   }
 
   // Electron's `invalidate()` always yields a paint, changed or not, and main.cjs relies on it:
@@ -995,6 +1070,8 @@ class CdpWebContents extends EventEmitter {
   async captureFrame() {
     let shot;
     let timer = null;
+    const t0 = performance.now();
+    const generation = this.capture.generation || 0;
     try {
       // PNG, not JPEG: the frame is decoded to a bitmap and re-encoded for the terminal anyway,
       // and a JPEG round trip smears text — the one thing a browser pane must render sharply.
@@ -1018,6 +1095,10 @@ class CdpWebContents extends EventEmitter {
       clearTimeout(timer);
     }
     if (this.destroyed || !nativeImage) return;
+    // The page moved while this was being taken: the screencast has drawn something newer, and
+    // the settle timer will ask again once it stops.
+    if ((this.capture.generation || 0) !== generation && !this.capture.forceNext) return;
+    const t1 = performance.now();
     let image = nativeImage.createFromBuffer(Buffer.from(shot.data, "base64"));
     const want = this.frameSize;
     const raw = image.getSize();
@@ -1029,13 +1110,16 @@ class CdpWebContents extends EventEmitter {
     // Damage, recovered by comparison (see damage.cjs). Unchanged frames are not painted at all
     // — Electron does not paint when nothing changed either — and a changed one carries the box
     // that changed, so main.cjs can send a caret blink as a patch rather than a whole frame.
+    const t2 = performance.now();
     const bitmap = image.toBitmap();
+    const t3 = performance.now();
     const previous = this.lastBitmap;
     const sameSize = previous && previous.width === size.width && previous.height === size.height;
     const dirty = sameSize
       ? dirtyRect(previous.pixels, bitmap, size.width, size.height)
       : { x: 0, y: 0, width: size.width, height: size.height };
     this.lastBitmap = { pixels: bitmap, width: size.width, height: size.height };
+    if (PROFILE) profileCapture(this, { capture: t1 - t0, decode: t2 - t1, bitmap: t3 - t2, diff: performance.now() - t3, bytes: shot.data.length * 0.75, changed: Boolean(dirty) });
     if (!dirty && !this.capture.forceNext) return;
     this.capture.forceNext = false;
     this.emit("paint", {}, dirty || { x: 0, y: 0, width: size.width, height: size.height }, image);
