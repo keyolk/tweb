@@ -48,6 +48,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/cdp/engine.cjs
 	node --check electron/cdp/input.cjs
 	node --check electron/cdp/preload-bridge.cjs
+	node --check electron/cdp/sign-in-block.cjs
 	node --check electron/cdp/web-contents.cjs
 	node --check electron/context-menu.cjs
 	node --check electron/preload.cjs

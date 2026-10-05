@@ -220,6 +220,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/cdp/preload-bridge.cjs"),
     ),
     (
+        "cdp/sign-in-block.cjs",
+        include_str!("../../../electron/cdp/sign-in-block.cjs"),
+    ),
+    (
         "cdp/web-contents.cjs",
         include_str!("../../../electron/cdp/web-contents.cjs"),
     ),

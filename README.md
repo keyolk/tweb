@@ -227,7 +227,7 @@ That window has no DevTools port and no automation flags, so it is a plain Chrom
 stores lands in the profile every `--engine chrome` pane uses (measured: a cookie survives a
 normal-window run and is read back by the engine). It refuses to start while an `--engine chrome`
 pane holds the profile, because Chrome cannot open one profile twice. Nothing is copied from your own
-Chrome.
+Chrome. A pane that reaches Google's refusal page shows these steps in its place.
 
 When Chrome cannot be driven — a policy that forbids remote debugging, which `tweb doctor` checks —
 the fallback is a manual handoff:
@@ -333,7 +333,7 @@ The Chrome engine was driven through the same scenarios as Electron, side by sid
 | Mouse | same: hint click, terminal click, drag, wheel distance, clicks inside an out-of-process iframe, context menu and its actions |
 | Agent | same: snapshot, fill, select, press, wait, console, errors, network, screenshot, full-screenshot, pdf, device, capture, tabs |
 | Page features | same: downloads, alert/confirm answered, print to PDF, popups keeping `window.opener`, resize, audio ownership, paste |
-| Frames | idle page sends nothing; a caret blink goes out as a patch; a full-rate canvas ran 23fps (Electron 27) with none dropped |
+| Frames | idle page sends nothing; a caret blink goes out as a patch; motion is drawn at half resolution until it settles (see below) |
 | Better | Cmd-C reaches the system clipboard (Electron's offscreen copy does not); tab titles follow `document.title` live |
 | Startup | first frame 1.6–2.1s when Chrome is launched, 0.8–1.7s when it is already running (Electron 0.6–0.8s) |
 
@@ -341,10 +341,13 @@ Differences that remain: TWeb's unpacked-extension directory is not loaded (Chro
 managed extensions); audio is detected from media elements and `AudioContext`, not from Chrome's
 tab state; JavaScript dialogs are answered the way Electron's offscreen window answers them.
 
-Chrome has no damage reporting and no offscreen paint event, so the engine builds both: the
-screencast is a change signal only (it is CSS-pixel sized, half resolution on a Retina pane), each
-change is answered with a device-pixel `captureScreenshot`, and the dirty rect is recovered by
-comparing the frame with the last one. One Chrome defect is worked around, and measured rather than
+Chrome has no damage reporting and no offscreen paint event, so the engine builds both. While the
+page moves, the screencast frame itself is drawn, scaled to the pane: it arrives at up to 60fps but
+only at CSS-pixel size, half resolution on a Retina pane. 150ms after the last change one device-pixel
+`captureScreenshot` replaces it, and its dirty rect is recovered by comparing with the previous capture,
+so a caret blink still goes out as a patch. Capturing every frame at device size was the first design
+and cost 270–300ms per frame on a playing YouTube video — 6.4 frames/s and 140–190% CPU; drawing motion
+from the screencast measured 9.2 frames/s at 23% CPU (Electron: 9.6 at 7%). One Chrome defect is worked around, and measured rather than
 assumed: once a tab has been both screencast and captured, Chrome routes mouse input as if it were in
 device pixels, so every point lands at `(x, y) / deviceScaleFactor`. The engine measures that with one
 probe move and undoes it; `tweb engine-log` shows `chrome input skew … measured, correcting` when it
