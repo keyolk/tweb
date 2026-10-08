@@ -185,6 +185,7 @@ class CdpFrame {
     this.url = "";
     this.parentId = null;
     this.detached = false;
+    this.documentPending = false;
     // Execution contexts in this frame: the isolated world the preload lives in, and the page's.
     this.isolatedContextId = null;
     this.mainContextId = null;
@@ -382,6 +383,7 @@ class CdpWebContents extends EventEmitter {
     session.on("Page.frameNavigated", (params) => this.onFrameNavigated(params.frame, session.id));
     session.on("Page.frameAttached", (params) => this.onFrameAttached(params, session.id));
     session.on("Page.frameDetached", (params) => this.onFrameDetached(params));
+    session.on("Page.frameStartedNavigating", (params) => this.onFrameStartedNavigating(params, session.id));
     session.on("Page.frameStartedLoading", (params) => this.onFrameStartedLoading(params, session.id));
     session.on("Page.frameStoppedLoading", (params) => this.onFrameStoppedLoading(params));
     session.on("Page.navigatedWithinDocument", (params) => this.onNavigatedWithinDocument(params));
@@ -627,6 +629,15 @@ class CdpWebContents extends EventEmitter {
     this.frames.delete(params.frameId);
   }
 
+  // Only this event says whether a new document is coming. Chrome sends `frameStartedLoading` for
+  // `history.pushState` and hash changes too (measured: frameStartedLoading → navigatedWithinDocument
+  // → frameStoppedLoading, with no frameStartedNavigating), so the kind is remembered here and read
+  // when loading starts.
+  onFrameStartedNavigating(params, sessionId) {
+    const frame = this.ensureFrame(params.frameId, sessionId);
+    frame.documentPending = params.navigationType === "differentDocument";
+  }
+
   onFrameStartedLoading(params, sessionId) {
     const frame = this.ensureFrame(params.frameId, sessionId);
     const isMainFrame = !frame.parentId;
@@ -634,9 +645,15 @@ class CdpWebContents extends EventEmitter {
       this.loading = true;
       this.emit("did-start-loading", {});
     }
+    // Reported as a new document every time, a pushState made main.cjs drop the main frame from
+    // its ready set; the preload, which a same-document navigation does not reload, never
+    // registered again, and every agent request after it (snapshot, query, `tweb wait`) went
+    // unanswered — measured on SAP Concur, a React SPA.
+    const isSameDocument = !frame.documentPending;
+    frame.documentPending = false;
     // main.cjs prunes per-frame readiness here; the frame object it gets must be the live one.
     this.emit("did-start-navigation", {
-      url: frame.url, isSameDocument: false, isMainFrame, frame,
+      url: frame.url, isSameDocument, isMainFrame, frame,
     });
   }
 

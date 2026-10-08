@@ -112,8 +112,9 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// Navigate the resolved browser page.
+    /// Navigate the resolved browser page. Exits non-zero when the page fails to load.
     Navigate {
+        /// URL, host or local path. `back`, `forward` and `reload` run those commands instead.
         url: String,
         #[command(flatten)]
         agent: AgentOptions,
@@ -464,10 +465,20 @@ pub enum ResourceAction {
 
 #[derive(Subcommand, Debug)]
 pub enum ProfileAction {
-    /// Chrome profile bootstrap.
-    Bootstrap { source: String },
-    /// List profiles.
-    List,
+    /// Not built yet (DESIGN.md §10): it will import a Chrome profile's state into tweb.
+    ///
+    /// Today it exits with "not yet implemented". To browse as your everyday Chrome account, run a
+    /// pane with `--engine chrome` and sign that profile in once with `tweb chrome login`.
+    Bootstrap {
+        /// The Chrome profile to import from: a profile directory name such as `Default` or
+        /// `"Profile 1"` (see `chrome://version` → Profile Path), or a path to one.
+        source: String,
+    },
+    /// The browser profiles panes run on, and the Google account each is signed in as.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -659,6 +670,9 @@ pub async fn run() -> Result<()> {
             DaemonAction::Restart => daemon::restart()?,
         },
         Command::Panes { agent } => agent::list_panes(agent.json)?,
+        Command::Profile {
+            action: ProfileAction::List { json },
+        } => chrome::list_profiles(json)?,
         Command::Mcp { agent } => mcp::serve(agent.pane.as_deref())?,
         Command::Tab { action } => {
             let (method, params, agent) = match action {
@@ -689,10 +703,17 @@ fn agent_call(
 ) -> Result<(&'static str, serde_json::Value, AgentOptions)> {
     let act = |r#ref: String, action: &str, value: Option<String>| json!({ "ref": r#ref, "action": action, "value": value });
     Ok(match command {
-        Command::Navigate { url, agent } => {
-            let url = resolve_url_argument(&url, working_directory);
-            ("navigate", json!({ "url": url }), agent)
-        }
+        // `back`, `forward` and `reload` are commands, not hosts: as URLs they became
+        // `https://back`, a DNS failure that left every following read on an error page.
+        Command::Navigate { url, agent } => match url.trim().to_ascii_lowercase().as_str() {
+            "back" => ("back", json!({}), agent),
+            "forward" => ("forward", json!({}), agent),
+            "reload" => ("reload", json!({}), agent),
+            _ => {
+                let url = resolve_url_argument(&url, working_directory);
+                ("navigate", json!({ "url": url }), agent)
+            }
+        },
         Command::Back { agent } => ("back", json!({}), agent),
         Command::Forward { agent } => ("forward", json!({}), agent),
         Command::Reload { agent } => ("reload", json!({}), agent),
@@ -966,6 +987,30 @@ mod tests {
             resolve_url_argument("example.com", directory),
             "example.com"
         );
+    }
+
+    /// `tweb navigate back` loaded https://back, failed DNS, and every read after it ran on the
+    /// error page. History words map onto their own commands, even with a `./back` file around.
+    #[test]
+    fn navigate_history_words_are_history_commands() {
+        let directory = std::env::temp_dir().join(format!("tweb-nav-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("dir");
+        std::fs::write(directory.join("back"), "").expect("file");
+        for (word, method) in [
+            ("back", "back"),
+            ("Forward", "forward"),
+            ("reload", "reload"),
+        ] {
+            let cli = Cli::try_parse_from(["tweb", "navigate", word]).expect("parse");
+            let (called, params, _) = super::agent_call(cli.command, &directory).expect("call");
+            assert_eq!(called, method, "{word}");
+            assert_eq!(params, serde_json::json!({}));
+        }
+        let cli = Cli::try_parse_from(["tweb", "navigate", "back.example.com"]).expect("parse");
+        let (called, params, _) = super::agent_call(cli.command, &directory).expect("call");
+        assert_eq!(called, "navigate");
+        assert_eq!(params["url"], "back.example.com");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

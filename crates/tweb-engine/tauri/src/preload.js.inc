@@ -658,6 +658,29 @@
     return frameOffsets.get(document_) || { x: 0, y: 0 };
   }
 
+  // An element's boxes. A `display: contents` element has none of its own — its children are laid
+  // out in its place — so it is measured as the union of theirs. Without this such an element was
+  // never hinted and never in `snapshot`: SAP Concur's expense rows are `display: contents`
+  // listitems whose cells sit in the parent grid, and every row reported a 0x0 box.
+  function layoutRects(element, style) {
+    if (style.display !== "contents") return element.getClientRects();
+    let left = Infinity;
+    let top = Infinity;
+    let right = -Infinity;
+    let bottom = -Infinity;
+    const range = element.ownerDocument.createRange();
+    range.selectNodeContents(element);
+    for (const rect of range.getClientRects()) {
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      left = Math.min(left, rect.left);
+      top = Math.min(top, rect.top);
+      right = Math.max(right, rect.right);
+      bottom = Math.max(bottom, rect.bottom);
+    }
+    if (left === Infinity) return [];
+    return [{ left, top, right, bottom, width: right - left, height: bottom - top }];
+  }
+
   function visibleRect(element) {
     // Callers reach here from optional chains — `visibleRect(panSurface())?.height` reads
     // as guarded, but `?.` protects the result and not the argument, so a null surface
@@ -666,7 +689,7 @@
     const style = ownerView(element).getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return null;
     const offset = frameOffset(element);
-    for (const rect of element.getClientRects()) {
+    for (const rect of layoutRects(element, style)) {
       if (rect.width < 3 || rect.height < 3) continue;
       const left = rect.left + offset.x;
       const top = rect.top + offset.y;
@@ -727,6 +750,10 @@
   const handlerSelector = [
     "[onclick]", "[jsaction]:not([jsaction=''])", "[aria-haspopup]", "[aria-controls]",
     "[tabindex]:not([tabindex='-1'])",
+    // A selectable row: no cursor and no handler of its own (the click is delegated from the
+    // root), only the selection state. SAP Concur's expense grid is all such rows.
+    "[role=listitem][aria-current]", "[role=listitem][aria-selected]",
+    "[role=row][aria-current]", "[role=row][aria-selected]",
   ].join(",");
 
   const interactiveSelector = [

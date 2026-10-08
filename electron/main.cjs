@@ -42,6 +42,9 @@ const { startAgentServer, runtimeDir } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
+const { waitFor } = require("./agent-wait.cjs");
+const { evaluate } = require("./agent-eval.cjs");
+const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
 const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
@@ -222,6 +225,9 @@ let originalPaneTitle = null;
 const tabFrames = new Map();
 const tabZoomFactors = new Map();
 const tabSessionUrls = new Map();
+// The last main-frame load failure per tab, and the error page shown for it. `tweb navigate` reads
+// it to tell "the tab is on tweb's error page for my URL" from a page that merely loaded.
+const tabLoadFailures = new WeakMap();
 // The pane a tab belongs to. Every event a tab emits — paint above all — arrives with the tab and
 // nothing else, so this is what turns that into a pane. Read at fire time and never captured when a
 // handler is registered: `configureTab` runs before `adoptTab` records the mapping.
@@ -4360,32 +4366,14 @@ function agentPressKey(key, modifiers = []) {
   for (const event of pressEvents(key, modifiers)) contents.sendInputEvent(event);
 }
 
-async function agentWaitFor(params) {
-  const deadline = Date.now() + (params.timeout ?? 10000);
-  const interval = 100;
-  for (;;) {
-    if (params.ms !== undefined) {
-      await new Promise((resolve) => setTimeout(resolve, Number(params.ms)));
-      return { waited: Number(params.ms) };
-    }
-    const info = await agentPageRequest("info", {});
-    if (params.url && info.url.includes(params.url)) return info;
-    if (params.load && info.readyState === "complete") return info;
-    if (params.selector) {
-      try {
-        return await agentPageRequest("query", { selector: params.selector });
-      } catch (_) {}
-    }
-    if (params.text) {
-      const found = await agentContents().executeJavaScript(
-        `document.body?.innerText?.includes(${JSON.stringify(params.text)}) || false`, true);
-      if (found) return info;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`wait timed out after ${params.timeout ?? 10000}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, interval));
-  }
+// The loop lives in agent-wait.cjs, against injected probes, so it can be tested without a page.
+function agentWaitFor(params) {
+  return waitFor(params, {
+    info: () => agentPageRequest("info", {}),
+    query: (selector, options) => agentPageRequest("query", { selector, ...options }),
+    hasText: (text) => agentContents().executeJavaScript(
+      `document.body?.innerText?.includes(${JSON.stringify(text)}) || false`, true),
+  });
 }
 
 function agentTabList() {
@@ -4714,9 +4702,19 @@ async function dispatchAgentCommand(method, params) {
       return { ok: true, ...result };
     }
     case "navigate": {
-      const url = normalizeUrl(String(params.url || ""));
-      await agentContents().loadURL(url);
-      return { url: agentContents().getURL() };
+      // `tweb back` exists, but `tweb navigate back` used to load https://back.
+      const word = historyWord(params.url);
+      if (word) return dispatchAgentCommand(word, {});
+      const tab = agentTab();
+      const contents = tab.webContents;
+      return agentNavigateTab(normalizeUrl(String(params.url || "")), {
+        load: (url) => contents.loadURL(url),
+        isLoading: () => contents.isLoading(),
+        currentUrl: () => contents.getURL(),
+        title: () => contents.getTitle(),
+        failure: () => tabLoadFailures.get(tab) || null,
+        clearFailure: () => tabLoadFailures.delete(tab),
+      });
     }
     case "back": {
       const history = agentContents().navigationHistory;
@@ -4739,8 +4737,19 @@ async function dispatchAgentCommand(method, params) {
     case "type":
       agentContents().insertText(String(params.text ?? ""));
       return { ok: true };
-    case "eval":
-      return { value: await agentContents().executeJavaScript(String(params.script || ""), true) };
+    case "eval": {
+      // Through the debugger where there is one: `executeJavaScript` reports a thrown exception
+      // only as "Script failed to execute", and the exception is the answer (see agent-eval.cjs).
+      const tab = agentTab();
+      const contents = tab.webContents;
+      const debuggerSend = pageBackend.kind !== "chrome" && ensureDebugger(tab)
+        ? (method, commandParams) => contents.debugger.sendCommand(method, commandParams)
+        : null;
+      return evaluate(params.script, {
+        debuggerSend,
+        executeJavaScript: (script) => contents.executeJavaScript(script, true),
+      });
+    }
     case "screenshot":
       return agentScreenshot(params);
     case "full-screenshot":
@@ -6199,7 +6208,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     if (!isMainFrame || code === -3 || showingLoadError) return;
     showingLoadError = true;
     console.error(`tweb: failed to load ${failedUrl}: ${description} (${code})`);
-    void contents.loadURL(errorPage(failedUrl || contents.getURL(), code, description));
+    const shown = errorPage(failedUrl || contents.getURL(), code, description);
+    tabLoadFailures.set(tab, { url: failedUrl || contents.getURL(), code, description, errorPageUrl: shown });
+    void contents.loadURL(shown);
   });
   // A lost render process leaves an offscreen tab dead but silent: the bytes are released, the
   // engine keeps answering `tweb status` with a healthy pid, and the pane holds the last image

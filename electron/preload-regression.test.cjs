@@ -30,6 +30,19 @@ function assertPreload(source) {
   // ranking can never drift away from what the hint pass actually collects.
   assert.match(source, /const interactiveSelector = \[\s*\n\s*controlSelector, handlerSelector, "audio", "video", "canvas",\s*\n\s*\]\.join\(","\);/);
 
+  // A selectable list row is a click target even with no cursor and no handler attribute: React
+  // delegates the click from the root, and the row's only signal is its selection state. Measured
+  // on SAP Concur's expense grid — `div[role=listitem][aria-current=false]` rows — `snapshot`
+  // returned none of them and the agent fell back to `eval` and DOM walking. Plain list items
+  // without that state stay out, or every article list would fill the snapshot.
+  assert.match(source, /"\[role=listitem\]\[aria-current\]", "\[role=listitem\]\[aria-selected\]",/);
+  assert.match(source, /"\[role=row\]\[aria-current\]", "\[role=row\]\[aria-selected\]",/);
+  assert.doesNotMatch(source, /"\[role=listitem\]",/);
+  // Those rows are also `display: contents`: no box of their own, so they were measured 0x0 and
+  // dropped before the selector mattered. Their box is the union of their children's.
+  assert.match(source, /if \(style\.display !== "contents"\) return element\.getClientRects\(\);/);
+  assert.match(source, /for \(const rect of layoutRects\(element, style\)\) \{/);
+
   // A cross-origin subframe used to be inert: it ignored `f`, and the engine's
   // `sendToFocusedTabFrame` handed the key back to the main frame on seeing it was not a
   // shortcut frame. The main frame cannot reach into it either, so an embedded app — a
