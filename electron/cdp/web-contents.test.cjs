@@ -107,9 +107,11 @@ test("an invalidate without the screencast captures at once", () => {
 function fakeImages(pictures) {
   return {
     createFromBuffer(buffer) {
-      const pixels = pictures.get(buffer.toString("base64"));
+      const entry = pictures.get(buffer.toString("base64"));
+      const pixels = entry.pixels || entry;
+      const size = entry.size || { width: 4, height: 2 };
       const image = {
-        getSize: () => ({ width: 4, height: 2 }),
+        getSize: () => size,
         toBitmap: () => Buffer.from(pixels),
         resize: () => image,
         crop: () => image,
@@ -126,7 +128,7 @@ function screencastContents(pictures) {
   created.painting = true;
   created.frameRate = 1000;
   created.viewport = { width: 4, height: 2 };
-  created.deviceScaleFactor = 1;
+  created.deviceScaleFactor = 2;
   created.frameSize = { width: 4, height: 2 };
   created.scheduleSettle = () => {};
   const paints = [];
@@ -149,9 +151,24 @@ test("a screencast frame paints only the box that changed since the last one", a
   await settle();
   created.presentScreencastFrame("Qg==");
   await settle();
-  assert.deepStrictEqual(paints[0], { x: 0, y: 0, width: 4, height: 2 });
+  // The first frame has nothing to compare with; the settle capture draws it.
+  assert.strictEqual(paints.length, 1);
   // Pixel 5 is column 1 of row 1: a caret, not the pane.
-  assert.deepStrictEqual(paints[1], { x: 1, y: 1, width: 1, height: 1 });
+  assert.deepStrictEqual(paints[0], { x: 1, y: 1, width: 1, height: 1 });
+});
+
+// Measured on claude.ai at zoom 0.8: Chrome alternated 860x840 (CSS) and 1376x1344 (device)
+// frames with nothing on the page moving, and each one was painted as whole-pane damage.
+test("a screencast that alternates between two sizes paints nothing while the page is still", async () => {
+  const small = { pixels: Buffer.alloc(2 * 1 * 4), size: { width: 2, height: 1 } };
+  const pictures = new Map([["QQ==", picture()], ["Qg==", small]]);
+  const { created, paints } = screencastContents(pictures);
+  for (const data of ["QQ==", "Qg==", "QQ==", "Qg==", "QQ=="]) {
+    // Each one is a new frame to Chrome; the filter in onScreencastFrame is not under test.
+    created.presentScreencastFrame(data);
+    await settle();
+  }
+  assert.deepStrictEqual(paints, []);
 });
 
 test("the settle capture redraws a soft box even when the page is back where it was", async () => {
@@ -159,7 +176,7 @@ test("the settle capture redraws a soft box even when the page is back where it 
   const { created, paints } = screencastContents(pictures);
   // The pane was sharp with the caret off; a screencast frame drew it on.
   created.lastBitmap = { pixels: picture(), width: 4, height: 2 };
-  created.capture.lastCast = { pixels: picture(), width: 4, height: 2 };
+  created.capture.lastCasts = new Map([["4x2", picture()]]);
   created.presentScreencastFrame("Qg==");
   await settle();
   // The caret is off again by the time the capture runs: identical to `lastBitmap`.
