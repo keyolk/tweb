@@ -333,9 +333,17 @@ test("the engine opens a round and asks every ready frame, not just the focused 
   assert.match(main, /const frames = \[mainFrame, \.\.\.\(mainFrame\?\.framesInSubtree \|\| \[\]\)\]/);
   assert.match(main, /if \(ready\.has\(key\)\) expected\.add\(key\)/);
   // And `f` itself reaches all of them, since each has to answer with its own count.
-  const key = body("  // `f`/`F` open a round before the key is delivered.", "const text = eventKind");
-  assert.match(key, /startHintRound\(currentWindows\(\)\.win\);/);
-  assert.match(key, /sendToTabFrames\(currentWindows\(\)\.win, "tweb-terminal-key"/);
+  const key = body("function routeHintShortcut(tab, key, modifiers)", "function dispatchNamedKey(");
+  assert.match(key, /startHintRound\(tab\);/);
+  assert.match(key, /sendToTabFrames\(tab, "tweb-terminal-key"/);
+  // Both key sources open the round: the pane, and the float viewer. The viewer used to send `f`
+  // straight to the page, the count arrived with no round open, and no badge was drawn.
+  assert.match(body("function dispatchNamedKey(", "const text = eventKind"),
+    /routeHintShortcut\(currentWindows\(\)\.win, key, modifiers\)/);
+  const viewer = body('ipcMain.on("tweb-float-input"', 'ipcMain.on("tweb-float-resized"');
+  assert.ok(viewer.indexOf("routeHintShortcut(tab,") !== -1, "the float viewer skips the hint round");
+  assert.ok(viewer.indexOf("routeHintShortcut(tab,") < viewer.indexOf("relayInputEvents("),
+    "the viewer relays `f` to the page before the round is open");
 });
 
 test("the labels are divided so no two frames produce the same one", () => {

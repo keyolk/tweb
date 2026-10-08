@@ -6954,6 +6954,10 @@ ipcMain.on("tweb-float-input", (event, kind, data) => {
     return;
   }
   withPaneScope(tabPanes.get(tab), () => {
+    if (kind === "key" && routeHintShortcut(tab, String(data?.key || ""), data?.modifiers || [])) {
+      markInteractionActivity();
+      return;
+    }
     // Input through the viewer is interaction, exactly as input through the pane is. Only the
     // tmux paths called this, so scrolling or typing in a floating window left the pane at
     // whatever tier the last settle chose — the one case where the user is unambiguously
@@ -7097,6 +7101,36 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
   if (eventKind === 1) contents.sendInputEvent({ ...event, type: "keyUp" });
 }
 
+/// The two keys a hint round needs the engine for, shared by the pane and the float viewer.
+///
+/// A hint round has badges up in several frames at once, and only one of them has focus — so
+/// while a round is open a keystroke cannot go to the focused frame alone or a label in any other
+/// frame would be untypeable. Every keystroke goes to every frame instead.
+///
+/// `f`/`F` open a round before the key is delivered. The round has to exist first: the key then
+/// reaches EVERY frame, each answers with its count, and the engine divides the labels once they
+/// are all in. Opening it afterwards would drop the counts of whichever frames answered quickest.
+///
+/// The float viewer used to skip this and hand `f` straight to the page. The preload still started
+/// its hints and reported a count, but `noteHintCount` found no round open and dropped it, so no
+/// badge was ever drawn: `f` did nothing in a floating window on either engine.
+function routeHintShortcut(tab, key, modifiers) {
+  if (!tab || !inputState().vimium || inputState().insertMode || modifiers.includes("meta")) {
+    return false;
+  }
+  if ((key.length === 1 || key === "Escape" || key === "Backspace") && routeHintKey(tab, key)) {
+    return true;
+  }
+  if ((key !== "f" && key !== "F") || modifiers.includes("control")) return false;
+  startHintRound(tab);
+  sendToTabFrames(tab, "tweb-terminal-key", {
+    key, code: "", event: "keydown", text: key,
+    shiftKey: modifiers.includes("shift"), altKey: false, ctrlKey: false, metaKey: false,
+    synthesizeKeyUp: true,
+  });
+  return true;
+}
+
 function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints = []) {
   if (!currentWindows().win || !key) return;
   const modifiers = electronModifiers(modifierMask);
@@ -7182,29 +7216,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // Only the press is routed: the viewer has no notion of a key being held.
   if (pressed && routePdfKey(key, modifiers)) return;
 
-  // A hint round has badges up in several frames at once, and only one of them has focus —
-  // so the key cannot go to the focused frame alone or a label in any other frame would be
-  // untypeable. While a round is open every keystroke goes to every frame instead.
-  if (pressed && inputState().vimium && !inputState().insertMode && !modifiers.includes("meta")
-    && (key.length === 1 || key === "Escape" || key === "Backspace")
-    && routeHintKey(currentWindows().win, key)) {
-    return;
-  }
-
-  // `f`/`F` open a round before the key is delivered. The round has to exist first: the key
-  // then reaches EVERY frame (below), each answers with its count, and the engine divides the
-  // labels once they are all in. Opening it afterwards would drop the counts of whichever
-  // frames answered quickest.
-  if (pressed && inputState().vimium && !inputState().insertMode
-    && (key === "f" || key === "F") && !modifiers.includes("control") && !modifiers.includes("meta")) {
-    startHintRound(currentWindows().win);
-    sendToTabFrames(currentWindows().win, "tweb-terminal-key", {
-      key, code: "", event: "keydown", text: key,
-      shiftKey: modifiers.includes("shift"), altKey: false, ctrlKey: false, metaKey: false,
-      synthesizeKeyUp: true,
-    });
-    return;
-  }
+  if (pressed && routeHintShortcut(currentWindows().win, key, modifiers)) return;
 
   const text = eventKind !== 3
     ? textCodepoints.length > 0
