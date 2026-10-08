@@ -71,7 +71,8 @@ mod tests {
         assert!(script.contains("showTabList"));
         assert!(script.contains("showHelp"));
         assert!(script.contains("__tweb_help__"));
-        assert!(script.contains("case \"?\": showHelp()"));
+        // Keys are bound from the help table since f8930a3, not from a `switch`.
+        assert!(script.contains("{ \"?\": () => showHelp() }"));
         assert!(script.contains("hitTestTargets"));
         assert!(script.contains("native-click"));
         assert!(script.contains("native-hover"));
@@ -84,7 +85,7 @@ mod tests {
         assert!(script.contains("dismissPageOverlay"));
         assert!(script.contains("native-escape"));
         assert!(script.contains("scrollableTargets"));
-        assert!(script.contains("case \"s\": startScrollPicker()"));
+        assert!(script.contains("{ s: () => startScrollPicker() }"));
         assert!(script.contains("hintClickPoint"));
         assert!(script.contains("topViewportPoint"));
         assert!(script.contains("else send(\"native-click\", hintClickPoint(item))"));
