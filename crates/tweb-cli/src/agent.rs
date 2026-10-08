@@ -147,11 +147,40 @@ pub fn resolve_socket(pane: Option<&str>) -> Result<PathBuf> {
 /// The wait has to outlast an ordinary slow page and still end.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long one call may take. A `wait` runs for as long as the caller asked, and cutting it off
+/// at the default read timeout hid both of its outcomes — the match and the timeout error — behind
+/// a socket error. The margin covers the engine's last poll and its reply.
+pub(crate) fn read_timeout(method: &str, params: &Value) -> Duration {
+    let asked = match method {
+        "wait" => params
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .max(params.get("ms").and_then(Value::as_u64).unwrap_or(0)),
+        _ => 0,
+    };
+    READ_TIMEOUT.max(Duration::from_millis(asked) + Duration::from_secs(15))
+}
+
+/// `--json` output. Most methods print the engine's reply as it is; `eval` prints the value
+/// alone, JSON-encoded, because a script reading it needs the type — the string `"true"` and the
+/// boolean `true` were indistinguishable, and `undefined` arrived as `{}` (a `{ value: undefined }`
+/// loses its key on the way through JSON).
+pub fn render_json(method: &str, result: &Value) -> String {
+    match method {
+        "eval" => {
+            serde_json::to_string(result.get("value").unwrap_or(&Value::Null)).unwrap_or_default()
+        }
+        _ => serde_json::to_string_pretty(result).unwrap_or_default(),
+    }
+}
+
 /// One request/response round trip.
 pub fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("cannot reach browser pane at {}", socket.display()))?;
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    let timeout = read_timeout(method, &params);
+    stream.set_read_timeout(Some(timeout))?;
     let mut writer = stream.try_clone()?;
     let request = json!({ "id": 1, "method": method, "params": params });
     writeln!(writer, "{request}")?;
@@ -169,7 +198,7 @@ pub fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
                 "browser pane did not answer {method} within {}s; the page is busy or its \
                  renderer is gone (run `tweb diag --pane ...`: its `page` field probes the \
                  page with its own short timeout, while `status` only reports the engine)",
-                READ_TIMEOUT.as_secs()
+                timeout.as_secs()
             ),
             _ => anyhow::Error::new(error).context("browser pane closed the connection"),
         })?;
@@ -251,6 +280,13 @@ pub fn render_snapshot(result: &Value) -> String {
 pub fn render(method: &str, result: &Value) -> String {
     match method {
         "snapshot" => render_snapshot(result),
+        // Strings bare, as before, so `$(tweb eval 'location.href')` stays a plain string.
+        // Anything else is JSON. `undefined` prints nothing rather than `{}`.
+        "eval" => match result.get("value") {
+            None => String::new(),
+            Some(Value::String(text)) => format!("{text}\n"),
+            Some(other) => format!("{other}\n"),
+        },
         // Read actions carry their payload alongside the ok flag; print the payload.
         "act" => {
             for key in ["text", "html", "value"] {
@@ -518,7 +554,7 @@ pub fn render(method: &str, result: &Value) -> String {
 pub fn run(pane: Option<&str>, method: &str, params: Value, as_json: bool) -> Result<()> {
     let result = request(pane, method, params)?;
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!("{}", render_json(method, &result));
     } else {
         print!("{}", render(method, &result));
     }
@@ -602,5 +638,83 @@ mod tests {
             rendered.contains("POST    -    https://example.com/api"),
             "{rendered}"
         );
+    }
+
+    /// `undefined` used to come back as `{}` — the engine's `{ value: undefined }` loses its key
+    /// in JSON — so "no value" read as an empty object. It prints nothing now, and `null` in JSON.
+    #[test]
+    fn eval_undefined_is_not_an_empty_object() {
+        let result = serde_json::json!({});
+        assert_eq!(super::render("eval", &result), "");
+        assert_eq!(super::render_json("eval", &result), "null");
+    }
+
+    /// `--json` is what a script parses, so it carries the type: the string "true" and the
+    /// boolean true were both printed as `true`.
+    #[test]
+    fn eval_json_keeps_the_type() {
+        let text = serde_json::json!({ "value": "true" });
+        let boolean = serde_json::json!({ "value": true });
+        assert_eq!(super::render_json("eval", &text), "\"true\"");
+        assert_eq!(super::render_json("eval", &boolean), "true");
+        assert_eq!(
+            super::render_json("eval", &serde_json::json!({ "value": "abc" })),
+            "\"abc\""
+        );
+        // The human form stays as it was: strings bare, everything else as JSON.
+        assert_eq!(super::render("eval", &text), "true\n");
+        assert_eq!(
+            super::render("eval", &serde_json::json!({ "value": { "a": 1 } })),
+            "{\"a\":1}\n"
+        );
+    }
+
+    /// The socket read used to give up at a fixed 60s, so `tweb wait --timeout 90000` was cut
+    /// off by the CLI before the engine could report either outcome.
+    #[test]
+    fn a_long_wait_outlasts_the_default_read_timeout() {
+        let params = serde_json::json!({ "selector": "#x", "timeout": 90_000 });
+        assert!(super::read_timeout("wait", &params) > std::time::Duration::from_secs(90));
+        assert_eq!(
+            super::read_timeout("eval", &serde_json::json!({})),
+            super::READ_TIMEOUT
+        );
+        let short = serde_json::json!({ "selector": "#x", "timeout": 1000 });
+        assert_eq!(super::read_timeout("wait", &short), super::READ_TIMEOUT);
+    }
+
+    /// A page exception reaches the engine as an error reply, and that has to become a failed
+    /// command (non-zero exit, message on stderr) rather than printed output.
+    #[test]
+    fn an_error_reply_is_a_failed_call() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("tweb-agent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let socket = dir.join("agent.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone"))
+                .read_line(&mut line)
+                .expect("read");
+            let mut writer = stream;
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({ "id": 1, "error": "TypeError: Cannot read properties of undefined (reading 'click')" })
+            )
+            .expect("write");
+        });
+        let error = super::call(
+            &socket,
+            "eval",
+            serde_json::json!({ "script": "[][0].click()" }),
+        )
+        .expect_err("a page exception must fail the call");
+        assert!(error.to_string().contains("TypeError"), "{error}");
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

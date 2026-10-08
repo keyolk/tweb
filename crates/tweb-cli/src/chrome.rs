@@ -129,6 +129,88 @@ pub fn engine_profile_dir() -> PathBuf {
     engine_user_data_dir().join("chrome-profile")
 }
 
+/// The Chrome profiles inside an engine user-data dir, as (directory, name, signed-in account),
+/// sorted by directory. Read from Chrome's own `Local State`, which is what its profile picker
+/// shows; a dir Chrome has never run in has none.
+pub fn engine_profiles(dir: &std::path::Path) -> Result<Vec<(String, String, String)>> {
+    let path = dir.join("Local State");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let state: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("malformed {}", path.display()))?;
+    let field = |entry: &serde_json::Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut rows: Vec<(String, String, String)> = state
+        .pointer("/profile/info_cache")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(directory, entry)| {
+            (
+                directory.clone(),
+                field(entry, "name"),
+                field(entry, "user_name"),
+            )
+        })
+        .collect();
+    rows.sort();
+    Ok(rows)
+}
+
+/// `tweb profile list` — which browser profiles tweb runs on and who they are signed in as.
+///
+/// There are two: the Electron engine's own session (no Google account; sites keep their cookies
+/// there) and the `--engine chrome` user-data dir, whose Chrome profiles carry a Google account.
+/// It is not the user's everyday Chrome profile, which `tweb chrome login` exists to work around.
+pub fn list_profiles(as_json: bool) -> Result<()> {
+    let electron = engine_user_data_dir();
+    let chrome = engine_profile_dir();
+    let profiles = engine_profiles(&chrome)?;
+    let in_use = profile_in_use(&chrome);
+    if as_json {
+        let rows: Vec<serde_json::Value> = profiles
+            .iter()
+            .map(|(directory, name, account)| {
+                serde_json::json!({ "directory": directory, "name": name, "account": account })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "electron": { "path": electron },
+                "chrome": { "path": chrome, "chrome_pid": in_use, "profiles": rows },
+            }))?
+        );
+        return Ok(());
+    }
+    println!("electron  {}", electron.display());
+    let state = match in_use {
+        Some(pid) => format!(" (open in Chrome pid {pid})"),
+        None => String::new(),
+    };
+    println!("chrome    {}{state}", chrome.display());
+    if profiles.is_empty() {
+        println!("  no profiles yet (start a pane with --engine chrome)");
+    }
+    for (directory, name, account) in &profiles {
+        let account = if account.is_empty() {
+            "not signed in"
+        } else {
+            account
+        };
+        println!("  {directory:<12} {name:<20} {account}");
+    }
+    Ok(())
+}
+
 /// Electron's `app.getPath("userData")` for this app: `TWEB_USER_DATA_DIR`, else the platform's
 /// application-data directory named after `package.json`'s `name`.
 fn engine_user_data_dir() -> PathBuf {
@@ -282,6 +364,51 @@ pub fn login(url: &str) -> Result<()> {
     }
     println!("Chrome closed; the sign-in is stored in the profile.");
     Ok(())
+}
+
+#[cfg(test)]
+mod profile_list_tests {
+    /// `tweb profile list` exited with "command not yet implemented", so the only way to learn
+    /// which Google account an `--engine chrome` pane browses as was to read `Local State` by hand.
+    #[test]
+    fn engine_profiles_come_from_local_state() {
+        let dir = std::env::temp_dir().join(format!("tweb-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("Local State"),
+            r#"{"profile":{"info_cache":{
+                "Profile 1":{"name":"Work","user_name":"me@work.test"},
+                "Default":{"name":"Your Chrome","user_name":"me@home.test"}
+            }}}"#,
+        )
+        .expect("write");
+        let rows = super::engine_profiles(&dir).expect("profiles");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "Default".to_string(),
+                    "Your Chrome".to_string(),
+                    "me@home.test".to_string()
+                ),
+                (
+                    "Profile 1".to_string(),
+                    "Work".to_string(),
+                    "me@work.test".to_string()
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A profile Chrome has never run has no `Local State` yet; that is "no profiles", not an error.
+    #[test]
+    fn a_fresh_profile_lists_nothing() {
+        let dir = std::env::temp_dir().join(format!("tweb-profiles-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert!(super::engine_profiles(&dir).expect("profiles").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

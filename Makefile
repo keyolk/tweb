@@ -65,6 +65,9 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/agent-server.cjs
 	node --check electron/paste-state.cjs
 	node --check electron/url-normalization.cjs
+	node --check electron/agent-wait.cjs
+	node --check electron/agent-eval.cjs
+	node --check electron/agent-navigate.cjs
 	node --check electron/patch-geometry.cjs
 	node --check electron/frame-rate-policy.cjs
 	node --check electron/history-view.cjs

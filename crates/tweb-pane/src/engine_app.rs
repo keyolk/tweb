@@ -76,6 +76,18 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/url-normalization.cjs"),
     ),
     (
+        "agent-wait.cjs",
+        include_str!("../../../electron/agent-wait.cjs"),
+    ),
+    (
+        "agent-eval.cjs",
+        include_str!("../../../electron/agent-eval.cjs"),
+    ),
+    (
+        "agent-navigate.cjs",
+        include_str!("../../../electron/agent-navigate.cjs"),
+    ),
+    (
         "patch-geometry.cjs",
         include_str!("../../../electron/patch-geometry.cjs"),
     ),
