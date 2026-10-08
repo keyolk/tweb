@@ -549,6 +549,13 @@ const solePane = createPaneRecord({
 // image id its frontend allocated. Registering this process's derived identity first would make
 // the first real attach look like a supersession of a pane that never existed — and would put a
 // record in the registry that nothing is drawing for.
+// `tweb open` with no url asks the pane to restore its tmux window's tabs. A host learns that per
+// pane from each ATTACH (`restoreSession`); a per-pane engine is told once, through the environment.
+// Reading it was lost when the session state moved onto pane records (#54), so every engine started
+// without the supervisor — every `--engine chrome` pane, and Electron with the daemon off — opened
+// about:blank instead of restoring. Measured on an `--engine chrome` pane: `tab opened 1
+// about:blank` logged ahead of the session slot it should have restored from.
+if (!hostedRuntime) solePane.session.restore = process.env.TWEB_RESTORE_SESSION === "1";
 if (!hostedRuntime) paneRegistry.attach(solePane);
 // The sole pane's window context is registered under its key, so `windowsFor` returns the very
 // object the single-pane path has always used instead of creating a second one beside it.

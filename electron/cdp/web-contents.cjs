@@ -34,9 +34,22 @@ const CAPTURE_TIMEOUT_MS = 1000;
 const INPUT_SCALE_RECHECK_MS = 3000;
 // Quiet time after the last screencast frame before a device-pixel capture sharpens the picture.
 const SETTLE_MS = 150;
+const INVALIDATE_GRACE_MS = 50;
 // The screencast is now what motion is drawn from, so its quality is visible; 90 keeps text legible
 // mid-scroll at a fraction of the bytes of 100.
 const SCREENCAST_QUALITY = 90;
+
+// Whether a screencast frame is a picture of the viewport. It comes at either of two sizes: CSS
+// pixels, and — once a device-pixel `captureScreenshot` has run on the tab — device pixels
+// (measured at dsf 1.6: 900x563, then 1440x900 for every frame after the first settle capture).
+// Accepting only the CSS size dropped every frame after that first capture, so nothing moved in
+// the pane until the 50ms capture behind the settle timer. A frame of the WINDOW instead
+// (900x476, 761x476 — see `fitWindowToViewport`) matches neither and is still refused.
+function isViewportFrame(got, viewport, deviceScaleFactor) {
+  const near = (scale) => Math.abs(got.width - Math.round(viewport.width * scale)) <= 2
+    && Math.abs(got.height - Math.round(viewport.height * scale)) <= 2;
+  return near(1) || near(deviceScaleFactor || 1);
+}
 
 // `TWEB_CDP_PROFILE=1`: every 5s, where a frame's time went — the screenshot round trip, the PNG
 // decode, the bitmap copy, the damage diff — and how many screencast signals arrived per capture.
@@ -569,7 +582,7 @@ class CdpWebContents extends EventEmitter {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
-    for (const key of ["timer", "castTimer", "settleTimer"]) {
+    for (const key of ["timer", "castTimer", "settleTimer", "graceTimer"]) {
       if (this.capture[key]) clearTimeout(this.capture[key]);
     }
     this.debugger.detach();
@@ -1059,8 +1072,7 @@ class CdpWebContents extends EventEmitter {
       const got = decoded.getSize();
       // A frame of the window rather than the viewport (see `fitWindowToViewport`) would be
       // stretched into the wrong picture. It is dropped; the settle capture draws the change.
-      if (Math.abs(got.width - Math.round(this.viewport.width)) > 2
-        || Math.abs(got.height - Math.round(this.viewport.height)) > 2) {
+      if (!isViewportFrame(got, this.viewport, this.deviceScaleFactor)) {
         if (this.engine.debug && !capture.loggedMismatch) {
           capture.loggedMismatch = true;
           console.error(`tweb: screencast frame ${got.width}x${got.height} does not match the viewport `
@@ -1098,10 +1110,41 @@ class CdpWebContents extends EventEmitter {
   // a pane coming back into view repaints from it, and `awaitRestoredFrame` waits for it. So an
   // explicit invalidate forces the next frame through the unchanged-frame filter; a damage
   // signal from the screencast does not.
+  //
+  // With the screencast running, the capture waits `INVALIDATE_GRACE_MS` for a screencast frame
+  // first. An invalidate usually follows a change the page is about to draw — hint badges going up,
+  // an overlay closing — and the screencast delivers that ~16ms after it is drawn, where a
+  // device-pixel capture takes 20–50ms and, while it runs, holds back the screencast frame too.
+  // Measured on `f` over Hacker News: badges on screen 80–110ms after the key with the capture
+  // asked at once, against Electron's ~35ms. A page that has nothing new to draw sends no frame, and
+  // the capture then runs as before, so an invalidate still always yields a paint.
   invalidate() {
     if (this.destroyed || !this.painting) return;
-    this.capture.forceNext = true;
-    this.requestCapture();
+    const capture = this.capture;
+    capture.forceNext = true;
+    if (!capture.screencast) {
+      this.requestCapture();
+      return;
+    }
+    // Re-armed by each invalidate. The first one of a keypress is the idle wake-up in
+    // `markInteractionActivity`, ahead of the change it announces; left to expire, its capture ran
+    // just as the badges were drawn and held their screencast frame back (measured: 86ms, not 55).
+    // Only within one more grace period, though: invalidates arriving faster than the grace forever
+    // would otherwise put the capture off forever, and a static page would never paint.
+    const now = Date.now();
+    if (capture.graceTimer) {
+      if (now - capture.graceSince >= INVALIDATE_GRACE_MS) return;
+      clearTimeout(capture.graceTimer);
+    } else {
+      capture.graceSince = now;
+      capture.graceGeneration = capture.generation || 0;
+    }
+    capture.graceTimer = setTimeout(() => {
+      capture.graceTimer = null;
+      // A frame came and was drawn; the settle capture that frame scheduled will sharpen it.
+      if ((capture.generation || 0) !== capture.graceGeneration) return;
+      this.requestCapture();
+    }, INVALIDATE_GRACE_MS);
   }
 
   requestCapture() {
@@ -1472,6 +1515,7 @@ function scaleMouse(event, zoom) {
 }
 
 module.exports = {
+  isViewportFrame,
   PendingSession,
   CdpDebugger,
   CdpFrame,
