@@ -28,6 +28,32 @@ const { dirtyRect } = require("./damage.cjs");
 const { KeySequencer, toCdpMouse } = require("./input.cjs");
 const { BINDING_NAME, WORLD_NAME, preloadScript } = require("./preload-bridge.cjs");
 
+// The box covering both, either of which may be null.
+function unionRect(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  return {
+    x,
+    y,
+    width: Math.max(a.x + a.width, b.x + b.width) - x,
+    height: Math.max(a.y + a.height, b.y + b.height) - y,
+  };
+}
+
+// A soft box from a screencast frame of another size cannot reach past this frame's edges.
+function clampRect(rect, size) {
+  const x = Math.max(0, Math.min(rect.x, size.width));
+  const y = Math.max(0, Math.min(rect.y, size.height));
+  return {
+    x,
+    y,
+    width: Math.max(0, Math.min(rect.x + rect.width, size.width) - x),
+    height: Math.max(0, Math.min(rect.y + rect.height, size.height) - y),
+  };
+}
+
 let nextContentsId = 1000;
 
 const CAPTURE_TIMEOUT_MS = 1000;
@@ -1087,12 +1113,26 @@ class CdpWebContents extends EventEmitter {
       const image = got.width === want.width && got.height === want.height
         ? decoded
         : decoded.resize({ width: want.width, height: want.height, quality: "good" });
-      // The damage diff is skipped: a frame arriving here differs from the last by construction,
-      // and its pixels are about to be replaced by the settled capture anyway.
-      this.lastBitmap = null;
-      this.capture.forceNext = false;
       const size = image.getSize();
-      this.emit("paint", {}, { x: 0, y: 0, width: size.width, height: size.height }, image);
+      const whole = { x: 0, y: 0, width: size.width, height: size.height };
+      // Damaged against the previous screencast frame, not the settled capture: the two are drawn
+      // at different resolutions and differ everywhere. Sending the whole frame instead was a
+      // flicker: a caret blinking in a focused field put the half-resolution picture over the
+      // entire pane and the settle capture sharpened it 150ms later, twice a second for as long as
+      // the field had focus. Now only the caret's box goes soft, and only until the settle.
+      const bitmap = image.toBitmap();
+      const previous = capture.lastCast;
+      const dirty = previous && previous.width === size.width && previous.height === size.height
+        ? dirtyRect(previous.pixels, bitmap, size.width, size.height)
+        : whole;
+      capture.lastCast = { pixels: bitmap, width: size.width, height: size.height };
+      if (!dirty) return;
+      // The pane now holds screencast pixels in this box, which the settled capture's own diff
+      // cannot see: the page can be back to the picture `lastBitmap` holds (a caret that blinked
+      // off and on again) and the box would never be redrawn sharp.
+      capture.soft = unionRect(capture.soft, dirty);
+      this.capture.forceNext = false;
+      this.emit("paint", {}, dirty, image);
     }, Math.max(0, wait));
   }
 
@@ -1222,14 +1262,16 @@ class CdpWebContents extends EventEmitter {
     const t3 = performance.now();
     const previous = this.lastBitmap;
     const sameSize = previous && previous.width === size.width && previous.height === size.height;
+    const whole = { x: 0, y: 0, width: size.width, height: size.height };
     const dirty = sameSize
-      ? dirtyRect(previous.pixels, bitmap, size.width, size.height)
-      : { x: 0, y: 0, width: size.width, height: size.height };
+      ? unionRect(dirtyRect(previous.pixels, bitmap, size.width, size.height), this.capture.soft)
+      : whole;
+    this.capture.soft = null;
     this.lastBitmap = { pixels: bitmap, width: size.width, height: size.height };
     if (PROFILE) profileCapture(this, { capture: t1 - t0, decode: t2 - t1, bitmap: t3 - t2, diff: performance.now() - t3, bytes: shot.data.length * 0.75, changed: Boolean(dirty) });
     if (!dirty && !this.capture.forceNext) return;
     this.capture.forceNext = false;
-    this.emit("paint", {}, dirty || { x: 0, y: 0, width: size.width, height: size.height }, image);
+    this.emit("paint", {}, dirty ? clampRect(dirty, size) : whole, image);
   }
 
   async capturePage(rect) {

@@ -95,3 +95,76 @@ test("an invalidate without the screencast captures at once", () => {
   created.invalidate();
   assert.strictEqual(captures.length, 1);
 });
+
+// --- screencast frames are damaged like captures ---
+//
+// A caret blinking in a focused field changes a few pixels twice a second. The screencast frame it
+// produces used to be painted as the WHOLE pane at half resolution, then sharpened by the settle
+// capture 150ms later: the entire pane flickered for as long as the field had focus. Measured on
+// claude.ai with the prompt focused: 36 whole frames in 6s, against 8 with it blurred.
+
+// A fake decoded frame: a byte buffer standing in for the bitmap, keyed by the base64 data.
+function fakeImages(pictures) {
+  return {
+    createFromBuffer(buffer) {
+      const pixels = pictures.get(buffer.toString("base64"));
+      const image = {
+        getSize: () => ({ width: 4, height: 2 }),
+        toBitmap: () => Buffer.from(pixels),
+        resize: () => image,
+        crop: () => image,
+      };
+      return image;
+    },
+  };
+}
+
+function screencastContents(pictures) {
+  const { setNativeImage } = require("./web-contents.cjs");
+  setNativeImage(fakeImages(pictures));
+  const { created } = contents();
+  created.painting = true;
+  created.frameRate = 1000;
+  created.viewport = { width: 4, height: 2 };
+  created.deviceScaleFactor = 1;
+  created.frameSize = { width: 4, height: 2 };
+  created.scheduleSettle = () => {};
+  const paints = [];
+  created.on("paint", (_event, dirty) => paints.push(dirty));
+  return { created, paints };
+}
+
+function picture(changedPixel) {
+  const pixels = Buffer.alloc(4 * 2 * 4);
+  if (changedPixel !== undefined) pixels.writeUInt32LE(0xffffffff, changedPixel * 4);
+  return pixels;
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+test("a screencast frame paints only the box that changed since the last one", async () => {
+  const pictures = new Map([["QQ==", picture()], ["Qg==", picture(5)]]);
+  const { created, paints } = screencastContents(pictures);
+  created.presentScreencastFrame("QQ==");
+  await settle();
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  assert.deepStrictEqual(paints[0], { x: 0, y: 0, width: 4, height: 2 });
+  // Pixel 5 is column 1 of row 1: a caret, not the pane.
+  assert.deepStrictEqual(paints[1], { x: 1, y: 1, width: 1, height: 1 });
+});
+
+test("the settle capture redraws a soft box even when the page is back where it was", async () => {
+  const pictures = new Map([["QQ==", picture()], ["Qg==", picture(5)]]);
+  const { created, paints } = screencastContents(pictures);
+  // The pane was sharp with the caret off; a screencast frame drew it on.
+  created.lastBitmap = { pixels: picture(), width: 4, height: 2 };
+  created.capture.lastCast = { pixels: picture(), width: 4, height: 2 };
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  // The caret is off again by the time the capture runs: identical to `lastBitmap`.
+  created.session.send = async () => ({ data: "QQ==" });
+  await created.captureFrame();
+  assert.deepStrictEqual(paints.at(-1), { x: 1, y: 1, width: 1, height: 1 });
+  assert.strictEqual(created.capture.soft, null);
+});
