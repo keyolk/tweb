@@ -157,18 +157,22 @@ test("a screencast frame paints only the box that changed since the last one", a
   assert.deepStrictEqual(paints[0], { x: 1, y: 1, width: 1, height: 1 });
 });
 
-// Measured on claude.ai at zoom 0.8: Chrome alternated 860x840 (CSS) and 1376x1344 (device)
-// frames with nothing on the page moving, and each one was painted as whole-pane damage.
-test("a screencast that alternates between two sizes paints nothing while the page is still", async () => {
-  const small = { pixels: Buffer.alloc(2 * 1 * 4), size: { width: 2, height: 1 } };
-  const pictures = new Map([["QQ==", picture()], ["Qg==", small]]);
+// Measured on claude.ai and namu.wiki at zoom 0.8 (dsf 1.6): Chrome alternated 860x840 and
+// 1376x1344 frames, and the 860x840 ones held only the top-left corner of the page. Drawn, they
+// flickered the pane (#141) and then zoomed it in and out; they are change signals, not pictures.
+test("a screencast frame at another size than the pane is never drawn", async () => {
+  // Two corner frames that differ: the corner itself changed, as a hint badge going up does.
+  const corner = (fill) => ({ pixels: Buffer.alloc(2 * 1 * 4, fill), size: { width: 2, height: 1 } });
+  const pictures = new Map([
+    ["QQ==", picture()], ["Qg==", corner(0x10)], ["RA==", corner(0x7f)], ["Qw==", picture(5)],
+  ]);
   const { created, paints } = screencastContents(pictures);
-  for (const data of ["QQ==", "Qg==", "QQ==", "Qg==", "QQ=="]) {
-    // Each one is a new frame to Chrome; the filter in onScreencastFrame is not under test.
+  for (const data of ["QQ==", "Qg==", "QQ==", "RA==", "Qw=="]) {
     created.presentScreencastFrame(data);
     await settle();
   }
-  assert.deepStrictEqual(paints, []);
+  // Only the pane-size change is drawn, against the last pane-size frame.
+  assert.deepStrictEqual(paints, [{ x: 1, y: 1, width: 1, height: 1 }]);
 });
 
 test("the settle capture redraws a soft box even when the page is back where it was", async () => {
@@ -176,7 +180,7 @@ test("the settle capture redraws a soft box even when the page is back where it 
   const { created, paints } = screencastContents(pictures);
   // The pane was sharp with the caret off; a screencast frame drew it on.
   created.lastBitmap = { pixels: picture(), width: 4, height: 2 };
-  created.capture.lastCasts = new Map([["4x2", picture()]]);
+  created.capture.lastCast = picture();
   created.presentScreencastFrame("Qg==");
   await settle();
   // The caret is off again by the time the capture runs: identical to `lastBitmap`.
