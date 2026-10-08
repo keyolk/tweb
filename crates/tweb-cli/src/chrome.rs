@@ -181,6 +181,71 @@ fn profile_in_use(profile: &std::path::Path) -> Option<u32> {
     alive.then_some(pid)
 }
 
+/// Frees the profile from an engine Chrome no pane is using, or explains why it cannot.
+///
+/// An engine Chrome outlives its panes when they are killed rather than closed — measured: a
+/// Chrome started for a pane on Oct 5 still held the profile on Oct 8 with no pane open, and
+/// `tweb chrome login` refused with nothing the user could do. Whether a pane still uses it is
+/// asked of the panes themselves (`status.browser`); Chrome's own `/json/list` cannot tell, as it
+/// has no `attached` field for CDP sessions (measured). A Chrome the user opened (no DevTools
+/// port) is never closed.
+fn reclaim_profile(profile: &std::path::Path, pid: u32) -> Result<()> {
+    let args = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    if !args.contains("--remote-debugging-port") {
+        anyhow::bail!(
+            "the Chrome engine profile is open in another Chrome window (pid {pid}); quit it, then run `tweb chrome login` again"
+        );
+    }
+    let statuses: Vec<(String, serde_json::Value)> = crate::agent::discover_sockets()
+        .iter()
+        .filter_map(|socket| {
+            let name = socket
+                .file_stem()?
+                .to_str()?
+                .trim_start_matches("agent-")
+                .to_string();
+            let status = crate::agent::call(socket, "status", serde_json::json!({})).ok()?;
+            Some((name, status))
+        })
+        .collect();
+    let users = chrome_panes(&statuses);
+    if !users.is_empty() {
+        anyhow::bail!(
+            "the Chrome engine is in use by pane {}; close {} (Ctrl-C), then run `tweb chrome login` again",
+            users.join(", "),
+            if users.len() == 1 { "it" } else { "them" }
+        );
+    }
+    println!("Closing an idle Chrome engine left by an earlier pane (pid {pid}).");
+    Command::new("kill").arg(pid.to_string()).status()?;
+    for _ in 0..50 {
+        if profile_in_use(profile).is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("the idle Chrome engine (pid {pid}) did not exit; quit it and try again")
+}
+
+/// The panes that may be driving the Chrome engine. A pane from before `status.browser` existed
+/// does not say, so it counts — closing a Chrome under a live pane is the worse mistake.
+fn chrome_panes(statuses: &[(String, serde_json::Value)]) -> Vec<String> {
+    statuses
+        .iter()
+        .filter(
+            |(_, status)| match status.get("browser").and_then(serde_json::Value::as_str) {
+                Some(kind) => kind == "chrome",
+                None => true,
+            },
+        )
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// Opens the `--engine chrome` profile in an ordinary Chrome window, so the user can sign in.
 ///
 /// WHY a separate window: Google refuses sign-in with "This browser or app may not be secure"
@@ -193,9 +258,7 @@ fn profile_in_use(profile: &std::path::Path) -> Option<u32> {
 pub fn login(url: &str) -> Result<()> {
     let profile = engine_profile_dir();
     if let Some(pid) = profile_in_use(&profile) {
-        anyhow::bail!(
-            "the Chrome engine profile is in use (Chrome pid {pid}); close every `--engine chrome` pane first, then run `tweb chrome login` again"
-        );
+        reclaim_profile(&profile, pid)?;
     }
     let binary = chrome_binary()
         .ok_or_else(|| anyhow::anyhow!("Google Chrome not found; install it or set TWEB_CHROME"))?;
@@ -223,7 +286,20 @@ pub fn login(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod login_tests {
-    use super::profile_in_use;
+    use super::{chrome_panes, profile_in_use};
+
+    #[test]
+    fn only_chrome_panes_and_unknown_ones_hold_the_engine() {
+        use serde_json::json;
+        let statuses = vec![
+            ("%1".to_string(), json!({ "browser": "electron" })),
+            ("%2".to_string(), json!({ "browser": "chrome" })),
+            ("%3".to_string(), json!({})),
+        ];
+        assert_eq!(chrome_panes(&statuses), vec!["%2", "%3"]);
+        assert!(chrome_panes(&[("%1".to_string(), json!({ "browser": "electron" }))]).is_empty());
+        assert!(chrome_panes(&[]).is_empty());
+    }
 
     #[test]
     fn a_profile_without_a_lock_is_free() {

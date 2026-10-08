@@ -4792,6 +4792,9 @@ async function dispatchAgentCommand(method, params) {
       return {
         pid: process.pid,
         pane: ownTmuxPane,
+        // Which page engine serves this pane: `tweb chrome login` must not close a Chrome a pane
+        // is still driving, and this is the only place that can say so.
+        browser: pageBackend.kind,
         tabs: agentTabList(),
       };
     // A peer says the claim changed. Nothing is returned and nothing is trusted — the
@@ -8163,7 +8166,7 @@ app.on("will-quit", (event) => {
   pageBackendStopped = true;
   event.preventDefault();
   const done = () => app.quit();
-  const timer = setTimeout(done, 1500);
+  const timer = setTimeout(done, 3000);
   pageBackend.engine.stop().catch((error) => {
     console.error(`tweb: chrome engine stop failed: ${error.message}`);
   }).finally(() => {

@@ -133,6 +133,30 @@ class CdpIpcMain extends EventEmitter {
   }
 }
 
+// The pid Chrome writes into the profile's `SingletonLock` symlink (`<host>-<pid>`).
+function lockHolder(userDataDir) {
+  try {
+    const pid = Number(fs.readlinkSync(path.join(userDataDir, "SingletonLock")).split("-").pop());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function terminateIfAlive(pid, graceMs) {
+  const alive = () => {
+    try { process.kill(pid, 0); return true; } catch (_) { return false; }
+  };
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    if (!alive()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (alive()) {
+    try { process.kill(pid, "SIGTERM"); } catch (_) { /* gone in between */ }
+  }
+}
+
 class CdpEngine extends EventEmitter {
   constructor({ userDataDir, nativeImage, clipboard, debug = false, downloadsPath = () => null }) {
     super();
@@ -444,15 +468,25 @@ class CdpEngine extends EventEmitter {
 
   // This engine's tabs, then Chrome itself if no other pane is using it. Chrome is shared, so it is
   // only closed when the last page left is nobody's — a pane in another tmux window keeps it alive.
+  //
+  // "Nobody else" is a page with a debugger attached that is not an extension's: every live pane
+  // holds a session on each of its tabs, and a policy extension can open a page of its own that
+  // no pane drives. Counting that page kept Chrome alive forever — measured: an engine Chrome from
+  // Oct 5 still held the profile on Oct 8 with no pane and one extension error page, which made
+  // `tweb chrome login` refuse. `Browser.close` was also seen not to end that Chrome, so it is
+  // followed by a SIGTERM to the pid in the profile's lock if Chrome is still there a second later.
   async stop() {
     if (!this.connection || this.connection.closed) return;
     await Promise.all([...this.windows].map((window) => this.closeTarget(window)));
     try {
       const { targetInfos } = await this.connection.send("Target.getTargets");
-      const inUse = targetInfos.some((info) => info.type === "page" && info.attached);
+      const inUse = targetInfos.some((info) => info.type === "page" && info.attached
+        && !String(info.url).startsWith("chrome-extension://"));
       if (!inUse) {
         if (this.debug) console.error("tweb: last chrome pane closed, closing chrome");
+        const pid = lockHolder(this.userDataDir);
         await this.connection.send("Browser.close").catch(() => {});
+        if (pid) await terminateIfAlive(pid, 1000);
       }
     } catch (_) { /* Chrome already gone */ }
     this.connection.close();
