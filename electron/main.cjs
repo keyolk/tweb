@@ -443,6 +443,14 @@ function frameProbeSummary() {
     patch: summarise(frameProbeSamples.filter((row) => row.kind === "patch")),
   };
 }
+// Whoever reads the engine's stderr can go away first: a `TWEB_DEBUG` pane's terminal closes, or a
+// harness that piped it exits and leaves the engine orphaned. The next write then fails with EPIPE,
+// and a stream with no "error" listener turns that into an uncaught exception, which Electron shows
+// as a modal dialog over a pane nobody is watching. Losing diagnostics is the right outcome, so the
+// error is dropped; `engineLog` below still keeps every line for `engine-log`.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on("error", () => {});
+}
 const writeError = console.error.bind(console);
 console.error = (...args) => {
   const line = args.map((part) => (typeof part === "string" ? part : String(part))).join(" ");
