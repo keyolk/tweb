@@ -937,7 +937,38 @@ class CdpWebContents extends EventEmitter {
       screenWidth: Math.round(width),
       screenHeight: Math.round(height),
     }).catch(() => {});
+    await this.fitWindowToViewport();
     this.invalidate();
+  }
+
+  // The headless window, sized so its page area equals the emulated viewport.
+  //
+  // The metrics override sets the page's layout and `captureScreenshot`'s output, but once the
+  // window has been resized — and `captureScreenshot` resizes it — the screencast draws the
+  // window's page area instead (measured: override 810x840, window 810x840 → screencast 810x753;
+  // window 2000x2000 → 2000x1913). Stretched to the pane, those frames magnified and squashed the
+  // page, and alternating with the correctly sized captures they made the pane look like it was
+  // zooming in and out on every scroll. The window is therefore sized to viewport + browser frame,
+  // the frame being read off the window's bounds against the page area a screencast frame reports,
+  // and re-fitted whenever a frame comes back the wrong size.
+  async fitWindowToViewport(pageArea = null) {
+    try {
+      const { windowId } = await this.connection.send("Browser.getWindowForTarget", { targetId: this.targetId });
+      const { bounds } = await this.connection.send("Browser.getWindowBounds", { windowId });
+      if (pageArea) {
+        this.windowFrame = {
+          width: Math.max(0, bounds.width - pageArea.width),
+          height: Math.max(0, bounds.height - pageArea.height),
+        };
+      }
+      const frame = this.windowFrame || { width: 0, height: 0 };
+      const width = Math.round(this.viewport.width) + frame.width;
+      const height = Math.round(this.viewport.height) + frame.height;
+      if (bounds.width === width && bounds.height === height) return;
+      await this.connection.send("Browser.setWindowBounds", { windowId, bounds: { width, height, windowState: "normal" } });
+    } catch (error) {
+      if (this.engine.debug) console.error(`tweb: chrome window resize failed: ${error.message}`);
+    }
   }
 
   setViewport(width, height, deviceScaleFactor = this.deviceScaleFactor) {
@@ -1008,7 +1039,23 @@ class CdpWebContents extends EventEmitter {
       capture.lastAt = Date.now();
       const decoded = nativeImage.createFromBuffer(Buffer.from(next, "base64"));
       const want = this.frameSize || decoded.getSize();
-      const image = decoded.getSize().width === want.width && decoded.getSize().height === want.height
+      const got = decoded.getSize();
+      // A frame of the window rather than the viewport (see `fitWindowToViewport`) would be
+      // stretched into the wrong picture. It is dropped; the settle capture draws the change.
+      if (Math.abs(got.width - Math.round(this.viewport.width)) > 2
+        || Math.abs(got.height - Math.round(this.viewport.height)) > 2) {
+        if (this.engine.debug && !capture.loggedMismatch) {
+          capture.loggedMismatch = true;
+          console.error(`tweb: screencast frame ${got.width}x${got.height} does not match the viewport `
+            + `${Math.round(this.viewport.width)}x${Math.round(this.viewport.height)}; refitting the window`);
+        }
+        if (!capture.refitting) {
+          capture.refitting = true;
+          void this.fitWindowToViewport(got).finally(() => { capture.refitting = false; });
+        }
+        return;
+      }
+      const image = got.width === want.width && got.height === want.height
         ? decoded
         : decoded.resize({ width: want.width, height: want.height, quality: "good" });
       // The damage diff is skipped: a frame arriving here differs from the last by construction,
