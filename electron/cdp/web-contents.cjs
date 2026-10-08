@@ -42,6 +42,18 @@ function unionRect(a, b) {
   };
 }
 
+// A box in one bitmap's pixels, grown outward to cover the same area in a bitmap of another size.
+function scaleRect(rect, sx, sy) {
+  const x = Math.floor(rect.x * sx);
+  const y = Math.floor(rect.y * sy);
+  return {
+    x,
+    y,
+    width: Math.ceil((rect.x + rect.width) * sx) - x,
+    height: Math.ceil((rect.y + rect.height) * sy) - y,
+  };
+}
+
 // A soft box from a screencast frame of another size cannot reach past this frame's edges.
 function clampRect(rect, size) {
   const x = Math.max(0, Math.min(rect.x, size.width));
@@ -1110,23 +1122,31 @@ class CdpWebContents extends EventEmitter {
         }
         return;
       }
+      // Damaged against an earlier screencast frame, never against the settled capture: the two
+      // are drawn at different resolutions and differ in every pixel. Painting the whole frame
+      // was a flicker — the pane went soft at half resolution and the settle capture sharpened it
+      // 150ms later, for every caret blink.
+      //
+      // And only against a frame Chrome sent at the SAME size. The screencast comes at two sizes
+      // and on some pages alternates between them: CSS pixels (860x840 at zoom 0.8 in a 688x672
+      // pane) and device pixels (1376x1344). Measured on claude.ai with nothing moving, a CSS frame
+      // scaled up differed from the device frame before it everywhere, so every frame was whole-
+      // pane damage and the pane flickered several times a second. The first frame at a size has
+      // nothing to compare with and is not drawn; the settle capture `scheduleSettle` already
+      // armed draws the change sharp 150ms later.
+      const sizeKey = `${got.width}x${got.height}`;
+      const bitmap = decoded.toBitmap();
+      if (!capture.lastCasts) capture.lastCasts = new Map();
+      const previous = capture.lastCasts.get(sizeKey);
+      capture.lastCasts.set(sizeKey, bitmap);
+      if (!previous) return;
+      const changed = dirtyRect(previous, bitmap, got.width, got.height);
+      if (!changed) return;
       const image = got.width === want.width && got.height === want.height
         ? decoded
         : decoded.resize({ width: want.width, height: want.height, quality: "good" });
       const size = image.getSize();
-      const whole = { x: 0, y: 0, width: size.width, height: size.height };
-      // Damaged against the previous screencast frame, not the settled capture: the two are drawn
-      // at different resolutions and differ everywhere. Sending the whole frame instead was a
-      // flicker: a caret blinking in a focused field put the half-resolution picture over the
-      // entire pane and the settle capture sharpened it 150ms later, twice a second for as long as
-      // the field had focus. Now only the caret's box goes soft, and only until the settle.
-      const bitmap = image.toBitmap();
-      const previous = capture.lastCast;
-      const dirty = previous && previous.width === size.width && previous.height === size.height
-        ? dirtyRect(previous.pixels, bitmap, size.width, size.height)
-        : whole;
-      capture.lastCast = { pixels: bitmap, width: size.width, height: size.height };
-      if (!dirty) return;
+      const dirty = clampRect(scaleRect(changed, size.width / got.width, size.height / got.height), size);
       // The pane now holds screencast pixels in this box, which the settled capture's own diff
       // cannot see: the page can be back to the picture `lastBitmap` holds (a caret that blinked
       // off and on again) and the box would never be redrawn sharp.
