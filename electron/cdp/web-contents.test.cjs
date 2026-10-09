@@ -250,3 +250,30 @@ test("the settle capture redraws a soft box even when the page is back where it 
   assert.deepStrictEqual(paints.at(-1), { x: 1, y: 1, width: 1, height: 1 });
   assert.strictEqual(created.capture.soft, null);
 });
+
+// --- the user agent ---
+//
+// Measured on dogdrip.net: nginx answered 403 to `HeadlessChrome/155.0.0.0` and 200 to the same
+// string with `Chrome/`, so the Chrome engine could not open a site the Electron engine could.
+
+test("the browser user agent drops the headless marker and keeps the version", () => {
+  const { browserUserAgent } = require("./engine.cjs");
+  const headless = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) HeadlessChrome/155.0.0.0 Safari/537.36";
+  assert.strictEqual(
+    browserUserAgent(headless),
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+  );
+  assert.strictEqual(browserUserAgent(""), null);
+});
+
+test("every session is given the browser user agent before its page runs", async () => {
+  const { created } = contents();
+  created.engine.userAgent = "UA Chrome/155";
+  created.engine.downloadDirectory = () => "/tmp";
+  const sent = [];
+  const session = { id: "C", on() {}, send: async (method, params) => { sent.push([method, params]); return {}; } };
+  await created.prepareSession(session, false);
+  assert.deepStrictEqual(sent.find(([method]) => method === "Emulation.setUserAgentOverride"),
+    ["Emulation.setUserAgentOverride", { userAgent: "UA Chrome/155" }]);
+});
