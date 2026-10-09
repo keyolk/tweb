@@ -157,83 +157,48 @@ test("a screencast frame paints only the box that changed since the last one", a
   assert.deepStrictEqual(paints[0], { x: 1, y: 1, width: 1, height: 1 });
 });
 
-// Measured at zoom 0.8 (dsf 1.6): Chrome sends CSS-size screencast frames too, and they are either
-// the top-left corner of the device picture (namu.wiki) or the whole page scaled down (YouTube
-// after a pane resize). The corner must never be drawn — it zoomed the pane in and out — and the
-// scaled page must be, or a playing video freezes.
+// Measured at zoom 0.8 (dsf 1.6): Chrome sends CSS-size screencast frames too. On namu.wiki they
+// are the top-left corner of the device picture; on YouTube after a pane resize, the page scaled
+// down. Neither may be drawn — the corner zooms the pane, the scaled page flickers it between
+// sharp frames, and a classifier between the two (#143) misjudged corners as the page.
 const W = 40, H = 40, w = 20, h = 20;
-// A page whose right half is white, at device size, scaled down, and as a top-left corner cut.
-function halves(width, height, rightWhite = true) {
+
+// A page whose right half is white: as the device picture, and scaled down to CSS size. #143's
+// classifier read the small one as the page scaled, which is what drew it.
+function halves(width, height) {
   const pixels = Buffer.alloc(width * height * 4);
-  if (rightWhite) {
-    for (let y = 0; y < height; y += 1) pixels.fill(255, (y * width + width / 2) * 4, (y * width + width) * 4);
-  }
+  for (let y = 0; y < height; y += 1) pixels.fill(255, (y * width + width / 2) * 4, (y * width + width) * 4);
   return pixels;
 }
 
-test("isScaledDown tells a scaled page from a cropped corner", () => {
-  const { isScaledDown } = require("./damage.cjs");
-  assert.strictEqual(isScaledDown(halves(w, h), w, h, halves(W, H), W, H), true);
-  assert.strictEqual(isScaledDown(halves(w, h, false), w, h, halves(W, H), W, H), false);
-});
-
-function cssFrames(smallPixels) {
-  const changed = Buffer.from(smallPixels);
-  changed.fill(128, 0, 4);
-  const pictures = new Map([
-    ["QQ==", { pixels: smallPixels, size: { width: w, height: h } }],
-    ["Qg==", { pixels: changed, size: { width: w, height: h } }],
-  ]);
-  const { created, paints } = screencastContents(pictures);
+function cssContents() {
+  const page = { pixels: halves(w, h), size: { width: w, height: h } };
+  const changed = { pixels: Buffer.from(halves(w, h)).fill(128, 0, 4), size: { width: w, height: h } };
+  const { created, paints } = screencastContents(new Map([["QQ==", page], ["Qg==", changed]]));
   created.viewport = { width: w, height: h };
   created.frameSize = { width: W, height: H };
   created.lastBitmap = { pixels: halves(W, H), width: W, height: H };
-  return { created, paints };
+  const captures = [];
+  created.requestCapture = () => captures.push(Date.now());
+  return { created, paints, captures };
 }
 
-test("a CSS-size screencast frame of the scaled page is drawn", async () => {
-  const { created, paints } = cssFrames(halves(w, h));
-  created.presentScreencastFrame("QQ==");
-  await settle();
-  created.presentScreencastFrame("Qg==");
-  await settle();
-  // The changed pixel (0,0) of the 20x20 frame covers (0,0)-(2,2) of the 40x40 pane.
-  assert.deepStrictEqual(paints, [{ x: 0, y: 0, width: 2, height: 2 }]);
-});
-
-test("a CSS-size screencast frame that is a cropped corner is never drawn", async () => {
-  const { created, paints } = cssFrames(halves(w, h, false));
-  created.presentScreencastFrame("QQ==");
-  await settle();
-  created.presentScreencastFrame("Qg==");
-  await settle();
-  assert.deepStrictEqual(paints, []);
-});
-
-// Measured on YouTube after a pane resize, scrolling: 1256x1344, 785x840, 1256x1344 within 0.2s.
-// Drawing the scaled CSS frames between the device ones swapped a sharp pane for a soft one and
-// back several times a second.
-test("a CSS-size frame is not drawn while device-size frames are still coming", async () => {
-  const { created, paints } = cssFrames(halves(w, h));
-  const device = { pixels: halves(W, H), size: { width: W, height: H } };
-  const deviceChanged = { pixels: Buffer.from(halves(W, H)).fill(9, 0, 4), size: { width: W, height: H } };
-  const pictures = new Map([
-    ["RA==", device], ["RQ==", deviceChanged],
-  ]);
-  const { setNativeImage } = require("./web-contents.cjs");
-  const both = fakeImages(new Map([
-    ["QQ==", { pixels: halves(w, h), size: { width: w, height: h } }],
-    ["Qg==", { pixels: Buffer.from(halves(w, h)).fill(128, 0, 4), size: { width: w, height: h } }],
-    ...pictures,
-  ]));
-  setNativeImage(both);
-  for (const data of ["RA==", "QQ==", "RQ==", "Qg==", "RA=="]) {
+test("a CSS-size screencast frame is never drawn, whatever it shows", async () => {
+  const { created, paints } = cssContents();
+  for (const data of ["QQ==", "Qg==", "QQ==", "Qg=="]) {
     created.presentScreencastFrame(data);
     await settle();
   }
-  // Only the device frames are drawn: RQ== against RA==, then RA== against RQ==.
-  assert.strictEqual(paints.length, 2);
-  assert.ok(paints.every((box) => box.width <= 1 && box.height <= 1));
+  assert.deepStrictEqual(paints, []);
+});
+
+// Measured on namu.wiki: `j` reached the pane in ~20ms when the next frame was device-size and
+// ~200ms when it was CSS-size and the change waited for the settle capture.
+test("a CSS-size screencast frame asks for a capture at once", async () => {
+  const { created, captures } = cssContents();
+  created.presentScreencastFrame("QQ==");
+  await settle();
+  assert.strictEqual(captures.length, 1);
 });
 
 test("the settle capture redraws a soft box even when the page is back where it was", async () => {
@@ -241,7 +206,7 @@ test("the settle capture redraws a soft box even when the page is back where it 
   const { created, paints } = screencastContents(pictures);
   // The pane was sharp with the caret off; a screencast frame drew it on.
   created.lastBitmap = { pixels: picture(), width: 4, height: 2 };
-  created.capture.lastCasts = new Map([["4x2", picture()]]);
+  created.capture.lastCast = picture();
   created.presentScreencastFrame("Qg==");
   await settle();
   // The caret is off again by the time the capture runs: identical to `lastBitmap`.
