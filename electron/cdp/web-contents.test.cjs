@@ -210,6 +210,32 @@ test("a CSS-size screencast frame that is a cropped corner is never drawn", asyn
   assert.deepStrictEqual(paints, []);
 });
 
+// Measured on YouTube after a pane resize, scrolling: 1256x1344, 785x840, 1256x1344 within 0.2s.
+// Drawing the scaled CSS frames between the device ones swapped a sharp pane for a soft one and
+// back several times a second.
+test("a CSS-size frame is not drawn while device-size frames are still coming", async () => {
+  const { created, paints } = cssFrames(halves(w, h));
+  const device = { pixels: halves(W, H), size: { width: W, height: H } };
+  const deviceChanged = { pixels: Buffer.from(halves(W, H)).fill(9, 0, 4), size: { width: W, height: H } };
+  const pictures = new Map([
+    ["RA==", device], ["RQ==", deviceChanged],
+  ]);
+  const { setNativeImage } = require("./web-contents.cjs");
+  const both = fakeImages(new Map([
+    ["QQ==", { pixels: halves(w, h), size: { width: w, height: h } }],
+    ["Qg==", { pixels: Buffer.from(halves(w, h)).fill(128, 0, 4), size: { width: w, height: h } }],
+    ...pictures,
+  ]));
+  setNativeImage(both);
+  for (const data of ["RA==", "QQ==", "RQ==", "Qg==", "RA=="]) {
+    created.presentScreencastFrame(data);
+    await settle();
+  }
+  // Only the device frames are drawn: RQ== against RA==, then RA== against RQ==.
+  assert.strictEqual(paints.length, 2);
+  assert.ok(paints.every((box) => box.width <= 1 && box.height <= 1));
+});
+
 test("the settle capture redraws a soft box even when the page is back where it was", async () => {
   const pictures = new Map([["QQ==", picture()], ["Qg==", picture(5)]]);
   const { created, paints } = screencastContents(pictures);
