@@ -46,4 +46,41 @@ function dirtyRect(previous, next, width, height) {
   return { x: left, y: top, width: right - left + 1, height: bottom - top + 1 };
 }
 
-module.exports = { dirtyRect };
+/**
+ * Whether a screencast frame smaller than the device picture is that picture scaled down, rather
+ * than its top-left corner cut to the smaller size.
+ *
+ * Chrome sends both at CSS-pixel size and they cannot be told apart by size or metadata. Measured
+ * at zoom 0.8 (dsf 1.6): on namu.wiki the 860x840 frames held the first 860x840 device pixels; on
+ * YouTube after a pane resize the 860x460 frames held the whole page, scaled. Drawn stretched over
+ * the pane, the corner zooms the page in; dropped, the whole-page frames leave a playing video
+ * frozen. So the frame is compared with the device picture both ways, over the top band of the
+ * page — a masthead or a search bar, the part least likely to be moving — and wins whichever
+ * reading matches better. Sampled on a coarse grid: this runs once per size change.
+ */
+function isScaledDown(small, smallWidth, smallHeight, large, largeWidth, largeHeight) {
+  if (!small || !large || smallWidth >= largeWidth || smallHeight >= largeHeight) return false;
+  const sx = largeWidth / smallWidth;
+  const sy = largeHeight / smallHeight;
+  const band = Math.max(1, Math.floor(smallHeight * 0.25));
+  let scaled = 0;
+  let cropped = 0;
+  let samples = 0;
+  for (let y = 2; y < band; y += 4) {
+    for (let x = 2; x < smallWidth - 2; x += 4) {
+      const at = (y * smallWidth + x) * 4;
+      const ys = Math.min(largeHeight - 1, Math.round(y * sy));
+      const xs = Math.min(largeWidth - 1, Math.round(x * sx));
+      const atScaled = (ys * largeWidth + xs) * 4;
+      const atCropped = (y * largeWidth + x) * 4;
+      for (let c = 0; c < 3; c += 1) {
+        scaled += Math.abs(small[at + c] - large[atScaled + c]);
+        cropped += Math.abs(small[at + c] - large[atCropped + c]);
+      }
+      samples += 1;
+    }
+  }
+  return samples > 0 && scaled < cropped;
+}
+
+module.exports = { dirtyRect, isScaledDown };

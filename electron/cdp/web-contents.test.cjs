@@ -113,7 +113,7 @@ function fakeImages(pictures) {
       const image = {
         getSize: () => size,
         toBitmap: () => Buffer.from(pixels),
-        resize: () => image,
+        resize: (to) => ({ ...image, getSize: () => ({ width: to.width, height: to.height }) }),
         crop: () => image,
       };
       return image;
@@ -157,22 +157,57 @@ test("a screencast frame paints only the box that changed since the last one", a
   assert.deepStrictEqual(paints[0], { x: 1, y: 1, width: 1, height: 1 });
 });
 
-// Measured on claude.ai and namu.wiki at zoom 0.8 (dsf 1.6): Chrome alternated 860x840 and
-// 1376x1344 frames, and the 860x840 ones held only the top-left corner of the page. Drawn, they
-// flickered the pane (#141) and then zoomed it in and out; they are change signals, not pictures.
-test("a screencast frame at another size than the pane is never drawn", async () => {
-  // Two corner frames that differ: the corner itself changed, as a hint badge going up does.
-  const corner = (fill) => ({ pixels: Buffer.alloc(2 * 1 * 4, fill), size: { width: 2, height: 1 } });
+// Measured at zoom 0.8 (dsf 1.6): Chrome sends CSS-size screencast frames too, and they are either
+// the top-left corner of the device picture (namu.wiki) or the whole page scaled down (YouTube
+// after a pane resize). The corner must never be drawn — it zoomed the pane in and out — and the
+// scaled page must be, or a playing video freezes.
+const W = 40, H = 40, w = 20, h = 20;
+// A page whose right half is white, at device size, scaled down, and as a top-left corner cut.
+function halves(width, height, rightWhite = true) {
+  const pixels = Buffer.alloc(width * height * 4);
+  if (rightWhite) {
+    for (let y = 0; y < height; y += 1) pixels.fill(255, (y * width + width / 2) * 4, (y * width + width) * 4);
+  }
+  return pixels;
+}
+
+test("isScaledDown tells a scaled page from a cropped corner", () => {
+  const { isScaledDown } = require("./damage.cjs");
+  assert.strictEqual(isScaledDown(halves(w, h), w, h, halves(W, H), W, H), true);
+  assert.strictEqual(isScaledDown(halves(w, h, false), w, h, halves(W, H), W, H), false);
+});
+
+function cssFrames(smallPixels) {
+  const changed = Buffer.from(smallPixels);
+  changed.fill(128, 0, 4);
   const pictures = new Map([
-    ["QQ==", picture()], ["Qg==", corner(0x10)], ["RA==", corner(0x7f)], ["Qw==", picture(5)],
+    ["QQ==", { pixels: smallPixels, size: { width: w, height: h } }],
+    ["Qg==", { pixels: changed, size: { width: w, height: h } }],
   ]);
   const { created, paints } = screencastContents(pictures);
-  for (const data of ["QQ==", "Qg==", "QQ==", "RA==", "Qw=="]) {
-    created.presentScreencastFrame(data);
-    await settle();
-  }
-  // Only the pane-size change is drawn, against the last pane-size frame.
-  assert.deepStrictEqual(paints, [{ x: 1, y: 1, width: 1, height: 1 }]);
+  created.viewport = { width: w, height: h };
+  created.frameSize = { width: W, height: H };
+  created.lastBitmap = { pixels: halves(W, H), width: W, height: H };
+  return { created, paints };
+}
+
+test("a CSS-size screencast frame of the scaled page is drawn", async () => {
+  const { created, paints } = cssFrames(halves(w, h));
+  created.presentScreencastFrame("QQ==");
+  await settle();
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  // The changed pixel (0,0) of the 20x20 frame covers (0,0)-(2,2) of the 40x40 pane.
+  assert.deepStrictEqual(paints, [{ x: 0, y: 0, width: 2, height: 2 }]);
+});
+
+test("a CSS-size screencast frame that is a cropped corner is never drawn", async () => {
+  const { created, paints } = cssFrames(halves(w, h, false));
+  created.presentScreencastFrame("QQ==");
+  await settle();
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  assert.deepStrictEqual(paints, []);
 });
 
 test("the settle capture redraws a soft box even when the page is back where it was", async () => {
@@ -180,7 +215,7 @@ test("the settle capture redraws a soft box even when the page is back where it 
   const { created, paints } = screencastContents(pictures);
   // The pane was sharp with the caret off; a screencast frame drew it on.
   created.lastBitmap = { pixels: picture(), width: 4, height: 2 };
-  created.capture.lastCast = picture();
+  created.capture.lastCasts = new Map([["4x2", picture()]]);
   created.presentScreencastFrame("Qg==");
   await settle();
   // The caret is off again by the time the capture runs: identical to `lastBitmap`.

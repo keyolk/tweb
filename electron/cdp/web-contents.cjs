@@ -24,7 +24,7 @@
 //              processId + frameToken, which is all `frameKey` reads.
 
 const { EventEmitter } = require("node:events");
-const { dirtyRect } = require("./damage.cjs");
+const { dirtyRect, isScaledDown } = require("./damage.cjs");
 const { KeySequencer, toCdpMouse } = require("./input.cjs");
 const { BINDING_NAME, WORLD_NAME, preloadScript } = require("./preload-bridge.cjs");
 
@@ -39,6 +39,18 @@ function unionRect(a, b) {
     y,
     width: Math.max(a.x + a.width, b.x + b.width) - x,
     height: Math.max(a.y + a.height, b.y + b.height) - y,
+  };
+}
+
+// A box in one bitmap's pixels, grown outward to cover the same area in a bitmap of another size.
+function scaleRect(rect, sx, sy) {
+  const x = Math.floor(rect.x * sx);
+  const y = Math.floor(rect.y * sy);
+  return {
+    x,
+    y,
+    width: Math.ceil((rect.x + rect.width) * sx) - x,
+    height: Math.ceil((rect.y + rect.height) * sy) - y,
   };
 }
 
@@ -1110,26 +1122,32 @@ class CdpWebContents extends EventEmitter {
         }
         return;
       }
-      // Only a frame at the pane's own pixel size is drawn. The screencast also comes at CSS-pixel
-      // size, and that frame is NOT the page scaled down: it is the top-left corner of the device-
-      // pixel picture, cut to the CSS size. Measured on namu.wiki at zoom 0.8 in a 688x672 pane
-      // (dsf 1.6): the 860x840 frames held the first 860x840 device pixels, so stretched over the
-      // pane they magnified the corner, and the next sharp capture shrank it back — the pane
-      // zoomed in and out while hints picked links. Sizes alternate frame to frame on the same
-      // page, so a frame of the other size is still a change signal: the settle capture
-      // `scheduleSettle` already armed draws it sharp 150ms later.
-      if (got.width !== want.width || got.height !== want.height) return;
-      // Damaged against the previous drawn screencast frame, never against the settled capture:
-      // the two are encoded differently and differ in every pixel. Painting the whole frame was a
-      // flicker — the pane went soft and the settle capture sharpened it 150ms later, for every
-      // caret blink. The first frame has nothing to compare with and is left to the settle.
+      // A frame smaller than the pane is drawn only once it is known to be the page scaled down.
+      // Chrome sends the screencast at CSS-pixel size as well as device-pixel size, and the CSS
+      // frame is one of two different pictures: the whole page scaled (YouTube after a pane
+      // resize, frame after frame for as long as the video plays), or the top-left corner of the
+      // device picture cut to the CSS size (namu.wiki at zoom 0.8, alternating with device
+      // frames). Drawing the corner zoomed the pane in and out; dropping every CSS frame, which
+      // #142 did, froze a playing video and left scrolling to the 150ms settle capture.
+      // `isScaledDown` tells them apart against the last sharp capture, once per size.
+      const sameSize = got.width === want.width && got.height === want.height;
       const bitmap = decoded.toBitmap();
-      const previous = capture.lastCast;
-      capture.lastCast = bitmap;
+      if (!sameSize && !this.screencastFrameIsWholePage(got, bitmap)) return;
+      // Damaged against the previous frame Chrome sent at the SAME size, never against the
+      // settled capture or a frame of the other size: those are encoded or scaled differently
+      // and differ in every pixel, which painted the whole pane soft for a caret blink and
+      // flickered it several times a second while sizes alternated (#140, #141). The first frame
+      // at a size has nothing to compare with and is left to the settle capture.
+      const sizeKey = `${got.width}x${got.height}`;
+      if (!capture.lastCasts) capture.lastCasts = new Map();
+      const previous = capture.lastCasts.get(sizeKey);
+      capture.lastCasts.set(sizeKey, bitmap);
       if (!previous || previous.length !== bitmap.length) return;
-      const dirty = dirtyRect(previous, bitmap, got.width, got.height);
-      if (!dirty) return;
-      const image = decoded;
+      const changed = dirtyRect(previous, bitmap, got.width, got.height);
+      if (!changed) return;
+      const image = sameSize ? decoded : decoded.resize({ width: want.width, height: want.height, quality: "good" });
+      const size = image.getSize();
+      const dirty = clampRect(scaleRect(changed, size.width / got.width, size.height / got.height), size);
       // The pane now holds screencast pixels in this box, which the settled capture's own diff
       // cannot see: the page can be back to the picture `lastBitmap` holds (a caret that blinked
       // off and on again) and the box would never be redrawn sharp.
@@ -1137,6 +1155,22 @@ class CdpWebContents extends EventEmitter {
       this.capture.forceNext = false;
       this.emit("paint", {}, dirty, image);
     }, Math.max(0, wait));
+  }
+
+  // Whether CSS-size screencast frames of this size are the whole page scaled down, judged against
+  // the last sharp capture and kept until the next one. Unknown — no capture yet, or one of another
+  // size — counts as no: the frame is not drawn and the settle capture draws it.
+  screencastFrameIsWholePage(got, bitmap) {
+    const capture = this.capture;
+    const key = `${got.width}x${got.height}@${Math.round(this.viewport.width)}x${Math.round(this.viewport.height)}`;
+    if (capture.cssKind?.key === key) return capture.cssKind.whole;
+    const sharp = this.lastBitmap;
+    const want = this.frameSize;
+    if (!sharp || !want || sharp.width !== want.width || sharp.height !== want.height) return false;
+    const whole = isScaledDown(bitmap, got.width, got.height, sharp.pixels, sharp.width, sharp.height);
+    capture.cssKind = { key, whole };
+    if (this.engine.debug) console.error(`tweb: screencast ${got.width}x${got.height} frames are ${whole ? "the page scaled" : "a cropped corner"}`);
+    return whole;
   }
 
   scheduleSettle() {
@@ -1271,6 +1305,8 @@ class CdpWebContents extends EventEmitter {
       : whole;
     this.capture.soft = null;
     this.lastBitmap = { pixels: bitmap, width: size.width, height: size.height };
+    // Which kind of CSS frame Chrome is sending is re-judged against each new sharp picture.
+    this.capture.cssKind = null;
     if (PROFILE) profileCapture(this, { capture: t1 - t0, decode: t2 - t1, bitmap: t3 - t2, diff: performance.now() - t3, bytes: shot.data.length * 0.75, changed: Boolean(dirty) });
     if (!dirty && !this.capture.forceNext) return;
     this.capture.forceNext = false;
