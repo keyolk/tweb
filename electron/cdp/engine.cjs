@@ -157,6 +157,18 @@ async function terminateIfAlive(pid, graceMs) {
   }
 }
 
+// The user agent every page is given: Chrome's own, without the word that says it is headless.
+//
+// A headless Chrome reports `HeadlessChrome/155.0.0.0` in place of `Chrome/155.0.0.0`, and that one
+// word is a common bot signal. Measured on dogdrip.net: nginx answered 403 to the headless string
+// and 200 to the same string with `Chrome`, and the Electron engine, whose UA carries `Chrome/`,
+// loaded the site fine. Client hints (`navigator.userAgentData.brands`) already say Google Chrome,
+// so only the string needs fixing. Nothing else changes: the version is Chrome's own, so a site
+// still sees the browser it is actually talking to.
+function browserUserAgent(userAgent) {
+  return String(userAgent || "").replace(/HeadlessChrome\//g, "Chrome/") || null;
+}
+
 class CdpEngine extends EventEmitter {
   constructor({ userDataDir, nativeImage, clipboard, debug = false, downloadsPath = () => null }) {
     super();
@@ -184,6 +196,7 @@ class CdpEngine extends EventEmitter {
       log: (message) => this.debug && console.error(`tweb: ${message}`),
     });
     this.version = version;
+    this.userAgent = browserUserAgent(version["User-Agent"]);
     this.connection = await CdpConnection.connect(version.webSocketDebuggerUrl);
     this.connection.on("Target.targetCreated", (params) => this.onTargetCreated(params.targetInfo));
     this.connection.on("Target.targetInfoChanged", (params) => this.onTargetInfoChanged(params.targetInfo));
@@ -548,4 +561,4 @@ class CdpDownloadItem extends EventEmitter {
   }
 }
 
-module.exports = { CdpBrowserWindow, CdpEngine, CdpIpcMain };
+module.exports = { CdpBrowserWindow, CdpEngine, CdpIpcMain, browserUserAgent };

@@ -468,7 +468,7 @@ class CdpWebContents extends EventEmitter {
     this.registerTree(tree.frameTree, null, session.id);
     try {
       const version = await session.send("Runtime.evaluate", { expression: "navigator.userAgent", returnByValue: true });
-      this.defaultUserAgent = version.result?.value || null;
+      this.defaultUserAgent = this.engine.userAgent || version.result?.value || null;
     } catch (_) { /* filled in lazily */ }
     await this.applyMetrics();
     await this.startScreencast();
@@ -502,6 +502,10 @@ class CdpWebContents extends EventEmitter {
       session.send("Page.addScriptToEvaluateOnNewDocument", { source: AUDIO_PROBE, runImmediately: true }),
       session.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }),
     ];
+    // Every session, child frames and workers included: a frame left on the headless string is a
+    // request a site can still refuse. See `browserUserAgent` in engine.cjs for why.
+    const userAgent = this.userAgentOverride || this.engine.userAgent;
+    if (userAgent) calls.push(session.send("Emulation.setUserAgentOverride", { userAgent }));
     if (root) {
       calls.push(
         session.send("Network.enable"),
