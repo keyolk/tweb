@@ -72,6 +72,10 @@ const CAPTURE_TIMEOUT_MS = 1000;
 const INPUT_SCALE_RECHECK_MS = 3000;
 // Quiet time after the last screencast frame before a device-pixel capture sharpens the picture.
 const SETTLE_MS = 150;
+// How long after a device-size screencast frame a CSS-size one is still not drawn. Chrome
+// interleaves the two at 4-10 frames a second while the page moves, so this outlasts the gaps
+// between device frames; a CSS-only stream (no device frame at all) is drawn after it.
+const DEVICE_CAST_HOLD_MS = 1000;
 const INVALIDATE_GRACE_MS = 50;
 // The screencast is now what motion is drawn from, so its quality is visible; 90 keeps text legible
 // mid-scroll at a fraction of the bytes of 100.
@@ -1131,6 +1135,13 @@ class CdpWebContents extends EventEmitter {
       // #142 did, froze a playing video and left scrolling to the 150ms settle capture.
       // `isScaledDown` tells them apart against the last sharp capture, once per size.
       const sameSize = got.width === want.width && got.height === want.height;
+      // Never mix the two resolutions. While scrolling or hovering Chrome interleaves device frames
+      // with scaled CSS frames — measured on YouTube after a resize: 1256x1344, 785x840, 1256x1344
+      // within 0.2s — and drawing both swapped a sharp pane for a soft one and back several times
+      // a second, which is the flicker. A CSS frame is drawn only when no device frame has come
+      // for a while; then it is the only picture there is, as for a video playing after a resize.
+      if (sameSize) capture.lastDeviceCastAt = Date.now();
+      else if (Date.now() - (capture.lastDeviceCastAt || 0) < DEVICE_CAST_HOLD_MS) return;
       const bitmap = decoded.toBitmap();
       if (!sameSize && !this.screencastFrameIsWholePage(got, bitmap)) return;
       // Damaged against the previous frame Chrome sent at the SAME size, never against the
