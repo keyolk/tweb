@@ -34,6 +34,7 @@ const { Worker } = require("node:worker_threads");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const net = require("node:net");
 const path = require("node:path");
+const { createInputTrace } = require("./input-trace.cjs");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
 const settings = require("./settings.cjs");
@@ -401,6 +402,8 @@ for (const warning of settings.snapshot().warnings) console.error(`tweb: config.
 // A patch reports `patch` for its crop+encode instead of `bitmap`, and no `pace` — patches
 // deliberately bypass the pacer.
 const frameProbeEnabled = Boolean(process.env.TWEB_FRAME_PROBE);
+// Per-key steps for bench/feel.py; see input-trace.cjs.
+const inputTrace = createInputTrace();
 const frameProbeSamples = [];
 const frameProbeMark = () => (frameProbeEnabled ? process.hrtime.bigint() : 0n);
 // Nanoseconds to milliseconds. A number, not a bigint: these are summarised, not accumulated.
@@ -1856,6 +1859,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
     total: frameProbeMs(patchStarted, frameProbeMark()),
   }, png.length);
   notePatch(frames, id, damage);
+  inputTrace.mark("frame", { kind: "patch", bytes: png.length });
   record.frames.patches += 1;
   const patchFramesSent = record.frames.patches;
   if (patchFramesSent <= 12) {
@@ -1879,6 +1883,7 @@ function transferFrame(pixels, generation, format = "png", size = null, probe = 
     + `c=${currentFrames().cells.cols},r=${currentFrames().cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
+  inputTrace.mark("frame", { kind: "whole", format });
   currentPane().frames.whole += 1;
   // Only the first few: enough to see when a page actually reached the pane, which
   // is what separates "the engine is behind" from "the site is slow", and quiet
@@ -3828,6 +3833,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     // The frame that owned the pick has run it. Every other frame still has badges up.
     case "hint-done":
+      inputTrace.mark("pick", { id: hintRound(tab)?.id ?? null });
       endHintRound(tab);
       break;
     // No label in this frame's block starts with what has been typed. That is the ordinary
@@ -3846,6 +3852,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       // A miss for a prefix that is no longer the one being typed is stale.
       if (String(value?.typed ?? "") !== round.typed) break;
       round.missed.add(frameKey(sourceFrame));
+      inputTrace.mark("miss", { id: round.id, typed: round.typed, missed: round.missed.size, drawn: round.drawn });
       if (round.missed.size >= round.drawn) endHintRound(tab);
       break;
     }
@@ -3857,6 +3864,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "hint-lost": {
       const round = hintRound(tab);
       if (!round || !round.open || value?.round !== round.id) break;
+      inputTrace.mark("lost", { id: round.id });
       if (round.drawnKeys.has(frameKey(sourceFrame)) || drawnFrameGone(tab, round)) endHintRound(tab);
       break;
     }
@@ -3981,11 +3989,12 @@ function hintRound(tab) {
   return hintRounds.get(tab) || null;
 }
 
-function endHintRound(tab, notify = true) {
+function endHintRound(tab, notify = true, endReason = "replaced") {
   const round = hintRounds.get(tab);
   if (!round) return;
   clearTimeout(round.timer);
   hintRounds.delete(tab);
+  inputTrace.mark("end", { id: round.id, reason: endReason });
   if (notify) sendToTabFrames(tab, "tweb-hint-end");
 }
 
@@ -3997,6 +4006,7 @@ function noteHintCount(tab, frame, count) {
   const key = frameKey(frame);
   if (!round.expected.has(key) || round.counts.has(key)) return;
   round.counts.set(key, { frame, count: Number(count) || 0 });
+  inputTrace.mark("count", { id: round.id, count: Number(count) || 0, main: key === round.mainKey });
   if (debugLogging) {
     console.error(`tweb: hint count ${round.counts.size}/${round.expected.size}`
       + ` ${String(frame.url || "").slice(0, 36)} = ${Number(count) || 0}`);
@@ -4029,8 +4039,9 @@ function closeHintRound(tab) {
   const entries = [...round.counts.entries()];
   const { total, offsets } = shareLabels(entries.map(([key, entry]) => ({ key, count: entry.count })));
   round.total = total;
+  inputTrace.mark("space", { id: round.id, total, answered: entries.length, asked: round.expected.size });
   if (total === 0) {
-    endHintRound(tab);
+    endHintRound(tab, true, "empty");
     return;
   }
   for (const [key, entry] of entries) {
@@ -4076,7 +4087,10 @@ function startHintRound(tab) {
     }).join(" | ");
     console.error(`tweb: hint round asked=${expected.size}/${frames.length} ${detail}`);
   }
-  if (expected.size === 0) return;
+  if (expected.size === 0) {
+    inputTrace.mark("round", { id: null, asked: 0, frames: frames.length });
+    return;
+  }
   const mainKey = mainFrame && expected.has(frameKey(mainFrame)) ? frameKey(mainFrame) : null;
   const round = {
     id: ++hintRoundSerial, expected, mainKey, counts: new Map(), open: false, waitElapsed: false,
@@ -4084,6 +4098,7 @@ function startHintRound(tab) {
   };
   round.timer = setTimeout(() => hintRoundWaitElapsed(tab), HINT_ROUND_WAIT_MS);
   hintRounds.set(tab, round);
+  inputTrace.mark("round", { id: round.id, asked: expected.size, frames: frames.length });
 }
 
 // A key typed while a round is open. It cannot go to the focused frame alone: only one frame
@@ -4092,6 +4107,7 @@ function startHintRound(tab) {
 function routeHintKey(tab, key) {
   const round = hintRounds.get(tab);
   if (!round || !round.open) return false;
+  inputTrace.mark("hint-key", { id: round.id, key });
   if (key === "Escape") {
     endHintRound(tab);
     return true;
@@ -7917,6 +7933,7 @@ function handleTargetedCommand(command, target) {
   }
 
   if (command.kind === "input") {
+    inputTrace.mark("in", { hex: command.hex });
     markInteractionActivity();
     const input = inputState();
     if (input.flushTimer) {
