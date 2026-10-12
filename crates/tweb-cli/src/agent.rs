@@ -561,6 +561,61 @@ pub fn run(pane: Option<&str>, method: &str, params: Value, as_json: bool) -> Re
     Ok(())
 }
 
+/// A browser pane `tweb devtools` can inspect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectTarget {
+    pub pane: String,
+    pub title: String,
+    pub url: String,
+    /// Shares the caller's window, which is where the DevTools pane is most likely wanted.
+    pub nearby: bool,
+}
+
+/// Every Chrome-engine pane, those beside the caller first. A pane already showing DevTools is
+/// left out: inspecting the inspector is never what was meant.
+pub fn inspect_targets() -> Vec<InspectTarget> {
+    let nearby = panes_in_our_window();
+    let mut targets: Vec<InspectTarget> = discover_sockets()
+        .iter()
+        .filter_map(|socket| {
+            let pane = socket
+                .file_stem()?
+                .to_str()?
+                .trim_start_matches("agent-")
+                .to_string();
+            let status = call(socket, "status", json!({})).ok()?;
+            inspect_target(pane, &status, &nearby)
+        })
+        .collect();
+    targets.sort_by_key(|target| !target.nearby);
+    targets
+}
+
+fn inspect_target(pane: String, status: &Value, nearby: &[String]) -> Option<InspectTarget> {
+    if status.get("browser").and_then(Value::as_str) != Some("chrome") {
+        return None;
+    }
+    let active = status
+        .pointer("/tabs/tabs")
+        .and_then(Value::as_array)
+        .and_then(|tabs| {
+            tabs.iter()
+                .find(|tab| tab.get("active").and_then(Value::as_bool) == Some(true))
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    let url = text_field(&active, "url");
+    if url.starts_with("http://127.0.0.1:") && url.contains("/devtools/inspector.html") {
+        return None;
+    }
+    Some(InspectTarget {
+        nearby: nearby.iter().any(|candidate| *candidate == pane),
+        title: text_field(&active, "title"),
+        url,
+        pane,
+    })
+}
+
 /// `tweb panes` — every browser pane an agent could drive.
 pub fn list_panes(as_json: bool) -> Result<()> {
     let sockets = discover_sockets();
@@ -605,6 +660,40 @@ pub fn list_panes(as_json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    fn status(browser: &str, url: &str) -> serde_json::Value {
+        json!({ "browser": browser, "tabs": { "tabs": [
+            { "active": false, "title": "other", "url": "https://other.test/" },
+            { "active": true, "title": "Page", "url": url },
+        ] } })
+    }
+
+    #[test]
+    fn devtools_targets_are_chrome_panes_showing_a_page() {
+        let nearby = vec!["%1".to_string()];
+        let target =
+            super::inspect_target("%1".into(), &status("chrome", "https://a.test/"), &nearby)
+                .expect("a chrome pane is a target");
+        assert_eq!(target.title, "Page");
+        assert_eq!(target.url, "https://a.test/");
+        assert!(target.nearby);
+        let far = super::inspect_target("%2".into(), &status("chrome", "https://b.test/"), &nearby)
+            .expect("a chrome pane elsewhere is a target too");
+        assert!(!far.nearby);
+        // Electron panes have no DevTools page to open.
+        assert!(super::inspect_target(
+            "%3".into(),
+            &status("electron", "https://c.test/"),
+            &nearby
+        )
+        .is_none());
+        // Nor is a DevTools pane itself something to inspect.
+        let devtools =
+            "http://127.0.0.1:62052/devtools/inspector.html?ws=127.0.0.1:62052/devtools/page/X";
+        assert!(super::inspect_target("%4".into(), &status("chrome", devtools), &nearby).is_none());
+    }
+
     /// Outside tmux there is no window to scope to, and the lookup must not shell
     /// out or panic — resolution just falls back to the ambiguity error.
     #[test]
