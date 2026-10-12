@@ -326,8 +326,9 @@ pub enum Command {
     },
     /// Open Chrome's DevTools for a Chrome-engine pane's page in a pane beside it.
     ///
-    /// The DevTools pane starts with TWeb's shortcuts off, so DevTools gets every key;
-    /// `Ctrl-/` turns them back on.
+    /// Without `--pane`, the Chrome-engine panes are listed and you pick one (a single one is
+    /// used as is). The DevTools pane starts with TWeb's shortcuts off, so DevTools gets every
+    /// key; `Ctrl-/` turns them back on.
     Devtools {
         #[command(flatten)]
         agent: AgentOptions,
@@ -932,7 +933,18 @@ async fn split_and_run_pane(
 /// the new pane is a Chrome-engine pane too: it reaches 127.0.0.1 on the same machine, and its
 /// origin is the one the engine Chrome allows (see `chromeArgs` in electron/cdp/connection.cjs).
 async fn open_devtools(pane: Option<&str>) -> Result<()> {
-    let result = agent::request(pane, "devtools", json!({}))?;
+    // Which page to inspect is the user's choice, not something to infer: without `--pane` the
+    // Chrome-engine panes are listed and one is picked, rather than the caller having to look a
+    // pane id up first, or getting whichever pane happens to sit next to the shell.
+    let picked;
+    let pane = match pane {
+        Some(pane) => pane,
+        None => {
+            picked = pick_inspect_target()?;
+            picked.as_str()
+        }
+    };
+    let result = agent::request(Some(pane), "devtools", json!({}))?;
     let Some(url) = result.get("url").and_then(serde_json::Value::as_str) else {
         let message = result
             .get("message")
@@ -941,13 +953,9 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
         anyhow::bail!("{message}");
     };
     // Beside the inspected pane, which is not necessarily the one `tweb devtools` was typed in.
-    let beside = match pane {
-        Some(pane) => Some(pane.to_string()),
-        None => agent::request(None, "status", json!({}))?
-            .get("pane")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-    };
+    // A pane started outside tmux is named `pid-<N>` and has nothing to split; the DevTools pane
+    // then opens beside the caller instead.
+    let beside = pane.starts_with('%').then(|| pane.to_string());
     let browser = BrowserOptions {
         engine: BrowserEngineArg::Chrome,
         frame_rate: None,
@@ -962,6 +970,70 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
         &[("TWEB_START_VIMIUM", "0")],
     )
     .await
+}
+
+/// The pane `tweb devtools` inspects when none was named: the only Chrome-engine pane, or the one
+/// picked from a numbered list.
+fn pick_inspect_target() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let targets = agent::inspect_targets();
+    match targets.as_slice() {
+        [] => anyhow::bail!("no Chrome-engine pane is running (open one with --engine chrome)"),
+        [only] => {
+            eprintln!("inspecting {} {}", only.pane, describe_target(only));
+            return Ok(only.pane.clone());
+        }
+        _ => {}
+    }
+    let listing = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            format!(
+                "  {}) {:<5} {}{}",
+                index + 1,
+                target.pane,
+                describe_target(target),
+                if target.nearby { "" } else { "  (elsewhere)" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("several Chrome-engine panes are running; pass --pane:\n{listing}");
+    }
+    eprintln!("Inspect which page?\n{listing}");
+    let mut stderr = std::io::stderr();
+    loop {
+        write!(stderr, "number [1]: ")?;
+        stderr.flush()?;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line)? == 0 {
+            anyhow::bail!("no pane picked");
+        }
+        let line = line.trim();
+        let choice = if line.is_empty() {
+            Ok(1)
+        } else {
+            line.parse::<usize>()
+        };
+        match choice {
+            Ok(number) if (1..=targets.len()).contains(&number) => {
+                return Ok(targets[number - 1].pane.clone());
+            }
+            _ => eprintln!("pick a number from 1 to {}", targets.len()),
+        }
+    }
+}
+
+fn describe_target(target: &agent::InspectTarget) -> String {
+    let title: String = target.title.chars().take(48).collect();
+    let url: String = target.url.chars().take(60).collect();
+    if title.is_empty() {
+        url
+    } else {
+        format!("{title} — {url}")
+    }
 }
 
 /// Finds the Tauri engine binary path (passed through an environment variable).
