@@ -216,6 +216,80 @@ test("the settle capture redraws a soft box even when the page is back where it 
   assert.strictEqual(created.capture.soft, null);
 });
 
+// Measured on a 1440x1800 pane playing a video: the screencast came at CSS size only, a frame
+// every ~33ms, and each one bumped the generation a capture is checked against. Every capture
+// took longer than that, so every one after the first was dropped as stale: 0 frames in 8s.
+test("a capture is kept when only CSS-size screencast frames arrived while it ran", async () => {
+  const { created, paints } = cssContents();
+  created.lastBitmap = null;
+  created.frameSize = { width: w, height: h };
+  let answer;
+  created.session.send = (method) => (method === "Page.captureScreenshot"
+    ? new Promise((resolve) => { answer = resolve; })
+    : Promise.resolve({}));
+  created.viewport = { width: w / 2, height: h / 2 };
+  const shot = created.captureFrame();
+  await settle();
+  // The video moved on twice while the capture ran; neither frame was drawn.
+  created.onScreencastFrame({ sessionId: 1, data: "QQ==" });
+  created.onScreencastFrame({ sessionId: 2, data: "Qg==" });
+  await settle();
+  answer({ data: "QQ==" });
+  await shot;
+  assert.strictEqual(paints.length, 1);
+});
+
+test("a capture is still dropped when a screencast frame was drawn while it ran", async () => {
+  const pictures = new Map([["QQ==", picture()], ["Qg==", picture(5)]]);
+  const { created, paints } = screencastContents(pictures);
+  created.lastBitmap = { pixels: picture(), width: 4, height: 2 };
+  created.capture.lastCast = picture();
+  let answer;
+  created.session.send = (method) => (method === "Page.captureScreenshot"
+    ? new Promise((resolve) => { answer = resolve; })
+    : Promise.resolve({}));
+  const shot = created.captureFrame();
+  created.onScreencastFrame({ sessionId: 1, data: "Qg==" });
+  await settle();
+  assert.strictEqual(paints.length, 1);
+  answer({ data: "QQ==" });
+  await shot;
+  // The older capture would have put the caret back off over the newer frame.
+  assert.strictEqual(paints.length, 1);
+});
+
+// Measured on a pane resized while a video played: an override sent with a capture in flight was
+// undone when that capture finished (5 in 5), and every capture after it came out at the old size.
+test("a viewport change made during a capture is applied again once the capture is done", async () => {
+  const { created } = contents();
+  created.initialized = true;
+  created.painting = true;
+  created.frameRate = 1000;
+  created.fitWindowToViewport = async () => {};
+  created.invalidate = () => {};
+  const overrides = [];
+  let answer;
+  created.session.send = (method, params) => {
+    if (method === "Emulation.setDeviceMetricsOverride") overrides.push(`${params.width}x${params.height}`);
+    if (method === "Page.captureScreenshot") return new Promise((resolve) => { answer = resolve; });
+    return Promise.resolve({});
+  };
+  created.captureFrame = () => created.session.send("Page.captureScreenshot");
+  created.capture.dirty = true;
+  created.pumpCapture();
+  assert.strictEqual(created.capture.inFlight, 1);
+  created.setViewport(750, 945, 1.6);
+  await settle();
+  assert.deepStrictEqual(overrides, ["750x945"]);
+  answer({});
+  await settle();
+  assert.deepStrictEqual(overrides, ["750x945", "750x945"]);
+  // With nothing in flight the next change is sent once.
+  created.setViewport(600, 800, 1.6);
+  await settle();
+  assert.deepStrictEqual(overrides, ["750x945", "750x945", "600x800"]);
+});
+
 // --- the user agent ---
 //
 // Measured on dogdrip.net: nginx answered 403 to `HeadlessChrome/155.0.0.0` and 200 to the same
