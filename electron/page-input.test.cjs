@@ -9,6 +9,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
 
 function body(name, end) {
   const from = main.indexOf(name);
@@ -350,14 +351,14 @@ test("the labels are divided so no two frames produce the same one", () => {
   assert.match(main, /const \{ shareLabels \} = require\("\.\/hint-labels\.cjs"\)/);
   const close = body("function closeHintRound(tab)", "// `f`. Ask every frame");
   assert.match(close, /shareLabels\(entries\.map\(/);
-  assert.match(close, /entry\.frame\.send\("tweb-hint-space", \{ offset: offsets\[key\], count: entry\.count, total \}\)/);
+  assert.match(close, /entry\.frame\.send\("tweb-hint-space", \{ offset: offsets\[key\], count: entry\.count, total, round: round\.id \}\)/);
   // A round nobody has targets for ends rather than leaving every frame waiting.
   assert.match(close, /if \(total === 0\) \{/);
 });
 
 test("a key during a round goes to every frame, because the badge may be in any of them", () => {
   const route = body("function routeHintKey(tab, key)", "// --- agent bridge ---");
-  assert.match(route, /sendToTabFrames\(tab, "tweb-hint-key", key\)/);
+  assert.match(route, /sendToTabFrames\(tab, "tweb-hint-key", key, round\.id\)/);
   assert.match(route, /if \(key === "Escape"\) \{\s*\n\s*endHintRound\(tab\);/);
   assert.doesNotMatch(route, /sendToFocusedTabFrame/);
 });
@@ -376,11 +377,33 @@ test("a miss ends the round only when no frame matched", () => {
   // A miss for a prefix that is no longer the one typed is stale and must not count.
   assert.match(miss, /if \(String\(value\?\.typed \?\? ""\) !== round\.typed\) break;/);
   // Only frames that will report are counted as drawing.
-  assert.match(main, /if \(entry\.count > 0\) round\.drawn \+= 1;/);
+  assert.match(main, /if \(entry\.count > 0\) \{\s*\n\s*round\.drawn \+= 1;\s*\n\s*round\.drawnKeys\.add\(key\);/);
   // Each keystroke starts the tally over.
   assert.match(main, /round\.missed\.clear\(\);/);
   // And the badges come down everywhere at once, not just where the pick happened.
   assert.match(main, /sendToTabFrames\(tab, "tweb-hint-end"\)/);
+});
+
+// Measured on gestalt: a frame's badges went away without a pick (the page side tore the picker
+// down), the engine never heard, and the open round claimed every key — `f` and every shortcut
+// were appended to the typed label until Escape. A frame that drew has to say it lost them.
+test("a frame that drew badges and lost them ends the round", () => {
+  const lost = body('    case "hint-lost": {', 'case "native-hover":');
+  // Only for THIS round, so a frame tearing down the previous round's badges cannot end the next.
+  assert.match(lost, /value\?\.round !== round\.id\) break;/);
+  // Only from a frame that drew — a frame with nothing to hint has no badges to lose.
+  // Or when the frame that drew is gone: a reload hands the new document a new frame token, so
+  // the report comes from a key the round never saw.
+  assert.match(lost, /if \(round\.drawnKeys\.has\(frameKey\(sourceFrame\)\) \|\| drawnFrameGone\(tab, round\)\) endHintRound\(tab\);/);
+  assert.match(main, /return \[\.\.\.round\.drawnKeys\]\.some\(\(key\) => !live\.has\(key\)\);/);
+  assert.match(main, /id: \+\+hintRoundSerial,/);
+  // Two ways the preload finds out: its own picker going away, and a round key arriving
+  // at a document that has no picker (a reload replaced it, so nothing could be sent).
+  assert.match(preload, /if \(reportLoss && pickerState\?\.mode === "hint" && pickerState\.shared\) \{\s*\n\s*send\("hint-lost", \{ round: pickerState\.round \}\);/);
+  assert.match(preload, /ipcRenderer\.on\("tweb-hint-key", \(_event, key, round\) => \{\s*\n(\s*\/\/.*\n)*\s*if \(pickerState\?\.mode !== "hint"\) \{\s*\n\s*if \(Number\.isFinite\(round\)\) send\("hint-lost", \{ round \}\);/);
+  // A pick and the engine's own end are not losses.
+  assert.match(preload, /cancelPicker\(false, false\);\s*\n\s*onPick\(selected\);/);
+  assert.match(preload, /if \(pickerState\?\.mode === "hint"\) cancelPicker\(true, false\);/);
 });
 
 test("a subframe that answers late is left out rather than holding the hints back", () => {

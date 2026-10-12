@@ -1726,7 +1726,13 @@ installPrintShim();
     return label.padStart(width, hintAlphabet[0]);
   }
 
-  function cancelPicker(restoreMode = true) {
+  // `reportLoss`: a shared hint picker going away without a pick or the engine's say-so has to
+  // be reported, or the engine keeps the round open and every key is typed into a label that
+  // no frame shows any more.
+  function cancelPicker(restoreMode = true, reportLoss = true) {
+    if (reportLoss && pickerState?.mode === "hint" && pickerState.shared) {
+      send("hint-lost", { round: pickerState.round });
+    }
     pickerState?.host.remove();
     pickerState = null;
     stopMediaHover();
@@ -1873,7 +1879,7 @@ installPrintShim();
     });
     document.documentElement.append(host);
     paintNow();
-    pickerState = { host, items, typed: "", mode, onPick, shared: Boolean(space) };
+    pickerState = { host, items, typed: "", mode, onPick, shared: Boolean(space), round: space?.round };
     setMode(mode, `${space ? space.total : targets.length}`);
   }
 
@@ -1894,7 +1900,8 @@ installPrintShim();
       const selected = exact || matches[0];
       const onPick = pickerState.onPick;
       showHintFeedback(selected);
-      cancelPicker(false);
+      // The pick itself ends the round (`hint-done`), so this is not a loss.
+      cancelPicker(false, false);
       onPick(selected);
     } else if (matches.length === 0) {
       // In a shared round, "no match here" is the ordinary case: the label being typed
@@ -5059,13 +5066,19 @@ installPrintShim();
   // The round ended somewhere — a pick, an Escape, or a key no frame's block matched. Every
   // frame's badges go at once, or the ones that did not own the pick would stay on screen.
   ipcRenderer.on("tweb-hint-end", () => {
-    if (pickerState?.mode === "hint") cancelPicker();
+    if (pickerState?.mode === "hint") cancelPicker(true, false);
   });
 
   // A key typed during a shared round. It arrives here rather than through this frame's own
   // key handler because only ONE frame has focus and the badge being typed may be in another.
-  ipcRenderer.on("tweb-hint-key", (_event, key) => {
-    if (pickerState?.mode !== "hint") return;
+  ipcRenderer.on("tweb-hint-key", (_event, key, round) => {
+    // No badges here while the engine still routes keys to a round: this document lost them
+    // without being able to say so — a reload or navigation replaced it. The engine ends the
+    // round only if this frame was one that drew.
+    if (pickerState?.mode !== "hint") {
+      if (Number.isFinite(round)) send("hint-lost", { round });
+      return;
+    }
     if (key === "Backspace") {
       pickerState.typed = pickerState.typed.slice(0, -1);
     } else {
