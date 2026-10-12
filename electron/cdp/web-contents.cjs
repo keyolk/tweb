@@ -1141,7 +1141,6 @@ class CdpWebContents extends EventEmitter {
       const next = capture.pendingCast;
       capture.pendingCast = null;
       if (!next || this.destroyed || !this.painting || !nativeImage) return;
-      capture.lastAt = Date.now();
       const decoded = nativeImage.createFromBuffer(Buffer.from(next, "base64"));
       const want = this.frameSize || decoded.getSize();
       const got = decoded.getSize();
@@ -1189,6 +1188,11 @@ class CdpWebContents extends EventEmitter {
       // off and on again) and the box would never be redrawn sharp.
       capture.soft = unionRect(capture.soft, dirty);
       this.capture.forceNext = false;
+      // Only a frame that is drawn spends the frame interval. Stamping every frame looked at made
+      // the capture a CSS-size frame asks for wait out an interval nothing had used: measured on
+      // `j` in a half-screen Retina pane, the capture started 33ms after the frame that asked for
+      // it, and the scroll reached the pane in ~100ms where Electron took ~3ms.
+      capture.lastAt = Date.now();
       this.emit("paint", {}, dirty, image);
     }, Math.max(0, wait));
   }
