@@ -1515,6 +1515,36 @@ installPrintShim();
       .filter((frame) => !sameOriginFrameDocument(frame));
   }
 
+  // The element or one of its composed ancestors. `elementFromPoint` on a document answers in that
+  // document's own tree — a hit inside a shadow root comes back as its host — so an element in a
+  // shadow root counts as on top when the hit is any host it sits under.
+  function composedSelfOrAncestor(candidate, element) {
+    for (let node = element; node; node = node.parentNode || node.host || null) {
+      if (node === candidate) return true;
+    }
+    return false;
+  }
+
+  // Whether a click at the hint's point would reach the element. A link under a modal, a sticky
+  // header or an open menu is inside the viewport and passes every visibility test, so it got a
+  // badge — and typing it sent the click to whatever was on top, which reads as "the click did
+  // nothing". The point tested is the one `hintClickPoint` clicks.
+  //
+  // Lenient on purpose: a hit on an ancestor is kept (a text gap inside a wrapped link, or a
+  // cover inside the same shadow host, both read that way), and only a hit on an unrelated
+  // element drops the target.
+  function reachableAt(item) {
+    const element = item.element;
+    const document_ = element.ownerDocument;
+    if (typeof document_?.elementFromPoint !== "function") return true;
+    const offset = frameOffset(element);
+    const x = Math.max(0, Math.min(innerWidth - 1, item.rect.left + item.rect.width / 2)) - offset.x;
+    const y = Math.max(0, Math.min(innerHeight - 1, item.rect.top + item.rect.height / 2)) - offset.y;
+    const hit = document_.elementFromPoint(x, y);
+    if (!hit) return true;
+    return composedSelfOrAncestor(hit, element) || element.contains(hit);
+  }
+
   function interactiveTargets() {
     forgetDeclaredCursors();
     const roots = collectRoots();
@@ -1529,7 +1559,8 @@ installPrintShim();
     const targets = uniqueVisibleTargets(hitTestTargets([...elements, ...opaqueFrames]), (element) => ({
       nativeSurface: isTag(element, "canvas"),
     }), opaqueFrames).filter((item) => !item.element.matches("video,audio")
-      && (!item.element.matches("iframe,frame") || opaqueFrames.has(item.element)));
+      && (!item.element.matches("iframe,frame") || opaqueFrames.has(item.element))
+      && reachableAt(item));
     return [...targets, ...media.flatMap(mediaControlTargets)]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }

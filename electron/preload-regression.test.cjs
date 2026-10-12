@@ -87,7 +87,7 @@ function assertPreload(source) {
   // itself is the hint that puts it there — and only when it is opaque, since a
   // same-origin one is already enumerated control by control.
   assert.match(source, /\.filter\(\(frame\) => !sameOriginFrameDocument\(frame\)\);/);
-  assert.match(source, /&& \(!item\.element\.matches\("iframe,frame"\) \|\| opaqueFrames\.has\(item\.element\)\)\);/);
+  assert.match(source, /&& \(!item\.element\.matches\("iframe,frame"\) \|\| opaqueFrames\.has\(item\.element\)\)(\);|\n)/);
   assert.doesNotMatch(source, /\.filter\(\(item\) => !item\.element\.matches\("video,audio,iframe"\)\);/);
   assert.match(source, /function commandKey\(value, shiftKey = false\)/);
   assert.match(source, /return commandKey\(keys\[event\.code\] \|\| event\.key, event\.shiftKey\)/);
@@ -2783,4 +2783,29 @@ test("the palette's search field is above the rows and always present", () => {
     electron.indexOf("function renderCommandPaletteQuery"),
   );
   assert.match(filter, /state\.query\.parentNode\?\.prepend\(state\.query\)/);
+});
+
+// A link under a modal or a sticky header is inside the viewport and passes every visibility
+// test, so it used to get a badge whose click landed on the cover. The hint pass drops a target
+// whose click point hits an unrelated element, and the sweep that finds extra surfaces stops at
+// its budget rather than missing the engine's wait and drawing nothing.
+test("hints skip covered targets and the hit-test sweep has a budget", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const targets = source.slice(source.indexOf("function interactiveTargets()"),
+    source.indexOf("function resourceUrl(value, element)"));
+  assert.match(targets, /&& reachableAt\(item\)\);/);
+  const reachable = source.slice(source.indexOf("function reachableAt(item)"),
+    source.indexOf("function interactiveTargets()"));
+  assert.match(reachable, /composedSelfOrAncestor\(hit, element\) \|\| element\.contains\(hit\)/);
+  assert.match(reachable, /- offset\.x/, "a same-origin frame's element is probed in its own coordinates");
+
+  const hitTest = source.slice(source.indexOf("function hitTestTargets(semantic)"),
+    source.indexOf("const mediaControlPresentation"));
+  assert.match(hitTest, /const deadline = performance\.now\(\) \+ HIT_TEST_BUDGET_MS;/);
+  assert.match(hitTest, /clickableAncestor\(hit, memo\)/);
+
+  const matcher = source.slice(source.indexOf("function declaredCursorMatcher()"),
+    source.indexOf("function forgetDeclaredCursors()"));
+  assert.match(matcher, /if \(walked\.has\(sheet\)\) return;/,
+    "a shadow root's ownerDocument is the page; re-reading its sheets per root blew up the selector");
 });
