@@ -33,6 +33,14 @@ test("Chrome is launched headless on its own profile with a picked port", () => 
   assert.ok(!headed.includes("--headless=new"));
 });
 
+// YouTube stops playback about a minute in when `navigator.webdriver` is set, which the debugging
+// port alone does. Both launch modes need it off.
+test("Chrome is launched without the webdriver flag the debugging port would set", () => {
+  for (const env of [{}, { TWEB_CHROME_HEADED: "1" }]) {
+    assert.ok(chromeArgs("/p", env).includes("--disable-blink-features=AutomationControlled"));
+  }
+});
+
 test("TWEB_CHROME wins over the installed candidates", () => {
   assert.strictEqual(findChrome({ TWEB_CHROME: "/opt/chrome" }, () => false), "/opt/chrome");
   assert.strictEqual(findChrome({}, () => false), null);
