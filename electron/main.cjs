@@ -4871,6 +4871,14 @@ async function dispatchAgentCommand(method, params) {
       return { errors: consoleLog.filter((entry) => entry.level === "error").slice(-(params.limit || 50)) };
     case "network":
       return { requests: params.clear ? networkLog.splice(0) : networkLog.slice(-(params.limit || 100)) };
+    case "devtools": {
+      // Chrome's own DevTools for this pane's page, opened by the CLI in a pane of its own.
+      // Only the Chrome engine serves that page; Electron's offscreen tabs keep `devTools: false`.
+      if (pageBackend.kind !== "chrome" || !pageBackend.engine) {
+        return { ok: false, message: "DevTools needs a Chrome-engine pane (--engine chrome)" };
+      }
+      return pageBackend.engine.devtoolsFor(currentWindows().win?.webContents);
+    }
     case "inspect-element": {
       // The user picked an element in inspect mode. Forward the payload the preload
       // collected to the agent — or answer null if inspect mode is closed.
@@ -6575,7 +6583,10 @@ function inputState() {
       caretPoint: null,
       caretHidden: false,
       // The shortcut mode, and the mirror of the preload's insert mode that key dispatch reads.
-      vimium: true,
+      // `TWEB_START_VIMIUM=0` starts it off: `tweb devtools` opens DevTools that way, since its
+      // own keys (Esc, arrows, Cmd-F, every letter in the console) are what the pane is for.
+      // `Ctrl-/` turns the shortcuts back on.
+      vimium: process.env.TWEB_START_VIMIUM !== "0",
       bypass: false,
       insertMode: false,
       // Whether this pane's page is shown as an OS desktop window (floating mode).

@@ -324,6 +324,14 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Open Chrome's DevTools for a Chrome-engine pane's page in a pane beside it.
+    ///
+    /// The DevTools pane starts with TWeb's shortcuts off, so DevTools gets every key;
+    /// `Ctrl-/` turns them back on.
+    Devtools {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// The element the user picked in inspect mode — selector, HTML, text, box.
     InspectElement {
         #[command(flatten)]
@@ -613,7 +621,7 @@ pub async fn run() -> Result<()> {
         } => {
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // An omitted URL is preserved across tmux split-window too.
-            split_and_run_pane(url.as_deref(), &browser, horizontal).await?;
+            split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
         }
         Command::PaneInternal { browser, page, url } => {
             // Without a URL, restore the tmux window session.
@@ -670,6 +678,7 @@ pub async fn run() -> Result<()> {
             DaemonAction::Restart => daemon::restart()?,
         },
         Command::Panes { agent } => agent::list_panes(agent.json)?,
+        Command::Devtools { agent } => open_devtools(agent.pane.as_deref()).await?,
         Command::Profile {
             action: ProfileAction::List { json },
         } => chrome::list_profiles(json)?,
@@ -853,10 +862,13 @@ fn split_window_args(pane: Option<&str>, command: &str) -> Vec<String> {
 }
 
 /// Creates a pane via tmux split-window and runs `tweb __pane` inside it.
+/// `beside` splits that pane instead of the calling one; `extra_env` is set for the new pane only.
 async fn split_and_run_pane(
     url: Option<&str>,
     browser: &BrowserOptions,
     _horizontal: bool,
+    beside: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> Result<()> {
     // Re-invoke the same executable through an internal subcommand. Nothing looks up a separate
     // binary, so a split pane cannot end up running a different build than this CLI.
@@ -886,6 +898,10 @@ async fn split_and_run_pane(
         }
     }
 
+    for (name, value) in extra_env {
+        env_str.push_str(&format!("{name}={} ", shell_quote(value)));
+    }
+
     let url_arg = url
         .map(|value| format!(" {}", shell_quote(value)))
         .unwrap_or_default();
@@ -896,7 +912,9 @@ async fn split_and_run_pane(
         browser.shell_args(),
         url_arg
     );
-    let target_pane = std::env::var("TMUX_PANE").ok();
+    let target_pane = beside
+        .map(str::to_string)
+        .or_else(|| std::env::var("TMUX_PANE").ok());
     let split_args = split_window_args(target_pane.as_deref(), &pane_command);
     let status = std::process::Command::new("tmux")
         .args(split_args)
@@ -906,6 +924,44 @@ async fn split_and_run_pane(
         anyhow::bail!("tmux split-window failed: {:?}", status);
     }
     Ok(())
+}
+
+/// `tweb devtools`: ask the pane for its page's DevTools URL and open it beside that pane.
+///
+/// The URL is Chrome's own DevTools page, served by the engine Chrome over its debugging port, so
+/// the new pane is a Chrome-engine pane too: it reaches 127.0.0.1 on the same machine, and its
+/// origin is the one the engine Chrome allows (see `chromeArgs` in electron/cdp/connection.cjs).
+async fn open_devtools(pane: Option<&str>) -> Result<()> {
+    let result = agent::request(pane, "devtools", json!({}))?;
+    let Some(url) = result.get("url").and_then(serde_json::Value::as_str) else {
+        let message = result
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the pane did not return a DevTools URL");
+        anyhow::bail!("{message}");
+    };
+    // Beside the inspected pane, which is not necessarily the one `tweb devtools` was typed in.
+    let beside = match pane {
+        Some(pane) => Some(pane.to_string()),
+        None => agent::request(None, "status", json!({}))?
+            .get("pane")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    };
+    let browser = BrowserOptions {
+        engine: BrowserEngineArg::Chrome,
+        frame_rate: None,
+        adaptive_frame_rate: false,
+        no_adaptive_frame_rate: false,
+    };
+    split_and_run_pane(
+        Some(url),
+        &browser,
+        false,
+        beside.as_deref(),
+        &[("TWEB_START_VIMIUM", "0")],
+    )
+    .await
 }
 
 /// Finds the Tauri engine binary path (passed through an environment variable).

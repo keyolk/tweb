@@ -276,7 +276,15 @@ tweb eval "location.pathname"
 tweb tab new https://localhost:5173
 tweb diag                        # pane geometry, zoom, frame and input state
 tweb engine-log --limit 40       # engine debug lines (resize and frame accounting)
+tweb devtools                    # Chrome DevTools for the page, in a pane beside it (--engine chrome)
 ```
+
+`tweb devtools` opens Chrome's own DevTools (Elements, Console, Network, Sources…) for a
+Chrome-engine pane's page, in a new pane beside it. The DevTools pane starts with TWeb's shortcuts
+off so every key reaches DevTools; `Ctrl-/` turns them back on. It needs the engine Chrome to have
+been started by this version or later, which allows exactly its own DevTools page to connect to its
+debugging port. An engine Chrome started earlier answers with an error: quit it while no
+Chrome-engine pane is open, and the next pane starts a new one.
 
 Output defaults to a human-readable summary; `--json` returns the raw form. `--pane` can be omitted —
 with one pane it picks that one, and with several it uses **panes in the same tmux window**. Browsers
