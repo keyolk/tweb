@@ -53,6 +53,13 @@ function chromeArgs(userDataDir, env = process.env) {
     "--disable-renderer-backgrounding",
     "--disable-backgrounding-occluded-windows",
     "--hide-scrollbars",
+    // `--remote-debugging-port` alone sets `navigator.webdriver`, with or without a client
+    // attached, and YouTube stops a video about a minute in with "Something went wrong" when it
+    // is set. Measured on one video, Chrome 155 with no tweb involved: headless, headless with
+    // the headless marker out of the user agent, headed off-screen, and headed with no CDP client
+    // at all all failed at 40-60s of playback; headless with CDP attached and this flag played
+    // past 129s. It turns off only the `webdriver` flag, not the debugging port tweb drives.
+    "--disable-blink-features=AutomationControlled",
   ];
   if (env.TWEB_CHROME_HEADED === "1") args.push("--window-position=-32000,-32000", "--window-size=800,600");
   else args.push("--headless=new");
