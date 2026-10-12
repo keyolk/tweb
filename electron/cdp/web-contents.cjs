@@ -14,9 +14,10 @@
 //              only at CSS-pixel size (measured: 720x450 for a 720x450 dpr-2 viewport, with or
 //              without maxWidth), which halves the resolution of every frame on a Retina pane.
 //              `captureScreenshot` returns device pixels (2880x1800 measured) at 15fps serial,
-//              30fps with two in flight. So the screencast is the CHANGE SIGNAL — it is silent on
+//              30fps with two in flight — but see `pumpCapture` for why only one is ever in flight.
+//              So the screencast is the CHANGE SIGNAL — it is silent on
 //              a static page (1 frame in 3s measured) — and each signal is answered with a
-//              device-pixel screenshot, two in flight, capped at the pane's frame rate.
+//              device-pixel screenshot, one at a time, capped at the pane's frame rate.
 //   dirty rect Chrome reports none. Every paint is whole-frame; main.cjs already handles a
 //              dirty rect equal to the frame as "send the whole thing".
 //   preload    see preload-bridge.cjs.
@@ -1135,6 +1136,8 @@ class CdpWebContents extends EventEmitter {
     this.capture.lastSignal = params.data;
     this.capture.generation = (this.capture.generation || 0) + 1;
     this.scheduleSettle();
+    // Whether a capture was running when Chrome sent this frame; see `presentScreencastFrame`.
+    this.capture.pendingInCapture = this.capture.inFlight > 0;
     this.presentScreencastFrame(params.data);
   }
 
@@ -1178,6 +1181,19 @@ class CdpWebContents extends EventEmitter {
       // frame after it was a CSS one and waited for the settle. A CSS-only stream — a video
       // playing after a resize — is drawn by those captures back to back.
       if (got.width !== want.width || got.height !== want.height) {
+        this.requestCapture();
+        return;
+      }
+      // A frame Chrome sent while a capture was running is not drawn either, whatever its size.
+      // Some of them are the CSS-pixel picture stretched by the device scale factor to device
+      // size: the pane's own size, but the page zoomed in. Measured on Hacker News at dsf 1.6
+      // while scrolling: 7 of 70 device-size frames were the top-left 1585x820 of the page scaled
+      // up 1.6x (matched to 0.4 mean difference), every one of them sent while a capture was in
+      // flight; drawn, the pane zoomed in and back on every few scroll steps. No metadata tells
+      // them apart (pageScaleFactor, deviceWidth and scrollOffset are those of a good frame) and
+      // the arrival time inside the capture does not either, so the frame is a change signal
+      // only and the capture it asks for draws the change.
+      if (capture.pendingInCapture) {
         this.requestCapture();
         return;
       }
@@ -1264,9 +1280,15 @@ class CdpWebContents extends EventEmitter {
     this.pumpCapture();
   }
 
+  // One capture at a time. With two in flight the second one sometimes came back as the CSS-pixel
+  // picture laid on the device canvas 1:1 — the whole page shrunk into the top-left corner — and
+  // drawn, the pane zoomed out for one frame. Measured on Hacker News while scrolling: 4 of 4
+  // shrunk captures were the second of two in flight, none with one. Serial captures cost no
+  // frame rate on a playing video (12-13 fps against 10-11 with two) because the two had been
+  // contending for the same compositor.
   pumpCapture() {
     const capture = this.capture;
-    if (!capture.dirty || capture.timer || capture.inFlight >= 2 || this.destroyed || !this.painting) return;
+    if (!capture.dirty || capture.timer || capture.inFlight >= 1 || this.destroyed || !this.painting) return;
     const interval = 1000 / Math.max(1, this.frameRate);
     const wait = capture.lastAt + interval - Date.now();
     if (wait > 0) {
