@@ -1265,24 +1265,37 @@ installPrintShim();
 
   function declaredCursorMatcher() {
     if (declaredCursorSelector !== undefined) return declaredCursorSelector;
-    const selectors = [];
+    // Each sheet is read once, and each selector kept once. A shadow root's `ownerDocument` is
+    // the page, so walking `styleSheets` per root re-read the whole document once per shadow
+    // root, and web components adopt the same sheet into every instance. Measured on a GitHub
+    // repo page: 28 roots turned 452 cursor rules into 12,656 selectors (746KB). Every
+    // `matches` against that took 0.17ms, the `f` pass ran ~3s, the engine stopped waiting
+    // for the main frame at 1.5s, and `f` drew nothing at all.
+    const declared = new Set();
+    const walked = new Set();
     const walk = (rules) => {
       for (const rule of rules || []) {
         // `@media`/`@supports`/nesting hold their own lists, and real sites put
         // plenty of cursor rules under a media query.
         if (rule.cssRules) walk(rule.cssRules);
-        if (rule.style?.cursor && rule.selectorText) selectors.push(rule.selectorText);
+        if (rule.style?.cursor && rule.selectorText) declared.add(rule.selectorText);
       }
+    };
+    const walkSheet = (sheet) => {
+      if (walked.has(sheet)) return;
+      walked.add(sheet);
+      // Cross-origin sheets throw on `cssRules`; their declarations are simply
+      // invisible and such elements keep the old behaviour.
+      try { walk(sheet.cssRules); } catch (_) {}
     };
     for (const root of collectRoots()) {
       const document_ = root.ownerDocument || root;
-      // Cross-origin sheets throw on `cssRules`; their declarations are simply
-      // invisible and such elements keep the old behaviour.
-      try { for (const sheet of document_.styleSheets || []) walk(sheet.cssRules); } catch (_) {}
-      try { for (const sheet of root.adoptedStyleSheets || []) walk(sheet.cssRules); } catch (_) {}
+      try { for (const sheet of document_.styleSheets || []) walkSheet(sheet); } catch (_) {}
+      try { for (const sheet of root.adoptedStyleSheets || []) walkSheet(sheet); } catch (_) {}
     }
     // `:is()` is forgiving, so one selector this engine cannot parse does not
     // poison the whole match.
+    const selectors = [...declared];
     declaredCursorSelector = selectors.length ? `:is(${selectors.join(",")})` : "";
     return declaredCursorSelector;
   }
@@ -1317,15 +1330,32 @@ installPrintShim();
     return ownsPointerIntent(element);
   }
 
-  function clickableAncestor(element) {
+  // `memo` holds, for every element already walked in this pass, the ancestor the walk found
+  // from it. Neighbouring probe points hit the same chain of wrappers up to <body>, and each
+  // step costs a computed style and a selector match — so without it the sweep paid for the
+  // same ancestors hundreds of times.
+  function clickableAncestor(element, memo) {
+    const walked = [];
+    let found = null;
     let current = element;
     while (isElement(current)) {
-      if (hasPointerIntent(current)) return current;
+      if (memo?.has(current)) {
+        found = memo.get(current);
+        break;
+      }
+      walked.push(current);
+      if (hasPointerIntent(current)) {
+        found = current;
+        break;
+      }
       const root = current.getRootNode();
       current = current.parentElement || root instanceof ShadowRoot && root.host || null;
     }
-    return null;
+    for (const node of walked) memo?.set(node, found);
+    return found;
   }
+
+  const HIT_TEST_BUDGET_MS = 400;
 
   function hitTestTargets(semantic) {
     const found = new Set(semantic);
@@ -1350,7 +1380,13 @@ installPrintShim();
     // every root is what made this slow — over a second on GitHub's 19 roots —
     // so a root only sees the points its host actually covers.
     const probes = points.slice(0, 600);
+    const memo = new Map();
+    // The engine stops waiting for this frame's count after 1.5s and draws the round without
+    // it — so a page where the sweep runs long got no badges at all. The probes only find
+    // extra surfaces on top of `semantic`; past the budget, what has been found is drawn.
+    const deadline = performance.now() + HIT_TEST_BUDGET_MS;
     for (const root of collectRoots()) {
+      if (performance.now() > deadline) break;
       const host = root === document ? null : (root.host || root.defaultView?.frameElement);
       const bounds = isElement(host) ? visibleRect(host) : null;
       if (host && !bounds) continue;
@@ -1363,9 +1399,14 @@ installPrintShim();
         }
         const x = ourX - offset.x;
         const y = ourY - offset.y;
+        if (performance.now() > deadline) break;
         const hits = typeof root.elementsFromPoint === "function" ? root.elementsFromPoint(x, y) : [];
-        const target = hits.map(clickableAncestor).find(Boolean);
-        if (target) found.add(target);
+        for (const hit of hits) {
+          const target = clickableAncestor(hit, memo);
+          if (!target) continue;
+          found.add(target);
+          break;
+        }
       }
     }
     return [...found];
@@ -1474,6 +1515,36 @@ installPrintShim();
       .filter((frame) => !sameOriginFrameDocument(frame));
   }
 
+  // The element or one of its composed ancestors. `elementFromPoint` on a document answers in that
+  // document's own tree — a hit inside a shadow root comes back as its host — so an element in a
+  // shadow root counts as on top when the hit is any host it sits under.
+  function composedSelfOrAncestor(candidate, element) {
+    for (let node = element; node; node = node.parentNode || node.host || null) {
+      if (node === candidate) return true;
+    }
+    return false;
+  }
+
+  // Whether a click at the hint's point would reach the element. A link under a modal, a sticky
+  // header or an open menu is inside the viewport and passes every visibility test, so it got a
+  // badge — and typing it sent the click to whatever was on top, which reads as "the click did
+  // nothing". The point tested is the one `hintClickPoint` clicks.
+  //
+  // Lenient on purpose: a hit on an ancestor is kept (a text gap inside a wrapped link, or a
+  // cover inside the same shadow host, both read that way), and only a hit on an unrelated
+  // element drops the target.
+  function reachableAt(item) {
+    const element = item.element;
+    const document_ = element.ownerDocument;
+    if (typeof document_?.elementFromPoint !== "function") return true;
+    const offset = frameOffset(element);
+    const x = Math.max(0, Math.min(innerWidth - 1, item.rect.left + item.rect.width / 2)) - offset.x;
+    const y = Math.max(0, Math.min(innerHeight - 1, item.rect.top + item.rect.height / 2)) - offset.y;
+    const hit = document_.elementFromPoint(x, y);
+    if (!hit) return true;
+    return composedSelfOrAncestor(hit, element) || element.contains(hit);
+  }
+
   function interactiveTargets() {
     forgetDeclaredCursors();
     const roots = collectRoots();
@@ -1488,7 +1559,8 @@ installPrintShim();
     const targets = uniqueVisibleTargets(hitTestTargets([...elements, ...opaqueFrames]), (element) => ({
       nativeSurface: isTag(element, "canvas"),
     }), opaqueFrames).filter((item) => !item.element.matches("video,audio")
-      && (!item.element.matches("iframe,frame") || opaqueFrames.has(item.element)));
+      && (!item.element.matches("iframe,frame") || opaqueFrames.has(item.element))
+      && reachableAt(item));
     return [...targets, ...media.flatMap(mediaControlTargets)]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
