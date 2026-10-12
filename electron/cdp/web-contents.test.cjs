@@ -276,3 +276,30 @@ test("every new document stops the top-level page bouncing, and only the top-lev
   assert.deepStrictEqual(run(true), [["overscroll-behavior", "none", "important"]]);
   assert.deepStrictEqual(run(false), []);
 });
+
+// The order Chrome sends on a reload of a page with one iframe, measured over CDP:
+//   frameNavigated(main) → frameAttached(new iframe) → frameNavigated(new iframe)
+// with no frameDetached for the old iframe. Keeping the old one meant every `f` round asked a
+// frame that would never answer, one more per reload.
+test("a reload leaves only the new document's frames", () => {
+  const { created } = contents();
+  const load = (iframe) => {
+    created.onFrameNavigated({ id: "MAIN", url: "http://page.test/" }, "S");
+    created.onFrameAttached({ frameId: iframe, parentFrameId: "MAIN" }, "S");
+    created.onFrameNavigated({ id: iframe, parentId: "MAIN", url: "about:srcdoc" }, "S");
+  };
+  load("IFRAME-1");
+  load("IFRAME-2");
+  load("IFRAME-3");
+  assert.deepStrictEqual(created.mainFrame.framesInSubtree.map((frame) => frame.frameId), ["IFRAME-3"]);
+});
+
+test("a subframe navigating drops its own children, not its siblings", () => {
+  const { created } = contents();
+  created.onFrameNavigated({ id: "MAIN", url: "http://page.test/" }, "S");
+  created.onFrameAttached({ frameId: "A", parentFrameId: "MAIN" }, "S");
+  created.onFrameAttached({ frameId: "B", parentFrameId: "MAIN" }, "S");
+  created.onFrameAttached({ frameId: "A1", parentFrameId: "A" }, "S");
+  created.onFrameNavigated({ id: "A", parentId: "MAIN", url: "http://ad.test/" }, "S");
+  assert.deepStrictEqual(created.mainFrame.framesInSubtree.map((frame) => frame.frameId).sort(), ["A", "B"]);
+});

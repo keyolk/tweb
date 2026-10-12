@@ -689,6 +689,24 @@ class CdpWebContents extends EventEmitter {
     frame.parentId = params.parentFrameId || null;
   }
 
+  // A frame that commits a new document has no children yet: the old document's iframes went with
+  // it. Chrome does not say so — measured on a reload, `frameNavigated` for the main frame and then
+  // `frameAttached` for the new iframe, with no `frameDetached` for the old one — so the old ones
+  // stayed in `frames` forever. Each was still asked in every `f` round and never answered: a page
+  // with one iframe asked 42 frames after 40 reloads, every `f` waited out HINT_ROUND_WAIT_MS, and
+  // a round whose main frame was slower than the cap closed with no badges at all.
+  //
+  // The children of a committed frame arrive after its `frameNavigated`, so this never removes a
+  // frame that belongs to the new document. A same-document navigation does not come through here.
+  dropChildFrames(parentId) {
+    for (const child of [...this.frames.values()]) {
+      if (child.parentId !== parentId || child.frameId === parentId) continue;
+      this.dropChildFrames(child.frameId);
+      child.detached = true;
+      this.frames.delete(child.frameId);
+    }
+  }
+
   onFrameDetached(params) {
     // "swap" means the frame moved to another process and lives on under a new session.
     if (params.reason === "swap") return;
@@ -736,6 +754,7 @@ class CdpWebContents extends EventEmitter {
 
   onFrameNavigated(cdpFrame, sessionId) {
     const frame = this.ensureFrame(cdpFrame.id, sessionId);
+    this.dropChildFrames(frame.frameId);
     frame.url = cdpFrame.url + (cdpFrame.urlFragment || "");
     frame.parentId = cdpFrame.parentId || (sessionId !== this.session.id ? frame.parentId : null);
     if (!cdpFrame.parentId && sessionId === this.session.id) {
@@ -1122,7 +1141,6 @@ class CdpWebContents extends EventEmitter {
       const next = capture.pendingCast;
       capture.pendingCast = null;
       if (!next || this.destroyed || !this.painting || !nativeImage) return;
-      capture.lastAt = Date.now();
       const decoded = nativeImage.createFromBuffer(Buffer.from(next, "base64"));
       const want = this.frameSize || decoded.getSize();
       const got = decoded.getSize();
@@ -1170,6 +1188,11 @@ class CdpWebContents extends EventEmitter {
       // off and on again) and the box would never be redrawn sharp.
       capture.soft = unionRect(capture.soft, dirty);
       this.capture.forceNext = false;
+      // Only a frame that is drawn spends the frame interval. Stamping every frame looked at made
+      // the capture a CSS-size frame asks for wait out an interval nothing had used: measured on
+      // `j` in a half-screen Retina pane, the capture started 33ms after the frame that asked for
+      // it, and the scroll reached the pane in ~100ms where Electron took ~3ms.
+      capture.lastAt = Date.now();
       this.emit("paint", {}, dirty, image);
     }, Math.max(0, wait));
   }

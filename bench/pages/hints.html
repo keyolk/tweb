@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>hints</title>
+<!-- bench/feel.py: a page with many hint targets, an iframe that has its own, and enough height
+     to scroll. The hint round has to collect counts from both frames, which is where `f` has
+     failed before (see main.cjs, HINT_ROUND_WAIT_MS). -->
+<style>body{font:16px system-ui;margin:24px} li{margin:6px 0} iframe{width:600px;height:200px}</style>
+<h1>Hint targets</h1>
+<iframe srcdoc="&lt;a href='#a'&gt;framed a&lt;/a&gt; &lt;a href='#b'&gt;framed b&lt;/a&gt; &lt;button&gt;framed button&lt;/button&gt;"></iframe>
+<ul>
+<li><a href="#item-0">Item 0</a> <button type="button">act 0</button> <input placeholder="field 0"></li>
+<li><a href="#item-1">Item 1</a> <button type="button">act 1</button> <input placeholder="field 1"></li>
+<li><a href="#item-2">Item 2</a> <button type="button">act 2</button> <input placeholder="field 2"></li>
+<li><a href="#item-3">Item 3</a> <button type="button">act 3</button> <input placeholder="field 3"></li>
+<li><a href="#item-4">Item 4</a> <button type="button">act 4</button> <input placeholder="field 4"></li>
+<li><a href="#item-5">Item 5</a> <button type="button">act 5</button> <input placeholder="field 5"></li>
+<li><a href="#item-6">Item 6</a> <button type="button">act 6</button> <input placeholder="field 6"></li>
+<li><a href="#item-7">Item 7</a> <button type="button">act 7</button> <input placeholder="field 7"></li>
+<li><a href="#item-8">Item 8</a> <button type="button">act 8</button> <input placeholder="field 8"></li>
+<li><a href="#item-9">Item 9</a> <button type="button">act 9</button> <input placeholder="field 9"></li>
+<li><a href="#item-10">Item 10</a> <button type="button">act 10</button> <input placeholder="field 10"></li>
+<li><a href="#item-11">Item 11</a> <button type="button">act 11</button> <input placeholder="field 11"></li>
+<li><a href="#item-12">Item 12</a> <button type="button">act 12</button> <input placeholder="field 12"></li>
+<li><a href="#item-13">Item 13</a> <button type="button">act 13</button> <input placeholder="field 13"></li>
+<li><a href="#item-14">Item 14</a> <button type="button">act 14</button> <input placeholder="field 14"></li>
+<li><a href="#item-15">Item 15</a> <button type="button">act 15</button> <input placeholder="field 15"></li>
+<li><a href="#item-16">Item 16</a> <button type="button">act 16</button> <input placeholder="field 16"></li>
+<li><a href="#item-17">Item 17</a> <button type="button">act 17</button> <input placeholder="field 17"></li>
+<li><a href="#item-18">Item 18</a> <button type="button">act 18</button> <input placeholder="field 18"></li>
+<li><a href="#item-19">Item 19</a> <button type="button">act 19</button> <input placeholder="field 19"></li>
+<li><a href="#item-20">Item 20</a> <button type="button">act 20</button> <input placeholder="field 20"></li>
+<li><a href="#item-21">Item 21</a> <button type="button">act 21</button> <input placeholder="field 21"></li>
+<li><a href="#item-22">Item 22</a> <button type="button">act 22</button> <input placeholder="field 22"></li>
+<li><a href="#item-23">Item 23</a> <button type="button">act 23</button> <input placeholder="field 23"></li>
+<li><a href="#item-24">Item 24</a> <button type="button">act 24</button> <input placeholder="field 24"></li>
+<li><a href="#item-25">Item 25</a> <button type="button">act 25</button> <input placeholder="field 25"></li>
+<li><a href="#item-26">Item 26</a> <button type="button">act 26</button> <input placeholder="field 26"></li>
+<li><a href="#item-27">Item 27</a> <button type="button">act 27</button> <input placeholder="field 27"></li>
+<li><a href="#item-28">Item 28</a> <button type="button">act 28</button> <input placeholder="field 28"></li>
+<li><a href="#item-29">Item 29</a> <button type="button">act 29</button> <input placeholder="field 29"></li>
+<li><a href="#item-30">Item 30</a> <button type="button">act 30</button> <input placeholder="field 30"></li>
+<li><a href="#item-31">Item 31</a> <button type="button">act 31</button> <input placeholder="field 31"></li>
+<li><a href="#item-32">Item 32</a> <button type="button">act 32</button> <input placeholder="field 32"></li>
+<li><a href="#item-33">Item 33</a> <button type="button">act 33</button> <input placeholder="field 33"></li>
+<li><a href="#item-34">Item 34</a> <button type="button">act 34</button> <input placeholder="field 34"></li>
+<li><a href="#item-35">Item 35</a> <button type="button">act 35</button> <input placeholder="field 35"></li>
+<li><a href="#item-36">Item 36</a> <button type="button">act 36</button> <input placeholder="field 36"></li>
+<li><a href="#item-37">Item 37</a> <button type="button">act 37</button> <input placeholder="field 37"></li>
+<li><a href="#item-38">Item 38</a> <button type="button">act 38</button> <input placeholder="field 38"></li>
+<li><a href="#item-39">Item 39</a> <button type="button">act 39</button> <input placeholder="field 39"></li>
+<li><a href="#item-40">Item 40</a> <button type="button">act 40</button> <input placeholder="field 40"></li>
+<li><a href="#item-41">Item 41</a> <button type="button">act 41</button> <input placeholder="field 41"></li>
+<li><a href="#item-42">Item 42</a> <button type="button">act 42</button> <input placeholder="field 42"></li>
+<li><a href="#item-43">Item 43</a> <button type="button">act 43</button> <input placeholder="field 43"></li>
+<li><a href="#item-44">Item 44</a> <button type="button">act 44</button> <input placeholder="field 44"></li>
+<li><a href="#item-45">Item 45</a> <button type="button">act 45</button> <input placeholder="field 45"></li>
+<li><a href="#item-46">Item 46</a> <button type="button">act 46</button> <input placeholder="field 46"></li>
+<li><a href="#item-47">Item 47</a> <button type="button">act 47</button> <input placeholder="field 47"></li>
+<li><a href="#item-48">Item 48</a> <button type="button">act 48</button> <input placeholder="field 48"></li>
+<li><a href="#item-49">Item 49</a> <button type="button">act 49</button> <input placeholder="field 49"></li>
+<li><a href="#item-50">Item 50</a> <button type="button">act 50</button> <input placeholder="field 50"></li>
+<li><a href="#item-51">Item 51</a> <button type="button">act 51</button> <input placeholder="field 51"></li>
+<li><a href="#item-52">Item 52</a> <button type="button">act 52</button> <input placeholder="field 52"></li>
+<li><a href="#item-53">Item 53</a> <button type="button">act 53</button> <input placeholder="field 53"></li>
+<li><a href="#item-54">Item 54</a> <button type="button">act 54</button> <input placeholder="field 54"></li>
+<li><a href="#item-55">Item 55</a> <button type="button">act 55</button> <input placeholder="field 55"></li>
+<li><a href="#item-56">Item 56</a> <button type="button">act 56</button> <input placeholder="field 56"></li>
+<li><a href="#item-57">Item 57</a> <button type="button">act 57</button> <input placeholder="field 57"></li>
+<li><a href="#item-58">Item 58</a> <button type="button">act 58</button> <input placeholder="field 58"></li>
+<li><a href="#item-59">Item 59</a> <button type="button">act 59</button> <input placeholder="field 59"></li>
+</ul>
