@@ -35,6 +35,7 @@ const { AsyncLocalStorage } = require("node:async_hooks");
 const net = require("node:net");
 const path = require("node:path");
 const { createInputTrace } = require("./input-trace.cjs");
+const { runtimeInfoRows } = require("./runtime-info.cjs");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
 const settings = require("./settings.cjs");
@@ -3818,6 +3819,12 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     // An overlay just went up. Painting is driven by Chromium's frame clock, so
     // without a nudge the hints would wait for the next tick to reach the pane.
+    // The `?` help asks for this when it opens; it answers the frame that showed the help.
+    case "runtime-info":
+      if (sourceFrame && !sourceFrame.isDestroyed() && !sourceFrame.detached) {
+        sourceFrame.send("tweb-runtime-info", runtimeInfoModel());
+      }
+      break;
     case "repaint":
       markInteractionActivity();
       contents.invalidate();
@@ -4225,6 +4232,30 @@ function agentPageRequest(method, params, timeoutMs = 10000) {
     // measured on a Google Meet add-on panel: `snapshot` timed out at 10s, `page-diag` at 3s,
     // while the page answered `eval` normally, because `eval` does not go through this path.
     sendToMainTabFrame(tab, "tweb-agent-request", { id, method, params });
+  });
+}
+
+function runtimeInfoModel() {
+  const tab = currentWindows().win && !currentWindows().win.isDestroyed() ? currentWindows().win : null;
+  const frame = tab ? tabFrames.get(tab)?.image?.getSize() : null;
+  return runtimeInfoRows({
+    version: electron.app.getVersion(),
+    appDir: __dirname,
+    backend: pageBackend.kind,
+    electronVersion: process.versions.electron,
+    chromiumVersion: process.versions.chrome,
+    chromeInfo: pageBackend.engine?.version,
+    pane: ownTmuxPane,
+    pid: process.pid,
+    hosted: hostedRuntime,
+    frames: {
+      adaptive: adaptiveFrameRate,
+      idle: idleFrameRate,
+      max: maxActiveFrameRate,
+      rate: currentWindows().activeFrameRate,
+      size: frame ? { width: frame.width, height: frame.height } : null,
+    },
+    mode: inputState().bypass ? "bypass (keys go to the page)" : "shortcuts",
   });
 }
 

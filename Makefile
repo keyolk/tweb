@@ -86,6 +86,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/frame-context.cjs
 	node --check electron/pane-windows.cjs
 	node --check electron/input-trace.cjs
+	node --check electron/runtime-info.cjs
 	node --check electron/download-state.cjs
 	node --check electron/file-chooser.cjs
 	node --check electron/pdf-frame.cjs
