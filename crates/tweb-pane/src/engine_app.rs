@@ -164,6 +164,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/input-trace.cjs"),
     ),
     (
+        "runtime-info.cjs",
+        include_str!("../../../electron/runtime-info.cjs"),
+    ),
+    (
         "download-state.cjs",
         include_str!("../../../electron/download-state.cjs"),
     ),

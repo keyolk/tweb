@@ -264,6 +264,7 @@ installPrintShim();
   let historyState = null;
   let helpHost = null;
   let helpScroller = null;
+  let helpRuntimeInfo = null;
   let contextMenuReturnFocus = null;
   let indicatorHost = null;
   let indicatorLabel = null;
@@ -2885,6 +2886,7 @@ installPrintShim();
     helpHost?.remove();
     helpHost = null;
     helpScroller = null;
+    helpRuntimeInfo = null;
     if (restoreMode) normalMode();
   }
 
@@ -2947,7 +2949,11 @@ installPrintShim();
       group.append(name, list);
       grid.append(group);
     }
-    panel.append(header, grid);
+    // Filled when main answers `runtime-info`; empty until then, so the help never waits on it.
+    const runtimeInfo = document.createElement("dl");
+    runtimeInfo.style.cssText = "display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:0 0 12px;padding:8px 11px;border:1px solid #ffffff18;border-radius:7px;background:#ffffff08;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#bdc1c6";
+    runtimeInfo.hidden = true;
+    panel.append(header, runtimeInfo, grid);
     backdrop.append(panel);
     backdrop.addEventListener("click", (event) => {
       if (event.target === backdrop) cancelHelp();
@@ -2957,6 +2963,8 @@ installPrintShim();
     paintNow();
     helpHost = host;
     helpScroller = backdrop;
+    helpRuntimeInfo = runtimeInfo;
+    send("runtime-info");
     setMode("help", "?·Esc close");
     requestAnimationFrame(() => close.focus({ preventScroll: true }));
   }
@@ -5085,6 +5093,23 @@ installPrintShim();
       pickerState.typed += String(key).toLowerCase();
     }
     updatePicker();
+  });
+
+  ipcRenderer.on("tweb-runtime-info", (_event, rows) => {
+    const list = helpRuntimeInfo;
+    if (!list || !Array.isArray(rows)) return;
+    list.replaceChildren();
+    for (const [label, value] of rows) {
+      const key = document.createElement("dt");
+      key.textContent = label;
+      key.style.cssText = "margin:0;color:#8ab4f8";
+      const detail = document.createElement("dd");
+      detail.textContent = value;
+      detail.style.cssText = "margin:0;overflow-wrap:anywhere";
+      list.append(key, detail);
+    }
+    list.hidden = false;
+    paintNow();
   });
 
   ipcRenderer.on("tweb-shortcuts-mode", (_event, mode) => {
