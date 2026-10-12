@@ -689,6 +689,24 @@ class CdpWebContents extends EventEmitter {
     frame.parentId = params.parentFrameId || null;
   }
 
+  // A frame that commits a new document has no children yet: the old document's iframes went with
+  // it. Chrome does not say so — measured on a reload, `frameNavigated` for the main frame and then
+  // `frameAttached` for the new iframe, with no `frameDetached` for the old one — so the old ones
+  // stayed in `frames` forever. Each was still asked in every `f` round and never answered: a page
+  // with one iframe asked 42 frames after 40 reloads, every `f` waited out HINT_ROUND_WAIT_MS, and
+  // a round whose main frame was slower than the cap closed with no badges at all.
+  //
+  // The children of a committed frame arrive after its `frameNavigated`, so this never removes a
+  // frame that belongs to the new document. A same-document navigation does not come through here.
+  dropChildFrames(parentId) {
+    for (const child of [...this.frames.values()]) {
+      if (child.parentId !== parentId || child.frameId === parentId) continue;
+      this.dropChildFrames(child.frameId);
+      child.detached = true;
+      this.frames.delete(child.frameId);
+    }
+  }
+
   onFrameDetached(params) {
     // "swap" means the frame moved to another process and lives on under a new session.
     if (params.reason === "swap") return;
@@ -736,6 +754,7 @@ class CdpWebContents extends EventEmitter {
 
   onFrameNavigated(cdpFrame, sessionId) {
     const frame = this.ensureFrame(cdpFrame.id, sessionId);
+    this.dropChildFrames(frame.frameId);
     frame.url = cdpFrame.url + (cdpFrame.urlFragment || "");
     frame.parentId = cdpFrame.parentId || (sessionId !== this.session.id ? frame.parentId : null);
     if (!cdpFrame.parentId && sessionId === this.session.id) {
