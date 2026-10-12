@@ -3849,6 +3849,17 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       if (round.missed.size >= round.drawn) endHintRound(tab);
       break;
     }
+    // A frame that drew badges for this round no longer has them: something on the page side
+    // tore its picker down (a mode change, a reload, a navigation) without a pick. The engine
+    // cannot see that on its own, and an open round claims every key — measured on gestalt:
+    // the round stayed open with no badge anywhere, `f` and every shortcut were appended to
+    // the typed label, and only Escape got the pane back.
+    case "hint-lost": {
+      const round = hintRound(tab);
+      if (!round || !round.open || value?.round !== round.id) break;
+      if (round.drawnKeys.has(frameKey(sourceFrame)) || drawnFrameGone(tab, round)) endHintRound(tab);
+      break;
+    }
     case "native-hover":
       if ([value?.x, value?.y].every(Number.isFinite)) {
         const { x, y } = pageToWindowPoint(contents, value);
@@ -3961,6 +3972,9 @@ const hintRounds = new WeakMap();
 // empty, and `f` showed no hints; pressing again sometimes landed in a quicker moment, which
 // read as "`f` works after a few presses". The cap only guards a main frame that never answers.
 const HINT_ROUND_WAIT_MS = 120;
+// Tells one round from the next, so a frame tearing down the previous round's badges cannot
+// end the round that replaced it.
+let hintRoundSerial = 0;
 const HINT_ROUND_MAIN_FRAME_CAP_MS = 1500;
 
 function hintRound(tab) {
@@ -4021,10 +4035,25 @@ function closeHintRound(tab) {
   }
   for (const [key, entry] of entries) {
     if (entry.frame.isDestroyed() || entry.frame.detached) continue;
-    entry.frame.send("tweb-hint-space", { offset: offsets[key], count: entry.count, total });
+    entry.frame.send("tweb-hint-space", { offset: offsets[key], count: entry.count, total, round: round.id });
     // Only these frames will report misses; see `hint-miss`.
-    if (entry.count > 0) round.drawn += 1;
+    if (entry.count > 0) {
+      round.drawn += 1;
+      round.drawnKeys.add(key);
+    }
   }
+}
+
+// A reload or navigation replaces the document, and the new one comes with a new frame token —
+// so the frame that drew is no longer in the tree, and the document now in its place reports
+// the loss under a key the round has never seen. Measured: `f`, reload, then every key was
+// still typed into the round with `hint-lost` arriving and being turned away.
+function drawnFrameGone(tab, round) {
+  const mainFrame = tab.webContents.mainFrame;
+  const live = new Set([mainFrame, ...(mainFrame?.framesInSubtree || [])]
+    .filter((frame) => frame && !frame.isDestroyed() && !frame.detached)
+    .map(frameKey));
+  return [...round.drawnKeys].some((key) => !live.has(key));
 }
 
 // `f`. Ask every frame that can answer, then divide the space between the ones that do.
@@ -4050,8 +4079,8 @@ function startHintRound(tab) {
   if (expected.size === 0) return;
   const mainKey = mainFrame && expected.has(frameKey(mainFrame)) ? frameKey(mainFrame) : null;
   const round = {
-    expected, mainKey, counts: new Map(), open: false, waitElapsed: false,
-    total: 0, drawn: 0, missed: new Set(), timer: null, typed: "",
+    id: ++hintRoundSerial, expected, mainKey, counts: new Map(), open: false, waitElapsed: false,
+    total: 0, drawn: 0, drawnKeys: new Set(), missed: new Set(), timer: null, typed: "",
   };
   round.timer = setTimeout(() => hintRoundWaitElapsed(tab), HINT_ROUND_WAIT_MS);
   hintRounds.set(tab, round);
@@ -4070,7 +4099,8 @@ function routeHintKey(tab, key) {
   if (key === "Backspace") round.typed = round.typed.slice(0, -1);
   else round.typed += key.toLowerCase();
   round.missed.clear();
-  sendToTabFrames(tab, "tweb-hint-key", key);
+  // The round id lets a frame that has lost its badges say so; see `hint-lost`.
+  sendToTabFrames(tab, "tweb-hint-key", key, round.id);
   return true;
 }
 
