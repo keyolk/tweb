@@ -11,7 +11,7 @@
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const path = require("node:path");
-const { CdpConnection, ensureChrome } = require("./connection.cjs");
+const { CdpConnection, devtoolsOriginAllowed, devtoolsUrl, ensureChrome } = require("./connection.cjs");
 const { CdpWebContents } = require("./web-contents.cjs");
 
 const HIDDEN_BOUNDS = { x: -10_000, y: -10_000 };
@@ -198,6 +198,7 @@ class CdpEngine extends EventEmitter {
     this.version = version;
     this.userAgent = browserUserAgent(version["User-Agent"]);
     this.connection = await CdpConnection.connect(version.webSocketDebuggerUrl);
+    this.debuggingPort = Number(new URL(version.webSocketDebuggerUrl).port) || 0;
     this.connection.on("Target.targetCreated", (params) => this.onTargetCreated(params.targetInfo));
     this.connection.on("Target.targetInfoChanged", (params) => this.onTargetInfoChanged(params.targetInfo));
     this.connection.on("Target.targetDestroyed", (params) => this.onTargetDestroyed(params.targetId));
@@ -212,6 +213,19 @@ class CdpEngine extends EventEmitter {
     }).catch(() => {});
     if (this.debug) console.error(`tweb: chrome engine ${version.Browser} at ${this.userDataDir}`);
     return this;
+  }
+
+  // The Chrome DevTools page for one tab, or why there is none (see `devtoolsUrl`).
+  async devtoolsFor(contents) {
+    if (!contents?.targetId) return { ok: false, message: "no page in this pane" };
+    if (!await devtoolsOriginAllowed(this.debuggingPort, this.version?.webSocketDebuggerUrl)) {
+      return {
+        ok: false,
+        message: "the engine Chrome was started without a DevTools origin; quit it (no Chrome-engine"
+          + " pane open) and open the pane again",
+      };
+    }
+    return { ok: true, url: devtoolsUrl(this.debuggingPort, contents.targetId, true) };
   }
 
   downloadDirectory() {
