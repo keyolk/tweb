@@ -1028,11 +1028,20 @@ class CdpWebContents extends EventEmitter {
 
   // Not before `initialize` has finished: the override is per session, and the session is the
   // one being set up.
+  //
+  // A `captureScreenshot` in flight undoes it. Chrome takes the shot under the metrics it had when
+  // the shot began and puts them back when it is done, over any override sent meanwhile — measured
+  // on a pane resized while a video played: with no capture in flight the new size held 16 times
+  // in 16, with one in flight the page was back at the old size within 100ms 5 times in 5, and
+  // every capture after it came out at the old size and was dropped, so the pane stopped. A video
+  // keeps a capture in flight almost all the time. So the override is sent again once the
+  // captures in flight have finished (see `pumpCapture`).
   async applyMetrics() {
     if (!this.initialized) return;
     this.invalidateInputScale();
     const { width, height } = this.viewport;
     if (width < 1 || height < 1) return;
+    if (this.capture.inFlight > 0) this.capture.metricsBehind = true;
     await this.session.send("Emulation.setDeviceMetricsOverride", {
       width: Math.round(width),
       height: Math.round(height),
@@ -1193,6 +1202,7 @@ class CdpWebContents extends EventEmitter {
       // `j` in a half-screen Retina pane, the capture started 33ms after the frame that asked for
       // it, and the scroll reached the pane in ~100ms where Electron took ~3ms.
       capture.lastAt = Date.now();
+      capture.castsDrawn = (capture.castsDrawn || 0) + 1;
       this.emit("paint", {}, dirty, image);
     }, Math.max(0, wait));
   }
@@ -1271,6 +1281,10 @@ class CdpWebContents extends EventEmitter {
     capture.inFlight += 1;
     this.captureFrame().finally(() => {
       capture.inFlight -= 1;
+      if (capture.metricsBehind && capture.inFlight === 0) {
+        capture.metricsBehind = false;
+        void this.applyMetrics();
+      }
       this.pumpCapture();
     });
   }
@@ -1279,7 +1293,7 @@ class CdpWebContents extends EventEmitter {
     let shot;
     let timer = null;
     const t0 = performance.now();
-    const generation = this.capture.generation || 0;
+    const drawn = this.capture.castsDrawn || 0;
     try {
       // PNG, not JPEG: the frame is decoded to a bitmap and re-encoded for the terminal anyway,
       // and a JPEG round trip smears text — the one thing a browser pane must render sharply.
@@ -1303,9 +1317,13 @@ class CdpWebContents extends EventEmitter {
       clearTimeout(timer);
     }
     if (this.destroyed || !nativeImage) return;
-    // The page moved while this was being taken: the screencast has drawn something newer, and
-    // the settle timer will ask again once it stops.
-    if ((this.capture.generation || 0) !== generation && !this.capture.forceNext) return;
+    // The screencast drew something newer while this was being taken, and the settle timer will
+    // ask again once it stops. Only a frame that was DRAWN makes this one stale: a CSS-size frame
+    // is never drawn, only asks for a capture, and while a video plays they come every ~33ms —
+    // shorter than any capture. Counting every screencast frame (as this once did) dropped every
+    // capture after the first: measured on a 1440x1800 pane playing a video, 0 frames in 8s while
+    // Electron sent 14 a second.
+    if ((this.capture.castsDrawn || 0) !== drawn && !this.capture.forceNext) return;
     const t1 = performance.now();
     let image = nativeImage.createFromBuffer(Buffer.from(shot.data, "base64"));
     const want = this.frameSize;
