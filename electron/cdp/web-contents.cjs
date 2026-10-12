@@ -112,6 +112,29 @@ const PRINT_SHIM = `(() => {
   });
 })();`;
 
+// Chrome on macOS rubber-bands the top-level page when a wheel pushes past either end, even
+// headless. The screencast catches the bounce mid-spring, so each wheel event at an end drew the
+// page a few pixels off and back — measured on gestalt and a plain page: ±7 device px every frame
+// for as long as the wheel kept coming, which in the pane is the whole page shaking. No feature
+// flag turns it off (ElasticOverscroll, ScrollBounce, overscroll-history-navigation and
+// smooth scrolling all tried; the bounce was unchanged). `overscroll-behavior: none` on the root
+// does, and only the top-level root bounces, so it is set there alone: nested scrollers and frames
+// still chain into the page as before.
+// Electron's offscreen pages never bounce, so this only brings Chrome in line.
+const NO_BOUNCE = `(() => {
+  // A frame's root set to none would stop a wheel at the frame's end from scrolling the page.
+  if (window.top !== window) return;
+  const apply = () => {
+    const root = document.documentElement;
+    if (!root) return false;
+    root.style.setProperty("overscroll-behavior", "none", "important");
+    return true;
+  };
+  if (apply()) return;
+  new MutationObserver((_, observer) => { if (apply()) observer.disconnect(); })
+    .observe(document, { childList: true });
+})();`;
+
 // What Electron's `context-menu` event would have said, read in the isolated world at the
 // moment the page's own `contextmenu` fires — after the page had its chance to cancel it.
 const CONTEXT_MENU_PROBE = `(() => {
@@ -480,6 +503,9 @@ class CdpWebContents extends EventEmitter {
       }),
       session.send("Page.addScriptToEvaluateOnNewDocument", {
         source: TITLE_PROBE, worldName: WORLD_NAME, runImmediately: true,
+      }),
+      session.send("Page.addScriptToEvaluateOnNewDocument", {
+        source: NO_BOUNCE, worldName: WORLD_NAME, runImmediately: true,
       }),
       // The main world, not the isolated one: AudioContext has to be wrapped where the page
       // constructs it, and media mute has to touch the elements the page holds.

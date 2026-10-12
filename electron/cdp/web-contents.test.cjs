@@ -242,3 +242,37 @@ test("every session is given the browser user agent before its page runs", async
   assert.deepStrictEqual(sent.find(([method]) => method === "Emulation.setUserAgentOverride"),
     ["Emulation.setUserAgentOverride", { userAgent: "UA Chrome/155" }]);
 });
+
+// Chrome on macOS rubber-bands the top-level page at either end of a wheel scroll, and the
+// screencast drew each bounce: ±7 device px every frame, the whole pane shaking while the wheel
+// came. The fix is the root's `overscroll-behavior` — on the top frame only, since a frame's root
+// set to none would stop a wheel at the frame's end from scrolling the page.
+test("every new document stops the top-level page bouncing, and only the top-level one", async () => {
+  const sources = [];
+  const engine = { connection: { send: async () => ({}) }, windowFor: () => null, debug: false, downloadDirectory: () => "/tmp" };
+  const session = {
+    id: "S", on() {},
+    send: async (method, params) => {
+      if (method === "Page.addScriptToEvaluateOnNewDocument") sources.push(params);
+      return {};
+    },
+  };
+  const created = new CdpWebContents(engine, "MAIN", session);
+  await created.prepareSession(session, true);
+  const script = sources.find((entry) => /overscroll-behavior/.test(entry.source));
+  assert.ok(script, "no script sets overscroll-behavior");
+  // Isolated world: the page cannot see or undo the script itself, only its effect.
+  assert.ok(script.worldName && script.runImmediately);
+
+  const vm = require("node:vm");
+  function run(top) {
+    const set = [];
+    const window = {};
+    window.top = top ? window : {};
+    const document = { documentElement: { style: { setProperty: (...args) => set.push(args) } } };
+    vm.runInNewContext(script.source, { window, document, MutationObserver: class { observe() {} } });
+    return set;
+  }
+  assert.deepStrictEqual(run(true), [["overscroll-behavior", "none", "important"]]);
+  assert.deepStrictEqual(run(false), []);
+});
