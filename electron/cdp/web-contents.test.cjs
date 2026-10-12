@@ -290,6 +290,44 @@ test("a viewport change made during a capture is applied again once the capture 
   assert.deepStrictEqual(overrides, ["750x945", "750x945", "600x800"]);
 });
 
+// Measured on Hacker News at dsf 1.6: device-size screencast frames sent while a capture was in
+// flight were sometimes the CSS picture stretched to device size — the page zoomed in.
+test("a screencast frame sent while a capture ran is not drawn, only asks for a capture", async () => {
+  const pictures = new Map([["QQ==", picture()], ["Qg==", picture(5)]]);
+  const { created, paints } = screencastContents(pictures);
+  // The pane last drew a picture both frames below differ from.
+  created.capture.lastCast = picture(3);
+  const captures = [];
+  created.requestCapture = () => captures.push(Date.now());
+  created.capture.inFlight = 1;
+  created.onScreencastFrame({ sessionId: 1, data: "Qg==" });
+  await settle();
+  assert.deepStrictEqual(paints, []);
+  assert.strictEqual(captures.length, 1);
+  // With no capture running the same kind of frame is drawn as before.
+  created.capture.inFlight = 0;
+  created.onScreencastFrame({ sessionId: 2, data: "QQ==" });
+  await settle();
+  assert.strictEqual(paints.length, 1);
+});
+
+// The second of two captures in flight sometimes came back with the page shrunk into a corner.
+test("only one capture is ever in flight", () => {
+  const { created } = contents();
+  created.painting = true;
+  created.frameRate = 1000;
+  let started = 0;
+  created.captureFrame = () => { started += 1; return new Promise(() => {}); };
+  created.capture.dirty = true;
+  created.pumpCapture();
+  // The frame interval has passed and the page changed again.
+  created.capture.lastAt = 0;
+  created.capture.dirty = true;
+  created.pumpCapture();
+  assert.strictEqual(started, 1);
+  assert.strictEqual(created.capture.inFlight, 1);
+});
+
 // --- the user agent ---
 //
 // Measured on dogdrip.net: nginx answered 403 to `HeadlessChrome/155.0.0.0` and 200 to the same
