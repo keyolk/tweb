@@ -558,7 +558,7 @@ installPrintShim();
       // surface like `d`/`u`, so an inner pane pages by its own height rather than the
       // window's. Nine tenths rather than the whole thing: browsers leave a few lines of
       // the previous screen behind so the reader can pick the thread back up.
-      scrollSurfaceBy(0, (key === "PageUp" ? -0.9 : 0.9) * scrollSurfaceHeight());
+      scrollSurfacePage(key === "PageUp" ? -0.9 : 0.9);
       return;
     }
     if (editable && typeof payload.text === "string" && payload.text) {
@@ -1747,15 +1747,126 @@ installPrintShim();
     if (panSurfaceBy(left, top)) return;
     const target = scrollSurface();
     if (target) target.scrollBy({ left, top, behavior: "instant" });
-    else scrollBy({ left, top, behavior: "instant" });
+    else scrollContent({ kind: "by", left, top });
+  }
+
+  // A share of a page rather than pixels, because with nothing picked the content that scrolls
+  // may be a frame of another height, and only that frame knows its own.
+  function scrollSurfacePage(share) {
+    if (panSurface() || scrollSurface()) {
+      scrollSurfaceBy(0, share * scrollSurfaceHeight());
+      return;
+    }
+    scrollContent({ kind: "by", left: 0, top: 0, share });
   }
 
   function scrollSurfaceTo(top) {
     if (panSurface()) return;
     const target = scrollSurface();
     if (target) target.scrollTo({ top, behavior: "instant" });
-    else scrollTo({ top, behavior: "instant" });
+    else scrollContent(top === 0 ? { kind: "top" } : { kind: "end" });
   }
+
+  // The scroll keys with no area picked: the content the user is looking at, wherever it is.
+  //
+  // That used to be this frame's own window, and on a page whose window does not scroll — an
+  // app shell that scrolls an inner pane, or a viewer whose content is an iframe — `j` did
+  // nothing at all. claude.ai's artifact viewer is both: the top document and its same-origin
+  // inner frame are fixed, the artifact sits in a cross-origin frame
+  // (`*.claudeusercontent.com`), and inside that in an `about:srcdoc` frame, which is the only
+  // document that scrolls. The wheel worked there (Chrome routes it to the frame under the
+  // pointer); `j` and `d` did nothing, measured on both engines.
+  //
+  // So, like Vimium, a window that cannot scroll hands the keys to the largest thing on screen
+  // that can: a same-origin scroller or frame document is scrolled here; a cross-origin frame
+  // is asked to do it (`SCROLL_ASK`) and applies the same rule inside. Only something at least
+  // a quarter of the viewport counts, so a small sidebar or comment box does not take the keys
+  // the page did not offer it; `v` still picks those.
+  const SCROLL_ASK = "tweb:scroll";
+  const SCROLL_MIN_SHARE = 0.25;
+
+  function scrollContent(op) {
+    const page = document.scrollingElement || document.documentElement;
+    // Along the axis the key moves: a page that only overflows sideways does not take `j`.
+    const sideways = op.kind === "by" && !op.top && !op.share;
+    const scrollsThatWay = (element) => (sideways
+      ? element.scrollWidth > element.clientWidth + 8
+      : element.scrollHeight > element.clientHeight + 8);
+    if (page && scrollsThatWay(page)) {
+      applyScroll(null, op);
+      return;
+    }
+    const viewportArea = innerWidth * innerHeight;
+    let best = null;
+    const consider = (candidate, rect) => {
+      const area = clippedArea(rect);
+      if (area < viewportArea * SCROLL_MIN_SHARE) return;
+      if (!best || area > best.area) best = { ...candidate, area };
+    };
+    for (const item of scrollableTargets()) {
+      if (item.page || item.pan || !scrollsThatWay(item.element)) continue;
+      consider({ element: item.element }, item.rect);
+    }
+    // Cross-origin frames only: a same-origin one is a root above, and its document is
+    // already a candidate if it scrolls.
+    for (const root of collectRoots()) {
+      for (const frame of root.querySelectorAll("iframe,frame")) {
+        if (sameOriginFrameDocument(frame) || !frame.contentWindow) continue;
+        const rect = visibleRect(frame);
+        if (rect) consider({ frame }, rect);
+      }
+    }
+    if (!best) {
+      applyScroll(null, op);
+      return;
+    }
+    if (best.frame) {
+      try { best.frame.contentWindow.postMessage({ __tweb: SCROLL_ASK, op }, "*"); } catch (_) {}
+      return;
+    }
+    applyScroll(best.element, op);
+  }
+
+  // `element` null means this window. A frame's scrolling element is scrolled through its own
+  // window so the document scrolls the way the wheel would scroll it.
+  function applyScroll(element, op) {
+    const view = element ? ownerView(element) : window;
+    const docScroller = !element || element === view.document.scrollingElement;
+    const target = docScroller ? view : element;
+    const height = docScroller ? view.innerHeight : element.clientHeight;
+    const end = docScroller ? view.document.documentElement.scrollHeight : element.scrollHeight;
+    if (op.kind === "by") {
+      const top = Number.isFinite(op.share) ? op.share * height : op.top;
+      target.scrollBy({ left: op.left || 0, top: top || 0, behavior: "instant" });
+    } else {
+      target.scrollTo({ top: op.kind === "top" ? 0 : end, behavior: "instant" });
+    }
+  }
+
+  function clippedArea(rect) {
+    const width = Math.min(rect.right, innerWidth) - Math.max(rect.left, 0);
+    const height = Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0);
+    return width > 0 && height > 0 ? width * height : 0;
+  }
+
+  // Taken only from an ancestor: the frame that handed the keys down. Comparing window objects
+  // is an identity test that works across origins, so a sibling or an opener cannot drive this
+  // frame's scrolling by naming itself.
+  function fromAncestor(source) {
+    for (let view = window; view !== view.parent; view = view.parent) {
+      if (view.parent === source) return true;
+    }
+    return false;
+  }
+
+  addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data || data.__tweb !== SCROLL_ASK || topFrame || !fromAncestor(event.source)) return;
+    const op = data.op;
+    if (!op || !["by", "top", "end"].includes(op.kind)) return;
+    if (op.kind === "by" && ![op.left || 0, op.top || 0].every(Number.isFinite)) return;
+    scrollContent(op);
+  });
 
   function scrollSurfaceHeight() {
     return visibleRect(panSurface())?.height || scrollSurface()?.clientHeight || innerHeight;
@@ -2882,8 +2993,8 @@ installPrintShim();
         l: () => scrollSurfaceBy(90, 0),
       }],
       ["d · u", "half page down · up", {
-        d: () => scrollSurfaceBy(0, scrollSurfaceHeight() * 0.5),
-        u: () => scrollSurfaceBy(0, -scrollSurfaceHeight() * 0.5),
+        d: () => scrollSurfacePage(0.5),
+        u: () => scrollSurfacePage(-0.5),
       }],
       ["gg · G", "top · bottom of page", {
         g: () => { pendingG = true; pendingGTimer = setTimeout(resetPendingG, 800); setMode("normal", "g"); },

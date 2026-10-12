@@ -255,13 +255,18 @@ test("page keys scroll by the surface, not by a line", () => {
   const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
   const pageKeys = source.slice(source.indexOf('if (key === "PageUp" || key === "PageDown") {'),
     source.indexOf("function hideTabPopover()"));
-  assert.match(pageKeys, /scrollSurfaceHeight\(\)/,
+  // A share of a page, never pixels: `scrollSurfacePage` resolves it against the picked
+  // surface, or against whichever frame ends up scrolling when nothing is picked.
+  assert.match(pageKeys, /scrollSurfacePage\(key === "PageUp" \? -0\.9 : 0\.9\)/,
     "a fixed pixel step is a line step, whatever the number");
   assert.doesNotMatch(pageKeys, /scrollSurfaceBy\(0, key === "PageUp" \? -?\d+ : \d+\)/);
+  const pageHelper = source.slice(source.indexOf("function scrollSurfacePage(share)"),
+    source.indexOf("function scrollSurfaceTo(top)"));
+  assert.match(pageHelper, /share \* scrollSurfaceHeight\(\)/);
 
-  // Measured against the same surface `d`/`u` use, so an inner pane pages by its own height.
+  // The same helper `d`/`u` use, so an inner pane pages by its own height.
   const halfPage = source.slice(source.indexOf('["d · u", '), source.indexOf('["gg · G", '));
-  assert.match(halfPage, /scrollSurfaceHeight\(\)/);
+  assert.match(halfPage, /scrollSurfacePage\(0\.5\)/);
 });
 
 // `visibleRect(panSurface())?.height` reads as guarded, but `?.` protects the result and
@@ -1828,7 +1833,7 @@ test("the page keys move the caret in a field before they scroll", () => {
   assert.match(page, /if \(moveTextControlCaret\(active, key, Boolean\(payload\.shiftKey\)\)\) return;/);
   assert.match(page, /if \(active\?\.isContentEditable && moveContentEditableCaret\(key, Boolean\(payload\.shiftKey\)\)\) return;/);
   // And only then the surface, which is what it always did.
-  assert.match(page, /scrollSurfaceBy\(0, \(key === "PageUp" \? -0\.9 : 0\.9\) \* scrollSurfaceHeight\(\)\)/);
+  assert.match(page, /scrollSurfacePage\(key === "PageUp" \? -0\.9 : 0\.9\)/);
 
   const destination = electron.slice(electron.indexOf("function textControlDestination(element, key, position)"),
     electron.indexOf("function moveTextControlCaret("));
@@ -2808,4 +2813,90 @@ test("hints skip covered targets and the hit-test sweep has a budget", () => {
     source.indexOf("function forgetDeclaredCursors()"));
   assert.match(matcher, /if \(walked\.has\(sheet\)\) return;/,
     "a shadow root's ownerDocument is the page; re-reading its sheets per root blew up the selector");
+});
+
+// --- scroll keys with nothing picked: the content on screen, across frames ---
+//
+// claude.ai's artifact viewer scrolls only inside a cross-origin frame's `about:srcdoc` child;
+// the window and the same-origin frame above it are fixed. `j` scrolled the window and did
+// nothing. These run the decision with the DOM around it stubbed.
+function scrollContentHarness({ pageScrolls = false, scrollers = [], frames = [] } = {}) {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const start = source.indexOf("  const SCROLL_ASK = \"tweb:scroll\";");
+  const end = source.indexOf("  addEventListener(\"message\", (event) => {", start);
+  const calls = [];
+  const viewport = { innerWidth: 1000, innerHeight: 800 };
+  const page = { scrollHeight: pageScrolls ? 4000 : 800, clientHeight: 800, scrollWidth: 1000, clientWidth: 1000 };
+  const win = {
+    scrollBy: (o) => calls.push(["window.scrollBy", o]),
+    scrollTo: (o) => calls.push(["window.scrollTo", o]),
+    innerHeight: 800,
+    document: { scrollingElement: page, documentElement: page },
+  };
+  const deps = {
+    document: { scrollingElement: page, documentElement: page },
+    window: win,
+    innerWidth: viewport.innerWidth,
+    innerHeight: viewport.innerHeight,
+    scrollableTargets: () => scrollers.map((s) => ({ element: s.element, rect: s.rect })),
+    collectRoots: () => [{ querySelectorAll: () => frames.map((f) => f.element) }],
+    sameOriginFrameDocument: (frame) => (frames.find((f) => f.element === frame)?.sameOrigin ? {} : null),
+    visibleRect: (frame) => frames.find((f) => f.element === frame)?.rect || null,
+    ownerView: () => win,
+    topFrame: true,
+  };
+  const names = Object.keys(deps);
+  const run = new Function(...names, `${source.slice(start, end)}\nreturn { scrollContent };`);
+  return { ...run(...names.map((n) => deps[n])), calls };
+}
+
+function box(left, top, width, height) {
+  return { left, top, right: left + width, bottom: top + height, width, height };
+}
+
+test("j scrolls the window when the window scrolls", () => {
+  const { scrollContent, calls } = scrollContentHarness({ pageScrolls: true });
+  scrollContent({ kind: "by", left: 0, top: 90 });
+  assert.deepStrictEqual(calls, [["window.scrollBy", { left: 0, top: 90, behavior: "instant" }]]);
+});
+
+test("j hands a fixed window's scroll to the largest cross-origin frame on screen", () => {
+  const posted = [];
+  const frame = { contentWindow: { postMessage: (m) => posted.push(m) } };
+  const sidebar = { scrollHeight: 2000, clientHeight: 600, scrollWidth: 280, clientWidth: 280,
+    scrollBy: () => posted.push("sidebar") };
+  const { scrollContent, calls } = scrollContentHarness({
+    scrollers: [{ element: sidebar, rect: box(0, 50, 280, 750) }],
+    frames: [{ element: frame, rect: box(0, 48, 1000, 752) }],
+  });
+  scrollContent({ kind: "by", left: 0, top: 90 });
+  assert.deepStrictEqual(calls, []);
+  assert.deepStrictEqual(posted, [{ __tweb: "tweb:scroll", op: { kind: "by", left: 0, top: 90 } }]);
+});
+
+test("a small scroller or frame does not take the keys the page did not offer it", () => {
+  const posted = [];
+  const frame = { contentWindow: { postMessage: (m) => posted.push(m) } };
+  const { scrollContent, calls } = scrollContentHarness({
+    frames: [{ element: frame, rect: box(700, 600, 300, 200) }],
+  });
+  scrollContent({ kind: "by", left: 0, top: 90 });
+  assert.deepStrictEqual(posted, []);
+  assert.deepStrictEqual(calls, [["window.scrollBy", { left: 0, top: 90, behavior: "instant" }]]);
+});
+
+test("a large same-origin scroller is scrolled in place", () => {
+  const seen = [];
+  const pane = { scrollHeight: 5000, clientHeight: 700, scrollWidth: 900, clientWidth: 900,
+    scrollBy: (o) => seen.push(o) };
+  const { scrollContent } = scrollContentHarness({ scrollers: [{ element: pane, rect: box(50, 50, 900, 700) }] });
+  scrollContent({ kind: "by", left: 0, top: 0, share: 0.5 });
+  assert.deepStrictEqual(seen, [{ left: 0, top: 350, behavior: "instant" }]);
+});
+
+test("a frame takes a scroll request only from an ancestor", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const handler = source.slice(source.indexOf("function fromAncestor(source)"));
+  assert.match(handler, /view\.parent === source/);
+  assert.match(source, /data\.__tweb !== SCROLL_ASK \|\| topFrame \|\| !fromAncestor\(event\.source\)/);
 });
