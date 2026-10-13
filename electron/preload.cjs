@@ -2510,16 +2510,11 @@ installPrintShim();
         y = markerBox.top - element.scrollTop;
         mirror.remove();
       } else if (element.isContentEditable) {
-        const selection = getSelection();
-        if (selection?.rangeCount) {
-          const range = selection.getRangeAt(0).cloneRange();
-          range.collapse(true);
-          const rangeBox = range.getBoundingClientRect();
-          if (rangeBox.left || rangeBox.top) {
-            x = rangeBox.left;
-            y = rangeBox.top;
-            height = rangeBox.height || height;
-          }
+        const box = contentEditableCaretBox();
+        if (box) {
+          x = box.left;
+          y = box.top;
+          height = box.height || height;
         }
       }
     } catch (_) {
@@ -2530,6 +2525,60 @@ installPrintShim();
       y: Math.max(0, Math.min(innerHeight - 1, y)),
       height,
     };
+  }
+
+  // Where the caret of a contenteditable is, in this frame's viewport, or null.
+  //
+  // A collapsed range has no box of its own in the places a caret most often sits: on an empty
+  // line (`<div><br></div>`, the line Enter just made) and between two elements, Chrome answers
+  // all zeros. Treating that as "no caret" sent the terminal cursor to the editor's top-left
+  // corner after every Enter — measured: the true caret at (36,54), the cursor at (20,20). So the
+  // box is asked of what sits at the caret instead: the character after it, else the one before
+  // it (its right edge), else the element there — the `<br>` that holds an empty line open.
+  function contentEditableCaretBox() {
+    const selection = getSelection();
+    if (!selection?.rangeCount) return null;
+    const range = selection.getRangeAt(0).cloneRange();
+    range.collapse(true);
+    const usable = (rect) => rect && (rect.width || rect.height) ? rect : null;
+    const direct = usable(range.getClientRects()[0]) || usable(range.getBoundingClientRect());
+    if (direct) return { left: direct.left, top: direct.top, height: direct.height };
+    const node = range.startContainer;
+    const offset = range.startOffset;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const probe = document.createRange();
+      if (offset < node.length) {
+        probe.setStart(node, offset);
+        probe.setEnd(node, offset + 1);
+        const after = usable(probe.getClientRects()[0]);
+        if (after) return { left: after.left, top: after.top, height: after.height };
+      }
+      if (offset > 0) {
+        probe.setStart(node, offset - 1);
+        probe.setEnd(node, offset);
+        const before = usable(probe.getClientRects()[0]);
+        if (before) return { left: before.right, top: before.top, height: before.height };
+      }
+      return null;
+    }
+    // At the end of an element whose last child is text — where `selectNodeContents` and a
+    // click past the last line leave the caret — the box is that text's last character's right
+    // edge, not the element's: the element's box put the cursor at its top-left corner.
+    const before = node.childNodes[offset - 1];
+    if (!node.childNodes[offset] && before?.nodeType === Node.TEXT_NODE && before.length) {
+      const probe = document.createRange();
+      probe.setStart(before, before.length - 1);
+      probe.setEnd(before, before.length);
+      const last = usable(probe.getClientRects()[0]);
+      if (last) return { left: last.right, top: last.top, height: last.height };
+    }
+    const child = node.childNodes[offset] || before || node;
+    const target = child.nodeType === Node.ELEMENT_NODE ? child : child.parentElement;
+    const rect = usable(target?.getClientRects()[0]) || usable(target?.getBoundingClientRect());
+    if (!rect) return null;
+    // A `<br>` or an empty block: its left edge is where the next character goes.
+    const lineHeight = parseFloat(getComputedStyle(target).lineHeight);
+    return { left: rect.left, top: rect.top, height: Number.isFinite(lineHeight) ? lineHeight : rect.height };
   }
 
   // The slot reserves cells PAST the caret and paints over them, which is right where a
