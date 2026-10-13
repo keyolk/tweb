@@ -14,6 +14,7 @@ const { app, clipboard, nativeImage, screen } = electron;
 const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug: true });
 const { BrowserWindow, ipcMain, session } = pageBackend;
 const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
+const { toCdpKey } = require("./cdp/input.cjs");
 const {
   appendFileSync,
   closeSync,
@@ -1046,7 +1047,23 @@ function ensureTmuxPassthroughTable() {
       "\\;", "switch-client", "-T", passthroughTable,
     ]);
   }
-  commands.push(["bind-key", "-T", passthroughTable, "Any", "send-keys", "\\;", "switch-client", "-T", passthroughTable]);
+  // Every key goes to the pane — but only while the pane the client is in is the one that asked.
+  // The focus hooks below normally switch the table back the instant focus leaves; this guard is
+  // what holds if a hook was missed (another tmux config replaced them, a client attached while
+  // the table was armed): the key is then delivered and the client returns to root at once.
+  commands.push([
+    "bind-key", "-T", passthroughTable, "Any",
+    "if-shell", "-F", "#{||:#{==:#{@tweb_edit},1},#{==:#{@tweb_browser},1}}",
+    `send-keys ; switch-client -T ${passthroughTable}`,
+    "send-keys ; switch-client -T root",
+  ]);
+  // Edit mode is scoped to the focused pane. Leaving the pane — prefix-arrow, a mouse click, a
+  // window or session switch — puts the client back on the root table before the next key; coming
+  // back to a pane whose `@tweb_edit` is still 1 arms it again.
+  commands.push(["set-hook", "-g", "pane-focus-out[71]",
+    `if-shell -F "#{==:#{client_key_table},${passthroughTable}}" "switch-client -T root"`]);
+  commands.push(["set-hook", "-g", "pane-focus-in[71]",
+    `if-shell -F "#{==:#{@tweb_edit},1}" "switch-client -T ${passthroughTable}"`]);
   for (const key of passthroughMouseKeys) {
     commands.push(["bind-key", "-T", passthroughTable, key, "send-keys", "-M", "\\;", "switch-client", "-T", passthroughTable]);
   }
@@ -1102,7 +1119,8 @@ function switchTmuxClientTable(tty, table) {
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
   if (!ownTmuxPane) return;
   const paneId = ownTmuxPane;
-  const passthroughArmed = !inputState().vimium;
+  const passthroughArmed = !inputState().vimium || inputState().bypass;
+  setPaneEditOption(paneId, inputState().bypass);
 
   for (const [tty, originalTable] of [...passthroughClientTables]) {
     const state = states.get(tty);
@@ -1125,6 +1143,45 @@ function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
         console.error(`tweb: passthrough client arm ${tty} ${state.paneId} from ${originalTable || "root"}`);
       }
     }
+  }
+}
+
+// `@tweb_edit` on this pane is what the tmux focus hooks read (see `ensureTmuxPassthroughTable`):
+// the hooks run inside tmux the moment focus moves, so they can switch a client's key table back
+// before the next key is read — the engine only learns of a focus change at its next tick.
+let paneEditOption = null;
+
+// The pane process (crates/tweb-pane) is the only side that sees a typed Ctrl-C: raw mode turns
+// it into a byte, and that process ends the pane on it before the engine hears anything. In edit
+// mode Ctrl-C belongs to the page, so the pane process has to know the mode at that moment — and
+// a file it can stat is the one thing both processes can see without a round trip. Named after
+// the pane identity both sides use (`%3`, or `pid-<engine pid>` outside tmux).
+function editFlagPath(paneId = currentPane().paneId) {
+  return path.join(runtimeDir(), `edit-${String(paneId).replace(/[^%\w.-]/g, "")}`);
+}
+
+function setEditFlagFile(on) {
+  const file = editFlagPath();
+  try {
+    if (on) {
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, "1");
+    } else {
+      rmSync(file, { force: true });
+    }
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: edit flag ${on ? "write" : "remove"} failed: ${error.message}`);
+  }
+}
+
+function setPaneEditOption(paneId, on) {
+  if (!paneId || paneEditOption === on) return;
+  try {
+    execFileSync("tmux", ["set-option", "-p", "-t", paneId, "@tweb_edit", on ? "1" : "0"],
+      { timeout: 1000, stdio: "ignore" });
+    paneEditOption = on;
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: @tweb_edit failed: ${error.message}`);
   }
 }
 
@@ -3043,8 +3100,14 @@ function sendToFocusedTabFrame(tab, channel, ...args) {
 // each gate independently.
 function broadcastShortcutMode() {
   for (const tab of currentWindows().tabs) {
-    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
+    sendToTabFrames(tab, "tweb-shortcuts-mode", shortcutModeMessage());
   }
+}
+
+// What the preloads are told. `bypass` is edit mode, and in edit mode no frame may act on a key —
+// Escape must not blur the editor, `i` must not be a command — so it also reads as shortcuts off.
+function shortcutModeMessage() {
+  return { vimium: inputState().vimium && !inputState().bypass, bypass: inputState().bypass };
 }
 
 // Applies the correct combination of the two flags and runs the follow-up work once.
@@ -3077,6 +3140,7 @@ function modeLabel() {
 
 function setCmdBypassEnabled(enabled) {
   inputState().bypass = enabled;
+  setEditFlagFile(enabled);
   applyShortcutMode();
 }
 
@@ -3109,7 +3173,7 @@ function activateTab(index) {
   // just cleared it. Without this its focused input keeps thinking native
   // delivery is armed and its keys go back through the renderer, where they
   // arrive with keyCode 0.
-  sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
+  sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", shortcutModeMessage());
   // The other tab's caret says nothing about this one, and its preload only
   // reports on focus — which switching soleWindows.tabs does not fire.
   moveTerminalCaret(null);
@@ -3941,7 +4005,7 @@ ipcMain.on("tweb-preload-ready", bindPane(
   if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
-  event.reply("tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
+  event.reply("tweb-shortcuts-mode", shortcutModeMessage());
   if (tab === currentWindows().win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
@@ -6293,7 +6357,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
       if (debugLogging) console.error(`tweb: default zoom ${zoomFactor.toFixed(3)}`);
     }
     installPageEnhancements(tab);
-    sendToTabFrames(tab, "tweb-shortcuts-mode", { vimium: inputState().vimium, bypass: inputState().bypass });
+    sendToTabFrames(tab, "tweb-shortcuts-mode", shortcutModeMessage());
     if (debugLogging) {
       console.error(`tweb: loaded ${contents.getURL()} (${contents.getTitle()})`);
     }
@@ -7189,6 +7253,38 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
   if (eventKind === 1) contents.sendInputEvent({ ...event, type: "keyUp" });
 }
 
+/// One key in edit mode, delivered as a real key to whichever frame has focus.
+///
+/// Native delivery is what makes an editor inside an iframe usable: the renderer path reaches only
+/// the focused frame's preload, where it becomes an untrusted, keyCode-0 synthetic event plus
+/// `execCommand` — the shape a claude.ai artifact or Google Docs editor was getting, and why
+/// editing there was close to impossible. A native key is routed by the browser itself.
+///
+/// It goes out as a CDP `Input.dispatchKeyEvent` carrying the AppKit editing `commands` for the
+/// combination (cdp/input.cjs `editCommands`). A synthetic key never passes through AppKit's key
+/// bindings, so without them Ctrl-A, Option-Left or Cmd-Z only fire keydown and change nothing.
+/// The Chrome engine already sends every key this way; an Electron tab sends it through its own
+/// debugger, and falls back to `sendInputEvent` (no commands) if the debugger is taken.
+function dispatchEditKey(tab, key, text, modifiers, eventKind) {
+  if (!tab || tab.isDestroyed()) return;
+  const contents = tab.webContents;
+  if (pageBackend.kind === "chrome" || !ensureDebugger(tab)) {
+    dispatchNativeKey(contents, key, text, modifiers, eventKind);
+    return;
+  }
+  const send = (params) => contents.debugger.sendCommand("Input.dispatchKeyEvent", params).catch((error) => {
+    if (debugLogging) console.error(`tweb: edit key ${key} failed: ${error.message}`);
+  });
+  const keyCode = ACCELERATOR_KEYS.get(key) || key;
+  const event = { keyCode, modifiers };
+  if (eventKind === 3) {
+    void send(toCdpKey({ ...event, type: "keyUp" }));
+    return;
+  }
+  void send(toCdpKey({ ...event, type: "keyDown" }, text || undefined));
+  if (eventKind === 1) void send(toCdpKey({ ...event, type: "keyUp" }));
+}
+
 /// The two keys a hint round needs the engine for, shared by the pane and the float viewer.
 ///
 /// A hint round has badges up in several frames at once, and only one of them has focus — so
@@ -7245,6 +7341,20 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // The release is consumed as well, so no orphan keyUp reaches the page.
   if (control && key === ";") {
     if (pressed) toggleBrowserShortcuts();
+    return;
+  }
+
+  // Edit mode: the page gets every key, as the key it is. Nothing below may claim one — not
+  // Ctrl-C (quit), Ctrl-W (close tab), Ctrl-P, the zoom keys, Cmd-A/C/V/X through the renderer,
+  // `w`, hint labels — because each of those is also an editor's key. Ctrl-; above is the one
+  // way out, and the tmux side keeps it working (see `ensureTmuxPassthroughTable`).
+  if (inputState().bypass) {
+    const text = pressed
+      ? textCodepoints.length > 0
+        ? textCodepoints.map((value) => keyName(value) || "").join("")
+        : key.length === 1 && !control && !modifiers.includes("meta") ? key : ""
+      : "";
+    dispatchEditKey(currentWindows().win, key, text, modifiers, eventKind);
     return;
   }
 
@@ -8397,6 +8507,7 @@ app.on("before-quit", () => {
       ]);
     })],
     ["tmux passthrough", restoreTmuxPassthroughClients],
+    ["edit flag", () => setEditFlagFile(false)],
     ["pane title", restorePaneTitle],
   ]);
 });

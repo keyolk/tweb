@@ -77,21 +77,54 @@ function keyIdentity(name) {
 // Commands Chrome's own keyboard path runs for a platform shortcut. CDP input is synthetic
 // and does NOT go through the browser's accelerator table, so Cmd-A on a CDP keyDown fires the
 // keydown and selects nothing. `commands` is the documented hook for exactly this.
+//
+// The tables are AppKit's standard key bindings (StandardKeyBinding.dict), because those are what
+// a real key in a Mac text field runs and what an editor's own keydown handler expects to have
+// happened when it does not handle the key itself. A Shift variant extends the selection instead
+// of moving it. Ctrl-A/E/K and the rest are the Emacs bindings every Mac text field honours:
+// measured on a contenteditable before these were added, Ctrl-A, Ctrl-E, Ctrl-K and Option-Left
+// fired keydown and did nothing on either engine.
 const MAC_EDIT_COMMANDS = new Map([
   ["a", ["selectAll"]], ["c", ["copy"]], ["x", ["cut"]], ["v", ["paste"]],
   ["z", ["undo"]], ["Z", ["redo"]],
   ["ArrowLeft", ["moveToBeginningOfLine"]], ["ArrowRight", ["moveToEndOfLine"]],
   ["ArrowUp", ["moveToBeginningOfDocument"]], ["ArrowDown", ["moveToEndOfDocument"]],
-  ["Backspace", ["deleteToBeginningOfLine"]],
+  ["Backspace", ["deleteToBeginningOfLine"]], ["Delete", ["deleteToEndOfLine"]],
+]);
+const MAC_SHIFT_EDIT_COMMANDS = new Map([
+  ["ArrowLeft", ["moveToBeginningOfLineAndModifySelection"]],
+  ["ArrowRight", ["moveToEndOfLineAndModifySelection"]],
+  ["ArrowUp", ["moveToBeginningOfDocumentAndModifySelection"]],
+  ["ArrowDown", ["moveToEndOfDocumentAndModifySelection"]],
 ]);
 const ALT_EDIT_COMMANDS = new Map([
   ["ArrowLeft", ["moveWordLeft"]], ["ArrowRight", ["moveWordRight"]],
-  ["Backspace", ["deleteWordBackward"]],
+  ["ArrowUp", ["moveToBeginningOfParagraph"]], ["ArrowDown", ["moveToEndOfParagraph"]],
+  ["Backspace", ["deleteWordBackward"]], ["Delete", ["deleteWordForward"]],
+]);
+const ALT_SHIFT_EDIT_COMMANDS = new Map([
+  ["ArrowLeft", ["moveWordLeftAndModifySelection"]],
+  ["ArrowRight", ["moveWordRightAndModifySelection"]],
+  ["ArrowUp", ["moveParagraphBackwardAndModifySelection"]],
+  ["ArrowDown", ["moveParagraphForwardAndModifySelection"]],
+]);
+const CTRL_EDIT_COMMANDS = new Map([
+  ["a", ["moveToBeginningOfParagraph"]], ["e", ["moveToEndOfParagraph"]],
+  ["b", ["moveBackward"]], ["f", ["moveForward"]], ["p", ["moveUp"]], ["n", ["moveDown"]],
+  ["d", ["deleteForward"]], ["h", ["deleteBackward"]], ["k", ["deleteToEndOfParagraph"]],
+  ["t", ["transpose"]], ["y", ["yank"]], ["o", ["insertNewlineIgnoringFieldEditor", "moveBackward"]],
 ]);
 
+// Bits from `modifierMask`: alt 1, control 2, meta 4, shift 8.
 function editCommands(key, mask) {
-  if (mask & 4) return MAC_EDIT_COMMANDS.get(mask & 8 && key === "z" ? "Z" : key) || undefined;
-  if (mask & 1) return ALT_EDIT_COMMANDS.get(key) || undefined;
+  const shift = Boolean(mask & 8);
+  if (mask & 4) {
+    if (shift && MAC_SHIFT_EDIT_COMMANDS.has(key)) return MAC_SHIFT_EDIT_COMMANDS.get(key);
+    const letter = key.length === 1 ? key.toLowerCase() : key;
+    return MAC_EDIT_COMMANDS.get(shift && letter === "z" ? "Z" : letter) || undefined;
+  }
+  if (mask & 1) return (shift ? ALT_SHIFT_EDIT_COMMANDS : ALT_EDIT_COMMANDS).get(key) || undefined;
+  if (mask === 2) return CTRL_EDIT_COMMANDS.get(key.toLowerCase()) || undefined;
   return undefined;
 }
 
@@ -210,6 +243,7 @@ class KeySequencer {
 
 module.exports = {
   KeySequencer,
+  editCommands,
   keyIdentity,
   modifierMask,
   toCdpKey,
