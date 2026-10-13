@@ -415,3 +415,18 @@ test("a subframe navigating drops its own children, not its siblings", () => {
   created.onFrameNavigated({ id: "A", parentId: "MAIN", url: "http://ad.test/" }, "S");
   assert.deepStrictEqual(created.mainFrame.framesInSubtree.map((frame) => frame.frameId).sort(), ["A", "B"]);
 });
+
+// Measured in a real tmux pane at dsf 1.6: clicks within the cache's three seconds landed at
+// 1/1.6 of the way (5 of 12 per run), putting the caret lines away from where the user clicked.
+test("a press measures the input skew afresh; a move inside the cache window does not", async () => {
+  const { created } = contents();
+  let probes = 0;
+  created.measureInputScale = async () => { probes += 1; return 1.6; };
+  created.session.send = async () => ({});
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", x: 10, y: 10, buttons: 0 });
+  assert.strictEqual(probes, 1);
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", x: 11, y: 10, buttons: 0 });
+  assert.strictEqual(probes, 1, "a plain move uses the cached value");
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mousePressed", x: 12, y: 10, button: "left", buttons: 1 });
+  assert.strictEqual(probes, 2, "a press re-measures");
+});

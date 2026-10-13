@@ -591,10 +591,11 @@ class CdpWebContents extends EventEmitter {
 
   // The scale to multiply mouse coordinates by, measured when stale. Concurrent callers share one
   // measurement, and pointer events queue behind it so their order is kept.
-  inputScaleReady() {
+  inputScaleReady(fresh = false) {
     const now = Date.now();
     // Never mid-drag: the probe is a buttonless move, and it would end the drag on the page.
-    if (this.inputScale && (this.pointerHeld || now - this.inputScaleAt < INPUT_SCALE_RECHECK_MS)) {
+    if (this.inputScale && !fresh
+      && (this.pointerHeld || now - this.inputScaleAt < INPUT_SCALE_RECHECK_MS)) {
       return Promise.resolve(this.inputScale);
     }
     if (!this.inputScaleProbe) {
@@ -619,7 +620,12 @@ class CdpWebContents extends EventEmitter {
     }
     const send = async () => {
       if (method !== "Input.dispatchMouseEvent") return this.session.send(method, params);
-      const scale = await this.inputScaleReady();
+      // A press is measured afresh, whatever the cache says. The skew comes and goes while the tab
+      // is in use, and a press is where landing short shows: measured in a real tmux pane at dsf
+      // 1.6, the fourth of four clicks landed at (106,260) instead of (177,442) — 1/1.6 of the way —
+      // within the cache's three seconds, putting the caret a dozen lines from where the user
+      // clicked. The moves of a drag keep the press's value (see `pointerHeld`).
+      const scale = await this.inputScaleReady(params.type === "mousePressed");
       const sent = { ...params, x: params.x * scale, y: params.y * scale };
       // Wheel distance is in DIPs on Electron, where zoom is the browser's own and Chromium turns
       // DIPs into CSS pixels itself. Here zoom is an emulated scale with no such step, so a notch
