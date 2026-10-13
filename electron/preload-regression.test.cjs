@@ -1305,11 +1305,12 @@ test("the input toggles are a badge, not a mode", () => {
   const badge = electron.slice(electron.indexOf("function inputBadgeState()"),
     electron.indexOf("function renderIndicator()"));
   // Silent when both toggles are at their defaults — a badge that is always lit says
-  // nothing — and one badge, not two, when both are off.
+  // nothing. Edit mode (Ctrl-;) wins over shortcuts-off: it is the state that changes what
+  // Escape and Ctrl-C do, so it is the one the badge has to say.
   assert.match(badge, /return \{ text: "", title: "" \};/);
-  assert.match(badge, /if \(!vimiumEnabled && bypassEnabled\)/);
+  assert.match(badge, /if \(bypassEnabled\) \{\s*return \{ text: "EDIT"/);
   assert.match(badge, /if \(!vimiumEnabled\)/);
-  assert.match(badge, /if \(bypassEnabled\)/);
+  assert.ok(badge.indexOf("if (bypassEnabled)") < badge.indexOf("if (!vimiumEnabled)"));
 
   // The badge is hidden rather than emptied, so it takes no space when it has nothing
   // to say.
@@ -2899,4 +2900,51 @@ test("a frame takes a scroll request only from an ancestor", () => {
   const handler = source.slice(source.indexOf("function fromAncestor(source)"));
   assert.match(handler, /view\.parent === source/);
   assert.match(source, /data\.__tweb !== SCROLL_ASK \|\| topFrame \|\| !fromAncestor\(event\.source\)/);
+});
+
+// Edit mode (Ctrl-;): every key goes to the page natively, nothing is claimed on the way, and the
+// tmux side scopes it to the focused pane.
+test("edit mode hands every key to the page and only Ctrl-; leaves it", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const named = main.slice(main.indexOf("function dispatchNamedKey("), main.indexOf("function dispatchKey("));
+  const toggle = named.indexOf('if (control && key === ";")');
+  const edit = named.indexOf("if (inputState().bypass) {");
+  assert.ok(toggle > 0 && edit > toggle, "Ctrl-; is checked before edit mode takes every key");
+  // Before every claim a key could otherwise meet: Cmd-A/C/V/X, Ctrl-C quit, tab keys, hints.
+  for (const claim of ['key.toLowerCase() === "a"', '["c", "v", "x"]', "app.quit()", "closeTab()",
+    "routeHintShortcut(", "routePdfKey("]) {
+    assert.ok(named.indexOf(claim) > edit, `${claim} comes after the edit-mode return`);
+  }
+  assert.match(named.slice(edit, edit + 600), /dispatchEditKey\(currentWindows\(\)\.win, key, text, modifiers, eventKind\);\s*return;/);
+  // The frames are told shortcuts are off, so Escape is not swallowed and no letter is a command.
+  assert.match(main, /return \{ vimium: inputState\(\)\.vimium && !inputState\(\)\.bypass, bypass: inputState\(\)\.bypass \};/);
+  assert.doesNotMatch(main, /"tweb-shortcuts-mode", \{ vimium: inputState\(\)\.vimium, bypass/);
+});
+
+test("edit mode is scoped to the focused pane by tmux itself", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /const passthroughArmed = !inputState\(\)\.vimium \|\| inputState\(\)\.bypass;/);
+  assert.match(main, /"set-option", "-p", "-t", paneId, "@tweb_edit"/);
+  // Leaving the pane drops the table at once; coming back re-arms only an edit-mode pane.
+  assert.match(main, /"pane-focus-out\[71\]",\s*`if-shell -F "#\{==:#\{client_key_table\},\$\{passthroughTable\}\}" "switch-client -T root"`/);
+  assert.match(main, /"pane-focus-in\[71\]",\s*`if-shell -F "#\{==:#\{@tweb_edit\},1\}" "switch-client -T \$\{passthroughTable\}"`/);
+  // And a key that still arrives in the table for a pane that never asked goes back to root.
+  assert.match(main, /"Any",\s*"if-shell", "-F", "#\{\|\|:#\{==:#\{@tweb_edit\},1\},#\{==:#\{@tweb_browser\},1\}\}",\s*`send-keys ; switch-client -T \$\{passthroughTable\}`,\s*"send-keys ; switch-client -T root",/);
+});
+
+test("edit keys carry the AppKit editing commands a real key would run", () => {
+  const { editCommands } = require("./cdp/input.cjs");
+  // Bits: alt 1, control 2, meta 4, shift 8.
+  assert.deepStrictEqual(editCommands("a", 2), ["moveToBeginningOfParagraph"]);
+  assert.deepStrictEqual(editCommands("e", 2), ["moveToEndOfParagraph"]);
+  assert.deepStrictEqual(editCommands("k", 2), ["deleteToEndOfParagraph"]);
+  assert.deepStrictEqual(editCommands("ArrowLeft", 1), ["moveWordLeft"]);
+  assert.deepStrictEqual(editCommands("ArrowLeft", 1 | 8), ["moveWordLeftAndModifySelection"]);
+  assert.deepStrictEqual(editCommands("ArrowLeft", 4 | 8), ["moveToBeginningOfLineAndModifySelection"]);
+  assert.deepStrictEqual(editCommands("z", 4), ["undo"]);
+  assert.deepStrictEqual(editCommands("z", 4 | 8), ["redo"]);
+  assert.deepStrictEqual(editCommands("Z", 4 | 8), ["redo"]);
+  // Ctrl with anything else is the page's own shortcut, not an AppKit binding.
+  assert.strictEqual(editCommands("a", 2 | 8), undefined);
+  assert.strictEqual(editCommands("x", 0), undefined);
 });

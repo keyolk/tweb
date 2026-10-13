@@ -171,6 +171,31 @@ impl PasteTracker {
     }
 }
 
+/// The directory the engine keeps per-pane runtime files in — its agent sockets, and the edit-mode
+/// flag below. Same rule as `runtimeDir` in electron/agent-server.cjs.
+fn agent_runtime_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("TWEB_RUNTIME_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    if !cfg!(target_os = "macos") {
+        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+            return std::path::PathBuf::from(dir).join("tweb");
+        }
+    }
+    // SAFETY: getuid(2) cannot fail.
+    std::env::temp_dir().join(format!("tweb-{}", unsafe { libc::getuid() }))
+}
+
+/// Whether the pane is in edit mode, where Ctrl-C is the page's key and must not end the pane.
+///
+/// The engine writes `edit-<pane>` in its runtime directory while edit mode (Ctrl-;) is on —
+/// see `setEditFlagFile` in electron/main.cjs. Only checked when a Ctrl-C arrives, so the stat
+/// costs nothing the rest of the time. `pane` is the identity the engine names its files after:
+/// the tmux pane id, or `pid-<engine pid>` on a bare terminal.
+fn edit_mode_active(pane: &str) -> bool {
+    agent_runtime_dir().join(format!("edit-{pane}")).exists()
+}
+
 /// Ends the engine process, and does not wait forever for it to agree.
 ///
 /// SIGTERM first, because a clean exit lets the engine drop its own placements and save its
@@ -403,9 +428,13 @@ impl TmuxPaneMarker {
 impl Drop for TmuxPaneMarker {
     fn drop(&mut self) {
         if let Some(pane) = &self.pane {
-            let _ = std::process::Command::new("tmux")
-                .args(["set-option", "-p", "-u", "-t", pane, "@tweb_browser"])
-                .status();
+            // `@tweb_edit` too: the engine sets it while edit mode is on, and a pane left with it
+            // would re-arm the passthrough key table each time focus came back to its shell.
+            for option in ["@tweb_browser", "@tweb_edit"] {
+                let _ = std::process::Command::new("tmux")
+                    .args(["set-option", "-p", "-u", "-t", pane, option])
+                    .status();
+            }
         }
     }
 }
@@ -579,6 +608,8 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             let mut tty = tokio::io::stdin();
             let mut buf = [0u8; 256];
             let mut paste = PasteTracker::default();
+            let edit_identity = std::env::var("TMUX_PANE")
+                .unwrap_or_else(|_| format!("pid-{}", child_id.unwrap_or_default()));
 
             loop {
                 match tty.read(&mut buf).await {
@@ -587,7 +618,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                         // Ctrl-C ends the pane, and is NOT forwarded — see `CTRL_C` for why this
                         // is the only place that can see it. Ending the engine is what unblocks
                         // the `child.wait()` below, and the image delete after it then runs.
-                        if paste.typed_interrupt(&buf[..n]) {
+                        if paste.typed_interrupt(&buf[..n]) && !edit_mode_active(&edit_identity) {
                             end_engine(child_id).await;
                             break;
                         }
@@ -909,6 +940,7 @@ async fn run_hosted_session(
     let input_handle = tokio::spawn({
         let control_tx = control_tx.clone();
         let interrupt_tx = interrupt_tx.clone();
+        let edit_identity = pane.to_string();
         async move {
             let mut tty = tokio::io::stdin();
             let mut buf = [0u8; 256];
@@ -922,7 +954,7 @@ async fn run_hosted_session(
                         // place that can act on it. Swallowing it costs the page a literal
                         // Ctrl-C — worth it while the alternative is a pane the key does
                         // nothing to.
-                        if paste.typed_interrupt(&buf[..n]) {
+                        if paste.typed_interrupt(&buf[..n]) && !edit_mode_active(&edit_identity) {
                             let _ = interrupt_tx.send(()).await;
                             break;
                         }
@@ -1283,6 +1315,24 @@ mod tests {
     // up only as strips of a dead page left on screen.
     // Ctrl-C in raw mode is a BYTE, not a signal — the defect these guard was a pane that sat
     // there while every signal handler waited for a SIGINT the terminal never generated.
+    /// Edit mode hands Ctrl-C to the page: the engine's `edit-<pane>` file is what says so.
+    #[test]
+    fn edit_mode_is_read_from_the_engine_flag_file() {
+        let dir = std::env::temp_dir().join(format!("tweb-edit-flag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let saved = std::env::var("TWEB_RUNTIME_DIR").ok();
+        std::env::set_var("TWEB_RUNTIME_DIR", &dir);
+        assert!(!super::edit_mode_active("%7"));
+        std::fs::write(dir.join("edit-%7"), "1").expect("flag");
+        assert!(super::edit_mode_active("%7"));
+        assert!(!super::edit_mode_active("%8"));
+        match saved {
+            Some(value) => std::env::set_var("TWEB_RUNTIME_DIR", value),
+            None => std::env::remove_var("TWEB_RUNTIME_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_typed_ctrl_c_is_an_interrupt() {
         let mut paste = PasteTracker::default();

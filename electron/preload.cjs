@@ -797,15 +797,16 @@ installPrintShim();
   //
   // Neither belongs in the mode label. The mode is what the keyboard does on the page,
   // and folding these in meant a focused input showed the toggle state instead of `E`.
+  //
+  // `bypassEnabled` is edit mode (Ctrl-;): every key, Escape and Ctrl-C included, goes to the page
+  // as a real key while this pane has focus. It is the one state that changes what most keys do,
+  // so it gets the loudest badge.
   function inputBadgeState() {
-    if (!vimiumEnabled && bypassEnabled) {
-      return { text: "web", title: "Shortcuts off, Cmd to the page — every key goes to the web page" };
+    if (bypassEnabled) {
+      return { text: "EDIT", title: "Edit mode — every key goes to the page while this pane has focus (Ctrl-; to leave)" };
     }
     if (!vimiumEnabled) {
       return { text: "web", title: "TWeb shortcuts off (Ctrl-/ to turn them back on)" };
-    }
-    if (bypassEnabled) {
-      return { text: "⌘", title: "Cmd combinations go to the page (Ctrl-; to keep them in tmux)" };
     }
     return { text: "", title: "" };
   }
@@ -821,6 +822,10 @@ installPrintShim();
       : "#fdd663";
     const input = inputBadgeState();
     inputBadge.textContent = input.text;
+    // Edit mode changes what Escape and Ctrl-C do, so it must be impossible to miss.
+    inputBadge.style.background = input.text === "EDIT" ? "#f28b82" : "";
+    inputBadge.style.color = input.text === "EDIT" ? "#202124" : "";
+    inputBadge.style.fontWeight = input.text === "EDIT" ? "700" : "";
     inputBadge.title = input.title;
     inputBadge.style.display = input.text ? "" : "none";
     // The owner's pane id is what makes the badge actionable: it says where the sound is
@@ -910,10 +915,8 @@ installPrintShim();
 
   // The value written to dataset.twebInputMode. The two flags combine into a mode.
   function modeIndicator() {
-    if (vimiumEnabled && !bypassEnabled) return "shortcuts";
-    if (!vimiumEnabled && bypassEnabled) return "bypass";
-    if (vimiumEnabled && bypassEnabled) return "shortcuts and bypass";
-    return "web-only";
+    if (bypassEnabled) return "edit";
+    return vimiumEnabled ? "shortcuts" : "web-only";
   }
 
   function normalMode() {
@@ -3056,7 +3059,7 @@ installPrintShim();
       ["i", "insert mode — page's own shortcuts, Esc returns", { i: () => enterInsertMode() }],
       ["m", "take audio back — only one pane plays at a time", { m: () => { send("reclaim-audio"); flash("audio"); } }],
       ["?", "this help", { "?": () => showHelp() }],
-      ["Ctrl-;", "Shortcuts ↔ web passthrough"],
+      ["Ctrl-;", "Edit mode: every key to the page while this pane has focus"],
       ["Ctrl-C", "quit TWeb from Shortcuts mode"],
       ["Esc", "clear current mode · fullscreen · input focus"],
     ]],

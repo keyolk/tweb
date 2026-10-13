@@ -407,23 +407,28 @@ measured on Electron; see the Tauri note above.
 
 `Ctrl-;` and `Ctrl-/` are two independent toggles.
 
-- **`Ctrl-;` — bypass**: decides whether `Cmd` combinations go to the page. When on, tmux switches the client viewing this pane to the `tweb-pass` table, bypassing tmux prefix/root bindings and delivering keys, modifiers and mouse events to the page.
+- **`Ctrl-;` — edit mode**: for typing in a rich editor (an artifact, a code editor, a document).
+  While this pane has focus, **every key goes to the page as a real key** — Escape, `Ctrl-C`,
+  `Ctrl-W`, the tmux prefix (`C-a`), `Ctrl-/` — and TWeb claims none of them. The keys carry the
+  macOS editing commands a real key would run, so `Ctrl-A`/`Ctrl-E`/`Ctrl-K`, `Option-←/→`
+  (word), `Shift`/`Option-Shift`/`Cmd-Shift`-arrows (select) and `Cmd-Z` work in any text field,
+  including one inside an iframe. The badge shows a red **EDIT**. `Ctrl-;` again leaves it.
 - **`Ctrl-/` — vimium**: turns Vimium-style normal mode and the TWeb browser shortcuts on and off. With no input element focused, `f`/`j`/`k` and friends work; while typing they are not intercepted and `Esc` clears the focus.
 
-Because the two toggles are independent, their combination is the mode:
+**Edit mode is scoped to the focused pane.** It is a property of the pane (`@tweb_edit`), and tmux
+itself switches the client's key table: the moment focus leaves the pane — a mouse click, a
+`select-pane`, another window — the client is back on the `root` table before the next key, so no
+other pane ever sees edit-mode keys. Coming back to the pane re-arms it. Since the prefix goes to the
+page while the pane has focus, leave the pane with the mouse or turn edit mode off with `Ctrl-;`.
 
-| vimium \| bypass | bypass on | bypass off |
+| | edit mode on | edit mode off |
 |---|---|---|
-| **vimium on** | N (normal) | shortcuts only |
-| **vimium off** | P (passthrough) | web only |
+| **vimium on** | EDIT — every key to the page | N (normal) |
+| **vimium off** | EDIT — every key to the page | web only (passthrough table) |
 
-Normal-mode keys keep working with bypass on as long as vimium is on — the engine delivers `Cmd`
-natively regardless of mode, so it does not depend on the tmux table. The passthrough table is armed
-only when vimium is off.
-
-With bypass on, `Ctrl-C` goes to the page, so quitting TWeb means turning vimium on with `Ctrl-/` or
-bypass off with `Ctrl-;` first, then pressing `Ctrl-C`. Leaving the TWeb pane or ending the process
-restores that client's previous tmux key table.
+With vimium off and edit mode off ("web only"), keys go to the page natively too and the passthrough
+table is armed, but TWeb still owns `Ctrl-C` (quit) and the tab keys. Leaving the TWeb pane or ending
+the process restores that client's previous tmux key table.
 
 To use a page's own shortcuts briefly — `j`/`k` in a feed, `m` in a player — enter **insert mode** with
 `i` from normal mode. Every key except `Esc` reaches the page as a real engine-generated key event, so
