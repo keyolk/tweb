@@ -2994,7 +2994,7 @@ test("v is a round every frame answers, like f", () => {
   const pick = electron.slice(electron.indexOf("function pickVisualTarget(item)"), electron.indexOf("// The engine's reply"));
   assert.match(pick, /if \(item\.kind === "editable"\) \{\s*send\("native-click", editableClickPoint\(item\)\);/);
   const draw = electron.slice(electron.indexOf("function drawHints(space)"), electron.indexOf("const points = mediaHoverPoints();"));
-  assert.match(draw, /startPicker\(targets, "hint", pickVisualTarget, space\);/);
+  assert.match(draw, /startPicker\(targets, "hint", pickVisualTarget, space, "visual"\);/);
 });
 
 test("a subframe's editable arms native keys, and only its owner disarms them", () => {
@@ -3023,4 +3023,18 @@ test("inside an editor v labels blocks only, and a pick starts at the block's fi
   const point = electron.slice(electron.indexOf("function editableClickPoint(item)"), electron.indexOf("// The engine's reply"));
   assert.match(point, /topViewportPoint\(\{ x: first\.left \+ 1, y: first\.top \+ first\.height \/ 2 \}\)/);
   assert.match(electron, /send\("native-click", editableClickPoint\(item\)\);/);
+});
+
+// A `v` label's colour says what picking it does — text, link, image, editable, area — and the
+// shared round's indicator reads V rather than the H of the `f` picker it runs as.
+test("v badges are coloured by kind and the round reads as visual", () => {
+  assert.match(electron, /text: \{ fill: "#ffd75f"/);
+  assert.match(electron, /link: \{ fill: "#8ab4f8"/);
+  assert.match(electron, /image: \{ fill: "#f6aed1"/);
+  assert.match(electron, /editable: \{ fill: "#81c995"/);
+  assert.match(electron, /scroll: \{ fill: "#64ffda"/);
+  assert.match(electron, /`background:\$\{badgeColors\(target\)\.fill\}`/);
+  assert.match(electron, /return BADGE_COLORS\[target\.kind\] \|\| BADGE_COLORS\.text;/);
+  assert.match(electron, /startPicker\(targets, "hint", pickVisualTarget, space, "visual"\);/);
+  assert.match(electron, /setMode\(shown, `\$\{space \? space\.total : targets\.length\}`\);/);
 });
