@@ -3689,6 +3689,9 @@ function focusFloatWindow() {
   return { ok: true };
 }
 
+// The frame whose caret the terminal cursor shows, per tab, on the Chrome engine (see "caret").
+const caretOwners = new WeakMap();
+
 function handleNativeShortcut(tab, action, value, sourceFrame = null) {
   // `toggle-float` and `toggle-fullscreen` are view toggles, not browser shortcuts —
   // they work regardless of vimium mode.
@@ -3868,6 +3871,20 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       // report after the new focused frame and otherwise move the shared terminal
       // cursor back to stale coordinates (or hide it). Only the frame Chromium says
       // owns focus may control the one terminal cursor.
+      //
+      // The Chrome engine cannot say: CDP has no synchronous "focused frame", and its
+      // `focusedFrame` is always the main frame — so every caret reported from inside an
+      // iframe was dropped, and an editor there (a claude.ai artifact) had no terminal cursor
+      // at all. There the owner is the frame that last reported a caret: a report only comes
+      // from a frame with focus (the preload checks `document.hasFocus()`), and a frame giving
+      // up focus clears the cursor only if it still owns it.
+      if (pageBackend.kind === "chrome") {
+        const key = sourceFrame ? frameKey(sourceFrame) : null;
+        if (!value && key && caretOwners.get(tab) && caretOwners.get(tab) !== key) break;
+        caretOwners.set(tab, value ? key : null);
+        moveTerminalCaret(value);
+        break;
+      }
       const focused = contents.focusedFrame;
       if (sourceFrame && focused && frameKey(sourceFrame) !== frameKey(focused)) break;
       moveTerminalCaret(value);

@@ -2953,3 +2953,27 @@ test("edit keys carry the AppKit editing commands a real key would run", () => {
   assert.strictEqual(editCommands("a", 2 | 8), undefined);
   assert.strictEqual(editCommands("x", 0), undefined);
 });
+
+// The terminal cursor sat at the editor's top-left after Enter (an empty line has no range box)
+// and was missing entirely in an iframe editor on the Chrome engine (`focusedFrame` is always the
+// main frame there, so every subframe report was dropped).
+test("a contenteditable caret on an empty line or at the end is measured, not guessed", () => {
+  const box = electron.slice(electron.indexOf("function contentEditableCaretBox()"),
+    electron.indexOf("// The slot reserves cells PAST the caret"));
+  assert.match(box, /range\.getClientRects\(\)\[0\]/);
+  // The character after the caret, else the one before it (right edge), else the element there.
+  assert.match(box, /probe\.setEnd\(node, offset \+ 1\)/);
+  assert.match(box, /left: before\.right/);
+  assert.match(box, /left: last\.right/);
+  const caret = electron.slice(electron.indexOf("function caretPoint()"), electron.indexOf("function caretAtContentEnd()"));
+  assert.match(caret, /const box = contentEditableCaretBox\(\);/);
+});
+
+test("on the Chrome engine the caret owner is the frame that last reported one", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const branch = main.slice(main.indexOf('case "caret": {'), main.indexOf('case "insert-mode":'));
+  assert.match(branch, /if \(pageBackend\.kind === "chrome"\) \{/);
+  // A null from a frame that no longer owns the cursor must not hide the owner's cursor.
+  assert.match(branch, /if \(!value && key && caretOwners\.get\(tab\) && caretOwners\.get\(tab\) !== key\) break;/);
+  assert.match(branch, /caretOwners\.set\(tab, value \? key : null\);/);
+});
