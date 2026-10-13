@@ -3011,3 +3011,16 @@ test("a contenteditable caret scrolled out of view hides the cursor rather than 
   const caret = electron.slice(electron.indexOf("function caretPoint()"), electron.indexOf("function caretAtContentEnd()"));
   assert.match(caret, /if \(box\.top \+ \(box\.height \|\| 0\) <= 0 \|\| box\.top >= innerHeight\) return null;/);
 });
+
+// In a rich editor `v` labelled every inline code span alongside the paragraphs (21 labels on a
+// claude.ai artifact, a third of them mid-sentence), and picking a paragraph clicked its centre.
+test("inside an editor v labels blocks only, and a pick starts at the block's first character", () => {
+  const filter = electron.slice(electron.indexOf("function insideEditorButNotBlock(element)"), electron.indexOf("function visualTargets()"));
+  assert.match(electron, /const EDITOR_BLOCKS = "p,li,h1,h2,h3,h4,h5,h6,pre,blockquote";/);
+  assert.match(filter, /if \(element === host\) return Boolean\(host\.querySelector\(EDITOR_BLOCKS\)\);/);
+  assert.match(filter, /return !element\.matches\(EDITOR_BLOCKS\);/);
+  assert.match(electron, /\.filter\(\(item\) => !insideEditorButNotBlock\(item\.element\)\);/);
+  const point = electron.slice(electron.indexOf("function editableClickPoint(item)"), electron.indexOf("// The engine's reply"));
+  assert.match(point, /topViewportPoint\(\{ x: first\.left \+ 1, y: first\.top \+ first\.height \/ 2 \}\)/);
+  assert.match(electron, /send\("native-click", editableClickPoint\(item\)\);/);
+});
