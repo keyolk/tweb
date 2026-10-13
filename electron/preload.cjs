@@ -2047,7 +2047,24 @@ installPrintShim();
   // `{ offset, total }`, where this frame's targets number from `offset` in a space of
   // `total`. Absent, this frame is the only one hinting and numbers from zero — which is
   // every picker but `f`.
-  function startPicker(targets, mode, onPick, space = null) {
+  // A `v` badge's colour says what picking it will do, before the label is typed: text is
+  // selected (yellow), a link is followed or copied (blue), an image is saved or copied (pink),
+  // an editable takes the caret (green, the insert-mode colour of the mode label), and an area
+  // takes the scroll keys (teal). `f` badges have no kind and stay yellow.
+  const BADGE_COLORS = {
+    text: { fill: "#ffd75f", border: "#9b6b00" },
+    link: { fill: "#8ab4f8", border: "#1a5fb4" },
+    image: { fill: "#f6aed1", border: "#a3386c" },
+    editable: { fill: "#81c995", border: "#1e7a3a" },
+    scroll: { fill: "#64ffda", border: "#00796b" },
+  };
+  function badgeColors(target) {
+    return BADGE_COLORS[target.kind] || BADGE_COLORS.text;
+  }
+
+  // `shown` is the mode the indicator names; a shared `v` round runs as a "hint" picker (that is
+  // what routes typed labels to every frame) but should read V, not H.
+  function startPicker(targets, mode, onPick, space = null, shown = mode) {
     cancelTransient(false);
     if (targets.length === 0) {
       // A frame with nothing to hint must not report "0 hints" over a round where another
@@ -2079,8 +2096,8 @@ installPrintShim();
       badge.textContent = labels[index];
       badge.style.cssText = [
         "position:fixed", `left:${Math.max(0, badgeLeft)}px`, `top:${Math.max(0, badgeTop)}px`,
-        "padding:1px 4px", `border:1px solid ${area ? "#00796b" : "#9b6b00"}`, "border-radius:3px",
-        `background:${area ? "#64ffda" : "#ffd75f"}`,
+        "padding:1px 4px", `border:1px solid ${badgeColors(target).border}`, "border-radius:3px",
+        `background:${badgeColors(target).fill}`,
         "color:#161616", "box-shadow:0 1px 4px #0008", "font:700 12px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace",
       ].join(";");
       shadow.append(badge);
@@ -2089,7 +2106,7 @@ installPrintShim();
     document.documentElement.append(host);
     paintNow();
     pickerState = { host, items, typed: "", mode, onPick, shared: Boolean(space), round: space?.round };
-    setMode(mode, `${space ? space.total : targets.length}`);
+    setMode(shown, `${space ? space.total : targets.length}`);
   }
 
   function updatePicker() {
@@ -2809,7 +2826,7 @@ installPrintShim();
       // "hint" is the shared picker's mode either way: it is what routes typed labels through
       // the engine to every frame. Only the targets and what a pick does differ.
       const targets = counted ? counted.filter((target) => target.element.isConnected) : visualTargets();
-      startPicker(targets, "hint", pickVisualTarget, space);
+      startPicker(targets, "hint", pickVisualTarget, space, "visual");
       return;
     }
     const points = mediaHoverPoints();
@@ -3161,7 +3178,7 @@ installPrintShim();
         n: () => { if (!lastSearch) return false; stepSearch(true); },
         N: () => { if (!lastSearch) return false; stepSearch(false); },
       }],
-      ["v · V", "visual picker — teal labels pick an area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
+      ["v · V", "visual picker — label colour is the kind: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
