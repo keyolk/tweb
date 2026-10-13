@@ -90,3 +90,10 @@ test("the origin probe answers false where no Chrome is listening", async () => 
   assert.strictEqual(await devtoolsOriginAllowed(port, `ws://127.0.0.1:${port}/devtools/browser/x`), false);
   assert.strictEqual(await devtoolsOriginAllowed(0, null), false);
 });
+
+// Out-of-process iframes took the headless window's 1x while the tab was emulated at 1.6, so text
+// in them was upscaled and soft. The pane's scale is forced on the whole browser.
+test("Chrome is launched at the pane's device scale factor when one is given", () => {
+  assert.ok(chromeArgs("/p", {}, 0, 2).includes("--force-device-scale-factor=2"));
+  assert.ok(!chromeArgs("/p", {}, 0, 0).some((arg) => arg.startsWith("--force-device-scale-factor")));
+});

@@ -124,7 +124,7 @@ function createBackend(electron, { env = process.env, debug = false } = {}) {
     ipcMain,
     session,
     engine,
-    start: () => engine.start(),
+    start: (options) => engine.start(options),
   };
 }
 

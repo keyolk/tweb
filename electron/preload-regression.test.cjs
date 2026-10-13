@@ -3022,6 +3022,9 @@ test("inside an editor v labels blocks only, and a pick starts at the block's fi
   assert.match(electron, /\.filter\(\(item\) => !insideEditorButNotBlock\(item\.element\)\);/);
   const point = electron.slice(electron.indexOf("function editableClickPoint(item)"), electron.indexOf("// The engine's reply"));
   assert.match(point, /topViewportPoint\(\{ x: first\.left \+ 1, y: first\.top \+ first\.height \/ 2 \}\)/);
+  // From the first text node's line boxes, never the block range's element boxes.
+  assert.match(point, /createTreeWalker\(element, NodeFilter\.SHOW_TEXT\)/);
+  assert.match(point, /range\.selectNodeContents\(node\);/);
   assert.match(electron, /send\("native-click", editableClickPoint\(item\)\);/);
 });
 
