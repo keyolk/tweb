@@ -2992,7 +2992,7 @@ test("v is a round every frame answers, like f", () => {
   assert.match(round, /if \(visualState\?\.caret\) \{\s*selectFromCaret\(\);\s*send\("hint-round", \{ count: 0 \}\);/);
   // An editable is clicked: that is what focuses it in its own frame.
   const pick = electron.slice(electron.indexOf("function pickVisualTarget(item)"), electron.indexOf("// The engine's reply"));
-  assert.match(pick, /if \(item\.kind === "editable"\) \{\s*send\("native-click", hintClickPoint\(item\)\);/);
+  assert.match(pick, /if \(item\.kind === "editable"\) \{\s*send\("native-click", editableClickPoint\(item\)\);/);
   const draw = electron.slice(electron.indexOf("function drawHints(space)"), electron.indexOf("const points = mediaHoverPoints();"));
   assert.match(draw, /startPicker\(targets, "hint", pickVisualTarget, space\);/);
 });
