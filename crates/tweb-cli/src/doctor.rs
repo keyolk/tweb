@@ -114,7 +114,26 @@ const CMD_PASSTHROUGH_KEYS: &[(&str, u16, u16)] = &[
     ("super+shift+right", 5029, 129),
     ("super+shift+up", 5030, 130),
     ("super+shift+down", 5031, 131),
+    // The editing shortcuts a text editor in the page needs (edit mode, Ctrl-;). These cost
+    // Ghostty's own meaning for the key everywhere, which is why they are listed apart: Cmd-Z and
+    // Cmd-Shift-Z are Ghostty's undo/redo of closing a tab or split, and Cmd-Backspace,
+    // Cmd-Delete, Cmd-B/I/U and Cmd-/ have no default binding. A pane that is not tweb gets
+    // nothing for them (see `CMD_EDITING_CODES`), rather than a private code it would print.
+    // Cmd-F (Ghostty search) and Cmd-Enter (fullscreen) are left to Ghostty.
+    ("super+z", 5032, 132),
+    ("super+shift+z", 5033, 133),
+    ("super+b", 5034, 134),
+    ("super+i", 5035, 135),
+    ("super+u", 5036, 136),
+    ("super+backspace", 5037, 137),
+    ("super+delete", 5038, 138),
+    ("super+slash", 5039, 139),
 ];
+
+/// The codes from CMD_PASSTHROUGH_KEYS that only a tweb pane may receive. The older ones are sent
+/// to any pane as they always were; these are new, and a shell or Claude Code next to tweb would
+/// print a stray `ESC[5032~` as text — so tmux sends them only when the pane is tweb's.
+const CMD_EDITING_CODES: std::ops::RangeInclusive<u16> = 5032..=5039;
 
 /// The pre-Cmd private shortcuts GHOSTTY_MANAGED_BASE emits, as (private code,
 /// tmux user-keys slot, the key a non-tweb pane should get instead).
@@ -195,7 +214,13 @@ fn cmd_passthrough_tmux_config() -> String {
         let hex = private_sequence_hex(*code);
         // Both tables: root covers ordinary panes and Shortcuts mode, tweb-pass
         // covers passthrough and must re-arm itself like its other bindings.
-        config.push_str(&format!("bind-key -T root User{slot} send-keys -H {hex}\n"));
+        if CMD_EDITING_CODES.contains(code) {
+            config.push_str(&format!(
+                "bind-key -T root User{slot} if-shell -F '{TWEB_PANE_FORMAT}' 'send-keys -H {hex}'\n"
+            ));
+        } else {
+            config.push_str(&format!("bind-key -T root User{slot} send-keys -H {hex}\n"));
+        }
         config.push_str(&format!(
             "bind-key -T tweb-pass User{slot} send-keys -H {hex} \\; switch-client -T tweb-pass\n"
         ));
@@ -716,11 +741,18 @@ fn check_kitty_graphics_probe() -> Check {
 /// pane, like Shift-Enter — leaks into other panes as literal `5008~`. This names
 /// the slots so a "not configured" tells the user what to fix.
 fn check_tmux_user_keys() -> Check {
-    let slots = [
-        100, 101, 110, 111, 113, 114, 115, 116, 117, 118, 124, 125, 126, 127, 128, 129, 130, 131,
-    ];
+    // Derived from the tables rather than listed, so a key added there is checked here too: the
+    // fixed list stopped at 131 and would have called the editing Cmd keys configured.
+    let mut slots: Vec<u16> = vec![100, 101];
+    slots.extend(PRIVATE_SHORTCUT_KEYS.iter().map(|(_, slot, _)| *slot));
+    slots.extend(
+        CMD_PASSTHROUGH_KEYS
+            .iter()
+            .map(|(_, _, slot)| *slot)
+            .filter(|slot| *slot >= 124),
+    );
     let mut missing = Vec::new();
-    for slot in slots {
+    for &slot in &slots {
         let value = command_output(
             "tmux",
             &["show-options", "-s", &format!("user-keys[{slot}]")],
@@ -733,7 +765,10 @@ fn check_tmux_user_keys() -> Check {
         return Check {
             name: "tmux user-keys (private shortcuts)",
             status: CheckStatus::Ok,
-            detail: "slots 100-101, 110-111, 113-118, 124-131 registered".to_string(),
+            detail: format!(
+                "{} slots registered (100-101, 110-118, 124-139)",
+                slots.len()
+            ),
         };
     }
     Check {
@@ -908,13 +943,26 @@ fn apply_tmux_fix() -> Result<String> {
         let sequence = format!("\u{1b}[{code}~");
         live &= run_tmux(&["set-option", "-s", &format!("user-keys[{slot}]"), &sequence]);
         let hex = private_sequence_hex(*code);
-        let mut root = vec!["bind-key", "-T", "root"];
         let user_key = format!("User{slot}");
-        root.push(&user_key);
-        root.extend(["send-keys", "-H"]);
         let bytes: Vec<&str> = hex.split(' ').collect();
-        root.extend(bytes.iter().copied());
-        live &= run_tmux(&root);
+        if CMD_EDITING_CODES.contains(code) {
+            // Only a tweb pane gets the code; any other pane gets nothing rather than text.
+            let send_private = format!("send-keys -H {hex}");
+            live &= run_tmux(&[
+                "bind-key",
+                "-T",
+                "root",
+                &user_key,
+                "if-shell",
+                "-F",
+                TWEB_PANE_FORMAT,
+                &send_private,
+            ]);
+        } else {
+            let mut root = vec!["bind-key", "-T", "root", &user_key, "send-keys", "-H"];
+            root.extend(bytes.iter().copied());
+            live &= run_tmux(&root);
+        }
 
         let mut pass = vec!["bind-key", "-T", "tweb-pass", &user_key, "send-keys", "-H"];
         pass.extend(bytes.iter().copied());
@@ -1371,8 +1419,9 @@ mod tests {
         ghostty_version_supported, managed_block, migrate_legacy_ghostty_config,
         migrate_legacy_tmux_config, private_sequence_hex, select_ghostty_config_candidate,
         terminal_check, tmux_include_block, tmux_managed_config, upsert_managed_block,
-        user_key_is_set, CheckStatus, CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN, GHOSTTY_END,
-        LEGACY_TMUX_BEGIN, LEGACY_TMUX_END, PRIVATE_SHORTCUT_KEYS, TMUX_BEGIN, TMUX_END,
+        user_key_is_set, CheckStatus, CMD_EDITING_CODES, CMD_PASSTHROUGH_KEYS, GHOSTTY_BEGIN,
+        GHOSTTY_END, LEGACY_TMUX_BEGIN, LEGACY_TMUX_END, PRIVATE_SHORTCUT_KEYS, TMUX_BEGIN,
+        TMUX_END, TWEB_PANE_FORMAT,
     };
 
     #[test]
@@ -1571,6 +1620,30 @@ mod tests {
             );
         }
         assert!(cmd_passthrough_tmux_config().contains("switch-client -T tweb-pass"));
+    }
+
+    /// The editing Cmd keys reach a tweb pane only. A shell or Claude Code beside it would
+    /// print a private code it does not know as text.
+    #[test]
+    fn editing_cmd_keys_are_sent_only_to_tweb_panes() {
+        let config = cmd_passthrough_tmux_config();
+        for (trigger, code, slot) in CMD_PASSTHROUGH_KEYS {
+            let root_line = config
+                .lines()
+                .find(|line| line.starts_with(&format!("bind-key -T root User{slot} ")))
+                .unwrap_or_else(|| panic!("{trigger} has no root binding"));
+            assert_eq!(
+                CMD_EDITING_CODES.contains(code),
+                root_line.contains(TWEB_PANE_FORMAT),
+                "{trigger}: {root_line}"
+            );
+        }
+        for trigger in ["super+z", "super+shift+z", "super+backspace"] {
+            assert!(
+                CMD_PASSTHROUGH_KEYS.iter().any(|(t, _, _)| *t == trigger),
+                "{trigger} must be carried for editors"
+            );
+        }
     }
 
     #[test]

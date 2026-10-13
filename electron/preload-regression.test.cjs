@@ -352,9 +352,14 @@ test("Cmd caret motions are driven through the renderer", () => {
   // The motion branch returns before the Cmd key table below it, which legitimately does
   // use dispatchNamedKey — so the check is on the branch, not on a span of the file.
   const branch = main.slice(main.indexOf("const motion = CMD_CARET_MOTIONS.get(code)"),
-    main.indexOf("const cmdKey = CMD_PRIVATE_KEYS.get(code)"));
+    main.indexOf("const cmdShiftKey = CMD_SHIFT_PRIVATE_KEYS.get(code)"));
   assert.doesNotMatch(branch, /dispatchNamedKey|dispatchNativeKey/);
   assert.match(branch, /return;/);
+  // Except in edit mode, where the same code is a real Cmd-arrow carrying its AppKit command:
+  // that reaches an editor in any frame, which a DOM selection move does not.
+  const edit = main.slice(main.indexOf("const caretKey = CMD_CARET_KEYS.get(code)"),
+    main.indexOf("const motion = CMD_CARET_MOTIONS.get(code)"));
+  assert.match(edit, /if \(caretKey && inputState\(\)\.bypass\) \{\s*dispatchNamedKey\(caretKey\[0\], caretKey\[1\]\);\s*return;/);
 
   const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
   const handler = preload.slice(preload.indexOf('ipcRenderer.on("tweb-caret-motion"'),

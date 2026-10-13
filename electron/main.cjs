@@ -7530,6 +7530,25 @@ const CMD_PRIVATE_KEYS = new Map([
   [5021, "a"],
   [5022, "c"],
   [5023, "x"],
+  // The editing shortcuts a text editor needs and Ghostty sends no bytes for (doctor's
+  // CMD_PASSTHROUGH_KEYS binds them). Each one goes out as a native Cmd key; on the Chrome
+  // engine, and in edit mode on both, it carries its AppKit command (undo, redo, ...).
+  [5032, "z"],
+  [5034, "b"],
+  [5035, "i"],
+  [5036, "u"],
+  [5037, "Backspace"],
+  [5038, "Delete"],
+  [5039, "/"],
+]);
+// Cmd-Shift ones: the key and the shift bit. 1 + shift(1) + meta(8).
+const CMD_SHIFT_PRIVATE_KEYS = new Map([
+  [5033, "z"],
+]);
+// The caret motions as the arrow keys they are, for edit mode (see dispatchPrivateShortcut).
+const CMD_CARET_KEYS = new Map([
+  [5024, ["ArrowLeft", 9]], [5025, ["ArrowRight", 9]], [5026, ["ArrowUp", 9]], [5027, ["ArrowDown", 9]],
+  [5028, ["ArrowLeft", 10]], [5029, ["ArrowRight", 10]], [5030, ["ArrowUp", 10]], [5031, ["ArrowDown", 10]],
 ]);
 
 // Cmd motions inside a text field. macOS semantics: Cmd-Left/Right travel to the ends of
@@ -7580,9 +7599,22 @@ function dispatchPrivateShortcut(code) {
   // `moveToBeginningOfLine:` before the web content ever sees it, and a synthetic key
   // skips that translation entirely. Nothing downstream gives it meaning, which is the
   // same reason Cmd-C/V/X and Cmd-A are driven directly a few lines above.
+  // In edit mode a Cmd-arrow is a real Cmd-arrow carrying its AppKit command, which reaches an
+  // editor in any frame and an editor that keeps its own selection model. The renderer motion
+  // below only moves a DOM selection, in the focused frame's document.
+  const caretKey = CMD_CARET_KEYS.get(code);
+  if (caretKey && inputState().bypass) {
+    dispatchNamedKey(caretKey[0], caretKey[1]);
+    return;
+  }
   const motion = CMD_CARET_MOTIONS.get(code);
   if (motion) {
     sendToFocusedTabFrame(currentWindows().win, "tweb-caret-motion", motion);
+    return;
+  }
+  const cmdShiftKey = CMD_SHIFT_PRIVATE_KEYS.get(code);
+  if (cmdShiftKey) {
+    dispatchNamedKey(cmdShiftKey, 10);
     return;
   }
   const cmdKey = CMD_PRIVATE_KEYS.get(code);
