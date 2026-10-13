@@ -886,8 +886,15 @@ installPrintShim();
   // so a subframe blurring would otherwise disarm native delivery while the main
   // frame's input still holds focus.
   let engineNativeKeys = false;
+  //
+  // A subframe reports too, but only for itself and only while it has focus: an editor inside an
+  // iframe (a claude.ai artifact) is where native keys matter most — the renderer path reaches
+  // the focused frame's preload only on Electron, and on the Chrome engine not at all, so after
+  // clicking into such an editor the arrow keys went to the top document and moved nothing. The
+  // engine keeps one owner per tab, so a frame turning it off cannot disarm another's.
   function setEngineNativeKeys(enabled) {
-    if (!topFrame || enabled === engineNativeKeys) return;
+    if (enabled === engineNativeKeys) return;
+    if (!topFrame && enabled && !document.hasFocus()) return;
     engineNativeKeys = enabled;
     send("insert-mode", enabled);
   }
@@ -2512,6 +2519,10 @@ installPrintShim();
       } else if (element.isContentEditable) {
         const box = contentEditableCaretBox();
         if (box) {
+          // A long editor keeps focus while its caret scrolls out of view (PageDown, the wheel):
+          // the cursor is then nowhere on screen, and clamping it below put it on the pane's top
+          // or bottom edge, over text the caret is not in.
+          if (box.top + (box.height || 0) <= 0 || box.top >= innerHeight) return null;
           x = box.left;
           y = box.top;
           height = box.height || height;
@@ -2712,6 +2723,8 @@ installPrintShim();
   // reported 40 and drew 41, an ad frame drew the 41st label too, and typing it clicked the
   // ad's position instead of the link.
   let pendingHintTargets = null;
+  // What the shared round is picking: links and controls (`f`), or content and areas (`v`).
+  let pendingRoundKind = "hints";
 
   function startHints(newTab) {
     // Refresh where we are before any of these badges can be picked. The badges
@@ -2719,8 +2732,40 @@ installPrintShim();
     // click point does, and that is a keystroke away — long enough for the reply.
     requestFrameOffset();
     pendingHintNewTab = newTab;
+    pendingRoundKind = "hints";
     pendingHintTargets = interactiveTargets();
     send("hint-round", { count: pendingHintTargets.length });
+  }
+
+  // `v` as a round shared by every frame, like `f`. Each frame can only collect its own
+  // targets — a cross-origin frame's contents are unreachable from its parent — so a `v` run in
+  // the top frame alone offered nothing inside an embedded document: on a claude.ai artifact the
+  // whole text body sits in a cross-origin frame and `v` showed only the toolbar.
+  function startVisualRound() {
+    // In visual mode with a caret, `v` starts a selection there — it is not a new pick. The
+    // round still gets this frame's answer, an empty one, so it does not wait on it.
+    if (visualState?.caret) {
+      selectFromCaret();
+      send("hint-round", { count: 0 });
+      return;
+    }
+    requestFrameOffset();
+    pendingRoundKind = "visual";
+    pendingHintTargets = visualTargets();
+    send("hint-round", { count: pendingHintTargets.length });
+  }
+
+  // A `v` pick. An editable is what a person picks in order to type into it, so it is clicked —
+  // a real click focuses it in whichever frame it lives and puts the caret where it was aimed,
+  // which is the one thing that makes the following keys reach it. Everything else enters visual
+  // mode as before.
+  function pickVisualTarget(item) {
+    send("hint-done");
+    if (item.kind === "editable") {
+      send("native-click", hintClickPoint(item));
+      return;
+    }
+    enterVisual(item);
   }
 
   // The engine's reply: this frame's share of the round. Every frame that answered gets one,
@@ -2729,6 +2774,14 @@ installPrintShim();
     const newTab = pendingHintNewTab;
     const counted = space ? pendingHintTargets : null;
     pendingHintTargets = null;
+    if (pendingRoundKind === "visual") {
+      pendingRoundKind = "hints";
+      // "hint" is the shared picker's mode either way: it is what routes typed labels through
+      // the engine to every frame. Only the targets and what a pick does differ.
+      const targets = counted ? counted.filter((target) => target.element.isConnected) : visualTargets();
+      startPicker(targets, "hint", pickVisualTarget, space);
+      return;
+    }
     const points = mediaHoverPoints();
     const onPick = (item) => {
       const link = item.element.closest("a[href]");
@@ -3078,7 +3131,7 @@ installPrintShim();
         n: () => { if (!lastSearch) return false; stepSearch(true); },
         N: () => { if (!lastSearch) return false; stepSearch(false); },
       }],
-      ["v · V", "visual picker — teal labels pick an area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisual(), V: () => selectPageText() }],
+      ["v · V", "visual picker — teal labels pick an area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],

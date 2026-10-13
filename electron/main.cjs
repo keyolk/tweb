@@ -15,6 +15,9 @@ const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug
 const { BrowserWindow, ipcMain, session } = pageBackend;
 const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
+// The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
+// here because the mode resets that clear it run from functions defined well above that case.
+const insertModeOwners = new WeakMap();
 const {
   appendFileSync,
   closeSync,
@@ -3113,6 +3116,7 @@ function shortcutModeMessage() {
 // Applies the correct combination of the two flags and runs the follow-up work once.
 function applyShortcutMode() {
   inputState().insertMode = false;
+  if (currentWindows().win) insertModeOwners.delete(currentWindows().win);
   broadcastShortcutMode();
   // Once passthrough is armed (vimium off), focus so the page can receive keys.
   if (!inputState().vimium && currentWindows().win && !currentWindows().win.isDestroyed()) currentWindows().win.webContents.focus();
@@ -3169,6 +3173,7 @@ function activateTab(index) {
   currentWindows().win = currentWindows().tabs[normalized];
   inputState().clicks.reset();
   inputState().insertMode = false;
+  if (currentWindows().win) insertModeOwners.delete(currentWindows().win);
   // The preload mirrors this flag and skips redundant IPC, so tell the tab we
   // just cleared it. Without this its focused input keeps thinking native
   // delivery is armed and its keys go back through the renderer, where they
@@ -3890,9 +3895,22 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       moveTerminalCaret(value);
       break;
     }
-    case "insert-mode":
-      inputState().insertMode = Boolean(value);
+    case "insert-mode": {
+      // One owner per tab: the frame whose editable armed native keys. Focus moving from the top
+      // document into an iframe's editor makes the top frame report "off" AFTER the iframe
+      // reported "on" (its focusout runs late), and honouring that disarmed the editor that had
+      // just taken focus. Only the owner, or the top frame when nobody owns it, turns it off.
+      const key = sourceFrame ? frameKey(sourceFrame) : null;
+      const owner = insertModeOwners.get(tab);
+      if (value) {
+        insertModeOwners.set(tab, key);
+        inputState().insertMode = true;
+      } else if (!owner || !key || owner === key) {
+        insertModeOwners.delete(tab);
+        inputState().insertMode = false;
+      }
       break;
+    }
     // Take the speakers back from whichever pane holds them. Only ever a deliberate
     // keypress: a page starting playback in a muted pane does not get to do this.
     case "reclaim-audio":
@@ -4017,7 +4035,10 @@ ipcMain.on("tweb-preload-ready", bindPane(
   const frame = event.senderFrame;
   if (!tab || !frame || frame.isDestroyed() || frame.detached) return;
   // A fresh document starts in normal mode, so the mirror has to follow.
-  if (frame === tab.webContents.mainFrame) inputState().insertMode = false;
+  if (frame === tab.webContents.mainFrame) {
+    inputState().insertMode = false;
+    insertModeOwners.delete(tab);
+  }
   const key = frameKey(frame);
   if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
   else shortcutFrameKeys(tab).delete(key);
@@ -7322,7 +7343,7 @@ function routeHintShortcut(tab, key, modifiers) {
   if ((key.length === 1 || key === "Escape" || key === "Backspace") && routeHintKey(tab, key)) {
     return true;
   }
-  if ((key !== "f" && key !== "F") || modifiers.includes("control")) return false;
+  if ((key !== "f" && key !== "F" && key !== "v") || modifiers.includes("control")) return false;
   startHintRound(tab);
   sendToTabFrames(tab, "tweb-terminal-key", {
     key, code: "", event: "keydown", text: key,

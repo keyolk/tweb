@@ -1154,12 +1154,12 @@ test("insert mode delivers native keys to the page", () => {
   assert.match(electron, /function setEngineNativeKeys\(enabled\)[\s\S]*?send\("insert-mode", enabled\)/);
   assert.match(electron, /setEngineNativeKeys\(mode === "insert"\)/);
   // The mirror must reset wherever the preload's own flag would.
-  assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) inputState\(\)\.insertMode = false;/);
+  assert.match(main, /if \(frame === tab\.webContents\.mainFrame\) \{\s*inputState\(\)\.insertMode = false;\s*insertModeOwners\.delete\(tab\);/);
   // The preload skips redundant IPC, so every engine-side reset has to tell the
   // page — otherwise native delivery never re-arms after a tab switch.
   assert.match(electron, /engineNativeKeys = false;/);
   assert.match(main, new RegExp(
-    `inputState\\(\\)\\.insertMode = false;\\s*\\/\\/ The preload mirrors this flag[\\s\\S]*?`
+    `inputState\\(\\)\\.insertMode = false;\\s*(?:if \\(currentWindows\\(\\)\\.win\\) insertModeOwners\\.delete\\(currentWindows\\(\\)\\.win\\);\\s*)?\\/\\/ The preload mirrors this flag[\\s\\S]*?`
     + `sendToTabFrames\\((?:soleWindows|currentWindows\\(\\))\\.win, "tweb-shortcuts-mode"`));
 });
 
@@ -1287,9 +1287,10 @@ test("Escape stays a single delivery once a focused input goes native", () => {
   const handler = electron.slice(electron.indexOf("if (eventIsEditable(event)) {"),
     electron.indexOf("if (pendingG) {"));
   assert.match(handler, /dismissPageOverlay\(\);/);
-  // Only the top frame mirrors the flag; pageInsertMode is one flag per tab, so a
-  // subframe blurring must not disarm the main frame's focused input.
-  assert.match(electron, /if \(!topFrame \|\| enabled === engineNativeKeys\) return;/);
+  // A subframe blurring must not disarm the main frame's focused input: the engine keeps one
+  // owner per tab and only the owner turns it off (see "insert-mode" in main.cjs).
+  assert.match(electron, /if \(enabled === engineNativeKeys\) return;/);
+  assert.match(fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8"), /\} else if \(!owner \|\| !key \|\| owner === key\) \{/);
 });
 
 // The mode label used to carry three unrelated things: the page mode (normal/editing), the
@@ -2976,4 +2977,37 @@ test("on the Chrome engine the caret owner is the frame that last reported one",
   // A null from a frame that no longer owns the cursor must not hide the owner's cursor.
   assert.match(branch, /if \(!value && key && caretOwners\.get\(tab\) && caretOwners\.get\(tab\) !== key\) break;/);
   assert.match(branch, /caretOwners\.set\(tab, value \? key : null\);/);
+});
+
+// `v` offered nothing inside a cross-origin frame — a claude.ai artifact's whole text body —
+// because it collected from this frame's same-origin roots alone. It is a shared round now.
+test("v is a round every frame answers, like f", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /if \(\(key !== "f" && key !== "F" && key !== "v"\) \|\| modifiers\.includes\("control"\)\) return false;/);
+  assert.match(electron, /\{ v: \(\) => startVisualRound\(\), V: \(\) => selectPageText\(\) \}/);
+  const round = electron.slice(electron.indexOf("function startVisualRound()"), electron.indexOf("function pickVisualTarget(item)"));
+  assert.match(round, /pendingRoundKind = "visual";/);
+  assert.match(round, /send\("hint-round", \{ count: pendingHintTargets\.length \}\);/);
+  // Visual mode's own `v` (select from the caret) still answers the round, with nothing.
+  assert.match(round, /if \(visualState\?\.caret\) \{\s*selectFromCaret\(\);\s*send\("hint-round", \{ count: 0 \}\);/);
+  // An editable is clicked: that is what focuses it in its own frame.
+  const pick = electron.slice(electron.indexOf("function pickVisualTarget(item)"), electron.indexOf("// The engine's reply"));
+  assert.match(pick, /if \(item\.kind === "editable"\) \{\s*send\("native-click", hintClickPoint\(item\)\);/);
+  const draw = electron.slice(electron.indexOf("function drawHints(space)"), electron.indexOf("const points = mediaHoverPoints();"));
+  assert.match(draw, /startPicker\(targets, "hint", pickVisualTarget, space\);/);
+});
+
+test("a subframe's editable arms native keys, and only its owner disarms them", () => {
+  const arm = electron.slice(electron.indexOf("function setEngineNativeKeys(enabled)"), electron.indexOf("function setMode("));
+  assert.doesNotMatch(arm, /if \(!topFrame \|\|/);
+  assert.match(arm, /if \(!topFrame && enabled && !document\.hasFocus\(\)\) return;/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const branch = main.slice(main.indexOf('case "insert-mode": {'), main.indexOf("// Take the speakers back"));
+  assert.match(branch, /insertModeOwners\.set\(tab, key\);/);
+  assert.match(branch, /\} else if \(!owner \|\| !key \|\| owner === key\) \{/);
+});
+
+test("a contenteditable caret scrolled out of view hides the cursor rather than pinning it", () => {
+  const caret = electron.slice(electron.indexOf("function caretPoint()"), electron.indexOf("function caretAtContentEnd()"));
+  assert.match(caret, /if \(box\.top \+ \(box\.height \|\| 0\) <= 0 \|\| box\.top >= innerHeight\) return null;/);
 });
