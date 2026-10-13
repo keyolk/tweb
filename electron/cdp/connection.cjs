@@ -48,7 +48,14 @@ function findChrome(env = process.env, exists = fs.existsSync) {
 // origin — measured: no Origin 101, that Origin without the flag dropped, a wrong port 403. So
 // `tweb devtools` works only when the port is known before launch. Never `*`: that would let any
 // web page on this machine drive the signed-in profile over the port.
-function chromeArgs(userDataDir, env = process.env, port = 0) {
+//
+// `scaleFactor` is the screen's device scale factor, forced on the whole browser. The metrics
+// override that sizes each tab sets it for the tab's own renderer only: an out-of-process iframe
+// is drawn by another renderer, which took the headless window's 1x, and the compositor scaled
+// that up to the tab's 1.6. Text in such a frame came out soft while the page around it was sharp
+// — measured on a claude.ai artifact, whose whole body is a cross-origin frame. Forced to the
+// pane's own scale every renderer draws at it, and the override still sets the tab's exact size.
+function chromeArgs(userDataDir, env = process.env, port = 0, scaleFactor = 0) {
   const args = [
     `--user-data-dir=${userDataDir}`,
     // Chrome writes the port it bound to DevToolsActivePort either way, so concurrent profiles
@@ -70,6 +77,7 @@ function chromeArgs(userDataDir, env = process.env, port = 0) {
     // past 129s. It turns off only the `webdriver` flag, not the debugging port tweb drives.
     "--disable-blink-features=AutomationControlled",
   ];
+  if (scaleFactor > 0) args.push(`--force-device-scale-factor=${scaleFactor}`);
   if (port) args.push(`--remote-allow-origins=http://127.0.0.1:${port}`);
   if (env.TWEB_CHROME_HEADED === "1") args.push("--window-position=-32000,-32000", "--window-size=800,600");
   else args.push("--headless=new");
@@ -122,7 +130,7 @@ function trace(line) {
 
 /// A running Chrome for `userDataDir`, launched if there is none. Resolves to its version info,
 /// including `webSocketDebuggerUrl`.
-async function ensureChrome(userDataDir, { env = process.env, log = () => {} } = {}) {
+async function ensureChrome(userDataDir, { env = process.env, log = () => {}, scaleFactor = 0 } = {}) {
   fs.mkdirSync(userDataDir, { recursive: true });
   const existing = await probeBrowser(readActivePort(userDataDir));
   if (existing) return { version: existing, launched: null };
@@ -138,20 +146,20 @@ async function ensureChrome(userDataDir, { env = process.env, log = () => {} } =
   // DevTools page for `tweb devtools`, everything else as before, rather than no browser.
   const picked = await freePort().catch(() => 0);
   if (picked) {
-    const launched = await launchChrome(binary, userDataDir, env, picked, 100);
+    const launched = await launchChrome(binary, userDataDir, env, picked, 100, scaleFactor);
     if (launched) return launched;
     log(`chrome did not answer on picked port ${picked}; relaunching on a port of its own`);
   }
-  const launched = await launchChrome(binary, userDataDir, env, 0, 150);
+  const launched = await launchChrome(binary, userDataDir, env, 0, 150, scaleFactor);
   if (launched) return launched;
   throw new Error(`Chrome did not open its DevTools port within 15s (${binary})`);
 }
 
 // One launch, waited on for `tries` x 100ms. Null when it never answered, with the process killed
 // so the relaunch is not refused as a second instance on the same profile.
-async function launchChrome(binary, userDataDir, env, port, tries) {
+async function launchChrome(binary, userDataDir, env, port, tries, scaleFactor = 0) {
   // Detached so a pane closing does not take Chrome — and every other pane's tabs — with it.
-  const child = spawn(binary, chromeArgs(userDataDir, env, port), { detached: true, stdio: "ignore" });
+  const child = spawn(binary, chromeArgs(userDataDir, env, port, scaleFactor), { detached: true, stdio: "ignore" });
   child.unref();
   if (port) {
     try { fs.writeFileSync(path.join(userDataDir, PICKED_PORT_FILE), `${port}\n`); } catch (_) { /* best effort */ }

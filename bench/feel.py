@@ -34,6 +34,7 @@ import http.server
 import json
 import os
 import pty
+import shutil
 import select
 import signal
 import socketserver
@@ -176,6 +177,11 @@ class Pane:
         else:
             os.kill(self.pid, signal.SIGKILL)
         os.close(self.fd)
+        # Each pane leaves a Chrome profile and its frame files behind, tens of MB a run; a long
+        # session of runs once filled the disk. TWEB_FEEL_KEEP=1 keeps them for a post-mortem.
+        if not os.environ.get("TWEB_FEEL_KEEP"):
+            shutil.rmtree(self.dir, ignore_errors=True)
+            Path(self.socket).unlink(missing_ok=True)
 
 
 def wait_for(pane, since, predicate, timeout):

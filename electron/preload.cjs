@@ -2807,10 +2807,17 @@ installPrintShim();
   function editableClickPoint(item) {
     const element = item.element;
     if (element.matches(EDITOR_BLOCKS) && element.isContentEditable) {
-      const range = element.ownerDocument.createRange();
-      range.selectNodeContents(element);
-      const first = [...range.getClientRects()].find((rect) => rect.width > 0 && rect.height > 0);
-      if (first) return topViewportPoint({ x: first.left + 1, y: first.top + first.height / 2 });
+      // The first line box of the first visible text, not of the range over the whole block: that
+      // range's rects include the border box of an element inside it — the `<p>` in a list item —
+      // which spans every line, so its middle was the second line, and the caret landed there.
+      const walker = element.ownerDocument.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (!node.data.trim()) continue;
+        const range = element.ownerDocument.createRange();
+        range.selectNodeContents(node);
+        const first = [...range.getClientRects()].find((rect) => rect.width > 0 && rect.height > 0);
+        if (first) return topViewportPoint({ x: first.left + 1, y: first.top + first.height / 2 });
+      }
     }
     return hintClickPoint(item);
   }

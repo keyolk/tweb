@@ -190,10 +190,15 @@ class CdpEngine extends EventEmitter {
     this.browserContextId = undefined;
   }
 
-  async start() {
+  // `scaleFactor` is the pane's device scale factor, for a Chrome this engine launches (see
+  // `chromeArgs`). A Chrome already running keeps the one it was started with.
+  async start({ scaleFactor = 0 } = {}) {
     if (typeof this.userDataDir === "function") this.userDataDir = this.userDataDir();
+    // Read by the input-skew measurement (web-contents.cjs `measureInputScale`).
+    this.scaleFactor = scaleFactor || 1;
     const { version } = await ensureChrome(this.userDataDir, {
       log: (message) => this.debug && console.error(`tweb: ${message}`),
+      scaleFactor,
     });
     this.version = version;
     this.userAgent = browserUserAgent(version["User-Agent"]);

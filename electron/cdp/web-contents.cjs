@@ -72,10 +72,29 @@ const SCREENCAST_QUALITY = 90;
 // Accepting only the CSS size dropped every frame after that first capture, so nothing moved in
 // the pane until the 50ms capture behind the settle timer. A frame of the WINDOW instead
 // (900x476, 761x476 — see `fitWindowToViewport`) matches neither and is still refused.
-function isViewportFrame(got, viewport, deviceScaleFactor) {
+// A frame at the browser's own scale (`--force-device-scale-factor`, see `chromeArgs`) rather
+// than the emulated one. With the browser forced to the pane's 2 under an emulated 1.6, Chrome
+// sends the screencast at 2x the viewport: the whole viewport, sharper than the pane needs, not
+// the corner or the stretched picture a CSS-size frame can be. It is drawn scaled down.
+function isBrowserScaleFrame(got, viewport, browserScaleFactor) {
+  if (!(browserScaleFactor > 1)) return false;
+  return Math.abs(got.width - Math.round(viewport.width * browserScaleFactor)) <= 2
+    && Math.abs(got.height - Math.round(viewport.height * browserScaleFactor)) <= 2;
+}
+
+// The window's page area, in the DIPs `Browser.setWindowBounds` takes, from a screencast frame's
+// pixel size. A frame of the window is in device pixels once the browser's scale is forced; taken
+// as DIPs it sized the window's frame wrong by its height — measured: 1800x2010 frames for a
+// 900x1125 viewport at 2x, the page 120 DIPs short, and every frame dropped as a mismatch.
+function windowArea(got, browserScaleFactor) {
+  const scale = browserScaleFactor > 0 ? browserScaleFactor : 1;
+  return { width: Math.round(got.width / scale), height: Math.round(got.height / scale) };
+}
+
+function isViewportFrame(got, viewport, deviceScaleFactor, browserScaleFactor = 1) {
   const near = (scale) => Math.abs(got.width - Math.round(viewport.width * scale)) <= 2
     && Math.abs(got.height - Math.round(viewport.height * scale)) <= 2;
-  return near(1) || near(deviceScaleFactor || 1);
+  return near(1) || near(deviceScaleFactor || 1) || near(browserScaleFactor || 1);
 }
 
 // `TWEB_CDP_PROFILE=1`: every 5s, where a frame's time went — the screenshot round trip, the PNG
@@ -579,7 +598,15 @@ class CdpWebContents extends EventEmitter {
       if (!Array.isArray(seen) || !(seen[0] > 0)) return this.inputScale || 1;
       const ratio = probe.x / seen[0];
       const dsf = this.deviceScaleFactor || 1;
-      const scale = Math.abs(ratio - dsf) < 0.15 ? dsf : Math.abs(ratio - 1) < 0.15 ? 1 : (this.inputScale || 1);
+      // The skew is a ratio between two scales Chrome mixes up: the emulated one (the override's
+      // `deviceScaleFactor`, zoom included) and the browser's own — 1 for a headless window, or
+      // the pane's scale once `--force-device-scale-factor` sets it (see `chromeArgs`). Measured
+      // with it forced to 2 under an emulated 1.6: clicks landed at 1.25x, a ratio of 0.8, which
+      // a list of only 1 and the emulated scale rejected as a missed probe. Anything else still is.
+      const real = this.engine.scaleFactor || 1;
+      const candidates = [1, dsf, dsf / real, real / dsf];
+      const match = candidates.find((value) => Math.abs(ratio - value) < 0.06 * Math.max(1, value));
+      const scale = match ?? (this.inputScale || 1);
       if (scale !== 1 && this.inputScale !== scale && this.engine.debug) {
         console.error(`tweb: chrome input skew ${(1 / scale).toFixed(3)} measured, correcting`);
       }
@@ -1164,7 +1191,7 @@ class CdpWebContents extends EventEmitter {
       const got = decoded.getSize();
       // A frame of the window rather than the viewport (see `fitWindowToViewport`) would be
       // stretched into the wrong picture. It is dropped; the settle capture draws the change.
-      if (!isViewportFrame(got, this.viewport, this.deviceScaleFactor)) {
+      if (!isViewportFrame(got, this.viewport, this.deviceScaleFactor, this.engine.scaleFactor)) {
         if (this.engine.debug && !capture.loggedMismatch) {
           capture.loggedMismatch = true;
           console.error(`tweb: screencast frame ${got.width}x${got.height} does not match the viewport `
@@ -1172,7 +1199,7 @@ class CdpWebContents extends EventEmitter {
         }
         if (!capture.refitting) {
           capture.refitting = true;
-          void this.fitWindowToViewport(got).finally(() => { capture.refitting = false; });
+          void this.fitWindowToViewport(windowArea(got, this.engine.scaleFactor)).finally(() => { capture.refitting = false; });
         }
         return;
       }
@@ -1186,9 +1213,13 @@ class CdpWebContents extends EventEmitter {
       // namu.wiki, `j` reached the pane in ~20ms through a device frame and ~200ms when the first
       // frame after it was a CSS one and waited for the settle. A CSS-only stream — a video
       // playing after a resize — is drawn by those captures back to back.
+      let image = decoded;
       if (got.width !== want.width || got.height !== want.height) {
-        this.requestCapture();
-        return;
+        if (!isBrowserScaleFrame(got, this.viewport, this.engine.scaleFactor)) {
+          this.requestCapture();
+          return;
+        }
+        image = decoded.resize({ width: want.width, height: want.height, quality: "good" });
       }
       // A frame Chrome sent while a capture was running is not drawn either, whatever its size.
       // Some of them are the CSS-pixel picture stretched by the device scale factor to device
@@ -1207,13 +1238,12 @@ class CdpWebContents extends EventEmitter {
       // the two are encoded differently and differ in every pixel. Painting the whole frame was a
       // flicker — the pane went soft and the settle capture sharpened it 150ms later, for every
       // caret blink. The first frame has nothing to compare with and is left to the settle.
-      const bitmap = decoded.toBitmap();
+      const bitmap = image.toBitmap();
       const previous = capture.lastCast;
       capture.lastCast = bitmap;
       if (!previous || previous.length !== bitmap.length) return;
-      const dirty = dirtyRect(previous, bitmap, got.width, got.height);
+      const dirty = dirtyRect(previous, bitmap, want.width, want.height);
       if (!dirty) return;
-      const image = decoded;
       // The pane now holds screencast pixels in this box, which the settled capture's own diff
       // cannot see: the page can be back to the picture `lastBitmap` holds (a caret that blinked
       // off and on again) and the box would never be redrawn sharp.
@@ -1665,6 +1695,8 @@ function scaleMouse(event, zoom) {
 
 module.exports = {
   isViewportFrame,
+  isBrowserScaleFrame,
+  windowArea,
   PendingSession,
   CdpDebugger,
   CdpFrame,

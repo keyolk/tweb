@@ -2,7 +2,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { CdpWebContents, isViewportFrame } = require("./web-contents.cjs");
+const { CdpWebContents, isViewportFrame, isBrowserScaleFrame, windowArea } = require("./web-contents.cjs");
 
 // Just enough of an engine to construct contents and feed it Page events by hand.
 function contents() {
@@ -429,4 +429,37 @@ test("a press measures the input skew afresh; a move inside the cache window doe
   assert.strictEqual(probes, 1, "a plain move uses the cached value");
   await created.sendInput("Input.dispatchMouseEvent", { type: "mousePressed", x: 12, y: 10, button: "left", buttons: 1 });
   assert.strictEqual(probes, 2, "a press re-measures");
+});
+
+// With the browser forced to 2 and the tab emulated at 1.6, clicks landed at 1.25x — a ratio of
+// 0.8 that a list of only 1 and 1.6 dropped as a missed probe.
+test("the input skew is accepted at the ratio between the real and emulated scales", async () => {
+  const { created } = contents();
+  created.engine.scaleFactor = 2;
+  created.deviceScaleFactor = 1.6;
+  created.frames.set(created.mainFrameId || created.targetId, { isolatedContextId: 7 });
+  let seen = null;
+  created.evaluateIn = async (_session, _context, expression) => (expression.includes("__twebProbe\"") || expression === "globalThis.__twebProbe" ? seen : undefined);
+  created.session.send = async () => ({});
+  seen = [17 / 0.8, 13 / 0.8];
+  assert.strictEqual(await created.measureInputScale(), 0.8);
+  seen = [17 / 1.6, 13 / 1.6];
+  assert.strictEqual(await created.measureInputScale(), 1.6);
+  seen = [17, 13];
+  assert.strictEqual(await created.measureInputScale(), 1);
+  created.inputScale = 1;
+  seen = [5, 5];
+  assert.strictEqual(await created.measureInputScale(), 1, "a probe that missed keeps the last value");
+});
+
+test("a frame at the forced browser scale is the whole viewport, drawn scaled down", () => {
+  const viewport = { width: 900, height: 1125 };
+  // Forced to 2 under an emulated 1.6: Chrome sent 1800x2250, which was dropped as the window's.
+  assert.ok(isViewportFrame({ width: 1800, height: 2250 }, viewport, 1.6, 2));
+  assert.ok(isBrowserScaleFrame({ width: 1800, height: 2250 }, viewport, 2));
+  assert.ok(!isBrowserScaleFrame({ width: 1440, height: 1800 }, viewport, 2));
+  assert.ok(!isBrowserScaleFrame({ width: 900, height: 1125 }, viewport, 1));
+  // A window frame in device pixels sizes the window in DIPs.
+  assert.deepEqual(windowArea({ width: 1800, height: 2008 }, 2), { width: 900, height: 1004 });
+  assert.deepEqual(windowArea({ width: 900, height: 1004 }, 0), { width: 900, height: 1004 });
 });
