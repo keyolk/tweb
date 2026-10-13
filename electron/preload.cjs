@@ -1595,6 +1595,20 @@ installPrintShim();
     return resourceUrl(match?.[2], image);
   }
 
+  // Inside a rich editor the useful unit is the block: a paragraph, a list item, a heading.
+  // The selector also matches every inline `code`, link and image in the text, and the editor's
+  // own host — measured on a claude.ai artifact (Tiptap): 21 labels in view, a third of them on
+  // inline code spans in the middle of sentences, mixed in with the paragraph labels. An editor
+  // host that holds blocks is covered by them and dropped too; an empty or one-line editor keeps
+  // its host as the one target.
+  const EDITOR_BLOCKS = "p,li,h1,h2,h3,h4,h5,h6,pre,blockquote";
+  function insideEditorButNotBlock(element) {
+    if (!element.isContentEditable) return false;
+    const host = element.closest("[contenteditable]:not([contenteditable=false])");
+    if (element === host) return Boolean(host.querySelector(EDITOR_BLOCKS));
+    return !element.matches(EDITOR_BLOCKS);
+  }
+
   function visualTargets() {
     const selector = [
       "a[href]", "img", "picture", "canvas", "svg", "video", "p", "li", "pre", "code", "blockquote",
@@ -1612,7 +1626,8 @@ installPrintShim();
         image,
         imageURL: imageSource(image),
       };
-    }).filter((item) => item.kind !== "text" || item.element.innerText?.trim());
+    }).filter((item) => item.kind !== "text" || item.element.innerText?.trim())
+      .filter((item) => !insideEditorButNotBlock(item.element));
     // Inner scroll and drag-pan areas share this picker: like every other `v` target, picking
     // one points the next keys at it rather than clicking it — `j`/`k` scroll that area until
     // `Esc` hands them back to the page. The page entry `scrollableTargets` adds is left out
@@ -2762,10 +2777,25 @@ installPrintShim();
   function pickVisualTarget(item) {
     send("hint-done");
     if (item.kind === "editable") {
-      send("native-click", hintClickPoint(item));
+      send("native-click", editableClickPoint(item));
       return;
     }
     enterVisual(item);
+  }
+
+  // Where to click to start typing in a picked editable. A block inside an editor is clicked
+  // just inside its first character, so the caret lands at the start of that paragraph — the
+  // block's centre put it somewhere in the middle of a sentence. A field or an editor host keeps
+  // the centre, which is where its own caret logic expects a click.
+  function editableClickPoint(item) {
+    const element = item.element;
+    if (element.matches(EDITOR_BLOCKS) && element.isContentEditable) {
+      const range = element.ownerDocument.createRange();
+      range.selectNodeContents(element);
+      const first = [...range.getClientRects()].find((rect) => rect.width > 0 && rect.height > 0);
+      if (first) return topViewportPoint({ x: first.left + 1, y: first.top + first.height / 2 });
+    }
+    return hintClickPoint(item);
   }
 
   // The engine's reply: this frame's share of the round. Every frame that answered gets one,
