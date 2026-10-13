@@ -457,6 +457,13 @@ single definition, and all four layers have to line up for one key to arrive.
 3. the engine's `CMD_PRIVATE_KEYS` — turns the code back into the original `Cmd` key event.
 4. the engine's private sequence parser — it has to recognise this code range.
 
+For editing in a page (edit mode, `Ctrl-;`), `Cmd-Z`, `Cmd-Shift-Z`, `Cmd-B`/`I`/`U`,
+`Cmd-Backspace`, `Cmd-Delete` and `Cmd-/` are carried the same way (codes 5032–5039, slots
+132–139). Claiming them costs Ghostty's own meaning for the key — `Cmd-Z`/`Cmd-Shift-Z` undo and
+redo closing a tab or split — and tmux sends them only to a tweb pane, so a shell beside it gets
+nothing rather than a stray code. `Cmd-F` (search) and `Cmd-Enter` (fullscreen) stay Ghostty's.
+Run `tweb doctor --fix` to install them; `tweb doctor` lists the slots that are missing.
+
 The bindings live at the **Ghostty root**, not inside a key table. A table can only be entered by
 pressing its binding — no action, IPC or escape sequence activates one from outside — so a
 table-scoped binding leaves a freshly opened pane unable to deliver `Cmd` until `Ctrl-;` is pressed.
