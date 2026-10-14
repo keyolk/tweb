@@ -128,6 +128,7 @@ const { paneFrameFileList, runTeardown } = require("./teardown.cjs");
 const {
   parseControlLine, resolveTarget, formatOutbound, keyboardRestoreEvent,
 } = require("./pane-control.cjs");
+const { createControlGate } = require("./control-gate.cjs");
 const { isHostedRuntime, hostProtocolVersion } = require("./hosted-runtime.cjs");
 const {
   createFrameContext, nextPatchId: takeNextPatchId, notePatch, takeLivePatchIds,
@@ -8076,58 +8077,55 @@ function closePaneOnce(record, reason) {
   if (debugLogging) console.error(`tweb: closed ${record.paneId}: ${reason}`);
 }
 
-let controlBuffer = "";
+// Lines wait at the gate until the app is ready: see control-gate.cjs for the dialog an early
+// RESIZE used to raise.
+const controlGate = createControlGate(handleControlLine);
 process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  controlBuffer += chunk;
-  for (;;) {
-    const newline = controlBuffer.indexOf("\n");
-    if (newline < 0) break;
-    const line = controlBuffer.slice(0, newline).trim();
-    controlBuffer = controlBuffer.slice(newline + 1);
+process.stdin.on("data", (chunk) => controlGate.push(chunk));
+app.whenReady().then(() => controlGate.open());
 
-    // Parsed by `pane-control.cjs`, and addressed lines resolve through the registry. An
-    // unaddressed line means "the implicit sole pane", which is what the shipping frontend has
-    // always meant by it — so a frontend that never learns the `@%N` prefix keeps working.
-    const command = parseControlLine(line);
-    if (!command) continue;
+function handleControlLine(line) {
+  // Parsed by `pane-control.cjs`, and addressed lines resolve through the registry. An
+  // unaddressed line means "the implicit sole pane", which is what the shipping frontend has
+  // always meant by it — so a frontend that never learns the `@%N` prefix keeps working.
+  const command = parseControlLine(line);
+  if (!command) return;
 
-    // SESSION carries the pane's tmux window identity and arrives immediately before its ATTACH,
-    // so like ATTACH it cannot resolve through the registry — the pane it names is not registered
-    // yet. It is held until the attach claims a slot with it.
-    if (command.kind === "session") {
-      pendingSessionIdentities.set(command.paneId, command.identity);
-      continue;
-    }
-
-    // ATTACH is dispatched before resolution, because resolution is what it *creates*: the pane
-    // it names is by definition not registered yet, so `resolveTarget` answers null for it and
-    // the line would be dropped in silence. Left below the guard — which is where it sat — a
-    // perfectly well-formed attach did nothing at all, with no error and no log.
-    if (command.kind === "attach") {
-      handleAttach(command);
-      continue;
-    }
-
-    // A line addressed to a pane this runtime does not hold is dropped rather than applied to
-    // whichever pane happened to be first. With one registration the sole pane always resolves.
-    const target = resolveTarget(command, paneRegistry, tmuxServerIdentity);
-    if (!target) continue;
-
-    // A detach carrying a stale generation is a message from a pane that has already been
-    // replaced, and `resolveTarget` has already turned that into a miss rather than delivering
-    // it to the successor.
-    if (command.kind === "detach") {
-      closePane(target, "detached");
-      continue;
-    }
-
-    // From here the line is addressed to a known pane, so it is handled as that pane's work: a
-    // RESIZE reads that pane's origin, a VIS flips that pane's visibility, and INPUT is delivered
-    // to that pane's active tab.
-    withPaneScope(target, () => handleTargetedCommand(command, target));
+  // SESSION carries the pane's tmux window identity and arrives immediately before its ATTACH,
+  // so like ATTACH it cannot resolve through the registry — the pane it names is not registered
+  // yet. It is held until the attach claims a slot with it.
+  if (command.kind === "session") {
+    pendingSessionIdentities.set(command.paneId, command.identity);
+    return;
   }
-});
+
+  // ATTACH is dispatched before resolution, because resolution is what it *creates*: the pane
+  // it names is by definition not registered yet, so `resolveTarget` answers null for it and
+  // the line would be dropped in silence. Left below the guard — which is where it sat — a
+  // perfectly well-formed attach did nothing at all, with no error and no log.
+  if (command.kind === "attach") {
+    handleAttach(command);
+    return;
+  }
+
+  // A line addressed to a pane this runtime does not hold is dropped rather than applied to
+  // whichever pane happened to be first. With one registration the sole pane always resolves.
+  const target = resolveTarget(command, paneRegistry, tmuxServerIdentity);
+  if (!target) return;
+
+  // A detach carrying a stale generation is a message from a pane that has already been
+  // replaced, and `resolveTarget` has already turned that into a miss rather than delivering
+  // it to the successor.
+  if (command.kind === "detach") {
+    closePane(target, "detached");
+    return;
+  }
+
+  // From here the line is addressed to a known pane, so it is handled as that pane's work: a
+  // RESIZE reads that pane's origin, a VIS flips that pane's visibility, and INPUT is delivered
+  // to that pane's active tab.
+  withPaneScope(target, () => handleTargetedCommand(command, target));
+}
 
 /**
  * A control line whose pane is already resolved.
