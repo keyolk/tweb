@@ -9,6 +9,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod mcp;
+pub mod sites;
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -32,8 +33,9 @@ pub enum BrowserEngineArg {
 #[derive(Args, Clone, Debug)]
 pub struct BrowserOptions {
     /// Browser rendering engine.
-    #[arg(long, value_enum, default_value_t = BrowserEngineArg::Electron)]
-    pub engine: BrowserEngineArg,
+    /// Default: electron, or chrome for a URL listed in `engine.chrome_sites`.
+    #[arg(long, value_enum)]
+    pub engine: Option<BrowserEngineArg>,
 
     /// Maximum active frame rate. Default: `frame_rate.max` in config.toml (30).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=60))]
@@ -49,6 +51,31 @@ pub struct BrowserOptions {
 }
 
 impl BrowserOptions {
+    /// The engine for `url`: the flag when given; otherwise chrome for a site listed in
+    /// `engine.chrome_sites`, electron for everything else (and for a restored session).
+    fn with_engine_for(&self, url: Option<&str>) -> BrowserOptions {
+        let mut resolved = self.clone();
+        if resolved.engine.is_none() {
+            let site = url.and_then(|url| sites::matching_site(url, &config::chrome_sites()));
+            if let Some(site) = &site {
+                eprintln!(
+                    "tweb: {site} is in engine.chrome_sites; opening on the Chrome engine \
+                     (--engine electron to override)"
+                );
+            }
+            resolved.engine = Some(if site.is_some() {
+                BrowserEngineArg::Chrome
+            } else {
+                BrowserEngineArg::Electron
+            });
+        }
+        resolved
+    }
+
+    fn engine(&self) -> BrowserEngineArg {
+        self.engine.unwrap_or(BrowserEngineArg::Electron)
+    }
+
     /// A flag on this command line wins; otherwise `frame_rate.adaptive` from config.toml.
     fn adaptive(&self) -> bool {
         if self.adaptive_frame_rate {
@@ -68,7 +95,7 @@ impl BrowserOptions {
     fn shell_args(&self) -> String {
         let mut value = format!(
             "--engine {} --frame-rate {}",
-            match self.engine {
+            match self.engine() {
                 BrowserEngineArg::Electron => "electron",
                 BrowserEngineArg::Chrome => "chrome",
                 BrowserEngineArg::Webkit => "webkit",
@@ -624,7 +651,7 @@ pub async fn run() -> Result<()> {
             // split pane starts in a different shell directory.
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // An omitted URL is carried through to the pane frontend so it restores the tmux window session.
-            run_pane(url.as_deref(), &browser).await?;
+            run_pane(url.as_deref(), &browser.with_engine_for(url.as_deref())).await?;
         }
         Command::Split {
             browser,
@@ -633,6 +660,7 @@ pub async fn run() -> Result<()> {
         } => {
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // An omitted URL is preserved across tmux split-window too.
+            let browser = browser.with_engine_for(url.as_deref());
             split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
         }
         Command::PaneInternal { browser, page, url } => {
@@ -859,7 +887,7 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
     // package.json too), and being the same process there is no reason to pass them anyway.
     // An omitted URL is a request to restore the tmux window session.
     let options = tweb_pane::PaneOptions {
-        engine: match browser.engine {
+        engine: match browser.engine() {
             BrowserEngineArg::Electron => tweb_pane::BrowserEngine::Electron,
             BrowserEngineArg::Chrome => tweb_pane::BrowserEngine::Chrome,
             BrowserEngineArg::Webkit => tweb_pane::BrowserEngine::Webkit,
@@ -967,7 +995,7 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
     // then opens beside the caller instead.
     let beside = pane.starts_with('%').then(|| pane.to_string());
     let browser = BrowserOptions {
-        engine: BrowserEngineArg::Chrome,
+        engine: Some(BrowserEngineArg::Chrome),
         frame_rate: None,
         adaptive_frame_rate: false,
         no_adaptive_frame_rate: false,

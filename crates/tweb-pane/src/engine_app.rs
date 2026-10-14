@@ -252,6 +252,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/cdp/web-contents.cjs"),
     ),
     (
+        "chrome-sites.cjs",
+        include_str!("../../../electron/chrome-sites.cjs"),
+    ),
+    (
         "webkit/engine.cjs",
         include_str!("../../../electron/webkit/engine.cjs"),
     ),

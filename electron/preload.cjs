@@ -127,6 +127,9 @@ installPrintShim();
   // both surfaces read the same rows.
   const commandPaletteEntries = [
     { name: "chrome", label: "Open in Chrome", action: () => send("chrome-current") },
+    // The same page in a Chrome-engine pane beside this one: for a site listed in
+    // `engine.chrome_sites` reached by a link, which is told to the user but not moved for them.
+    { name: "chrome-pane", label: "Reopen in Chrome pane", action: () => send("chrome-pane") },
     { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
     // Moving focus between the floating window and its pane, without closing either. Losing
     // one of them on a busy desktop is the case these exist for.
@@ -4387,9 +4390,9 @@ installPrintShim();
     return outline;
   }
 
-  function flash(message) {
+  function flash(message, ms = 650) {
     setMode("normal", message);
-    setTimeout(normalMode, 650);
+    setTimeout(normalMode, ms);
   }
 
   function updateOutline(outline, rect) {
@@ -5575,6 +5578,12 @@ installPrintShim();
   // It deliberately overwrites the "✓ file.pdf" the save already posted. The PDF is on disk
   // either way and `gd` still lists it; what changes is whether the paper the user asked
   // for is coming, and that is the newer and more surprising fact.
+  // A one-line message from the engine, shown the way a key's own feedback is (`flash`), but long
+  // enough to read: it was not a reaction to a key the user is watching for.
+  ipcRenderer.on("tweb-flash", (_event, message) => {
+    if (typeof message === "string" && message) flash(message, 2500);
+  });
+
   ipcRenderer.on("tweb-print-paper", (_event, result) => {
     if (!result) return;
     transferState = {

@@ -60,15 +60,65 @@ function parseValue(raw) {
   }
   if (text.startsWith("'") && text.endsWith("'") && text.length >= 2) return { value: text.slice(1, -1) };
   if (/^[+-]?(\d[\d_]*)(\.\d[\d_]*)?([eE][+-]?\d+)?$/.test(text)) return { value: Number(text.replace(/_/g, "")) };
+  if (text.startsWith("[") && text.endsWith("]")) return parseStringArray(text.slice(1, -1));
   return { error: `unsupported value ${text}` };
+}
+
+// An array of strings — the only array a setting holds (`engine.chrome_sites`). Elements are split
+// on commas outside quotes; a trailing comma, as a multi-line array has, is allowed.
+function parseStringArray(inner) {
+  const items = [];
+  let current = "";
+  let quote = null;
+  for (let i = 0; i < inner.length; i += 1) {
+    const character = inner[i];
+    if (quote) {
+      current += character;
+      if (character === "\\" && quote === '"') {
+        current += inner[i + 1] || "";
+        i += 1;
+      } else if (character === quote) {
+        quote = null;
+      }
+    } else if (character === '"' || character === "'") {
+      quote = character;
+      current += character;
+    } else if (character === ",") {
+      items.push(current);
+      current = "";
+    } else {
+      current += character;
+    }
+  }
+  if (quote) return { error: `unterminated string in [${inner}]` };
+  items.push(current);
+  const values = [];
+  for (const item of items) {
+    if (!item.trim()) continue;
+    const parsed = parseValue(item);
+    if (parsed.error || typeof parsed.value !== "string") return { error: `arrays hold strings only: ${item.trim()}` };
+    values.push(parsed.value);
+  }
+  return { value: values };
 }
 
 function parseToml(text) {
   const values = {};
   const warnings = [];
   let table = "";
+  // A multi-line array is gathered until its closing bracket and parsed as one line.
+  let pending = null;
   String(text || "").split(/\r?\n/).forEach((original, index) => {
-    const line = stripComment(original).trim();
+    let line = stripComment(original).trim();
+    if (pending) {
+      pending.text += ` ${line}`;
+      if (!line.endsWith("]")) return;
+      line = pending.text;
+      pending = null;
+    } else if (/^[A-Za-z0-9_.-]+\s*=\s*\[/.test(line) && !line.endsWith("]")) {
+      pending = { text: line };
+      return;
+    }
     if (!line) return;
     const header = line.match(/^\[\s*([A-Za-z0-9_.-]+)\s*\]$/);
     if (header) {
@@ -116,6 +166,12 @@ function coerce(entry, value, fromEnv, env) {
     }
     case "path":
       return typeof value === "string" ? expandHome(value, env) : undefined;
+    case "list":
+      // Comma-separated in the environment, as `tweb config set` takes it too.
+      if (fromEnv) return String(value).split(",").map((part) => part.trim()).filter(Boolean);
+      return Array.isArray(value) && value.every((item) => typeof item === "string")
+        ? value.map((item) => item.trim()).filter(Boolean)
+        : undefined;
     default:
       return undefined;
   }

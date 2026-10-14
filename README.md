@@ -199,7 +199,33 @@ otherwise, and DESIGN.md names both shortcuts in its non-goals:
 > - Do not replicate Okta session cookies automatically or continuously.
 
 What TWeb offers instead is the real thing. `--engine chrome` runs the pane's pages in the user's
-own Google Chrome, driven over the DevTools protocol, so Chrome answers the check itself:
+own Google Chrome, driven over the DevTools protocol, so Chrome answers the check itself.
+
+Rather than remembering the flag, list those sites once:
+
+```bash
+tweb config set engine.chrome_sites okta.com,accounts.google.com,argo.example.com
+```
+
+An entry covers its host and every subdomain (`okta.com` matches `sendbird.okta.com`, not
+`notokta.com`). Then:
+
+- `tweb open`/`tweb split URL` without `--engine` opens a listed site on the Chrome engine and says so
+  on stderr; `--engine electron` still overrides it.
+- A URL typed into a pane's omnibox (`o`, `t`) for a listed site opens in a Chrome-engine pane beside
+  it. Outside tmux it goes to your own Chrome window instead.
+- A listed site reached by a **link or a redirect** stays where it is, with a one-line notice. An SSO
+  chain split across two browsers breaks at the cookie boundary (see below), so only what you type
+  is moved. `c` → **Reopen in Chrome pane** moves the current page on request.
+
+This is the support path for company-required extensions too. Endpoint Verification reads
+`chrome.enterprise.deviceAttributes` and `platformKeys` and talks to its native host; Cyberhaven talks
+to `com.cyberhaven.nativeproxy` and watches `webRequest` and `downloads`. Electron exposes none of
+those APIs to extensions and WebKit runs no Chrome extensions, and faking them would mean claiming a
+managed Chrome that is not there. On the Chrome engine the machine policy installs both into TWeb's
+Chrome profile, and they run for real.
+
+Directly:
 
 ```bash
 tweb open --engine chrome https://argocd.example.com/

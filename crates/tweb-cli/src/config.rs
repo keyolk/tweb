@@ -36,6 +36,8 @@ pub enum Kind {
     Int,
     Float,
     Path,
+    /// Strings. A TOML array in the file; comma-separated in the environment and on `set`.
+    List,
 }
 
 #[derive(Deserialize)]
@@ -113,7 +115,16 @@ fn from_env(setting: &Setting, raw: &str) -> Option<serde_json::Value> {
             .filter(|n| n.is_finite())
             .map(|n| clamp(setting, n).into()),
         Kind::Path => Some(expand_home(raw).into()),
+        Kind::List => Some(split_list(raw).into()),
     }
+}
+
+fn split_list(raw: &str) -> Vec<serde_json::Value> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string().into())
+        .collect()
 }
 
 fn from_file(setting: &Setting, item: &Item) -> Option<serde_json::Value> {
@@ -132,6 +143,14 @@ fn from_file(setting: &Setting, item: &Item) -> Option<serde_json::Value> {
             })
         }
         Kind::Path => value.as_str().map(|s| expand_home(s).into()),
+        // Every element a string, or the line is not this setting: half a list is a list the
+        // user did not write.
+        Kind::List => value
+            .as_array()?
+            .iter()
+            .map(|item| item.as_str().map(|s| serde_json::Value::from(s.trim())))
+            .collect::<Option<Vec<_>>>()
+            .map(Into::into),
     }
 }
 
@@ -193,6 +212,17 @@ pub fn frame_rate_max() -> u16 {
         .unwrap_or(30)
 }
 
+/// `engine.chrome_sites`, resolved. A broken file is no list rather than an error, as everywhere.
+pub fn chrome_sites() -> Vec<String> {
+    resolve("engine.chrome_sites")
+        .ok()
+        .and_then(|r| r.value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
 pub fn frame_rate_adaptive() -> bool {
     resolve("frame_rate.adaptive")
         .ok()
@@ -238,6 +268,13 @@ fn parse_input(setting: &Setting, raw: &str) -> Result<Value> {
             n.into()
         }
         Kind::Path => raw.into(),
+        Kind::List => {
+            let mut array = toml_edit::Array::new();
+            for part in split_list(raw) {
+                array.push(part.as_str().unwrap_or_default());
+            }
+            Value::Array(array)
+        }
     })
 }
 
@@ -309,6 +346,15 @@ fn when(applies: &str) -> &'static str {
 
 fn display(value: &serde_json::Value) -> String {
     match value {
+        serde_json::Value::Array(items) if items.is_empty() => "[]".into(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map_or_else(|| item.to_string(), str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join(","),
         serde_json::Value::String(s) if s.is_empty() => "\"\"".into(),
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
@@ -372,6 +418,7 @@ impl Setting {
             Kind::Int => "int",
             Kind::Float => "float",
             Kind::Path => "path",
+            Kind::List => "list",
         }
     }
 }
@@ -498,9 +545,45 @@ mod tests {
                 Kind::Int => setting.default.is_i64(),
                 Kind::Float => setting.default.is_number(),
                 Kind::Path => setting.default.is_string(),
+                Kind::List => setting.default.is_array(),
             };
             assert!(ok, "{} default does not match its type", setting.key);
         }
+    }
+
+    #[test]
+    fn a_list_setting_round_trips_through_set_the_file_and_the_environment() {
+        let setting = find("engine.chrome_sites").unwrap();
+        let mut file = DocumentMut::new();
+        set_in(
+            &mut file,
+            &setting.key,
+            parse_input(&setting, " okta.com, ,argo.example.com ").unwrap(),
+        );
+        let text = file.to_string();
+        assert!(text.contains("[engine]"), "{text}");
+        assert!(
+            text.contains(r#"chrome_sites = ["okta.com", "argo.example.com"]"#),
+            "{text}"
+        );
+        let reread = doc(&text);
+        let resolved = resolve_with(&setting, &reread, &no_env);
+        assert_eq!(resolved.source, "file");
+        assert_eq!(
+            resolved.value,
+            serde_json::json!(["okta.com", "argo.example.com"])
+        );
+        assert_eq!(display(&resolved.value), "okta.com,argo.example.com");
+        let env = |name: &str| (name == "TWEB_CHROME_SITES").then(|| "a.test,b.test".to_string());
+        assert_eq!(
+            resolve_with(&setting, &reread, &env).value,
+            serde_json::json!(["a.test", "b.test"])
+        );
+        // A list holding anything but strings is not this setting.
+        assert_eq!(
+            resolve_with(&setting, &doc("[engine]\nchrome_sites = [1]\n"), &no_env).source,
+            "default"
+        );
     }
 
     #[test]
