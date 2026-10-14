@@ -82,6 +82,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/pane-identity.cjs
 	node --check electron/pane-registry.cjs
 	node --check electron/pane-control.cjs
+	node --check electron/control-gate.cjs
 	node --check electron/hosted-runtime.cjs
 	node --check electron/frame-context.cjs
 	node --check electron/pane-windows.cjs
