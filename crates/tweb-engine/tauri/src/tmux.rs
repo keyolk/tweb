@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+use crate::session_slot::WindowIdentity;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Mutex;
@@ -34,26 +34,30 @@ impl TmuxRuntime {
         }
     }
 
-    pub(crate) fn window_session_key(&self) -> Option<String> {
+    pub(crate) fn pane(&self) -> Option<&str> {
+        self.pane.as_deref()
+    }
+
+    pub(crate) fn window_identity(&self) -> Option<WindowIdentity> {
         let pane = self.pane.as_deref()?;
         let identity = tmux_output(&[
             "display-message",
             "-p",
             "-t",
             pane,
-            "#{socket_path}\t#{start_time}\t#{window_id}",
+            "#{socket_path}\t#{start_time}\t#{session_name}\t#{window_id}\t#{window_index}",
         ])?;
         let fields = identity.split('\t').collect::<Vec<_>>();
-        if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+        if fields.len() != 5 || fields.iter().any(|field| field.is_empty()) {
             return None;
         }
-        let digest = Sha256::digest(fields.join("\0").as_bytes());
-        Some(
-            digest[..12]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-        )
+        Some(WindowIdentity {
+            socket_path: fields[0].to_owned(),
+            server_started_at: fields[1].to_owned(),
+            session: fields[2].to_owned(),
+            window_id: fields[3].to_owned(),
+            window_index: fields[4].to_owned(),
+        })
     }
 
     pub(crate) fn notify(&self, message: &str) {

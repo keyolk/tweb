@@ -1,17 +1,21 @@
 mod browser;
+mod frame_rate;
 mod graphics;
 mod input;
 mod preload;
+mod session_slot;
 mod tmux;
 
 use anyhow::{Context, Result};
 use browser::BrowserRuntime;
 use clap::{ArgAction, Parser};
-use graphics::{write_kitty_delete, write_kitty_png, Frame, PaneOrigin};
+use graphics::{
+    frame_hash, pack_rgba, write_kitty_delete, write_kitty_png, write_kitty_raw_file, Capture,
+    ChannelOrder, Frame, PaneOrigin,
+};
 use input::{DecodedInput, InputDecoder};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,6 +96,10 @@ pub(crate) struct SnapshotState {
     stopping: AtomicBool,
     terminal_cleaned: AtomicBool,
     last_input_ms: AtomicU64,
+    // When the output thread last sent a frame that differed from the one before it, and
+    // how large it was; the scheduler reads both to pick the playback rate.
+    last_change_ms: AtomicU64,
+    frame_bytes: AtomicU64,
     generation: AtomicU64,
     last_hash: Mutex<Option<u64>>,
     viewport: Mutex<Viewport>,
@@ -101,6 +109,7 @@ pub(crate) struct SnapshotState {
     scheduler_wake: Condvar,
     frames: FrameMailbox,
     image_id: u32,
+    frame_path: PathBuf,
 }
 
 impl SnapshotState {
@@ -131,6 +140,8 @@ impl SnapshotState {
         if let Err(error) = write_kitty_delete(self.image_id, origin) {
             eprintln!("tweb: image delete failed: {error}");
         }
+        // After the delete, so the terminal is never told to show a file that is gone.
+        let _ = std::fs::remove_file(&self.frame_path);
     }
 }
 
@@ -196,9 +207,8 @@ pub(crate) fn javascript_string(value: &str) -> String {
 #[cfg(target_os = "macos")]
 fn request_snapshot(window: &WebviewWindow, state: Arc<SnapshotState>) {
     use block2::RcBlock;
-    use objc2::runtime::AnyObject;
-    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
-    use objc2_foundation::{NSDictionary, NSError};
+    use objc2_app_kit::NSImage;
+    use objc2_foundation::NSError;
     use objc2_web_kit::WKWebView;
 
     if state.stopping.load(Ordering::Acquire) {
@@ -215,43 +225,26 @@ fn request_snapshot(window: &WebviewWindow, state: Arc<SnapshotState>) {
     if window
         .with_webview(move |platform| unsafe {
             let webview = &*(platform.inner() as *mut WKWebView);
+            // This completion runs on the main thread, the same thread that delivers keys and
+            // mouse events to the page. It used to re-encode the snapshot TIFF -> PNG here,
+            // measured at 37-51ms per 2880x1800 frame, which stalled input for that long on
+            // every frame. Now it only copies the CGImage's bytes out (~1.6ms) and leaves every
+            // pass over the pixels to the output thread.
             let callback = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
                 let _flight = SnapshotFlight(callback_state.clone());
                 if !error.is_null() || image.is_null() {
                     return;
                 }
-                let image = &*image;
-                let Some(tiff) = image.TIFFRepresentation() else {
-                    return;
-                };
-                let Some(bitmap) = NSBitmapImageRep::imageRepWithData(&tiff) else {
-                    return;
-                };
-                let properties =
-                    NSDictionary::<objc2_app_kit::NSBitmapImageRepPropertyKey, AnyObject>::new();
-                let Some(png) = bitmap
-                    .representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
-                else {
-                    return;
-                };
                 if callback_state.stopping.load(Ordering::Acquire)
                     || callback_state.generation.load(Ordering::Acquire) != generation
                 {
                     return;
                 }
-                let png = png.to_vec();
-                let mut hasher = DefaultHasher::new();
-                png.hash(&mut hasher);
-                let hash = hasher.finish();
-                let mut last_hash = callback_state.last_hash.lock().unwrap();
-                if callback_state.generation.load(Ordering::Acquire) != generation
-                    || last_hash.as_ref() == Some(&hash)
-                {
+                let Some(capture) = capture_pixels(&*image) else {
                     return;
-                }
-                *last_hash = Some(hash);
+                };
                 callback_state.frames.replace(Frame {
-                    png,
+                    capture,
                     cols: viewport.cols,
                     rows: viewport.rows,
                     generation,
@@ -263,6 +256,42 @@ fn request_snapshot(window: &WebviewWindow, state: Arc<SnapshotState>) {
     {
         state.in_flight.store(false, Ordering::Release);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_pixels(image: &objc2_app_kit::NSImage) -> Option<Capture> {
+    use objc2_core_graphics::{CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo};
+
+    let image =
+        unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) }?;
+    let image = Some(&*image);
+    if CGImage::bits_per_pixel(image) != 32 || CGImage::bits_per_component(image) != 8 {
+        return None;
+    }
+    let alpha_first = match CGImage::alpha_info(image) {
+        CGImageAlphaInfo::PremultipliedFirst
+        | CGImageAlphaInfo::First
+        | CGImageAlphaInfo::NoneSkipFirst => true,
+        CGImageAlphaInfo::PremultipliedLast
+        | CGImageAlphaInfo::Last
+        | CGImageAlphaInfo::NoneSkipLast => false,
+        _ => return None,
+    };
+    let little = CGImage::byte_order_info(image) == CGImageByteOrderInfo::Order32Little;
+    let order = match (alpha_first, little) {
+        (true, true) => ChannelOrder::Bgra,
+        (true, false) => ChannelOrder::Argb,
+        (false, true) => ChannelOrder::Abgr,
+        (false, false) => ChannelOrder::Rgba,
+    };
+    let data = CGDataProvider::data(CGImage::data_provider(image).as_deref())?;
+    Some(Capture {
+        bytes: data.to_vec(),
+        width: u32::try_from(CGImage::width(image)).ok()?,
+        height: u32::try_from(CGImage::height(image)).ok()?,
+        bytes_per_row: CGImage::bytes_per_row(image),
+        order,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -290,6 +319,49 @@ pub(crate) fn activate_offscreen_window(window: &WebviewWindow) -> tauri::Result
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn activate_offscreen_window(_window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
+}
+
+const RAW_FRAME_FAILURE_LIMIT: u32 = 3;
+const FRAME_FILE_PREFIX: &str = "tweb-tauri-frame-";
+
+/// Where whole frames are staged for the terminal to read. The pid is in the name so a
+/// later engine can tell a dead engine's leftover from a live one's; the image id keeps two
+/// panes' files apart. `$TMPDIR` on macOS is per-user and private.
+fn frame_file_path(image_id: u32) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{FRAME_FILE_PREFIX}{}-{image_id}.rgba",
+        std::process::id()
+    ))
+}
+
+/// The pid inside a frame file name, for names this engine writes and nothing else.
+fn frame_file_owner(name: &str) -> Option<i32> {
+    let rest = name.strip_prefix(FRAME_FILE_PREFIX)?;
+    let rest = rest
+        .strip_suffix(".rgba")
+        .or_else(|| rest.strip_suffix(".rgba.tmp"))?;
+    let (pid, image_id) = rest.split_once('-')?;
+    image_id.parse::<u32>().ok()?;
+    pid.parse().ok().filter(|pid| *pid > 0)
+}
+
+/// A SIGKILLed engine never reaches `shutdown`, and a 20MB frame file per dead pane adds up.
+/// Only files whose owner pid is gone are removed; EPERM means alive.
+fn sweep_abandoned_frame_files() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(frame_file_owner) else {
+            continue;
+        };
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        if !alive {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// How long a half-decoded escape sequence waits for its remaining bytes before being
@@ -458,6 +530,8 @@ fn main() -> Result<()> {
         stopping: AtomicBool::new(false),
         terminal_cleaned: AtomicBool::new(false),
         last_input_ms: AtomicU64::new(now_ms()),
+        last_change_ms: AtomicU64::new(0),
+        frame_bytes: AtomicU64::new(0),
         generation: AtomicU64::new(0),
         last_hash: Mutex::new(None),
         viewport: Mutex::new(viewport),
@@ -467,24 +541,66 @@ fn main() -> Result<()> {
         scheduler_wake: Condvar::new(),
         frames: FrameMailbox::new(),
         image_id,
+        frame_path: frame_file_path(image_id),
     });
 
+    sweep_abandoned_frame_files();
     let output_state = state.clone();
-    std::thread::spawn(move || loop {
-        let frame = output_state.frames.receive();
-        if output_state.stopping.load(Ordering::Acquire) {
-            break;
-        }
-        let _output = output_state.output_gate.lock().unwrap();
-        if output_state.stopping.load(Ordering::Acquire)
-            || frame.generation != output_state.generation.load(Ordering::Acquire)
-        {
-            continue;
-        }
-        let origin = *output_state.pane_origin.lock().unwrap();
-        if let Err(error) = write_kitty_png(&frame, image_id, origin) {
-            eprintln!("tweb: frame output failed: {error}");
-            break;
+    let frame_path = state.frame_path.clone();
+    std::thread::spawn(move || {
+        let mut raw_frames = std::env::var("TWEB_RAW_FRAMES").as_deref() != Ok("0");
+        let mut raw_failures = 0;
+        loop {
+            let frame = output_state.frames.receive();
+            if output_state.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let Some(rgba) = pack_rgba(&frame.capture) else {
+                eprintln!("tweb: snapshot geometry does not match its bytes; frame dropped");
+                continue;
+            };
+            let hash = frame_hash(&rgba);
+            let _output = output_state.output_gate.lock().unwrap();
+            if output_state.stopping.load(Ordering::Acquire)
+                || frame.generation != output_state.generation.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            {
+                let mut last_hash = output_state.last_hash.lock().unwrap();
+                if *last_hash == Some(hash) {
+                    continue;
+                }
+                *last_hash = Some(hash);
+            }
+            output_state
+                .last_change_ms
+                .store(now_ms(), Ordering::Release);
+            output_state
+                .frame_bytes
+                .store(rgba.len() as u64, Ordering::Release);
+            let origin = *output_state.pane_origin.lock().unwrap();
+            if raw_frames {
+                match write_kitty_raw_file(&rgba, &frame, &frame_path, image_id, origin) {
+                    Ok(()) => continue,
+                    // Mirrors the Electron engine: a few failed frame files give raw up for
+                    // PNG rather than leaving the pane blank.
+                    Err(error) => {
+                        raw_failures += 1;
+                        eprintln!("tweb: raw frame failed: {error}");
+                        if raw_failures >= RAW_FRAME_FAILURE_LIMIT {
+                            raw_frames = false;
+                            eprintln!(
+                                "tweb: raw frames failed {raw_failures}x, falling back to PNG"
+                            );
+                        }
+                    }
+                }
+            }
+            if let Err(error) = write_kitty_png(&rgba, &frame, image_id, origin) {
+                eprintln!("tweb: frame output failed: {error}");
+                break;
+            }
         }
     });
 
@@ -532,14 +648,16 @@ fn main() -> Result<()> {
                 if let Some(window) = scheduler_runtime.active_window() {
                     request_snapshot(&window, scheduler_state.clone());
                 }
-                let recently_changed = now_ms()
-                    .saturating_sub(scheduler_state.last_input_ms.load(Ordering::Acquire))
-                    < 700;
-                let rate = if adaptive && !recently_changed {
-                    1
-                } else {
-                    max_rate
-                };
+                let rate = frame_rate::snapshot_rate(
+                    adaptive,
+                    max_rate,
+                    &frame_rate::Activity {
+                        now_ms: now_ms(),
+                        last_input_ms: scheduler_state.last_input_ms.load(Ordering::Acquire),
+                        last_change_ms: scheduler_state.last_change_ms.load(Ordering::Acquire),
+                        frame_bytes: scheduler_state.frame_bytes.load(Ordering::Acquire),
+                    },
+                );
                 let interval = Duration::from_millis((1000 / u64::from(rate)).max(1));
                 let generation = scheduler_state.scheduler_generation.lock().unwrap();
                 let _ = scheduler_state.scheduler_wake.wait_timeout_while(
@@ -565,26 +683,46 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_input_line, parse_resize_line, Frame, FrameMailbox, PaneOrigin, Viewport};
+    use super::{
+        frame_file_owner, parse_input_line, parse_resize_line, Capture, ChannelOrder, Frame,
+        FrameMailbox, PaneOrigin, Viewport,
+    };
+
+    fn frame(marker: u8, cols: u32, rows: u32, generation: u64) -> Frame {
+        Frame {
+            capture: Capture {
+                bytes: vec![marker; 4],
+                width: 1,
+                height: 1,
+                bytes_per_row: 4,
+                order: ChannelOrder::Rgba,
+            },
+            cols,
+            rows,
+            generation,
+        }
+    }
+
+    #[test]
+    fn reads_the_owner_only_from_our_frame_files() {
+        assert_eq!(frame_file_owner("tweb-tauri-frame-412-7.rgba"), Some(412));
+        assert_eq!(
+            frame_file_owner("tweb-tauri-frame-412-7.rgba.tmp"),
+            Some(412)
+        );
+        assert_eq!(frame_file_owner("tweb-tauri-frame-412.rgba"), None);
+        assert_eq!(frame_file_owner("tweb-frame-412-7.rgba"), None);
+        assert_eq!(frame_file_owner("tweb-tauri-frame-0-7.rgba"), None);
+    }
 
     #[test]
     fn frame_mailbox_keeps_only_the_latest_frame() {
         let mailbox = FrameMailbox::new();
-        mailbox.replace(Frame {
-            png: vec![1],
-            cols: 80,
-            rows: 24,
-            generation: 1,
-        });
-        mailbox.replace(Frame {
-            png: vec![2],
-            cols: 100,
-            rows: 30,
-            generation: 2,
-        });
+        mailbox.replace(frame(1, 80, 24, 1));
+        mailbox.replace(frame(2, 100, 30, 2));
 
         let frame = mailbox.receive();
-        assert_eq!(frame.png, vec![2]);
+        assert_eq!(frame.capture.bytes, vec![2; 4]);
         assert_eq!((frame.cols, frame.rows, frame.generation), (100, 30, 2));
     }
 

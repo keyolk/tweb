@@ -1,4 +1,5 @@
 use crate::preload::bridge_script;
+use crate::session_slot;
 use crate::tmux::TmuxRuntime;
 use crate::{activate_offscreen_window, javascript_string, SnapshotState, Viewport};
 use serde::{Deserialize, Serialize};
@@ -175,6 +176,9 @@ pub(crate) struct BrowserRuntime {
     mouse: Mutex<MouseState>,
     tmux: TmuxRuntime,
     window_session_path: Option<PathBuf>,
+    // The pre-slot session file, read only when slot 0 has nothing of its own yet.
+    legacy_session_path: Option<PathBuf>,
+    session_claim_path: Option<PathBuf>,
     restoring_session: AtomicBool,
     default_zoom: f64,
     show_window: bool,
@@ -188,12 +192,32 @@ impl BrowserRuntime {
             .unwrap_or(0.8)
             .clamp(0.5, 2.0);
         let tmux = TmuxRuntime::initialize();
-        let window_session_path = tmux.window_session_key().and_then(|key| {
-            let base = std::env::var_os("TWEB_USER_DATA_DIR")
-                .map(PathBuf::from)
-                .or_else(|| app.path().app_data_dir().ok())?;
-            Some(base.join("window-sessions").join(format!("{key}.json")))
-        });
+        let session_directory = std::env::var_os("TWEB_USER_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|| app.path().app_data_dir().ok())
+            .map(|base| base.join("window-sessions"));
+        let mut window_session_path = None;
+        let mut legacy_session_path = None;
+        let mut session_claim_path = None;
+        if let (Some(directory), Some(identity)) = (session_directory, tmux.window_identity()) {
+            if let Err(error) = fs::create_dir_all(&directory) {
+                eprintln!("tweb: window session dir failed: {error}");
+            }
+            let claim = session_slot::claim_slot(&identity, &directory, tmux.pane());
+            if debug_enabled() {
+                eprintln!(
+                    "tweb: window session slot {} (claimed={})",
+                    claim.slot,
+                    claim.claim_path.is_some()
+                );
+            }
+            window_session_path = Some(directory.join(format!("{}.json", claim.keys.primary)));
+            legacy_session_path = claim
+                .keys
+                .legacy
+                .map(|key| directory.join(format!("{key}.json")));
+            session_claim_path = claim.claim_path;
+        }
         Arc::new(Self {
             app,
             snapshot,
@@ -209,6 +233,8 @@ impl BrowserRuntime {
             mouse: Mutex::new(MouseState::default()),
             tmux,
             window_session_path,
+            legacy_session_path,
+            session_claim_path,
             restoring_session: AtomicBool::new(false),
             default_zoom,
             show_window: std::env::var_os("TWEB_TAURI_SHOW_WINDOW").is_some(),
@@ -263,6 +289,10 @@ impl BrowserRuntime {
                 tauri::webview::NewWindowResponse::Deny
             })
             .build()?;
+        // The builder's size is in points, but the viewport is the pane's pixels: on a 2x
+        // display that made every snapshot four times the pane (5760x3600 for a 2880x1800
+        // pane, 83MB raw). `resize_all` already sizes in pixels; the first size must too.
+        window.set_size(PhysicalSize::new(viewport.width, viewport.height))?;
         activate_offscreen_window(&window)?;
         set_native_zoom(&window, zoom);
 
@@ -324,7 +354,15 @@ impl BrowserRuntime {
 
     fn read_window_session(&self) -> Option<WindowSession> {
         let path = self.window_session_path.as_ref()?;
-        let data = fs::read(path).ok()?;
+        let data = fs::read(path).ok().or_else(|| {
+            let legacy = self.legacy_session_path.as_ref()?;
+            let data = fs::read(legacy).ok()?;
+            // Migrate forward so the next start reads the slot's own file.
+            if let Err(error) = fs::write(path, &data) {
+                eprintln!("tweb: legacy window session migration failed: {error}");
+            }
+            Some(data)
+        })?;
         let mut session: WindowSession = serde_json::from_slice(&data).ok()?;
         if session.version != 1 || session.tabs.is_empty() {
             return None;
@@ -408,6 +446,9 @@ impl BrowserRuntime {
             mouse.reset();
         }
         self.write_window_session();
+        if let Some(claim_path) = &self.session_claim_path {
+            session_slot::release_slot(claim_path, self.tmux.pane());
+        }
         self.snapshot.shutdown();
         self.tmux.cleanup();
     }
@@ -673,14 +714,7 @@ impl BrowserRuntime {
         }
         self.with_active_window(|window| {
             if wheel {
-                let payload = json!({
-                    "code": code,
-                    "column": column,
-                    "row": row,
-                    "cols": viewport.cols,
-                    "rows": viewport.rows,
-                });
-                let _ = window.eval(format!("window.__twebTerminalWheel?.({payload})"));
+                dispatch_native_wheel(window, code, column, row, viewport);
             } else {
                 let motion = code & 32 != 0;
                 let button = code & 3;
@@ -1305,6 +1339,91 @@ fn dispatch_native_mouse(window: &WebviewWindow, input: NativeMouseInput) {
             _ => webview.mouseMoved(&event),
         }
     });
+}
+
+/// Pixels one wheel notch scrolls, the Electron engine's `scroll.distance` default.
+const WHEEL_NOTCH_PIXELS: i32 = 100;
+
+/// Content movement for an xterm wheel button, in CGEvent's sign: positive moves the content
+/// down/right, which is what wheel up (64) and wheel left (66) ask for.
+fn wheel_delta(code: u32) -> (i32, i32) {
+    match code & 3 {
+        0 => (0, WHEEL_NOTCH_PIXELS),
+        1 => (0, -WHEEL_NOTCH_PIXELS),
+        2 => (WHEEL_NOTCH_PIXELS, 0),
+        _ => (-WHEEL_NOTCH_PIXELS, 0),
+    }
+}
+
+/// A real scroll-wheel event, not a script-built `WheelEvent`. A script event is untrusted,
+/// so WebKit never scrolls anything for it and pages that listen for wheel see a forgery;
+/// this one scrolls natively, reaches the element under the pointer and arrives trusted.
+///
+/// NSEvent has no scroll-wheel constructor, so it is built as a CGEvent. An event made that
+/// way carries no window, and WebKit then reads `locationInWindow` straight from the event's
+/// location, so the location is set to the window point rather than to a screen point. That
+/// was measured, not assumed: the screen point landed the pointer on the wrong element.
+#[cfg(target_os = "macos")]
+fn dispatch_native_wheel(
+    window: &WebviewWindow,
+    code: u32,
+    column: u32,
+    row: u32,
+    viewport: Viewport,
+) {
+    use objc2_app_kit::{NSEvent, NSScreen};
+    use objc2_core_graphics::{CGEvent, CGScrollEventUnit};
+    use objc2_foundation::{MainThreadMarker, NSPoint};
+    use objc2_web_kit::WKWebView;
+
+    let (delta_x, delta_y) = wheel_delta(code);
+    let _ = window.with_webview(move |platform| unsafe {
+        let webview = &*(platform.inner() as *mut WKWebView);
+        let bounds = webview.bounds();
+        let (x, y) = cell_center_point(
+            column,
+            row,
+            viewport.cols,
+            viewport.rows,
+            bounds.size.width,
+            bounds.size.height,
+        );
+        // WKWebView is flipped, so a top-down y converts as is.
+        let in_window = webview.convertPoint_toView(NSPoint::new(x, y), None);
+        let Some(marker) = MainThreadMarker::new() else {
+            return;
+        };
+        let Some(primary) = NSScreen::screens(marker).firstObject() else {
+            return;
+        };
+        let Some(event) = CGEvent::new_scroll_wheel_event2(
+            None,
+            CGScrollEventUnit::Pixel,
+            2,
+            delta_y,
+            delta_x,
+            0,
+        ) else {
+            return;
+        };
+        CGEvent::set_location(
+            Some(&event),
+            NSPoint::new(in_window.x, primary.frame().size.height - in_window.y),
+        );
+        if let Some(event) = NSEvent::eventWithCGEvent(&event) {
+            webview.scrollWheel(&event);
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dispatch_native_wheel(
+    _window: &WebviewWindow,
+    _code: u32,
+    _column: u32,
+    _row: u32,
+    _viewport: Viewport,
+) {
 }
 
 #[cfg(not(target_os = "macos"))]
