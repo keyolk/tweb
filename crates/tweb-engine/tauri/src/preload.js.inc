@@ -2650,29 +2650,6 @@
     });
   });
 
-  Object.defineProperty(window, "__twebTerminalWheel", {
-    configurable: true,
-    value(payload) {
-      const cols = Math.max(1, Number(payload.cols) || 1);
-      const rows = Math.max(1, Number(payload.rows) || 1);
-      const x = Math.min(innerWidth - 1, Math.max(0, (Number(payload.column) - 0.5) * innerWidth / cols));
-      const y = Math.min(innerHeight - 1, Math.max(0, (Number(payload.row) - 0.5) * innerHeight / rows));
-      const direction = Number(payload.code) & 3;
-      const target = document.elementFromPoint(x, y) || document.body;
-      target.dispatchEvent(new WheelEvent("wheel", {
-        bubbles: true,
-        cancelable: true,
-        clientX: x,
-        clientY: y,
-        deltaX: direction === 2 ? -100 : direction === 3 ? 100 : 0,
-        deltaY: direction === 0 ? -100 : direction === 1 ? 100 : 0,
-        shiftKey: Boolean(Number(payload.code) & 4),
-        altKey: Boolean(Number(payload.code) & 8),
-        ctrlKey: Boolean(Number(payload.code) & 16),
-      }));
-    },
-  });
-
   Object.defineProperty(window, "__twebTerminalKey", {
     configurable: true,
     value(payload) {

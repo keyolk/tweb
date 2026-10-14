@@ -108,7 +108,9 @@ mod tests {
         assert!(script.contains("tweb-action://"));
         assert!(script.contains("nonce=${++requestSerial}"));
         assert!(script.contains("__tweb_caret__"));
-        assert!(script.contains("__twebTerminalWheel"));
+        // The wheel is a native scroll event now (browser.rs `dispatch_native_wheel`); a
+        // script-built WheelEvent is untrusted and never scrolls, so it must not come back.
+        assert!(!script.contains("__twebTerminalWheel"));
         assert!(script.contains("captureTerminalEditable"));
         assert!(script.contains("suppressMouseProbe"));
         assert!(script.contains("moveTextControlCaret"));
