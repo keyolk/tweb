@@ -1225,7 +1225,11 @@ fn resolve_electron_paths(
 
 /// Finds the Electron binary path and the app directory.
 /// Returns: (electron binary path, electron app dir with package.json)
-fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+///
+/// Public for `tweb engine-paths`: a frontend that runs the engine itself (the cc-mods cockpit
+/// bridge) asks this binary where its engine is instead of guessing from the cache, where an
+/// older install's app directory can be the newest one on disk.
+pub fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     // `Command::current_dir` is applied before a relative program path is resolved.
     // Resolve workspace-relative selections before changing into the Electron app
     // directory, or `electron/node_modules/...` becomes `electron/electron/...`.
