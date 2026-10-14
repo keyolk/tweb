@@ -395,6 +395,14 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Print the Electron binary and the app directory this tweb runs its engine from,
+    /// unpacking the embedded app first if needed. For frontends that start the engine themselves.
+    #[command(name = "engine-paths")]
+    EnginePaths {
+        /// Print `{"electron": ..., "app": ...}` instead of two lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose and configure terminal/tmux/GPU capabilities.
     Doctor {
         /// Install the safely managed configuration block, then diagnose again.
@@ -627,6 +635,17 @@ pub async fn run() -> Result<()> {
         Command::PaneInternal { browser, page, url } => {
             // Without a URL, restore the tmux window session.
             run_pane(page.as_deref().or(url.as_deref()), &browser).await?;
+        }
+        Command::EnginePaths { json } => {
+            let (electron, app) = tweb_pane::find_electron()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "electron": electron.display().to_string(), "app": app.display().to_string() })
+                );
+            } else {
+                println!("{}\n{}", electron.display(), app.display());
+            }
         }
         Command::Doctor { fix } => {
             doctor::run(fix).await?;
@@ -1078,6 +1097,18 @@ mod tests {
         default_open_args, resolve_output_path, resolve_url_argument, split_window_args, Cli,
         Command,
     };
+
+    #[test]
+    fn engine_paths_is_a_command_of_its_own_not_an_open_url() {
+        // `default_open_args` turns an unknown first word into `open <url>`; this must not.
+        let cli = Cli::try_parse_from(default_open_args(vec![
+            OsString::from("tweb"),
+            OsString::from("engine-paths"),
+            OsString::from("--json"),
+        ]))
+        .expect("engine-paths should parse");
+        assert!(matches!(cli.command, Command::EnginePaths { json: true }));
+    }
 
     #[test]
     fn no_subcommand_opens_the_browser() {
