@@ -556,6 +556,13 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(engine_stderr())
         .env("TWEB_FRONTEND_PID", std::process::id().to_string())
+        // The CLI that started this engine, so the engine can open a site from
+        // `engine.chrome_sites` with `tweb split --engine chrome` beside this pane — the same
+        // build, not whichever `tweb` is first on PATH.
+        .env(
+            "TWEB_BIN",
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("tweb")),
+        )
         .env("TWEB_IMAGE_ID", image_id.to_string())
         .env(
             "TWEB_RESTORE_SESSION",

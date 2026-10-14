@@ -42,7 +42,9 @@ const { createInputTrace } = require("./input-trace.cjs");
 const { runtimeInfoRows } = require("./runtime-info.cjs");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
+const os = require("node:os");
 const settings = require("./settings.cjs");
+const { matchingSite } = require("./chrome-sites.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
 const { startAgentServer, runtimeDir } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
@@ -2949,6 +2951,66 @@ function sendToTabFrames(tab, channel, ...args) {
   }
 }
 
+// Hand a URL to the user's real Chrome window via $BROWSER, which is `tmux-chrome-open` — the same
+// wrapper `tweb chrome open` uses. It tries tmux-chrome first and falls back to
+// `open -a "Google Chrome"`, so the palette and the CLI take the same path. `$BROWSER` is a shell
+// variable the engine process may not inherit, so the absolute path is the default.
+function handOffToChrome(url) {
+  const browser = process.env.BROWSER || path.join(os.homedir(), ".local", "bin", "tmux-chrome-open");
+  execFile(browser, [url], { stdio: "ignore" }, (error) => {
+    if (error && debugLogging) console.error(`tweb: chrome handoff failed: ${error.message}`);
+  });
+}
+
+// `engine.chrome_sites` (chrome-sites.cjs): a URL the user typed for a listed site goes to a
+// Chrome-engine pane beside this one, where the managed Chrome and its policy extensions can answer
+// what the site checks. Only what the user TYPED moves; a link or a redirect stays in this pane,
+// because an SSO chain split across two browsers breaks at the cookie boundary (README, "Hand over
+// the site, not the identity provider"). Returns whether the URL was taken.
+function sendToChromeEngine(tab, url) {
+  if (pageBackend.kind === "chrome") return false;
+  const site = matchingSite(url, settings.get("engine.chrome_sites"));
+  if (!site) return false;
+  openInChromePane(tab, url, site);
+  return true;
+}
+
+// `tweb split --engine chrome URL` beside this pane: the CLI that started this engine, told which
+// pane to split. A pane outside tmux has nothing to split, so the URL goes to the user's own Chrome.
+function openInChromePane(tab, url, site) {
+  const paneId = currentPane()?.paneId;
+  const label = site || "this page";
+  if (!paneId || String(paneId).startsWith("pid-")) {
+    handOffToChrome(url);
+    if (tab) sendToMainTabFrame(tab, "tweb-flash", `${label} → Chrome`);
+    return;
+  }
+  const tweb = process.env.TWEB_BIN || path.join(os.homedir(), ".local", "bin", "tweb");
+  execFile(tweb, ["split", "--engine", "chrome", url], {
+    stdio: "ignore", env: { ...process.env, TMUX_PANE: paneId },
+  }, (error) => {
+    if (!error) return;
+    console.error(`tweb: chrome pane for ${url} failed (${error.message}); handing it to Chrome instead`);
+    handOffToChrome(url);
+  });
+  if (debugLogging) console.error(`tweb: ${label} → chrome pane beside ${paneId}`);
+  if (tab) sendToMainTabFrame(tab, "tweb-flash", `${label} → Chrome pane`);
+}
+
+// A listed site reached by a link or a redirect is not moved (see sendToChromeEngine), but the user
+// is told once per tab and site, with the way to move it.
+const chromeSiteNotices = new WeakMap();
+function noticeChromeSite(tab, url) {
+  if (pageBackend.kind === "chrome") return;
+  const site = matchingSite(url, settings.get("engine.chrome_sites"));
+  if (!site) return;
+  const seen = chromeSiteNotices.get(tab) || new Set();
+  chromeSiteNotices.set(tab, seen);
+  if (seen.has(site)) return;
+  seen.add(site);
+  sendToMainTabFrame(tab, "tweb-flash", `${site} needs Chrome: c → Reopen in Chrome pane`);
+}
+
 function sendToMainTabFrame(tab, channel, ...args) {
   if (!tab || tab.isDestroyed()) return;
   try {
@@ -3822,23 +3884,10 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       clipboard.writeText(contents.getURL());
       break;
     case "chrome-current":
-      // Hand the current tab's URL to Chrome via the user's $BROWSER, which is
-      // `tmux-chrome-open` — the same wrapper `tweb chrome open` uses. It tries
-      // tmux-chrome first and falls back to `open -a "Google Chrome"`, so the
-      // palette and the CLI take the same path.
-      // `$BROWSER` is a shell variable the engine process may not inherit, so
-      // default to the absolute path rather than relying on PATH.
-      {
-        const url = contents.getURL();
-        const { execFile } = require("node:child_process");
-        const path = require("node:path");
-        const os = require("node:os");
-        const browser = process.env.BROWSER
-          || path.join(os.homedir(), ".local", "bin", "tmux-chrome-open");
-        execFile(browser, [url], { stdio: "ignore" }, (error) => {
-          if (error && debugLogging) console.error(`tweb: chrome-current failed: ${error.message}`);
-        });
-      }
+      handOffToChrome(contents.getURL());
+      break;
+    case "chrome-pane":
+      openInChromePane(tab, contents.getURL(), null);
       break;
     case "copy-image":
       if ([value?.x, value?.y, value?.width, value?.height].every(Number.isFinite)) {
@@ -4017,12 +4066,12 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "navigate": {
       const url = normalizeOmniboxInput(value);
-      if (url) void contents.loadURL(url);
+      if (url && !sendToChromeEngine(tab, url)) void contents.loadURL(url);
       break;
     }
     case "new-tab": {
       const url = normalizeOmniboxInput(value);
-      if (url) createTab(url, true);
+      if (url && !sendToChromeEngine(tab, url)) createTab(url, true);
       break;
     }
   }
@@ -6389,6 +6438,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     }
     recordNavigation(url);
     updatePaneTitle();
+    noticeChromeSite(tab, url);
   });
   onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
     if (isMainFrame) { recordNavigation(url); updatePaneTitle(); }

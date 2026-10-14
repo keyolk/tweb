@@ -62,6 +62,14 @@
       "env": "TWEB_IME_SLOT_CELLS",
       "applies": "live",
       "description": "Width in cells of the box an IME composition is drawn in."
+    },
+    {
+      "key": "engine.chrome_sites",
+      "type": "list",
+      "default": [],
+      "env": "TWEB_CHROME_SITES",
+      "applies": "live",
+      "description": "Sites that need the managed Chrome (Okta Device Trust, Endpoint Verification, Cyberhaven). Each entry covers that host and its subdomains. `tweb open`/`split` without --engine, and a URL typed in a pane, go to a Chrome-engine pane; links and redirects stay where they are."
     }
   ]
 }

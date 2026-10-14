@@ -102,6 +102,7 @@ test("every schema entry is complete and its default has its type", () => {
       int: Number.isInteger(entry.default),
       float: typeof entry.default === "number",
       path: typeof entry.default === "string",
+      list: Array.isArray(entry.default) && entry.default.every((item) => typeof item === "string"),
     }[entry.type];
     assert.ok(typeOk, `${entry.key} default does not match ${entry.type}`);
   }
