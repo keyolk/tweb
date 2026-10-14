@@ -154,6 +154,28 @@ pub enum Command {
     Quit,
 }
 
+impl Command {
+    /// The view a command is about to change the picture of — input, navigation, resize, zoom —
+    /// so the snapshot clock treats it as lively again. Reads and queries are not activity.
+    pub fn activity_view(&self) -> Option<u32> {
+        match self {
+            Command::Load { view, .. }
+            | Command::Reload { view, .. }
+            | Command::Go { view, .. }
+            | Command::Resize { view, .. }
+            | Command::Zoom { view, .. }
+            | Command::Mouse { view, .. }
+            | Command::Key { view, .. }
+            | Command::Text { view, .. }
+            | Command::Edit { view, .. }
+            | Command::Paint { view, .. }
+            | Command::Invalidate { view }
+            | Command::Focus { view } => Some(*view),
+            _ => None,
+        }
+    }
+}
+
 static STDOUT: Mutex<()> = Mutex::new(());
 
 /// One event line. A failed write means the Electron engine is gone, and so is the reason to

@@ -42,6 +42,21 @@ const PAGE_HANDLER: &str = "twebPage";
 const POPUP_ID_BASE: u32 = 1 << 30;
 // How often the page's title, url and history are read for changes.
 const STATE_POLL: Duration = Duration::from_millis(200);
+// How long a view must go without input, a navigation or a changed picture before it is quiet,
+// and how much smaller a quiet view's pictures are.
+//
+// WebKit has no paint event, so an idle page is found unchanged only by taking its picture: at
+// main.cjs's idle rate (4/s) that measured 4% CPU on a static Retina page — the host's copy and
+// diff, WebKit's GPU process rendering the snapshot, and the page process — where Electron, told
+// when something paints, spends nothing.
+//
+// Taking those pictures less often was tried first and is the wrong trade: at once a second, a
+// change the page made on its own (a message arriving) reached the pane 770ms late, against
+// Electron's 34. So a quiet view is still looked at at its rate, but at a quarter of the width —
+// measured 0.6% CPU against 1.8% for the full picture — and only a probe that differs from the
+// last one asks for the full picture. A page that keeps changing never goes quiet.
+const QUIET_AFTER: Duration = Duration::from_secs(2);
+const PROBE_SCALE: f64 = 0.25;
 const DOWNLOAD_POLL: Duration = Duration::from_millis(500);
 
 struct View {
@@ -55,6 +70,11 @@ struct View {
     force: bool,
     in_flight: bool,
     last_snapshot: Option<Instant>,
+    /// The last input, navigation, page message or resize: anything after which the picture is
+    /// likely to change soon.
+    last_activity: Instant,
+    /// The last quiet-mode probe's hash; None while the view is lively.
+    probe_hash: Option<u64>,
     held_button: Option<u32>,
     last_state: Value,
     open_panel: Option<RcBlock<dyn Fn(*mut NSArray<NSURL>)>>,
@@ -177,23 +197,40 @@ fn spawn_ticker() {
 
 fn tick() {
     let now = Instant::now();
-    let due: Vec<u32> = with_state(|state| {
-        state
-            .views
-            .iter()
-            .filter(|(_, view)| {
-                view.painting
-                    && !view.in_flight
-                    && (view.force
-                        || view.last_snapshot.is_none_or(|at| {
-                            now.duration_since(at).as_secs_f64() >= 1.0 / view.rate.max(0.5)
-                        }))
-            })
-            .map(|(id, _)| *id)
-            .collect()
+    let due: Vec<(u32, bool)> = with_state(|state| {
+        let mut due = Vec::new();
+        for (id, view) in state.views.iter_mut() {
+            if !view.painting || view.in_flight {
+                continue;
+            }
+            if view.force {
+                due.push((*id, false));
+                continue;
+            }
+            let interval = Duration::from_secs_f64(1.0 / view.rate.max(0.5));
+            if view
+                .last_snapshot
+                .is_some_and(|at| now.duration_since(at) < interval)
+            {
+                continue;
+            }
+            let lively = pixels::last_change(*id).map_or(view.last_activity, |changed| {
+                changed.max(view.last_activity)
+            });
+            let quiet = is_quiet(now.saturating_duration_since(lively));
+            if !quiet {
+                view.probe_hash = None;
+            }
+            due.push((*id, quiet));
+        }
+        due
     });
-    for view in due {
-        snapshot(view);
+    for (view, quiet) in due {
+        if quiet {
+            probe(view);
+        } else {
+            snapshot(view);
+        }
     }
     let poll_state = with_state(|state| {
         let due = state
@@ -222,7 +259,87 @@ fn tick() {
     }
 }
 
+/// Whether a view that has been without input, navigation or a changed picture this long is
+/// looked at through probes rather than full pictures.
+fn is_quiet(quiet_for: Duration) -> bool {
+    quiet_for >= QUIET_AFTER
+}
+
+/// A word-at-a-time hash of a probe's bytes. A collision costs one missed change until the next
+/// one, not wrong pixels: the full picture is still what reaches the pane.
+fn probe_hash(bytes: &[u8]) -> u64 {
+    let mut hash = bytes.len() as u64;
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+        hash =
+            (hash.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    for byte in rest {
+        hash = (hash.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    hash
+}
+
+/// A quiet view's cheap look: the page at a quarter of its width, hashed here on the main thread
+/// (a 720x450 picture is 1.3MB). A probe that differs from the last one forces the full picture
+/// at once and makes the view lively again. The first probe of a quiet spell has nothing to
+/// compare with, so it forces one full picture too: a change made after the last full picture
+/// and before the spell began would otherwise be taken into the baseline and never shown.
+fn probe(view: u32) {
+    let mtm = marker();
+    let Some((webview, width)) = with_state(|state| {
+        let v = state.views.get_mut(&view)?;
+        v.in_flight = true;
+        v.last_snapshot = Some(Instant::now());
+        Some((v.webview.clone(), v.webview.bounds().size.width))
+    }) else {
+        return;
+    };
+    let configuration = unsafe { WKSnapshotConfiguration::new(mtm) };
+    unsafe {
+        configuration.setSnapshotWidth(Some(&objc2_foundation::NSNumber::new_f64(
+            (width * PROBE_SCALE).max(1.0),
+        )))
+    };
+    let block = RcBlock::new(move |image: *mut NSImage, _error: *mut NSError| {
+        let hash = (!image.is_null())
+            .then(|| capture_pixels(unsafe { &*image }))
+            .flatten()
+            .map(|capture| probe_hash(&capture.bytes));
+        with_state(|state| {
+            let Some(v) = state.views.get_mut(&view) else {
+                return;
+            };
+            v.in_flight = false;
+            let Some(hash) = hash else { return };
+            if v.probe_hash != Some(hash) {
+                let first = v.probe_hash.is_none();
+                v.probe_hash = Some(hash);
+                v.force = true;
+                if !first {
+                    v.last_activity = Instant::now();
+                    profile(format!("probe view={view} changed"));
+                }
+            }
+        });
+    });
+    unsafe {
+        webview.takeSnapshotWithConfiguration_completionHandler(Some(&configuration), &block)
+    };
+}
+
+fn mark_active(view: u32) {
+    with_state(|state| {
+        if let Some(v) = state.views.get_mut(&view) {
+            v.last_activity = Instant::now();
+        }
+    });
+}
+
 fn handle(command: Command) {
+    if let Some(view) = command.activity_view() {
+        mark_active(view);
+    }
     match command {
         Command::Init {
             tweb_scripts,
@@ -540,6 +657,8 @@ fn create(
                 force: true,
                 in_flight: false,
                 last_snapshot: None,
+                last_activity: Instant::now(),
+                probe_hash: None,
                 held_button: None,
                 last_state: Value::Null,
                 open_panel: None,
@@ -653,6 +772,7 @@ fn force_paint(view: u32) {
     with_state(|state| {
         if let Some(v) = state.views.get_mut(&view) {
             v.force = true;
+            v.last_activity = Instant::now();
         }
     });
 }
@@ -1017,6 +1137,7 @@ pub fn on_script_message(message: &WKScriptMessage) {
         return;
     };
     let name = unsafe { message.name() }.to_string();
+    mark_active(view);
     if !main {
         if let Some(fid) = fid {
             with_state(|state| {
@@ -1034,6 +1155,7 @@ pub fn on_script_message(message: &WKScriptMessage) {
 
 pub fn on_navigation(webview: &WKWebView, phase: &str, error: Option<&NSError>) {
     let Some(view) = view_id(webview) else { return };
+    mark_active(view);
     let url = unsafe { webview.URL() }
         .and_then(|url| url.absoluteString())
         .map(|url| url.to_string())
@@ -1381,5 +1503,28 @@ fn poll_page_state() {
             event["view"] = json!(view);
             emit(event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_quiet, probe_hash, QUIET_AFTER};
+    use std::time::Duration;
+
+    #[test]
+    fn a_view_goes_quiet_only_after_the_quiet_spell() {
+        assert!(!is_quiet(Duration::ZERO));
+        assert!(!is_quiet(QUIET_AFTER - Duration::from_millis(1)));
+        assert!(is_quiet(QUIET_AFTER));
+    }
+
+    #[test]
+    fn a_probe_hash_sees_one_changed_byte() {
+        let mut bytes = vec![9u8; 720 * 4 + 3];
+        let before = probe_hash(&bytes);
+        bytes[720 * 4 + 1] = 10;
+        assert_ne!(before, probe_hash(&bytes));
+        bytes[720 * 4 + 1] = 9;
+        assert_eq!(before, probe_hash(&bytes));
     }
 }

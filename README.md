@@ -339,6 +339,7 @@ What the WebKit engine does not have that Electron does — measured where a num
 | Context menu inside an iframe | opens at the frame's own coordinates, so off by the frame's offset |
 | Key-to-picture latency (`bench/feel.py`, 2880x1800) | `j` scroll p50 56ms (Electron 3.6ms, Chrome 86ms); `f` label pick p50 17–25ms (Electron 1.1ms). `f` open, rapid `f` and reload-then-`f` match Electron |
 | Hosting | each pane runs its own engine, as Chrome panes do; `twebd` hosts Electron pages only |
+| Idle cost (`bench/compare.py`, 2880x1800) | 1.6–2% CPU on a static page, where Electron spends 0%: WebKit has no paint event, so a quiet page is watched through quarter-width pictures and only a changed one is taken whole. A change the page makes on its own reaches the pane in p50 131ms (Electron 33ms) |
 
 Everything else was driven side by side with Electron in bare PTYs at 2880x1800 and behaved the same: typing (`hello 한글` through real key bytes), the wheel (375px for three notches at zoom 0.8 on both), `f` hints across a cross-origin iframe, SPA `pushState` routes, `target=_blank` tabs, `window.open` popups kept as tabs with `window.opener` intact, Back (including WebKit's back-forward cache), downloads, `tweb screenshot`/`pdf`/`console`/`snapshot`/`click`, and frames at exactly the pane's pixel size. A page restored from the back-forward cache re-registers its preload, and a navigation WebKit turns into a download is not shown as a failed load.
 
