@@ -609,7 +609,7 @@ fn inspect_target(pane: String, status: &Value, nearby: &[String]) -> Option<Ins
         return None;
     }
     Some(InspectTarget {
-        nearby: nearby.iter().any(|candidate| *candidate == pane),
+        nearby: nearby.contains(&pane),
         title: text_field(&active, "title"),
         url,
         pane,

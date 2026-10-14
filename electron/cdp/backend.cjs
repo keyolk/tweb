@@ -12,16 +12,24 @@
 //   ipcMain.on                   registered on both: the preload speaks CDP, the viewer Electron
 //   session.defaultSession       webRequest and downloads from Chrome; the rest stays Electron's
 //
+// `TWEB_BROWSER=webkit` is the same facade over WKWebViews in the tweb-webkit host
+// (webkit/engine.cjs): the engines differ in how a tab is hosted, not in what main.cjs sees.
+//
 // With the Electron backend (the default) this returns Electron's own objects untouched, so the
 // shipping path is byte-for-byte what it was.
 
 const path = require("node:path");
 const { CdpEngine } = require("./engine.cjs");
 const { setNativeImage } = require("./web-contents.cjs");
+const { WebKitEngine } = require("../webkit/engine.cjs");
+const { setNativeImage: setWebKitNativeImage } = require("../webkit/web-contents.cjs");
 
 function backendFromEnv(env = process.env) {
   const value = String(env.TWEB_BROWSER || "").trim().toLowerCase();
-  return value === "chrome" ? "chrome" : "electron";
+  if (value === "chrome") return "chrome";
+  // `tauri` was the WebKit engine's name before it became a page host under this engine.
+  if (value === "webkit" || value === "tauri") return "webkit";
+  return "electron";
 }
 
 // The Chrome profile lives beside TWeb's own, never in the user's Chrome directory: Chrome 136+
@@ -38,7 +46,7 @@ function isTabWindowOptions(options) {
 
 function createBackend(electron, { env = process.env, debug = false } = {}) {
   const backend = backendFromEnv(env);
-  if (backend !== "chrome") {
+  if (backend === "electron") {
     return {
       kind: "electron",
       BrowserWindow: electron.BrowserWindow,
@@ -52,13 +60,16 @@ function createBackend(electron, { env = process.env, debug = false } = {}) {
   // The profile path is resolved at start(), not here: this module loads before main.cjs has
   // applied TWEB_USER_DATA_DIR, and reading userData now would pin Chrome to the default profile
   // whatever the environment asked for.
-  const engine = new CdpEngine({
-    userDataDir: () => chromeProfileDir(env, electron.app.getPath("userData")),
-    nativeImage: electron.nativeImage,
-    clipboard: electron.clipboard,
-    debug,
-  });
+  const engine = backend === "webkit"
+    ? new WebKitEngine({ nativeImage: electron.nativeImage, clipboard: electron.clipboard, debug })
+    : new CdpEngine({
+      userDataDir: () => chromeProfileDir(env, electron.app.getPath("userData")),
+      nativeImage: electron.nativeImage,
+      clipboard: electron.clipboard,
+      debug,
+    });
   setNativeImage(electron.nativeImage);
+  setWebKitNativeImage(electron.nativeImage);
   const ElectronWindow = electron.BrowserWindow;
 
   // A function, not a class: `new BrowserWindow(...)` returns whichever object the constructor
@@ -99,6 +110,7 @@ function createBackend(electron, { env = process.env, debug = false } = {}) {
   const session = {
     get defaultSession() {
       if (!defaultSession) {
+        // Requests and downloads are the page engine's; everything else stays Electron's.
         const chrome = engine.session();
         const real = electron.session.defaultSession;
         defaultSession = {
@@ -119,7 +131,7 @@ function createBackend(electron, { env = process.env, debug = false } = {}) {
   };
 
   return {
-    kind: "chrome",
+    kind: backend,
     BrowserWindow,
     ipcMain,
     session,

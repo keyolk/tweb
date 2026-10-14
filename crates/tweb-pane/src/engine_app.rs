@@ -251,6 +251,18 @@ const FILES: &[(&str, &str)] = &[
         "cdp/web-contents.cjs",
         include_str!("../../../electron/cdp/web-contents.cjs"),
     ),
+    (
+        "webkit/engine.cjs",
+        include_str!("../../../electron/webkit/engine.cjs"),
+    ),
+    (
+        "webkit/helper.cjs",
+        include_str!("../../../electron/webkit/helper.cjs"),
+    ),
+    (
+        "webkit/web-contents.cjs",
+        include_str!("../../../electron/webkit/web-contents.cjs"),
+    ),
 ];
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.

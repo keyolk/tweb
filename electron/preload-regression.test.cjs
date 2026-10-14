@@ -7,7 +7,6 @@ const test = require("node:test");
 
 const root = path.resolve(__dirname, "..");
 const electron = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
-const tauri = fs.readFileSync(path.join(root, "crates/tweb-engine/tauri/src/preload.js.inc"), "utf8");
 
 function assertPreload(source) {
   assert.match(source, /"ㄹ": "f", "ᄅ": "f", "ㅎ": "g", "ᄒ": "g"/);
@@ -159,10 +158,6 @@ test("Electron preload maps Korean normal keys and uses trusted hint clicks", ()
   assertPreload(electron);
 });
 
-test("Tauri preload maps Korean normal keys and uses trusted hint clicks", () => {
-  assertPreload(tauri);
-});
-
 // `cursor` inherits, so a pointer-styled ad card makes every descendant compute
 // as `pointer` and the parent check suppresses them — including the dismiss "x"
 // the card puts in its own corner. Reproduced with two identical `x` elements
@@ -273,7 +268,7 @@ test("page keys scroll by the surface, not by a line", () => {
 // not the argument: with no pan surface picked, `getComputedStyle(null)` threw and took
 // the whole key handler with it, so the key did nothing at all and said nothing about it.
 test("visibleRect survives a null element", () => {
-  for (const source of [electron, tauri]) {
+  for (const source of [electron]) {
     const start = source.indexOf("function visibleRect(element)");
     const rect = source.slice(start, start + 600);
     assert.match(rect, /if \(!isElement\(element\)\) return null;/,
@@ -289,7 +284,7 @@ test("visibleRect survives a null element", () => {
 // Picking an inner surface with `s` was defeated by the very keys a reader reaches for:
 // Home/End/arrows called the window directly, so the page behind the panel moved instead.
 test("Home, End and the arrows scroll the picked surface", () => {
-  for (const source of [electron, tauri]) {
+  for (const source of [electron]) {
     const start = source.indexOf('if (!editable && key === "Home")');
     assert.ok(start > 0, "the non-editable scroll branch is missing");
     const block = source.slice(start, start + 400)
@@ -651,23 +646,10 @@ test("the terminal cursor follows the visual caret on an ordinary page", () => {
   assert.match(cancel, /if \(hadCaret\) reportCaret\(\);/);
 });
 
-test("the caret mode keys are mirrored into the Tauri preload", () => {
-  const tauri = fs.readFileSync(
-    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8");
-  for (const marker of ["function enterCaret()", "function selectFromCaret()",
-    'key === "v" && visualState.caret', '"}": ["forward", "paragraph"]',
-    "function visibleSelectionStart(range)", "function focusRect(selection)"]) {
-    assert.ok(tauri.includes(marker), `Tauri preload is missing ${marker}`);
-  }
-  // That engine has no caret reporting, so the mirror must not call into it.
-  assert.doesNotMatch(tauri, /reportCaret\(\)/);
-});
-
 // One form named its control "id" and the whole hint pass died on it: `form.id`
 // answered with that input, and `.startsWith` on an element throws.
 test("id reads survive a form whose control is named id", () => {
-  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
-    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+  for (const [name, source] of [["preload", electron]]) {
     assert.match(source, /function ownId\(element\) \{/, `${name} is missing ownId`);
     // Any raw `.id` read outside ownId itself is the bug coming back.
     const outside = source.replace(/function ownId\(element\) \{[^}]*\}/, "");
@@ -697,7 +679,7 @@ test("browser context menu uses Chromium hit-test data and native commands", () 
 });
 
 test("each pane owns an interactive tab badge instead of publishing tabs in tmux", () => {
-  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+  for (const [name, source] of [["Electron", electron]]) {
     assert.match(source, /let tabState = \{ activeIndex: 0, count: 1, tabs:/,
       `${name} has no initial pane-local tab state`);
     assert.match(source, /function showTabPopover\(pinned = false\)/,
@@ -724,16 +706,10 @@ test("each pane owns an interactive tab badge instead of publishing tabs in tmux
   assert.match(paneTitle, /tweb:fullscreen/);
   assert.match(paneTitle, /tweb:float/);
   assert.doesNotMatch(paneTitle, /tabLabel|activeTabIndex/);
-
-  const tauriBrowser = fs.readFileSync(path.join(root,
-    "crates/tweb-engine/tauri/src/browser.rs"), "utf8");
-  assert.match(tauriBrowser, /fn send_tab_state\(&self\)[\s\S]*"title": tab\.title/);
-  assert.match(tauriBrowser, /self\.emit_active\("tweb-tab-state", &model\)/);
-  assert.match(tauriBrowser, /fn sync_title\(&self\)[\s\S]*self\.tmux\.update_title\("tweb"\)/);
 });
 
 test("a frame draws exactly the targets it counted for a shared round", () => {
-  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+  for (const [name, source] of [["Electron", electron]]) {
     // Collecting again at draw time found more targets on a video page and pushed this
     // frame's labels into the next frame's block, so one label clicked in two places.
     assert.match(source, /pendingHintTargets = interactiveTargets\(\);\s*\n\s*send\("hint-round", \{ count: pendingHintTargets\.length \}\);/,
@@ -766,7 +742,7 @@ test("the shortcut help lists the float window and the command palette", () => {
 });
 
 test("a normal-mode shortcut cannot be bound without a help line", () => {
-  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+  for (const [name, source] of [["Electron", electron]]) {
     const normal = source.slice(source.indexOf("function handleNormalKey"));
     const dispatch = normal.slice(normal.indexOf("let handled = true;"), normal.indexOf("if (handled) {"));
     // The only key left in the switch is Escape, which has no single action to name.
@@ -790,7 +766,7 @@ test("a normal-mode shortcut cannot be bound without a help line", () => {
 });
 
 test("the shortcut help opens under Trusted Types and scrolls from the keyboard", () => {
-  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+  for (const [name, source] of [["Electron", electron]]) {
     const help = source.slice(source.indexOf("function showHelp()"), source.indexOf("function handleHelpKey("));
     // Meet enforces Trusted Types; a string assigned to innerHTML throws and `?` did nothing.
     assert.doesNotMatch(help, /\.innerHTML\s*=/, `${name} help builds markup from a string`);
@@ -804,7 +780,7 @@ test("the shortcut help opens under Trusted Types and scrolls from the keyboard"
 });
 
 test("visual image actions copy pixels, copy current source, and download", () => {
-  for (const [name, source] of [["Electron", electron], ["Tauri", tauri]]) {
+  for (const [name, source] of [["Electron", electron]]) {
     assert.match(source, /function imageSource\(image\)/, `${name} has no image source resolver`);
     assert.match(source, /image\.currentSrc \|\| image\.src/);
     assert.match(source, /imageURL: imageSource\(image\)/);
@@ -904,8 +880,7 @@ test("the shortcut runtime reports its own state to an agent", () => {
 // Picking a scroll surface used to be a one-way door: the surface was dropped the
 // moment it was used, and there was no candidate standing for the page.
 test("a picked scroll surface survives use and can be left", () => {
-  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
-    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+  for (const [name, source] of [["preload", electron]]) {
     const surface = source.slice(source.indexOf("function scrollSurface()"),
       source.indexOf("function panSurface()"));
     // A scrolled document root sits above the viewport, so visibility is the wrong
@@ -919,10 +894,7 @@ test("a picked scroll surface survives use and can be left", () => {
     assert.match(targets, /if \(picked\) targets\.unshift\(entry\)/,
       `${name} does not put the way out first`);
     // The preload picks areas from `v`, which offers no page entry — Escape is the way back.
-    // The Tauri copy still has the `s` picker and its page entry.
-    assert.match(source, name === "preload"
-      ? /scrollTarget = item\.pan \? null : item\.element;/
-      : /scrollTarget = item\.page \|\| item\.pan \? null : item\.element;/,
+    assert.match(source, /scrollTarget = item\.pan \? null : item\.element;/,
       `${name} does not hold the picked surface`);
     // Escape is the other way out.
     assert.match(source, /if \(scrollSurface\(\) \|\| panSurface\(\)\) \{\n\s+scrollTarget = null;\n\s+panTarget = null;/,
@@ -936,8 +908,7 @@ test("a picked scroll surface survives use and can be left", () => {
 // A page whose content is proxied through an iframe offered nothing to hint,
 // scroll or select unless focus happened to be inside the frame.
 test("collectors reach into a same-origin frame", () => {
-  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
-    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+  for (const [name, source] of [["preload", electron]]) {
     const roots = source.slice(source.indexOf("function collectRoots()"),
       source.indexOf("function uniqueVisibleTargets("));
     assert.match(roots, /sameOriginFrameDocument\(element\)/, `${name} skips frame documents`);
@@ -972,8 +943,7 @@ test("every function the preload calls is defined in it", () => {
     "cancelAnimationFrame", "scrollBy", "scrollTo", "isNaN", "isFinite", "structuredClone",
     "fetch", "btoa", "atob", "encodeURIComponent", "decodeURIComponent", "setImmediate",
     "matchMedia", "postMessage", "reportError", "blur", "focus"]);
-  for (const [name, source] of [["preload", electron], ["tauri", fs.readFileSync(
-    path.join(__dirname, "..", "crates", "tweb-engine", "tauri", "src", "preload.js.inc"), "utf8")]]) {
+  for (const [name, source] of [["preload", electron]]) {
     const defined = new Set([...source.matchAll(/function ([A-Za-z_$][\w$]*)\s*\(/g)]
       .map((found) => found[1]));
     for (const found of source.matchAll(/(?:const|let|var) ([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g)) {
@@ -1102,7 +1072,7 @@ test("scroll keys can target a picked inner surface", () => {
 });
 
 test("large canvas and SVG surfaces can be panned with scroll keys", () => {
-  for (const source of [electron, tauri]) {
+  for (const source of [electron]) {
     assert.match(source, /querySelectorAll\("canvas,svg"\)/);
     assert.match(source, /rect\.width < 320 \|\| rect\.height < 220/);
     assert.match(source, /function panSurfaceBy\(left, top\)/);
@@ -1113,9 +1083,6 @@ test("large canvas and SVG surfaces can be panned with scroll keys", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "native-drag":/);
   assert.match(main, /type: "mouseDown"[\s\S]*type: "mouseMove"[\s\S]*type: "mouseUp"/);
-  const browser = fs.readFileSync(path.join(root, "crates/tweb-engine/tauri/src/browser.rs"), "utf8");
-  assert.match(browser, /"native-drag" =>/);
-  assert.match(browser, /fn dispatch_native_drag\(/);
 });
 
 // Ctrl-; and Ctrl-/ are independent toggles: bypass (Cmd to the page) and
@@ -1474,7 +1441,6 @@ test("the page's caret bar is measured the same way as the terminal cursor", () 
 // is what makes it safe, so the binding and its guard are pinned together — an edit that
 // keeps the binding and drops the guard is the failure this exists to catch.
 //
-// Electron only: the Tauri preload is a separate file that does not carry these bindings.
 test("Backspace only navigates back when nothing editable has focus", () => {
   const binding = electron.slice(
     electron.indexOf('if (key === "Backspace" && !event.ctrlKey'),
@@ -2970,10 +2936,11 @@ test("a contenteditable caret on an empty line or at the end is measured, not gu
   assert.match(caret, /const box = contentEditableCaretBox\(\);/);
 });
 
-test("on the Chrome engine the caret owner is the frame that last reported one", () => {
+test("on the Chrome and WebKit engines the caret owner is the frame that last reported one", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const branch = main.slice(main.indexOf('case "caret": {'), main.indexOf('case "insert-mode":'));
-  assert.match(branch, /if \(pageBackend\.kind === "chrome"\) \{/);
+  // Neither has a synchronous focused frame; only Electron's own webContents does.
+  assert.match(branch, /if \(pageBackend\.kind !== "electron"\) \{/);
   // A null from a frame that no longer owns the cursor must not hide the owner's cursor.
   assert.match(branch, /if \(!value && key && caretOwners\.get\(tab\) && caretOwners\.get\(tab\) !== key\) break;/);
   assert.match(branch, /caretOwners\.set\(tab, value \? key : null\);/);

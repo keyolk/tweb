@@ -127,10 +127,8 @@ pub fn parse_probe(stdout: &str, pane: &str) -> TmuxProbe {
                     ));
                 }
             }
-            "C" => {
-                if !rest.split('\t').next().unwrap_or("").is_empty() {
-                    clients.push(rest.to_string());
-                }
+            "C" if !rest.split('\t').next().unwrap_or("").is_empty() => {
+                clients.push(rest.to_string());
             }
             _ => {}
         }
@@ -170,10 +168,8 @@ pub fn visibility_control_message(payload: &str) -> String {
     line
 }
 
-/// Only pushes when something actually moved. Two reasons beyond saving bytes: the engine
-/// treats every push as a change signal, and the Tauri engine restarts its 35ms
-/// escape-flush timer on any line it does not parse, so an unconditional 4Hz push would
-/// sit on top of a pending escape sequence there.
+/// Only pushes when something actually moved: the engine treats every push as a change
+/// signal, so an unconditional 4Hz push would be four wake-ups a second for nothing.
 pub fn changed_visibility_message(
     previous: &mut Option<String>,
     probe: &TmuxProbe,

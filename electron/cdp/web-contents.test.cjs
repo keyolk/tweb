@@ -59,32 +59,34 @@ function paintingContents() {
   return { created, captures };
 }
 
-test("an invalidate with the screencast running waits for its frame before capturing", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+// Real timers, not `t.mock.timers`: bun's node:test shim accepts the mock and never advances
+// `setTimeout` under it, so these failed under `make electron-test` while passing under node.
+// The grace is 50ms (INVALIDATE_GRACE_MS); waiting past it is the same check on either runner.
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("an invalidate with the screencast running waits for its frame before capturing", async () => {
   const { created, captures } = paintingContents();
   created.invalidate();
   assert.strictEqual(captures.length, 0);
   // The page drew: a screencast frame bumped the generation inside the grace.
   created.capture.generation = (created.capture.generation || 0) + 1;
-  t.mock.timers.tick(60);
+  await wait(80);
   assert.strictEqual(captures.length, 0);
 });
 
-test("an invalidate with nothing new to draw still captures", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+test("an invalidate with nothing new to draw still captures", async () => {
   const { created, captures } = paintingContents();
   created.invalidate();
-  t.mock.timers.tick(60);
+  await wait(80);
   assert.strictEqual(captures.length, 1);
   assert.strictEqual(created.capture.forceNext, true);
 });
 
-test("a stream of invalidates cannot put the capture off for good", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+test("a stream of invalidates cannot put the capture off for good", async () => {
   const { created, captures } = paintingContents();
   for (let i = 0; i < 20; i++) {
     created.invalidate();
-    t.mock.timers.tick(10);
+    await wait(10);
   }
   assert.ok(captures.length >= 1, "captured at least once in 200ms of invalidates");
 });

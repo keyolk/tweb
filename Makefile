@@ -7,7 +7,7 @@ PREFIX ?= $(HOME)/.local
 
 .DEFAULT_GOAL := help
 
-.PHONY: help deps build release test check fmt fmt-check clippy electron-test electron-check run run-tauri install uninstall clean
+.PHONY: help deps build release test check fmt fmt-check clippy electron-test electron-check run run-webkit install uninstall clean
 
 help: ## Show the available targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "} {printf "  %-16s %s\n", $$1, $$2}'
@@ -50,6 +50,9 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/cdp/preload-bridge.cjs
 	node --check electron/cdp/sign-in-block.cjs
 	node --check electron/cdp/web-contents.cjs
+	node --check electron/webkit/engine.cjs
+	node --check electron/webkit/helper.cjs
+	node --check electron/webkit/web-contents.cjs
 	node --check electron/context-menu.cjs
 	node --check electron/preload.cjs
 	node --check electron/gfx-worker.cjs
@@ -103,16 +106,17 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"
 
-run-tauri: build ## Run TWeb on the Tauri engine (URL=...)
-	./target/debug/tweb open --engine tauri "$(URL)"
+run-webkit: build ## Run TWeb on the WebKit engine (URL=...)
+	./target/debug/tweb open --engine webkit "$(URL)"
 
 # The app code lives in the binary (198KB) and the Electron runtime is fetched once on first run
 # (295MB — not a size to put in a binary). So the only thing to install is the binary.
 install: release ## Install tweb into PREFIX (default ~/.local)
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 0755 target/release/tweb "$(DESTDIR)$(PREFIX)/bin/tweb"
-	@test ! -f target/release/tweb-tauri \
-		|| install -m 0755 target/release/tweb-tauri "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
+	@# The WebKit page host. `--engine webkit` finds it beside `tweb`.
+	@test ! -f target/release/tweb-webkit \
+		|| install -m 0755 target/release/tweb-webkit "$(DESTDIR)$(PREFIX)/bin/tweb-webkit"
 	@# The supervisor. `tweb __pane` starts it on demand and finds it beside itself, so an install
 	@# without it is an install where every pane silently spawns its own engine.
 	@test ! -f target/release/twebd \
@@ -120,14 +124,15 @@ install: release ## Install tweb into PREFIX (default ~/.local)
 	@# 기존 binary 위에 덮어쓰면 macOS 서명이 깨지고 kernel이 exec 시 SIGKILL한다.
 	@# 조용한 no-op처럼 보여서 원인을 찾기 어렵다.
 	@test "$$(uname)" != Darwin || codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb"
-	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
-		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-tauri"
+	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/tweb-webkit" \
+		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-webkit"
 	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/twebd" \
 		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/twebd"
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb"
 
 uninstall: ## Remove what install placed (the cache is left alone)
-	rm -f "$(DESTDIR)$(PREFIX)/bin/tweb" "$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
+	rm -f "$(DESTDIR)$(PREFIX)/bin/tweb" "$(DESTDIR)$(PREFIX)/bin/tweb-webkit" \
+		"$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
 		"$(DESTDIR)$(PREFIX)/bin/twebd"
 
 clean: ## Remove the Rust build output

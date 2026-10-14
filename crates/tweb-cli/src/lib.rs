@@ -23,7 +23,10 @@ pub enum BrowserEngineArg {
     /// The user's real Google Chrome over CDP, for sites that need managed Chrome: Okta device
     /// trust, Endpoint Verification, policy-installed extensions. Hosted by the Electron engine.
     Chrome,
-    Tauri,
+    /// macOS WebKit, through the tweb-webkit page host. Hosted by the Electron engine, so every
+    /// feature but the Chromium-only ones (extensions, CDP) is the same code.
+    #[value(alias = "tauri")]
+    Webkit,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -68,7 +71,7 @@ impl BrowserOptions {
             match self.engine {
                 BrowserEngineArg::Electron => "electron",
                 BrowserEngineArg::Chrome => "chrome",
-                BrowserEngineArg::Tauri => "tauri",
+                BrowserEngineArg::Webkit => "webkit",
             },
             self.max_frame_rate()
         );
@@ -859,7 +862,7 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
         engine: match browser.engine {
             BrowserEngineArg::Electron => tweb_pane::BrowserEngine::Electron,
             BrowserEngineArg::Chrome => tweb_pane::BrowserEngine::Chrome,
-            BrowserEngineArg::Tauri => tweb_pane::BrowserEngine::Tauri,
+            BrowserEngineArg::Webkit => tweb_pane::BrowserEngine::Webkit,
         },
         frame_rate: browser.max_frame_rate(),
         adaptive_frame_rate: browser.adaptive(),
@@ -900,21 +903,9 @@ async fn split_and_run_pane(
     // in. Resolving them here instead looked for `electron/` under the cwd, so a split opened from
     // inside a checkout ran that checkout's older app code. Only an explicit override is passed on.
     let mut env_str = String::new();
-    match browser.engine {
-        BrowserEngineArg::Electron | BrowserEngineArg::Chrome => {
-            for name in ["TWEB_ELECTRON", "TWEB_ELECTRON_DIR"] {
-                if let Ok(value) = std::env::var(name) {
-                    env_str.push_str(&format!("{name}={} ", shell_quote(&value)));
-                }
-            }
-        }
-        BrowserEngineArg::Tauri => {
-            if let Some(path) = find_tauri_binary() {
-                env_str.push_str(&format!(
-                    "TWEB_TAURI={} ",
-                    shell_quote(&path.to_string_lossy())
-                ));
-            }
+    for name in ["TWEB_ELECTRON", "TWEB_ELECTRON_DIR", "TWEB_WEBKIT"] {
+        if let Ok(value) = std::env::var(name) {
+            env_str.push_str(&format!("{name}={} ", shell_quote(&value)));
         }
     }
 
@@ -1053,33 +1044,6 @@ fn describe_target(target: &agent::InspectTarget) -> String {
     } else {
         format!("{title} — {url}")
     }
-}
-
-/// Finds the Tauri engine binary path (passed through an environment variable).
-fn find_tauri_binary() -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("TWEB_TAURI") {
-        return Some(std::path::PathBuf::from(path));
-    }
-    for candidate in [
-        "target/release/tweb-tauri",
-        "../target/release/tweb-tauri",
-        "target/debug/tweb-tauri",
-        "../target/debug/tweb-tauri",
-    ] {
-        let path = std::path::PathBuf::from(candidate);
-        if path.exists() {
-            return Some(path.canonicalize().unwrap_or(path));
-        }
-    }
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            let sibling = directory.join("tweb-tauri");
-            if sibling.exists() {
-                return Some(sibling);
-            }
-        }
-    }
-    which::which("tweb-tauri").ok()
 }
 
 fn shell_quote(value: &str) -> String {

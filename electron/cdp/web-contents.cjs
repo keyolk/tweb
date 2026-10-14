@@ -1702,4 +1702,11 @@ module.exports = {
   CdpFrame,
   CdpWebContents,
   setNativeImage,
+  // The page-side probes, shared with the WebKit engine (webkit/web-contents.cjs), which reads
+  // the same facts off a WKWebView for the same reasons.
+  AUDIO_PROBE,
+  CONTEXT_MENU_PROBE,
+  NO_BOUNCE,
+  PRINT_SHIM,
+  TITLE_PROBE,
 };

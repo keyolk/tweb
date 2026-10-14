@@ -6,7 +6,7 @@
 node_modules/
 
 # Tauri generated bundles and local state
-/crates/tweb-engine/tauri/target/
+/crates/tweb-engine/webkit/target/
 *.app
 
 # Runtime/session artifacts

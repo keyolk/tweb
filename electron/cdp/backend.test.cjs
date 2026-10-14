@@ -5,11 +5,14 @@ const assert = require("node:assert");
 const { backendFromEnv, chromeProfileDir, isTabWindowOptions } = require("./backend.cjs");
 const { chromeArgs, devtoolsOriginAllowed, devtoolsUrl, findChrome, freePort, readActivePort } = require("./connection.cjs");
 
-test("only TWEB_BROWSER=chrome selects the Chrome backend", () => {
+test("TWEB_BROWSER selects the Chrome or WebKit backend, and nothing else does", () => {
   assert.strictEqual(backendFromEnv({}), "electron");
   assert.strictEqual(backendFromEnv({ TWEB_BROWSER: "chrome" }), "chrome");
   assert.strictEqual(backendFromEnv({ TWEB_BROWSER: " Chrome " }), "chrome");
-  assert.strictEqual(backendFromEnv({ TWEB_BROWSER: "tauri" }), "electron");
+  assert.strictEqual(backendFromEnv({ TWEB_BROWSER: "webkit" }), "webkit");
+  // The WebKit engine's old name still reaches it.
+  assert.strictEqual(backendFromEnv({ TWEB_BROWSER: "tauri" }), "webkit");
+  assert.strictEqual(backendFromEnv({ TWEB_BROWSER: "safari" }), "electron");
 });
 
 // Tabs are offscreen windows; the float viewer is a real one and must stay Electron's.
