@@ -1,6 +1,6 @@
 # TWeb
 
-TWeb is a terminal-native browser runtime that runs Chromium (Electron), the user's own Google Chrome (over CDP) or macOS WebKit (Tauri) pages as pane processes on top of Ghostty/Kitty and tmux.
+TWeb is a terminal-native browser runtime that runs Chromium (Electron), the user's own Google Chrome (over CDP) or macOS WebKit pages as pane processes on top of Ghostty/Kitty and tmux.
 
 ```text
 Ghostty / Kitty
@@ -65,8 +65,8 @@ tweb open https://localhost:5173
 # Create a tmux browser pane (default: Electron, adaptive 4–30fps)
 tweb split https://localhost:5173
 
-# Open on the macOS Tauri/WebKit engine
-tweb split --engine tauri https://localhost:5173
+# Open on the macOS WebKit engine (`--engine tauri` is the old name and still works)
+tweb split --engine webkit https://localhost:5173
 
 # Run the pages in your own (managed) Google Chrome — Okta device trust, Endpoint Verification
 tweb split --engine chrome https://sendbird.okta.com/
@@ -316,21 +316,31 @@ Register it with an MCP client as a stdio server.
 { "mcpServers": { "tweb": { "command": "tweb", "args": ["mcp"] } } }
 ```
 
-The agent socket is currently provided by the Electron engine. The Tauri engine supports the
-human-operated paths only.
+The agent socket is provided by the Electron engine, which also hosts the Chrome and WebKit engines'
+pages — so it serves all three.
 
 ## Browser engines and frame policy
 
-`open` and `split` both accept `--engine electron|chrome|tauri`. The default is `electron`, which
+`open` and `split` both accept `--engine electron|chrome|webkit`. The default is `electron`, which
 provides every existing feature.
 
 - **Electron**: built on Chromium offscreen paint. Provides all current TWeb browser features — Vimium-style modes, tabs/omnibox, visual/inspect, smart copy, detached DevTools. This is the engine every measurement in [Status](#status) was taken on.
 - **Chrome**: the pages run in the installed Google Chrome, headless, on a profile of TWeb's own (`<userData>/chrome-profile`, or `TWEB_CHROME_PROFILE`), driven over CDP. Use it for sites that only work in managed Chrome — see [Sites that need real Chrome](#sites-that-need-real-chrome). The Electron process stays the host and the pane logic is the same code: `electron/cdp/` presents each Chrome tab to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, is injected into each frame's isolated world. One Chrome serves every pane on the profile and exits with the last of them. `TWEB_CHROME` picks the binary, `TWEB_CHROME_HEADED=1` runs it with a (hidden) window, `TWEB_CDP_TRACE=1` logs the protocol.
-- **Tauri (macOS experimental)**: sends native snapshots of the system `WKWebView` as raw Kitty frames (`f=32` through a file, PNG inline when files fail or `TWEB_RAW_FRAMES=0`), so there is no separate Electron/Chromium startup cost. A page that changes on its own plays at the same byte-budgeted rate as Electron's playback tier (`TWEB_PLAYBACK_BUDGET`), and the wheel is a native scroll event. Supports resize, UTF-8/CSI-u/navigation keys, SGR mouse, adaptive frame transfer and terminal lifecycle. It shares the same preload as Electron, so Vimium-style modal shortcuts, hint/visual/inspect, the tab list, omnibox and multi-tab, find-in-page, zoom, smart copy/paste, and the browser shortcut ↔ web passthrough toggle all work too. DevTools opens as the Safari Web Inspector, and the Chromium-only `inspectElement` coordinate targeting has limited support.
+- **WebKit (macOS)**: the pages are `WKWebView`s in `tweb-webkit`, a small Rust host the Electron engine starts beside itself. As with Chrome, the Electron process stays the host and the pane logic is the same code: `electron/webkit/` presents each view to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, runs in each frame's isolated content world. Input is native `NSEvent`s, so WebKit routes clicks, keys and the wheel into cross-origin frames itself and they arrive trusted. WebKit has no paint event: the host snapshots at the pane's frame rate, drops unchanged pictures, and sends a changed one's dirty box only. `TWEB_WEBKIT` picks the host binary; `TWEB_WEBKIT_PROFILE=1` logs where each frame and eval spent its time.
 
-> The Tauri parity list above is **claimed by construction — a shared preload — and was not exercised
-> in the capability audit behind [Status](#status).** Every measured verdict in this README is
-> Electron. Treat Tauri as unvalidated until somebody drives it the same way.
+What the WebKit engine does not have that Electron does — measured where a number is given:
+
+| | WebKit engine |
+|---|---|
+| Extensions | none: WebKit loads no Chrome extensions |
+| `tweb devtools`, inspect `d` | open Safari's Web Inspector on the page (SPI); no element is preselected. Safari > Develop also lists every pane |
+| `tweb network` | always empty: WebKit gives an embedder no view of a page's requests |
+| `tweb device` | resizes the viewport only; no touch or mobile-viewport emulation |
+| Context menu inside an iframe | opens at the frame's own coordinates, so off by the frame's offset |
+| Key-to-picture latency (`bench/feel.py`, 2880x1800) | `j` scroll p50 56ms (Electron 3.6ms, Chrome 86ms); `f` label pick p50 17–25ms (Electron 1.1ms). `f` open, rapid `f` and reload-then-`f` match Electron |
+| Hosting | each pane runs its own engine, as Chrome panes do; `twebd` hosts Electron pages only |
+
+Everything else was driven side by side with Electron in bare PTYs at 2880x1800 and behaved the same: typing (`hello 한글` through real key bytes), the wheel (375px for three notches at zoom 0.8 on both), `f` hints across a cross-origin iframe, SPA `pushState` routes, `target=_blank` tabs, `window.open` popups kept as tabs with `window.opener` intact, Back (including WebKit's back-forward cache), downloads, `tweb screenshot`/`pdf`/`console`/`snapshot`/`click`, and frames at exactly the pane's pixel size. A page restored from the back-forward cache re-registers its preload, and a navigation WebKit turns into a download is not shown as a failed load.
 
 The Chrome engine was driven through the same scenarios as Electron, side by side in bare PTYs at
 2880x1800, through the real key and SGR-mouse paths and the agent socket:
@@ -362,7 +372,7 @@ probe move and undoes it; `tweb engine-log` shows `chrome input skew … measure
 applies.
 
 
-Electron and Tauri both persist the open tab URLs, the active tab and each tab's zoom per tmux window.
+Every engine persists the open tab URLs, the active tab and each tab's zoom per tmux window.
 Omitting the URL — plain `tweb open` — restores the last state, while naming a URL ignores the stored
 state, starts fresh on that single URL and updates the stored state to match. Electron does not store
 `about:blank` or its internal loading/notice pages, so a valid previous session is never overwritten.
@@ -394,16 +404,11 @@ stream, and when the writer falls behind, intermediate frames are dropped and on
 `--adaptive-frame-rate` states the default policy explicitly. `tweb diag` reports which tier is
 in force as `frames.rateKind`.
 
-On the same 80×24 tmux pane with a local fixture and debug builds, the median time to first Kitty frame
-(3 runs) was 6.084s for Electron and 1.834s for Tauri. Those are comparative numbers from the current
-development environment and will differ with release builds, real sites and WebKit cache state.
-
 ## Browser input modes
 
-The modal shortcuts and mode indicator below behave identically on the Electron and Tauri engines,
-which share the same preload runtime. The only per-engine difference is DevTools: Electron opens
-detached Chromium DevTools, Tauri opens the Safari Web Inspector. Everything described here was
-measured on Electron; see the Tauri note above.
+The modal shortcuts and mode indicator below are the same code on every engine, which share one
+preload runtime. The only per-engine difference is DevTools: Electron opens detached Chromium
+DevTools, WebKit the Safari Web Inspector.
 
 `Ctrl-;` and `Ctrl-/` are two independent toggles.
 
@@ -625,8 +630,8 @@ selection into the next text block, and the view scrolls along when the selectio
 caret mode, `y` copies the whole block the caret sits in.
 
 After picking a target in Inspect, `y` copies the CSS selector, `h` the outer HTML and `t` the text,
-while `d` opens DevTools. Electron selects that element directly in detached Chromium DevTools; Tauri
-opens the Safari Web Inspector and attempts element selection only where possible.
+while `d` opens DevTools. Electron selects that element directly in detached Chromium DevTools; WebKit
+opens the Safari Web Inspector on the page without selecting the element.
 
 The omnibox's visit history is appended to a per-profile file, so it is shared across panes and
 restarts. `o` prefills the current URL, so it opens filtered to that URL; use `t`/`O` to start from an
@@ -860,7 +865,7 @@ Not consolation prizes — these are things Chrome cannot do because it owns its
 2. Chrome extension/profile bootstrap compatibility — nothing is built, so nothing is validated
 3. tmux window-scoped agent resource exchange, beyond the agent socket that ships
 4. Remote Chromium/video transport scalability
-5. The Tauri engine, which no measurement in this README covers
+5. The WebKit engine inside a real tmux client: every WebKit number above is from a bare PTY
 6. A live macOS 2-set hangul IME with per-jamo backspace mid-composition
 
 See [DESIGN.md](DESIGN.md) for the design and [DETAIL.md](DETAIL.md) for the implementation-depth

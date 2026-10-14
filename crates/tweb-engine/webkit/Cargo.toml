@@ -1,0 +1,29 @@
+[package]
+name = "tweb-engine-webkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# The WebKit page host. Not an engine of its own: the Electron engine runs every pane and
+# drives this process the way it drives Chrome over CDP (electron/webkit/), so the pane logic
+# and the preload are shared byte for byte. This binary only hosts WKWebViews and answers.
+[[bin]]
+name = "tweb-webkit"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc = "=0.2.177"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "=0.6.2"
+dispatch2 = "=0.3.1"
+objc2 = "=0.6.4"
+objc2-app-kit = "=0.3.2"
+objc2-core-foundation = "=0.3.2"
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "objc2", "CGImage", "CGDataProvider", "CGEvent", "CGEventTypes", "CGRemoteOperation"] }
+objc2-foundation = "=0.3.2"
+objc2-web-kit = "=0.3.2"

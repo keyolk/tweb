@@ -16,7 +16,7 @@ matters, and every failed attempt with the trace lines around it.
   reload-f  reload, then `f` at once.  ok = it drew; catches the main frame not yet ready
 
 Usage:
-  python3 bench/feel.py [--engine electron|chrome|both] [--tweb PATH] [--runs N]
+  python3 bench/feel.py [--engine electron|chrome|webkit|both|all] [--tweb PATH] [--runs N]
                         [--scenario NAME ...] [--url URL ...] [--json OUT]
 
 Defaults to the fixtures in bench/pages served on localhost. `--url` adds real sites; they are
@@ -90,8 +90,8 @@ class Pane:
             "TERM": "xterm-ghostty",
         })
         args = [tweb, "open", url]
-        if engine == "chrome":
-            args[2:2] = ["--engine", "chrome"]
+        if engine in ("chrome", "webkit"):
+            args[2:2] = ["--engine", engine]
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execve(tweb, args, env)
@@ -314,7 +314,7 @@ def summarise(results):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", default="both", choices=["electron", "chrome", "both"])
+    parser.add_argument("--engine", default="both", choices=["electron", "chrome", "webkit", "both", "all"])
     parser.add_argument("--tweb", default=str(REPO / "target" / "release" / "tweb"))
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument("--scenario", nargs="*", default=["f-open", "f-pick", "f-rapid", "j-scroll", "reload-f"])
@@ -327,7 +327,7 @@ def main():
 
     server, base = serve_fixtures()
     urls = args.url or [f"{base}/hints.html"]
-    engines = ["electron", "chrome"] if args.engine == "both" else [args.engine]
+    engines = {"both": ["electron", "chrome"], "all": ["electron", "chrome", "webkit"]}.get(args.engine, [args.engine])
     workdir = args.workdir or tempfile.gettempdir()
     report = []
     for engine in engines:

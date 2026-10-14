@@ -5,7 +5,7 @@ members = [
     "crates/twebd",
     "crates/tweb-pane",
     "crates/tweb-engine/electron",
-    "crates/tweb-engine/tauri",
+    "crates/tweb-engine/webkit",
     "crates/tweb-platform",
     "crates/tweb-agent",
     "crates/tweb-cli",

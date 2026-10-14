@@ -36,7 +36,9 @@ pub enum BrowserEngine {
     /// Pages in the user's Google Chrome over CDP, hosted by the Electron engine
     /// (`TWEB_BROWSER=chrome`, see electron/cdp/backend.cjs).
     Chrome,
-    Tauri,
+    /// Pages in macOS WebKit, hosted by the Electron engine through the tweb-webkit process
+    /// (`TWEB_BROWSER=webkit`, see electron/webkit/engine.cjs).
+    Webkit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -509,7 +511,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     }
 
     let (mut command, engine_description) = match options.engine {
-        BrowserEngine::Electron | BrowserEngine::Chrome => {
+        BrowserEngine::Electron | BrowserEngine::Chrome | BrowserEngine::Webkit => {
             let (electron_path, electron_dir) = find_electron()?;
             tracing::debug!(path = %electron_path.display(), dir = %electron_dir.display(),
                 "resolved electron engine");
@@ -531,24 +533,20 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 })
                 .arg(url)
                 .current_dir(electron_dir);
-            if options.engine == BrowserEngine::Chrome {
-                command.env("TWEB_BROWSER", "chrome");
+            match options.engine {
+                BrowserEngine::Chrome => {
+                    command.env("TWEB_BROWSER", "chrome");
+                }
+                BrowserEngine::Webkit => {
+                    command.env("TWEB_BROWSER", "webkit");
+                    // The page host is found beside this binary, so the engine and its host are
+                    // one build; electron/webkit/helper.cjs falls back to a checkout or PATH.
+                    if let Some(host) = find_webkit() {
+                        command.env("TWEB_WEBKIT", host);
+                    }
+                }
+                BrowserEngine::Electron => {}
             }
-            (command, description)
-        }
-        BrowserEngine::Tauri => {
-            let tauri_path = find_tauri()?;
-            let description = tauri_path.display().to_string();
-            let mut command = Command::new(tauri_path);
-            command
-                .arg("--frame-rate")
-                .arg(options.frame_rate.to_string())
-                .arg(if options.adaptive_frame_rate {
-                    "--adaptive-frame-rate"
-                } else {
-                    "--no-adaptive-frame-rate"
-                })
-                .arg(url);
             (command, description)
         }
     };
@@ -823,9 +821,9 @@ enum HostedOutcome {
 async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
     let socket = twebd::paths::socket_path_in(&twebd::paths::runtime_dir());
     let flag = std::env::var(attach::DAEMON_FLAG).ok();
-    // A Chrome pane drives a browser that is already shared across panes; the supervisor hosts
-    // Electron pages only, so it is not consulted.
-    if options.engine == BrowserEngine::Chrome {
+    // A Chrome pane drives a browser that is already shared across panes, and a WebKit pane its
+    // own page host; the supervisor hosts Electron pages only, so it is not consulted.
+    if options.engine != BrowserEngine::Electron {
         return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
     }
     // Decided BEFORE the daemon is started or consulted: a pane that opted out, or one asking for
@@ -1063,20 +1061,12 @@ async fn recv_any(stream: &mut Option<tokio::signal::unix::Signal>) {
     }
 }
 
-fn find_tauri() -> Result<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("TWEB_TAURI") {
-        return Ok(std::path::PathBuf::from(path));
+fn find_webkit() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("TWEB_WEBKIT") {
+        return Some(std::path::PathBuf::from(path));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(directory) = exe.parent() {
-            let candidate = directory.join("tweb-tauri");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-    }
-    which::which("tweb-tauri")
-        .context("Tauri engine binary not found; build tweb-tauri or set TWEB_TAURI")
+    let sibling = std::env::current_exe().ok()?.parent()?.join("tweb-webkit");
+    sibling.exists().then_some(sibling)
 }
 
 /// Where `make install` puts things: if the binary is `<prefix>/bin/tweb`, the Electron

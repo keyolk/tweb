@@ -3883,8 +3883,9 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       // iframe was dropped, and an editor there (a claude.ai artifact) had no terminal cursor
       // at all. There the owner is the frame that last reported a caret: a report only comes
       // from a frame with focus (the preload checks `document.hasFocus()`), and a frame giving
-      // up focus clears the cursor only if it still owns it.
-      if (pageBackend.kind === "chrome") {
+      // up focus clears the cursor only if it still owns it. The WebKit engine has no focused
+      // frame to ask either, so it takes the same rule.
+      if (pageBackend.kind !== "electron") {
         const key = sourceFrame ? frameKey(sourceFrame) : null;
         if (!value && key && caretOwners.get(tab) && caretOwners.get(tab) !== key) break;
         caretOwners.set(tab, value ? key : null);
@@ -4977,7 +4978,7 @@ async function dispatchAgentCommand(method, params) {
     case "devtools": {
       // Chrome's own DevTools for this pane's page, opened by the CLI in a pane of its own.
       // Only the Chrome engine serves that page; Electron's offscreen tabs keep `devTools: false`.
-      if (pageBackend.kind !== "chrome" || !pageBackend.engine) {
+      if (!pageBackend.engine?.devtoolsFor) {
         return { ok: false, message: "DevTools needs a Chrome-engine pane (--engine chrome)" };
       }
       return pageBackend.engine.devtoolsFor(currentWindows().win?.webContents);
@@ -5675,8 +5676,9 @@ let extensionsDirectory = null;
 // the interface — see `extension-policy.cjs` for which manifests are accepted and why an
 // unsupported one is refused with a reason rather than loaded and left inert.
 async function setUpExtensions() {
-  // Chrome brings its own extensions — the managed, policy-installed ones it is used for.
-  if (pageBackend.kind === "chrome") return;
+  // Chrome brings its own extensions — the managed, policy-installed ones it is used for — and
+  // WebKit runs none.
+  if (pageBackend.kind !== "electron") return;
   const dir = extensionsDir(process.env, app.getPath("userData"));
   extensionsDirectory = dir;
   watchServiceWorkers(session.defaultSession, {
@@ -5780,6 +5782,13 @@ const chooserWiredTabs = new WeakSet();
 function attachChooserDebugger(tab) {
   const contents = tab.webContents;
   if (chooserWiredTabs.has(tab)) return true;
+  // The WebKit engine has no CDP; its host reports the open panel itself and is answered by
+  // `setFileChooserFiles` (see webkit/web-contents.cjs).
+  if (typeof contents.setFileChooserFiles === "function") {
+    chooserWiredTabs.add(tab);
+    contents.on("tweb-file-chooser", bindPane(() => tabPanes.get(tab), (_event, params) => openFileChooser(tab, params)));
+    return true;
+  }
   if (!ensureDebugger(tab)) return false;
   chooserWiredTabs.add(tab);
   // Bound like configureTab's handlers and for the same reason: the chooser prompt is drawn into
@@ -5881,6 +5890,11 @@ function resolveFileChooser(tab, value) {
   }
   fileChooserByTab.delete(tab);
   const { paths } = chosenPaths(typed.map((entry) => expandHome(entry, home)), { multiple: pending.multiple });
+  if (typeof tab.webContents.setFileChooserFiles === "function") {
+    tab.webContents.setFileChooserFiles(paths);
+    if (debugLogging) console.error(`tweb: file chooser ${paths.length ? paths.join(", ") : "cancelled"}`);
+    return;
+  }
   void tab.webContents.debugger.sendCommand("DOM.setFileInputFiles", {
     files: paths,
     backendNodeId: pending.backendNodeId,
@@ -8465,7 +8479,7 @@ function sweepAbandonedClaimFiles() {
 // The Chrome engine's tabs live in another process, which an exit does not take with it. Quitting is
 // held once — long enough to close this engine's tabs, and Chrome too when no other pane uses it —
 // then let go. Bounded, because a wedged Chrome must not keep a dead pane's engine alive.
-let pageBackendStopped = pageBackend.kind !== "chrome";
+let pageBackendStopped = pageBackend.kind === "electron";
 app.on("will-quit", (event) => {
   if (pageBackendStopped) return;
   pageBackendStopped = true;
@@ -8473,7 +8487,7 @@ app.on("will-quit", (event) => {
   const done = () => app.quit();
   const timer = setTimeout(done, 3000);
   pageBackend.engine.stop().catch((error) => {
-    console.error(`tweb: chrome engine stop failed: ${error.message}`);
+    console.error(`tweb: ${pageBackend.kind} engine stop failed: ${error.message}`);
   }).finally(() => {
     clearTimeout(timer);
     done();

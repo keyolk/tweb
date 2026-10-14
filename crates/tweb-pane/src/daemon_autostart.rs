@@ -215,8 +215,8 @@ mod tests {
     /// which is why this passed on its own and failed under `cargo test --workspace`.
     ///
     /// The name has to be unique across PROCESSES, not just across threads, and a pid is not
-    /// enough on its own. `tweb-pane` is linked into three test binaries — its own, `tweb`'s and
-    /// `tweb-tauri`'s — and `cargo test` runs them concurrently, each with a counter that starts at
+    /// enough on its own. `tweb-pane` is linked into several test binaries — its own and `tweb`'s
+    /// among them — and `cargo test` runs them concurrently, each with a counter that starts at
     /// zero. So `<pid>-<counter>` collided between binaries: one process bound a listener on the
     /// name while another asserted nothing was listening on it. That is what made this pass alone
     /// and fail about half the time under `cargo test --workspace`.
