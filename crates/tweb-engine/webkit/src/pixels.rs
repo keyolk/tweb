@@ -69,6 +69,22 @@ pub struct Rect {
 
 static SENDER: OnceLock<Sender<Job>> = OnceLock::new();
 
+/// When each view's picture last actually changed, written by the pixel thread (the only place
+/// that knows) and read by the snapshot clock on the main thread (see `app::tick`).
+static LAST_CHANGE: std::sync::Mutex<Option<HashMap<u32, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+pub fn last_change(view: u32) -> Option<std::time::Instant> {
+    LAST_CHANGE.lock().ok()?.as_ref()?.get(&view).copied()
+}
+
+fn note_change(view: u32) {
+    if let Ok(mut map) = LAST_CHANGE.lock() {
+        map.get_or_insert_with(HashMap::new)
+            .insert(view, std::time::Instant::now());
+    }
+}
+
 pub fn submit(job: Job) {
     if let Some(sender) = SENDER.get() {
         let _ = sender.send(job);
@@ -119,6 +135,9 @@ fn run(receiver: Receiver<Job>) {
                         height,
                     }),
                 };
+                if dirty.is_some() {
+                    note_change(view);
+                }
                 let dirty = match (dirty, force) {
                     (Some(rect), _) => rect,
                     (None, true) => Rect {
