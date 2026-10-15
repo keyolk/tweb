@@ -106,6 +106,10 @@ tweb inspect-element --pane %3
 # ...and paste it, with a screenshot of the element, into the agent pane beside it
 tweb inspect-element --send --pane %3
 
+# Record while the user reproduces a bug; stop writes timeline.md and pastes its path to the agent
+tweb record start --pane %3
+tweb record stop --pane %3        # --no-send to only write it
+
 # Supervisor status, stop and restart
 tweb daemon status
 tweb daemon restart
@@ -620,6 +624,7 @@ composition area and the terminal cursor are removed with it.
 | `x` / `X` | Close the current tab / restore the most recently closed tab |
 | `y` | Copy the current page URL |
 | `r` | Reload |
+| `gr` | Record for the agent; `gr` again stops and pastes the timeline into the agent pane |
 | `zi` / `zo` / `zz` | Zoom in / out / reset |
 | `i` | insert mode: use the page's own shortcuts (`Esc` returns) |
 | `m` | Take audio back for this pane (only one TWeb pane is audible at a time) |
@@ -680,6 +685,29 @@ that has not asked for bracketed paste (busy, not at its prompt), the toast says
 sent. `tweb inspect-element --send` does the same from the CLI or for an agent in another pane.
 
 The element PNGs are kept (the newest 200), mode 0600, because the agent may read them later.
+
+### Recording for the agent (`gr`)
+
+`gr` (or the palette's *Record for agent*, `:record`, `tweb record start`) starts a recording of the
+pane, and a red `● REC` badge stays up for as long as it runs. `gr` again stops it, writes a
+directory under `~/.cache/tweb/recordings/<time>/`, and pastes the path of its `timeline.md` and a
+one-line summary into the agent pane — the same delivery, and the same refusal, as `I` `a`.
+
+`timeline.md` is a table of timestamped actions with the absolute path of each keyframe; the same
+events are in `events.json`. What is recorded:
+
+- navigations, clicks (the element's selector and up to 80 characters of its text),
+- field changes when a field is committed (`change`, not each keystroke) with the new value,
+- console errors and requests that failed or answered 400 or above (method, URL, status),
+- keyframes (JPEG, at most 1440 wide): at the start and stop, on each navigation, after each click,
+  and every 5s (`--interval`) only while the page is painting. At most 60 keyframes and 1000 events.
+
+What is not: the value of a password field, or of any field whose type, name, id or autocomplete
+says it holds a password, card number, one-time code, token or secret — the page itself drops the
+value before reporting the change, and the engine checks again. Keystrokes, request bodies and
+cookies are never recorded. Keyframes are pictures of the pane, so anything **visible** on screen
+(text you typed into an ordinary field, for one) is in them; password fields show only dots.
+Files are mode 0600 in a 0700 directory, and nothing is deleted automatically.
 
 The omnibox's visit history is appended to a per-profile file, so it is shared across panes and
 restarts. `o` prefills the current URL, so it opens filtered to that URL; use `t`/`O` to start from an

@@ -131,6 +131,8 @@ installPrintShim();
     // `engine.chrome_sites` reached by a link, which is told to the user but not moved for them.
     { name: "chrome-pane", label: "Reopen in Chrome pane", action: () => send("chrome-pane") },
     { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
+    // Starts a recording, or stops one and pastes its timeline into the agent pane (`gr`).
+    { name: "record", label: "Record for agent (start / stop)", action: () => send("record-toggle") },
     // Moving focus between the floating window and its pane, without closing either. Losing
     // one of them on a busy desktop is the case these exist for.
     { name: "terminal", label: "Focus terminal", action: () => send("focus-terminal") },
@@ -279,6 +281,10 @@ installPrintShim();
   let audioBadge = null;
   let audioState = { muted: false, owner: null };
   let transferBadge = null;
+  let recordBadge = null;
+  // Whether this pane is being recorded (`gr`, `tweb record`). The engine says so on every new
+  // document; while it is on, clicks and committed field changes are reported (see recordClick).
+  let recordingOn = false;
   let transferState = null;
   let downloadsState = null;
   let fileChooserState = null;
@@ -727,12 +733,23 @@ installPrintShim();
     };
     popover.onmouseenter = () => clearTimeout(tabPopoverTimer);
     popover.onmouseleave = scheduleTabPopoverHide;
-    shadow.append(label, input, audio, transfer, badge, popover);
+    // Shown for the whole recording, so nobody types into a page without knowing it is logged.
+    const record = document.createElement("span");
+    record.style.cssText = [
+      "box-sizing:border-box", "display:none", "height:18px", "padding:1px 6px",
+      "border:1px solid #f28b8266", "border-radius:4px", "background:#111d", "color:#f28b82",
+      "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "white-space:nowrap", "backdrop-filter:blur(3px)",
+    ].join(";");
+    record.textContent = "● REC";
+    record.title = "Recording for the agent — gr stops and sends the timeline";
+    shadow.append(label, input, audio, record, transfer, badge, popover);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
     inputBadge = input;
     audioBadge = audio;
+    recordBadge = record;
     transferBadge = transfer;
     tabBadge = badge;
     tabPopover = popover;
@@ -842,6 +859,7 @@ installPrintShim();
       ? `Audio muted — ${audioState.owner || "another pane"} owns it · press m to take it back`
       : "";
     audioBadge.style.display = audioState.muted ? "" : "none";
+    recordBadge.style.display = recordingOn ? "" : "none";
     // The absolute path is what a terminal has instead of "Show in folder", and it is
     // strictly more useful: a path can be fed to the user's own tools, a Finder window
     // cannot. It goes in the tooltip rather than the badge because a full path would push
@@ -3188,6 +3206,7 @@ installPrintShim();
       }],
       ["b", "list open tabs", { b: () => showTabList() }],
       ["gh · gd", "history page · downloads — search, copy the path, open"],
+      ["gr", "record for the agent · again to stop and send the timeline"],
       ["J · K", "previous · next tab", { J: () => send("previous-tab"), K: () => send("next-tab") }],
       ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
       ["r · gi", "reload · focus first input", { r: () => send("reload") }],
@@ -5400,6 +5419,8 @@ installPrintShim();
       // almost every press wants, and silently promoting it to a paper job would surprise
       // someone who wanted the file.
       else if (key === "p") send("print-paper");
+      // Record for the agent: start, and again to stop and send the timeline.
+      else if (key === "r") send("record-toggle");
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
       else return;
       event.preventDefault();
@@ -5545,6 +5566,67 @@ installPrintShim();
     // The bar is a canvas, so a repaint is the only way its new contents reach the pane.
     paintNow();
     setMode("search", searchState.count);
+  });
+
+  // --- recording ---
+  //
+  // Clicks and COMMITTED field changes (the `change` event: a value is reported once, when the
+  // field is left or a choice is made, never per keystroke). A sensitive field's value never
+  // leaves this page: the rule below is applied here, and the engine applies the same rule again
+  // (recorder.cjs `sensitiveField`, kept equal by a test). This preload is sandboxed and cannot
+  // require that file.
+  const RECORD_SENSITIVE_NAME = /pass|pwd|secret|token|otp|cvc|cvv|card|ssn|security.?code/i;
+  const RECORD_SENSITIVE_AUTOCOMPLETE = /current-password|new-password|one-time-code|cc-/i;
+
+  function recordSensitiveField(field) {
+    if (String(field.type || "").toLowerCase() === "password") return true;
+    if (RECORD_SENSITIVE_AUTOCOMPLETE.test(String(field.autocomplete || ""))) return true;
+    return RECORD_SENSITIVE_NAME.test(`${field.name || ""} ${field.id || ""}`);
+  }
+
+  // tweb's own overlays (hints, palette, badges) are not the page; clicks on them are not recorded.
+  function fromTwebOverlay(event) {
+    return event.composedPath().some((node) => typeof node?.id === "string" && node.id.startsWith("__tweb_"));
+  }
+
+  function recordClick(event) {
+    if (!recordingOn || fromTwebOverlay(event)) return;
+    const element = event.composedPath().find(isElement);
+    if (!element) return;
+    const label = element.innerText || element.getAttribute?.("aria-label") || element.getAttribute?.("title") || "";
+    send("record-event", {
+      kind: "click", selector: cssSelector(element), text: String(label).slice(0, 120), url: location.href,
+    });
+  }
+
+  function recordFieldChange(event) {
+    if (!recordingOn || fromTwebOverlay(event)) return;
+    const element = event.composedPath().find(isElement);
+    if (!element || !/^(input|textarea|select)$/.test(element.localName)) return;
+    const type = element.localName === "input" ? String(element.type || "text").toLowerCase() : element.localName;
+    if (type === "hidden") return;
+    const field = { type, name: element.name || "", id: ownId(element) || "", autocomplete: element.autocomplete || "" };
+    if (!recordSensitiveField(field)) {
+      if (type === "checkbox" || type === "radio") field.checked = Boolean(element.checked);
+      else if (type !== "file") field.value = String(element.value ?? "").slice(0, 120);
+    }
+    send("record-event", { kind: "field", selector: cssSelector(element), field, url: location.href });
+  }
+
+  ipcRenderer.on("tweb-recording", (_event, state) => {
+    const on = Boolean(state?.recording);
+    if (on === recordingOn) return;
+    recordingOn = on;
+    // Capture phase, so a page that stops propagation still has its click recorded; the listener
+    // only reads, it never cancels.
+    if (on) {
+      document.addEventListener("click", recordClick, true);
+      document.addEventListener("change", recordFieldChange, true);
+    } else {
+      document.removeEventListener("click", recordClick, true);
+      document.removeEventListener("change", recordFieldChange, true);
+    }
+    if (topFrame) renderIndicator();
   });
 
   ipcRenderer.on("tweb-audio-state", (_event, state) => {

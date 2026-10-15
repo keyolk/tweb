@@ -52,6 +52,7 @@ const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibilit
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { waitFor } = require("./agent-wait.cjs");
 const { elementCrop, findAgentPane, pasteToAgent, inspectMessage } = require("./agent-handoff.cjs");
+const { Recording, cleanPageEvent, oneLine, timelineMarkdown } = require("./recorder.cjs");
 const { evaluate } = require("./agent-eval.cjs");
 const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
@@ -3883,6 +3884,14 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "inspect-to-agent":
       void sendInspectToAgent(tab, value);
       break;
+    // `gr`, the palette's Record row and `:record`.
+    case "record-toggle":
+      toggleRecording();
+      break;
+    // A click or a committed field change, from a frame of a tab being recorded.
+    case "record-event":
+      recordPageEvent(tab, value);
+      break;
     // The address the tab actually settled on, which the page cannot always see:
     // a subframe reports its own URL, and a cross-origin one cannot read the top.
     case "copy-url":
@@ -4100,6 +4109,8 @@ ipcMain.on("tweb-preload-ready", bindPane(
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-mode", shortcutModeMessage());
+  // A new document in a recorded tab starts listening for clicks again.
+  if (recordingForTab(tab)) event.reply("tweb-recording", { recording: true });
   if (tab === currentWindows().win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
@@ -4309,7 +4320,7 @@ function watchConsole(contents) {
       ? { level: first.level, message: first.message, line: first.lineNumber, source: first.sourceId }
       : { level, message, line, source: sourceId };
     const numericLevels = ["debug", "info", "warning", "error"];
-    recordConsoleMessage({
+    const entry = {
       level: typeof detail.level === "number"
         ? numericLevels[detail.level] || "info"
         : String(detail.level ?? "info"),
@@ -4317,7 +4328,9 @@ function watchConsole(contents) {
       line: detail.line,
       source: detail.source,
       url: contents.getURL(),
-    });
+    };
+    recordConsoleMessage(entry);
+    recordConsoleError(contents, entry);
   });
 }
 
@@ -4357,6 +4370,13 @@ function watchNetwork() {
     if (!entry) return;
     entry.statusCode = details.statusCode;
     entry.fromCache = Boolean(details.fromCache);
+    if (details.statusCode >= 400) recordNetworkFailure(details, details.statusCode, null);
+  });
+  // A request that never got a response at all — DNS, refused, blocked, aborted. Only a recording
+  // reads these; `tweb network` shows such a request as one with no status.
+  session.defaultSession.webRequest.onErrorOccurred((details) => {
+    if (details.error === "net::ERR_ABORTED") return;
+    recordNetworkFailure(details, null, details.error);
   });
 }
 
@@ -4918,6 +4938,227 @@ async function sendInspectToAgent(tab, payload) {
   return { ...result, screenshot };
 }
 
+// --- recording a pane for the agent (`tweb record`, `gr`) ---
+//
+// The rules — what an event may hold, the bounds, the timeline — are in recorder.cjs. This half
+// owns the hooks that feed it and the files. One recording per pane, keyed by the pane record.
+const recordings = new WeakMap();
+// The longest side a keyframe is stored at. A 2880x1800 pane frame is several MB as PNG and an
+// agent reads it no better than a 1440-wide JPEG; sixty of the former would be a quarter gigabyte.
+const KEYFRAME_MAX_WIDTH = 1440;
+const KEYFRAME_TIMER_MS = 1000;
+
+function activeRecording() {
+  return recordings.get(currentPane()) || null;
+}
+
+// The recording a tab's event belongs to: the tab's own pane, not whichever pane is ambient.
+function recordingForTab(tab) {
+  const record = tab && tabPanes.get(tab);
+  return record ? recordings.get(record) || null : null;
+}
+
+function tabForContents(contents) {
+  for (const tab of tabPanes.keys()) {
+    if (!tab.isDestroyed() && tab.webContents === contents) return tab;
+  }
+  return null;
+}
+
+function tabForWebContentsId(id) {
+  for (const tab of tabPanes.keys()) {
+    if (!tab.isDestroyed() && tab.webContents.id === id) return tab;
+  }
+  return null;
+}
+
+function broadcastRecordingState(record = currentPane()) {
+  const state = { recording: recordings.has(record) };
+  for (const tab of windowsFor(record).tabs) sendToTabFrames(tab, "tweb-recording", state);
+}
+
+// One keyframe of the pane's active tab, attached to `entry` (or to a new `change` event).
+//
+// Captures run one at a time, in the order asked: a navigation's keyframe is asked for while the
+// click that caused it is still being captured, and dropping the second lost the navigation's
+// picture. A timer keyframe is the exception — it is skipped while one is pending, since the
+// pending one already shows the page as it is now.
+function captureKeyframe(recording, record, reason, entry = null) {
+  if (reason === "change" && recording.pendingCaptures) return recording.captures;
+  recording.pendingCaptures = (recording.pendingCaptures || 0) + 1;
+  recording.captures = (recording.captures || Promise.resolve())
+    .then(() => captureKeyframeNow(recording, record, reason, entry))
+    .finally(() => { recording.pendingCaptures -= 1; });
+  return recording.captures;
+}
+
+// Right after a navigation commits the compositor is between documents, and `capturePage` fails
+// with `UnknownVizError` — measured on the very capture a navigation keyframe makes. The next
+// frame or two is fine.
+async function captureWithRetry(contents, attempts = 3) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await contents.capturePage();
+    } catch (error) {
+      if (attempt >= attempts || contents.isDestroyed()) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
+async function captureKeyframeNow(recording, record, reason, entry) {
+  // A delayed click or navigation keyframe that comes due after stop would be a file the
+  // timeline, already written, does not mention.
+  if (recording.stopped && reason !== "stop") return;
+  const tab = windowsFor(record).win;
+  if (!tab || tab.isDestroyed() || record.visible === false) return;
+  const name = recording.reserveKeyframe(reason);
+  if (!name) return;
+  try {
+    let image = await captureWithRetry(tab.webContents);
+    const size = image?.getSize?.() || { width: 0, height: 0 };
+    if (!image || image.isEmpty() || size.width < 32 || size.height < 32) {
+      recording.keyframes -= 1;
+      return;
+    }
+    if (size.width > KEYFRAME_MAX_WIDTH && image.resize) image = image.resize({ width: KEYFRAME_MAX_WIDTH });
+    writeFileSync(path.join(recording.directory, name), image.toJPEG(80), { mode: 0o600 });
+    const target = entry || recording.record("change", {});
+    if (target) target.keyframe = name;
+  } catch (error) {
+    recording.keyframes -= 1;
+    console.error(`tweb: record keyframe failed: ${error.message}`);
+  }
+}
+
+// After a click the page answers within a frame or two, and the answer is what is worth seeing.
+const CLICK_KEYFRAME_DELAY_MS = 400;
+// A navigation's keyframe is taken when it stops loading, or after this if it never does.
+const NAVIGATION_KEYFRAME_FALLBACK_MS = 3000;
+
+function recordTabNavigation(tab, url, inPage) {
+  const recording = recordingForTab(tab);
+  if (!recording || tab !== windowsFor(tabPanes.get(tab)).win) return;
+  const entry = recording.record("navigate", { url: oneLine(url, 300), inPage: Boolean(inPage) });
+  if (!entry) return;
+  const record = tabPanes.get(tab);
+  if (inPage) {
+    setTimeout(() => void captureKeyframe(recording, record, "navigate", entry), CLICK_KEYFRAME_DELAY_MS);
+    return;
+  }
+  clearTimeout(recording.navigationTimer);
+  recording.pendingNavigation = entry;
+  recording.navigationTimer = setTimeout(() => settleNavigationKeyframe(tab), NAVIGATION_KEYFRAME_FALLBACK_MS);
+}
+
+function settleNavigationKeyframe(tab) {
+  const recording = recordingForTab(tab);
+  if (!recording?.pendingNavigation) return;
+  const entry = recording.pendingNavigation;
+  recording.pendingNavigation = null;
+  clearTimeout(recording.navigationTimer);
+  void captureKeyframe(recording, tabPanes.get(tab), "navigate", entry);
+}
+
+function recordPageEvent(tab, event) {
+  const recording = recordingForTab(tab);
+  const clean = recording && cleanPageEvent(event);
+  if (!clean) return;
+  const { kind, ...detail } = clean;
+  const entry = recording.record(kind, detail);
+  if (entry && kind === "click") {
+    const record = tabPanes.get(tab);
+    setTimeout(() => void captureKeyframe(recording, record, "click", entry), CLICK_KEYFRAME_DELAY_MS);
+  }
+}
+
+function recordConsoleError(contents, entry) {
+  if (entry.level !== "error") return;
+  const recording = recordingForTab(tabForContents(contents));
+  recording?.record("console-error", {
+    message: oneLine(entry.message, 300), source: oneLine(entry.source, 200), line: entry.line, url: oneLine(entry.url, 300),
+  });
+}
+
+function recordNetworkFailure(details, status, error) {
+  const recording = recordingForTab(tabForWebContentsId(details.webContentsId));
+  recording?.record("network-failure", {
+    method: details.method, url: oneLine(details.url, 300), status: status ?? null, error: error || null,
+  });
+}
+
+function recordingDirectory() {
+  return path.join(twebCacheRoot(), "recordings", handoffStamp());
+}
+
+function startRecording(params = {}) {
+  const record = currentPane();
+  const existing = recordings.get(record);
+  if (existing) return { ok: true, recording: true, directory: existing.directory, already: true };
+  const directory = recordingDirectory();
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const recording = new Recording({
+    directory,
+    pane: handoffSelfPane() || record.id || null,
+    intervalMs: Number.isFinite(params.interval) ? params.interval * 1000 : undefined,
+  });
+  recordings.set(record, recording);
+  const tab = windowsFor(record).win;
+  const entry = recording.record("start", { url: oneLine(tab && !tab.isDestroyed() ? tab.webContents.getURL() : "", 300) });
+  void captureKeyframe(recording, record, "start", entry);
+  // Paints set `dirty`; this tick turns a changing page into a keyframe every interval.
+  recording.timer = setInterval(() => {
+    if (recording.periodicDue()) void captureKeyframe(recording, record, "change");
+  }, KEYFRAME_TIMER_MS);
+  broadcastRecordingState(record);
+  console.error(`tweb: recording to ${directory}`);
+  return { ok: true, recording: true, directory };
+}
+
+async function stopRecording(params = {}) {
+  const record = currentPane();
+  const recording = recordings.get(record);
+  if (!recording) return { ok: false, recording: false, message: "not recording" };
+  clearInterval(recording.timer);
+  clearTimeout(recording.navigationTimer);
+  recording.stopped = true;
+  const tab = windowsFor(record).win;
+  const entry = recording.record("stop", { url: oneLine(tab && !tab.isDestroyed() ? tab.webContents.getURL() : "", 300) });
+  // Queued behind any capture still running, so every keyframe is in the timeline it is linked from.
+  await captureKeyframe(recording, record, "stop", entry);
+  recordings.delete(record);
+  broadcastRecordingState(record);
+  recording.endedAt = Date.now();
+  const timeline = path.join(recording.directory, "timeline.md");
+  writeFileSync(timeline, timelineMarkdown(recording, path.join), { mode: 0o600 });
+  writeFileSync(path.join(recording.directory, "events.json"), `${JSON.stringify({
+    startedAt: new Date(recording.startedAt).toISOString(),
+    endedAt: new Date(recording.endedAt).toISOString(),
+    pane: recording.pane,
+    events: recording.events,
+  }, null, 2)}\n`, { mode: 0o600 });
+  const summary = recording.summary(timeline);
+  console.error(`tweb: recording stopped: ${timeline}`);
+  let sent = null;
+  if (params.send !== false) {
+    const target = await findHandoffTarget();
+    sent = target.ok ? await pasteHandoff(target, summary) : target;
+    if (tab && !tab.isDestroyed()) handoffToast(tab, "recording", sent);
+  } else if (tab && !tab.isDestroyed()) {
+    sendToMainTabFrame(tab, "tweb-flash", "recording saved");
+  }
+  return { ok: true, recording: false, directory: recording.directory, timeline, summary, ...recording.counts(), sent };
+}
+
+function toggleRecording() {
+  if (activeRecording()) void stopRecording();
+  else {
+    startRecording();
+    const tab = currentWindows().win;
+    if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", "● recording — gr stops");
+  }
+}
+
 /**
  * `tweb device` — lay the page out as a phone or tablet does.
  *
@@ -5149,6 +5390,16 @@ async function dispatchAgentCommand(method, params) {
       // `--send`: the same push the inspect `a` key does, for a caller in another pane.
       if (params?.send) return { ...result, sent: await sendInspectToAgent(agentTab(), result) };
       return result;
+    }
+    case "record-start":
+      return startRecording(params);
+    case "record-stop":
+      return stopRecording(params);
+    case "record-status": {
+      const recording = activeRecording();
+      return recording
+        ? { recording: true, directory: recording.directory, events: recording.events.length, keyframes: recording.keyframes }
+        : { recording: false };
     }
     case "float": {
       inputState().floating = true;
@@ -6380,7 +6631,11 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
   onContents("paint", (_event, dirty, image) => {
     // A page painting on its own is what separates video from a static screen, and the
     // frame-rate policy reads it to decide whether to fall all the way to idle.
-    if (tab === currentWindows().win) notePaintActivity();
+    if (tab === currentWindows().win) {
+      notePaintActivity();
+      const recording = activeRecording();
+      if (recording) recording.dirty = true;
+    }
     const size = image.getSize();
     const expected = currentFrames().viewport && renderedFrameSize(currentFrames().viewport);
     if (loggedFrameGeneration !== currentFrames().generation && !image.isEmpty()
@@ -6532,6 +6787,8 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
   // ordinary end, a stop, and a failure alike — a bar left behind by an error page would be
   // the most annoying form of this feature.
   onContents("did-stop-loading", () => sendLoadingProgress(tab, null));
+  // A recorded navigation's keyframe is the page it loaded, not the blank one it left.
+  onContents("did-stop-loading", () => settleNavigationKeyframe(tab));
 
   let showingLoadError = false;
   const recordNavigation = (url) => {
@@ -6551,9 +6808,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     recordNavigation(url);
     updatePaneTitle();
     noticeChromeSite(tab, url);
+    recordTabNavigation(tab, url, false);
   });
   onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
-    if (isMainFrame) { recordNavigation(url); updatePaneTitle(); }
+    if (isMainFrame) { recordNavigation(url); updatePaneTitle(); recordTabNavigation(tab, url, true); }
   });
 
   let initialZoomApplied = false;
