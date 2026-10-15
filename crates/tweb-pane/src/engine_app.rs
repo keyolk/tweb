@@ -329,6 +329,32 @@ fn write_app(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Writes the embedded binary files (the native addon) into an app directory that was not unpacked
+/// from this binary — a checkout's `electron/` in development. Only when the bytes differ, so a
+/// running engine never has its loaded addon replaced underneath it by an identical copy; the write
+/// is a rename, so an engine starting concurrently sees the old file or the new one, never half.
+pub fn place_binary_files(directory: &Path) -> Result<()> {
+    for (name, body) in BINARY_FILES {
+        if body.is_empty() {
+            continue;
+        }
+        let path = directory.join(name);
+        if std::fs::read(&path).is_ok_and(|current| current == *body) {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let staging = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&staging, body)
+            .with_context(|| format!("cannot write {}", staging.display()))?;
+        std::fs::rename(&staging, &path)
+            .with_context(|| format!("cannot place {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// The directory the embedded app code was unpacked into. If it already exists, it is used as is.
 pub fn extracted_app_dir() -> Result<PathBuf> {
     let target = cache_root().join(format!("app-{}", content_tag()));
@@ -566,6 +592,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_workspace_app_dir_gets_the_addon_once() {
+        let directory = std::env::temp_dir().join(format!("tweb-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        super::place_binary_files(&directory).expect("place");
+        for (name, body) in super::BINARY_FILES {
+            let path = directory.join(name);
+            if body.is_empty() {
+                assert!(!path.exists(), "an empty (unbuilt) addon is not written");
+                continue;
+            }
+            assert_eq!(std::fs::read(&path).expect("placed"), *body);
+            let placed = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .expect("mtime");
+            super::place_binary_files(&directory).expect("place again");
+            let again = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .expect("mtime");
+            assert_eq!(placed, again, "identical bytes are not rewritten");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The runtime download is named after this, so a range prefix left in place
