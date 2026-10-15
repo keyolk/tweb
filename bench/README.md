@@ -25,6 +25,8 @@ shipping configuration, which does not set that switch.
 | `stacking.py` | Whether a patch placed after a base actually draws *on top* of it (judged by eye — the protocol only reports lifetime) |
 | `shm-frames.py` | Whether whole frames through the shm addon (`t=s`) still drop at Retina size on a real Ghostty window, against the frame file, and whether every object is consumed — see DETAIL.md 8.8 |
 | `shm-consumer.py` | The engine's half of `t=s` on a bare PTY, with the harness acting as the terminal: every named object exists, is `s*v*4` bytes, has the right channel order (`--page smallpaint` paints only red and green), and is unlinked after reading |
+| `frame-rate-after-input.cjs` | Whether an offscreen window keeps its requested frame rate after input, stock against zenbu's patched Electron (only above 60fps does it not — DETAIL.md 8.8) |
+| `shared-texture.cjs` | Whether `offscreen.useSharedTexture` + reading the IOSurface beats `toBitmap()` on the main thread (it does not — DETAIL.md 8.8) |
 | `shm-through-tmux.py` | Whether `t=s` survives tmux passthrough, with a temp-file transfer as the control |
 | `raw-render.py` | Whether `f=32` raw pixels render correctly over the file medium (judged by eye) |
 | `convert-bench.cjs` | How the gfx worker's per-frame time splits between the BGRA→RGBA swap and the 20MB write |

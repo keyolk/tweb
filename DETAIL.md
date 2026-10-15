@@ -1198,6 +1198,44 @@ fullpaint 186 whole frames, smallpaint 136 patches, all through shm, every objec
 `s*v*4`, red and green read back as `ff0000`/`00ff00` (no blue, so the swap is right), 0 inline PNG
 patches.
 
+**And the shared-texture path, measured and not taken (2026-10-15).** zenbu-labs/terminal-browser runs
+macOS frames through `offscreen.useSharedTexture` and reads the IOSurface in native code. Adopting it
+here would mean reworking everything that holds a `paint` NativeImage (frame cache, patch crops,
+repaints), so it was priced first: `bench/shared-texture.cjs`, Electron 43, 2880x1800 at 30fps, the
+addon's `readIOSurface` against `toBitmap()`, two interleaved runs per page:
+
+```text
+page       path       main thread p50 / p90 / p99      Browser / GPU process CPU
+fullpaint  toBitmap   1.75 / 3.6 / 5.3 ms              1.5% / 0.6%
+fullpaint  IOSurface  4.57 / 6.0 / 8.0 ms              1.2% / 0.5%
+webgl      toBitmap   1.78 / 3.4 / 5.5 ms              1.4% / 0.4%
+webgl      IOSurface  4.70 / 5.9 / 7.7 ms              1.2% / 0.3%
+```
+
+Reading a GPU surface on the CPU costs more on the main thread than the copy `toBitmap()` makes, even
+for GPU-drawn content, and the process CPU it would save is within noise. tweb needs CPU pixels either
+way (for `t=s`), so the default path stays. `readIOSurface` stays in the addon so this can be re-run
+on a later Electron; nothing in the engine calls it.
+
+**Nor the patched Electron (2026-10-15).** zenbu-labs/terminal-browser publishes Electron builds with
+three offscreen patches (GitHub releases `electron-v<version>`, same zip layout as upstream, Developer
+ID-signed; their fuses leave `OnlyLoadAppFromAsar` off, so `TWEB_ELECTRON=<…>/MacOS/pixel` would run
+tweb's app as is). On macOS only one of them is active — `osr-shm-frame` is `#if BUILDFLAG(IS_LINUX)`,
+and `osr-wayland-scale` is Linux too. The remaining one, `osr-vsync-display`, says input clamps an
+offscreen window's begin frames to 60 and the clamp sticks. `bench/frame-rate-after-input.cjs`, stock
+against patched 44.2.0, two runs each:
+
+```text
+requested   stock: before -> input -> after      patched: before -> input -> after
+30          30 -> 29.8 -> 30                      30 -> 30 -> 30
+60          60 -> 60   -> 60                      60 -> 60 -> 60
+120         120 -> 62  -> 60  (stuck)             120 -> 120 -> 120
+```
+
+The bug is real and only exists above 60fps. tweb asks for 4-30, so the patched build buys nothing here
+and would cost a pinned third-party runtime (and its bundle id, `dev.zenbu.pixel`, owning the camera and
+microphone grants). Stock Electron stays.
+
 ## 9. A component and interface structure built for extension
 
 > **The traits below exist as Rust source; almost none of them have an implementation.**
