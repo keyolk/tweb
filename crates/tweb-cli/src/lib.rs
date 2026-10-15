@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod mcp;
 pub mod sites;
+pub mod skill;
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -57,6 +58,11 @@ pub struct BrowserOptions {
     // Hyphen values allowed: the pass-through form starts with an ssh flag (`-J bastion me@box`).
     #[arg(long, value_name = "DEST", allow_hyphen_values = true)]
     pub ssh: Option<String>,
+
+    /// Let the terminal show through pages that paint no background of their own.
+    /// `page.transparent` in config.toml turns it on for every pane. Electron engine only.
+    #[arg(long)]
+    pub transparent: bool,
 }
 
 impl BrowserOptions {
@@ -106,6 +112,19 @@ impl BrowserOptions {
         tweb_pane::ssh::parse_target(value).map(Some)
     }
 
+    /// Refuses `--transparent` where it cannot be honoured. Only the flag: `page.transparent`
+    /// from config.toml is ignored by those engines instead, because a setting meant for every
+    /// pane must not stop a Chrome pane from opening.
+    fn check_transparent(&self) -> Result<()> {
+        if self.transparent && !matches!(self.engine(), BrowserEngineArg::Electron) {
+            anyhow::bail!(
+                "--transparent needs the Electron engine: the Chrome engine's frames are JPEG and \
+                 the WebKit host has no transparent path"
+            );
+        }
+        Ok(())
+    }
+
     /// A flag on this command line wins; otherwise `frame_rate.adaptive` from config.toml.
     fn adaptive(&self) -> bool {
         if self.adaptive_frame_rate {
@@ -139,6 +158,9 @@ impl BrowserOptions {
         });
         if let Some(ssh) = &self.ssh {
             value.push_str(&format!(" --ssh={}", shell_quote(ssh)));
+        }
+        if self.transparent {
+            value.push_str(" --transparent");
         }
         value
     }
@@ -426,6 +448,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// The agent skill that teaches Claude Code or Codex to drive tweb: install, uninstall, print.
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
     /// Settings in config.toml: list, get, set, unset, edit, path.
     Config {
         #[command(subcommand)]
@@ -494,6 +521,52 @@ pub struct AgentOptions {
     /// Print raw JSON instead of the human-readable summary.
     #[arg(long, global = true)]
     pub json: bool,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct SkillAgents {
+    /// Claude Code: `~/.claude/skills/tweb/SKILL.md` (`$CLAUDE_CONFIG_DIR` when set).
+    #[arg(long)]
+    pub claude: bool,
+    /// Codex: `~/.codex/skills/tweb/SKILL.md` (`$CODEX_HOME` when set).
+    #[arg(long)]
+    pub codex: bool,
+}
+
+impl SkillAgents {
+    fn agents(&self) -> Vec<skill::Agent> {
+        let mut agents = Vec::new();
+        if self.claude {
+            agents.push(skill::Agent::Claude);
+        }
+        if self.codex {
+            agents.push(skill::Agent::Codex);
+        }
+        agents
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillAction {
+    /// Write the skill for the agents named, or for each agent installed here when none is.
+    Install {
+        #[command(flatten)]
+        agents: SkillAgents,
+        /// Replace a SKILL.md that tweb did not write.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the skill tweb installed. A SKILL.md it did not write is kept.
+    Uninstall {
+        #[command(flatten)]
+        agents: SkillAgents,
+    },
+    /// Print the skill to stdout, for an agent tweb does not know where to install for.
+    Print {
+        /// Include the Codex section.
+        #[arg(long)]
+        codex: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -695,6 +768,7 @@ pub async fn run() -> Result<()> {
             // An omitted URL is preserved across tmux split-window too.
             let browser = browser.with_engine_for(url.as_deref());
             browser.ssh_target()?;
+            browser.check_transparent()?;
             split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
         }
         Command::PaneInternal { browser, page, url } => {
@@ -730,6 +804,18 @@ pub async fn run() -> Result<()> {
         Command::Doctor { fix } => {
             doctor::run(fix).await?;
         }
+        Command::Skill { action } => match action {
+            SkillAction::Install { agents, force } => skill::install(&agents.agents(), force)?,
+            SkillAction::Uninstall { agents } => skill::uninstall(&agents.agents())?,
+            SkillAction::Print { codex } => print!(
+                "{}",
+                skill::render(if codex {
+                    skill::Agent::Codex
+                } else {
+                    skill::Agent::Claude
+                })
+            ),
+        },
         Command::Config { action } => match action.unwrap_or(ConfigAction::List { json: false }) {
             ConfigAction::List { json } => config::list(json)?,
             ConfigAction::Get { key } => config::get(&key)?,
@@ -931,6 +1017,7 @@ fn agent_call(
 /// rather than being spawned as a separate binary. That is what keeps version skew from
 /// appearing between the CLI and the frontend (DESIGN.md 4.1).
 async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
+    browser.check_transparent()?;
     // The frontend locates the engine paths itself. If the CLI guessed and passed them in, the
     // binary and the app directory could end up mismatched (node_modules/electron has a
     // package.json too), and being the same process there is no reason to pass them anyway.
@@ -945,6 +1032,7 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
         adaptive_frame_rate: browser.adaptive(),
         restore_session: url.is_none(),
         ssh: browser.ssh_target()?,
+        transparent: browser.transparent,
     };
     tweb_pane::run_with_options(url.unwrap_or("about:blank"), options).await
 }
@@ -1050,6 +1138,7 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
         adaptive_frame_rate: false,
         no_adaptive_frame_rate: false,
         ssh: None,
+        transparent: false,
     };
     split_and_run_pane(
         Some(url),
@@ -1214,6 +1303,34 @@ mod tests {
             panic!("not an open");
         };
         assert!(browser.ssh_target().is_err());
+    }
+
+    #[test]
+    fn transparent_reaches_the_split_pane_and_only_on_electron() {
+        let cli = Cli::try_parse_from([
+            "tweb",
+            "split",
+            "--frame-rate",
+            "30",
+            "--adaptive-frame-rate",
+            "--transparent",
+            "--engine",
+            "electron",
+        ])
+        .unwrap();
+        let Command::Split { browser, .. } = cli.command else {
+            panic!("not a split");
+        };
+        assert!(browser.check_transparent().is_ok());
+        assert!(browser.shell_args().ends_with(" --transparent"));
+        for engine in ["chrome", "webkit"] {
+            let cli =
+                Cli::try_parse_from(["tweb", "open", "--engine", engine, "--transparent"]).unwrap();
+            let Command::Open { browser, .. } = cli.command else {
+                panic!("not an open");
+            };
+            assert!(browser.check_transparent().is_err(), "{engine}");
+        }
     }
 
     #[test]
