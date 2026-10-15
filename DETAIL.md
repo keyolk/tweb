@@ -1198,6 +1198,25 @@ fullpaint 186 whole frames, smallpaint 136 patches, all through shm, every objec
 `s*v*4`, red and green read back as `ff0000`/`00ff00` (no blue, so the swap is right), 0 inline PNG
 patches.
 
+**And the shared-texture path, measured and not taken (2026-10-15).** zenbu-labs/terminal-browser runs
+macOS frames through `offscreen.useSharedTexture` and reads the IOSurface in native code. Adopting it
+here would mean reworking everything that holds a `paint` NativeImage (frame cache, patch crops,
+repaints), so it was priced first: `bench/shared-texture.cjs`, Electron 43, 2880x1800 at 30fps, the
+addon's `readIOSurface` against `toBitmap()`, two interleaved runs per page:
+
+```text
+page       path       main thread p50 / p90 / p99      Browser / GPU process CPU
+fullpaint  toBitmap   1.75 / 3.6 / 5.3 ms              1.5% / 0.6%
+fullpaint  IOSurface  4.57 / 6.0 / 8.0 ms              1.2% / 0.5%
+webgl      toBitmap   1.78 / 3.4 / 5.5 ms              1.4% / 0.4%
+webgl      IOSurface  4.70 / 5.9 / 7.7 ms              1.2% / 0.3%
+```
+
+Reading a GPU surface on the CPU costs more on the main thread than the copy `toBitmap()` makes, even
+for GPU-drawn content, and the process CPU it would save is within noise. tweb needs CPU pixels either
+way (for `t=s`), so the default path stays. `readIOSurface` stays in the addon so this can be re-run
+on a later Electron; nothing in the engine calls it.
+
 ## 9. A component and interface structure built for extension
 
 > **The traits below exist as Rust source; almost none of them have an implementation.**

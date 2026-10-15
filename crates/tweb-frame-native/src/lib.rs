@@ -127,6 +127,70 @@ fn fill(fd: libc::c_int, pixels: &[u8], swap: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// An Electron shared texture's IOSurface, read on the CPU. macOS only.
+///
+/// With `offscreen.useSharedTexture`, a paint hands over a GPU surface instead of a CPU bitmap;
+/// `textureInfo.handle.ioSurface` is a Buffer holding the `IOSurfaceRef` pointer. This locks it
+/// read-only and copies its rows out tightly packed, which is the CPU pass the default path's
+/// `toBitmap()` stands for — present so `bench/shared-texture.cjs` can price the two against each
+/// other. zenbu-labs/terminal-browser reads the surface the same way (pixel-node/src/iosurface.rs).
+#[cfg(target_os = "macos")]
+pub mod iosurface {
+    use std::ffi::c_void;
+
+    type IOSurfaceRef = *mut c_void;
+    const LOCK_READ_ONLY: u32 = 1;
+
+    #[link(name = "IOSurface", kind = "framework")]
+    extern "C" {
+        fn IOSurfaceLock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
+        fn IOSurfaceUnlock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
+        fn IOSurfaceGetBaseAddress(surface: IOSurfaceRef) -> *mut c_void;
+        fn IOSurfaceGetWidth(surface: IOSurfaceRef) -> usize;
+        fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
+        fn IOSurfaceGetBytesPerRow(surface: IOSurfaceRef) -> usize;
+    }
+
+    /// Copies the whole surface out as tightly packed 4-byte pixels, in the surface's own order.
+    ///
+    /// # Safety
+    /// `surface` must be a live `IOSurfaceRef` for the duration of the call — Electron guarantees
+    /// that until the texture's `release()` is called.
+    pub unsafe fn read(surface: usize) -> Result<(u32, u32, Vec<u8>), String> {
+        let surface = surface as IOSurfaceRef;
+        if surface.is_null() {
+            return Err("null IOSurface".into());
+        }
+        // SAFETY: the caller guarantees a live surface; locked read-only and unlocked below.
+        unsafe {
+            let status = IOSurfaceLock(surface, LOCK_READ_ONLY, std::ptr::null_mut());
+            if status != 0 {
+                return Err(format!("IOSurfaceLock failed: {status}"));
+            }
+            let width = IOSurfaceGetWidth(surface);
+            let height = IOSurfaceGetHeight(surface);
+            let stride = IOSurfaceGetBytesPerRow(surface);
+            let base = IOSurfaceGetBaseAddress(surface).cast::<u8>();
+            let row = width * 4;
+            let mut out = vec![0u8; row * height];
+            if !base.is_null() && stride >= row {
+                for y in 0..height {
+                    let src = std::slice::from_raw_parts(base.add(y * stride), row);
+                    out[y * row..(y + 1) * row].copy_from_slice(src);
+                }
+            }
+            IOSurfaceUnlock(surface, LOCK_READ_ONLY, std::ptr::null_mut());
+            if base.is_null() {
+                return Err("IOSurface has no CPU address".into());
+            }
+            if stride < row {
+                return Err(format!("stride {stride} shorter than a {width}px row"));
+            }
+            Ok((width as u32, height as u32, out))
+        }
+    }
+}
+
 /// BGRA to RGBA. Byte-indexed rather than through `u32` views: neither the Node buffer nor the
 /// mapping is guaranteed to be 4-byte aligned for a cast, and in a release build this loop is
 /// already memory-bandwidth bound (gfx-worker.cjs records a bare 20MB memcpy at 0.35ms).
@@ -153,6 +217,35 @@ mod node {
     pub fn write_shm_frame(name: String, pixels: Buffer, swap: bool) -> napi::Result<()> {
         crate::write_frame(&name, &pixels, swap)
             .map_err(|error| napi::Error::from_reason(format!("shm frame {name}: {error}")))
+    }
+
+    /// `readIOSurface(handle)`: `{ width, height, pixels }` from a shared texture's
+    /// `textureInfo.handle.ioSurface`. macOS only.
+    #[cfg(target_os = "macos")]
+    #[napi(object)]
+    pub struct SurfacePixels {
+        pub width: u32,
+        pub height: u32,
+        pub pixels: Buffer,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[napi(js_name = "readIOSurface")]
+    pub fn read_io_surface(handle: Buffer) -> napi::Result<SurfacePixels> {
+        let bytes: [u8; 8] = handle
+            .get(..8)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| napi::Error::from_reason("IOSurface handle is not 8 bytes"))?;
+        let address = usize::from_ne_bytes(bytes);
+        // SAFETY: Electron keeps the surface alive until the texture is released, and the caller
+        // reads it inside the paint handler before calling `release()`.
+        let (width, height, pixels) =
+            unsafe { crate::iosurface::read(address) }.map_err(napi::Error::from_reason)?;
+        Ok(SurfacePixels {
+            width,
+            height,
+            pixels: pixels.into(),
+        })
     }
 
     /// `unlinkShm(name)`: true when an object was removed.
