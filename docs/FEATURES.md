@@ -88,3 +88,21 @@ The agent socket is per-pane, so multiple agents can drive multiple panes withou
 cross-talk. Every method that touches the page (`snapshot`, `click`, `screenshot`,
 `eval`, `console`) goes through the same socket; methods that are pure bookkeeping
 (`panes`, `tabs`, `status`) do not.
+
+## Remote network
+
+`tweb split --ssh <dest> http://localhost:3000` opens a pane whose network is the remote
+host's: the page's `localhost` is the remote's loopback, so a dev server running on a remote
+box or a Coder workspace opens without forwarding each port. The ssh tunnel belongs to the
+pane — it asks for a password in the pane if it has to, and it ends when the pane closes.
+
+```
+local machine                          remote host
+┌──────────────────────┐   ssh -D      ┌──────────────────────┐
+│ tmux pane            │ ────────────▶ │ localhost:3000       │
+│  page → SOCKS proxy  │               │ (dev server)         │
+└──────────────────────┘               └──────────────────────┘
+```
+
+The pane keeps a profile of its own per destination, so the remote's `localhost` cookies never
+mix with the local one's. See README "Remote network" for the details and the limits.

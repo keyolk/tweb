@@ -252,6 +252,8 @@ installPrintShim();
   // Per pane and per process, deliberately not persisted — DESIGN.md 16.5.
   let commandLineHistory = [];
   let promptHost = null;
+  // What the open omnibox has to undo when it goes: its suggestion listener and pending request.
+  let promptCleanup = null;
   let searchState = null;
   // Requests still waiting for a result, and the backstop that un-hides the bar if one
   // never arrives, and the backstop that closes a bar whose Enter never landed.
@@ -3374,6 +3376,8 @@ installPrintShim();
   }
 
   function cancelPrompt(restoreMode = true) {
+    promptCleanup?.();
+    promptCleanup = null;
     promptHost?.remove();
     promptHost = null;
     if (restoreMode) normalMode();
@@ -3419,6 +3423,33 @@ installPrintShim();
     let model = { current: location.href, entries: [] };
     let matches = [];
     let selected = 0;
+    // Search suggestions for the current input, when `search.suggest` is on. Main fetches them (see
+    // `omniboxSuggestions`); `seq` drops a reply to a query the user has already typed past.
+    let suggestions = [];
+    let suggestSeq = 0;
+    let suggestTimer = null;
+    const SUGGEST_ROWS = 4;
+    const requestSuggestions = () => {
+      clearTimeout(suggestTimer);
+      const query = input.value.trim();
+      const seq = ++suggestSeq;
+      if (!query) {
+        suggestions = [];
+        return;
+      }
+      // Debounced so a word typed quickly is one request, not one per letter.
+      suggestTimer = setTimeout(() => send("omnibox-suggest", { query, seq }), 120);
+    };
+    const onSuggestions = (_event, reply) => {
+      if (promptHost !== host || reply?.seq !== suggestSeq) return;
+      suggestions = Array.isArray(reply.suggestions) ? reply.suggestions : [];
+      render();
+    };
+    ipcRenderer.on("tweb-omnibox-suggest", onSuggestions);
+    promptCleanup = () => {
+      clearTimeout(suggestTimer);
+      ipcRenderer.removeListener("tweb-omnibox-suggest", onSuggestions);
+    };
 
     const render = () => {
       const query = input.value.trim();
@@ -3428,9 +3459,13 @@ installPrintShim();
         const score = fuzzyScore(query, `${entry.title || ""} ${entry.url}`);
         if (!query || Number.isFinite(score)) deduped.set(entry.url, { ...entry, score });
       }
+      // History and tabs first, then up to SUGGEST_ROWS suggestions under them: what was visited
+      // is the likelier destination, and a suggestion row must never push it out of view.
+      const offered = query ? suggestions.filter((entry) => entry?.url && !deduped.has(entry.url)).slice(0, SUGGEST_ROWS) : [];
       matches = [...deduped.values()]
         .sort((left, right) => query ? right.score - left.score : (right.recency || 0) - (left.recency || 0))
-        .slice(0, 10);
+        .slice(0, 10 - offered.length)
+        .concat(offered);
       if (selected >= 0) selected = Math.min(selected, Math.max(0, matches.length - 1));
       list.replaceChildren();
       list.style.display = matches.length ? "block" : "none";
@@ -3442,7 +3477,7 @@ installPrintShim();
         title.textContent = entry.title || entry.url;
         title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:13px/1.35 system-ui,-apple-system,sans-serif";
         const detail = document.createElement("div");
-        detail.textContent = `${entry.kind === "tab" ? "TAB  " : ""}${entry.url}`;
+        detail.textContent = `${entry.kind === "tab" ? "TAB  " : entry.kind === "search" ? "SEARCH  " : ""}${entry.url}`;
         detail.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6;font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
         row.append(title, detail);
         row.onmousedown = (event) => {
@@ -3463,7 +3498,7 @@ installPrintShim();
       if (!newTab && entry?.kind === "tab" && Number.isInteger(entry.index)) send("activate-tab", entry.index);
       else send(newTab ? "new-tab" : "navigate", value);
     };
-    input.addEventListener("input", () => { selected = -1; render(); });
+    input.addEventListener("input", () => { selected = -1; requestSuggestions(); render(); });
     input.addEventListener("keydown", (event) => {
       event.stopPropagation();
       if (event.code === "Escape") {

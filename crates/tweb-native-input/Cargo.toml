@@ -1,0 +1,26 @@
+[package]
+name = "tweb-native-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# The macOS pointer and trackpad helper. Inside tmux a pane only hears the mouse in cells, and a
+# trackpad only as wheel notches; this process watches the real pointer and the real scroll
+# gesture (global event monitors, which mouse and scroll events need no permission for) and prints
+# them for the engine, which decides whether they belong to one of its panes
+# (electron/native-input.cjs). Same objc2 pins as the WebKit host, so one toolchain builds both.
+[[bin]]
+name = "tweb-native-input"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "=0.6.2"
+objc2 = "=0.6.4"
+objc2-app-kit = "=0.3.2"
+objc2-core-foundation = "=0.3.2"
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "objc2", "CGEvent", "CGEventTypes", "CGWindow"] }
+objc2-foundation = "=0.3.2"

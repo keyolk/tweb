@@ -287,7 +287,8 @@ test("middle-click still does not steal focus, while window.open does", () => {
 
 test("the gap is filled only while a button is held, and only inside tmux", () => {
   const dispatch = body("function dispatchMouse(cb, rawX, rawY, release)", "const KITTY_KEYS");
-  assert.match(dispatch, /if \(type === "mouseMove" && button && paneIsInTmux\(\)\)/);
+  // And not when the point is the native pointer's own: its moves already are the path.
+  assert.match(dispatch, /if \(type === "mouseMove" && button && paneIsInTmux\(\) && !native\)/);
   // A hover is quantised too, and nothing reads the path of one — filling it would be three
   // times the hit-testing for no visible difference.
   assert.doesNotMatch(dispatch, /if \(type === "mouseMove" && paneIsInTmux\(\)\)/);

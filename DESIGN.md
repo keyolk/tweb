@@ -1471,6 +1471,41 @@ These must be treated as their own conformance area.
 Where the terminal protocol cannot carry the composition lifecycle, committed-text input is supported and
 the constraint is stated. Global key event interception is never added to hide it.
 
+### 9.5 The native pointer and trackpad (macOS)
+
+tmux does not implement SGR-pixel mouse mode (1016), so inside tmux a pane hears the pointer only as cells
+and a trackpad only as wheel notches. On macOS `tweb-native-input` (`crates/tweb-native-input`) reads the
+real pointer and the real scroll gesture, and the engine (`electron/native-input.cjs`) decides whether
+they belong to one of its panes.
+
+```text
+window server ──copy──► tweb-native-input ──JSON lines──► engine ──► page
+      │                  (global monitors:                  ▲
+      │                   moves, drags, scroll)             │ cell reports locate the pane
+      └──► terminal ──► tmux ──► tweb __pane ───────────────┘
+```
+
+- **Permission.** The helper uses global event monitors for mouse and scroll events only. These need no
+  Accessibility, Input Monitoring or Screen Recording permission (measured with all three denied), so the
+  helper never prompts. It receives copies; it cannot change or swallow an event. Key events are never
+  monitored (9.4).
+- **Geometry.** The engine measures the pane's screen position instead of computing it. A cell report
+  for cell (C, R) means the pointer was inside that cell at the moment the helper last saw it. That
+  fixes the grid origin to one interval per cell. Intersecting the intervals narrows the origin to a
+  point as the pointer crosses cell edges. The origin is stored relative to the terminal window's
+  bounds and keyed by cell size, so a window move keeps it and a font change starts it again.
+- **Gating.** A native event acts on a pane only when all of these are true: the helper runs, the
+  window under the pointer is the window the pane's own reports came through, the grid is located to
+  half a cell, the pane is visible, and the terminal has reported the pointer in the pane since it last
+  left the pane's rect. Otherwise the terminal's reports are used unchanged.
+- **Wheel.** A precise native gesture (trackpad, Magic Mouse) scrolls by its own deltas, momentum events
+  included. The terminal's notches for the same gesture are dropped, and a notch that arrives first
+  waits up to 60ms for the gesture. A mouse wheel stays on the terminal's notches. WebKit receives the
+  gesture phases in the CGEvent it is given; CDP has no phase field, so Chromium receives precise pixel
+  deltas without phases.
+
+`input.native = false` turns all of this off.
+
 ## 10. Chrome profile bootstrap and synchronization
 
 > **Nothing in this section is implemented.** `tweb profile bootstrap <source>` and `tweb profile

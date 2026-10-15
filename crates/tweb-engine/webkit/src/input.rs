@@ -12,7 +12,7 @@
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType, NSScreen};
-use objc2_core_graphics::{CGEvent, CGScrollEventUnit};
+use objc2_core_graphics::{CGEvent, CGEventField, CGScrollEventUnit};
 use objc2_foundation::{NSPoint, NSString};
 use objc2_web_kit::WKWebView;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -58,6 +58,61 @@ pub struct Mouse<'a> {
     pub dy: f64,
     /// The button held, if any, so a move becomes a drag.
     pub held: Option<u32>,
+    pub gesture: Gesture,
+}
+
+/// Where a wheel event sits in a trackpad gesture, as AppKit's `NSEventPhase` masks.
+///
+/// Given by the native input helper (crates/tweb-native-input), which read them off the real
+/// gesture; a terminal wheel notch has none. WebKit reads a gesture's phases to latch it to one
+/// scroller, to rubber-band at an edge and to tell inertia from the fingers — none of which a
+/// phaseless event gets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Gesture {
+    pub phase: u64,
+    pub momentum: u64,
+    pub precise: bool,
+}
+
+// `NSEventPhase` bits, as the helper passes them on.
+const NS_BEGAN: u64 = 1;
+const NS_STATIONARY: u64 = 2;
+const NS_CHANGED: u64 = 4;
+const NS_ENDED: u64 = 8;
+const NS_CANCELLED: u64 = 16;
+const NS_MAY_BEGIN: u64 = 32;
+
+/// `NSEventPhase` as the `kCGScrollWheelEventScrollPhase` field spells it (`CGScrollPhase`):
+/// the same states with different bits, so a CGEvent built from them reads back as the phase
+/// AppKit gave.
+pub fn cg_scroll_phase(phase: u64) -> i64 {
+    if phase & NS_MAY_BEGIN != 0 {
+        128
+    } else if phase & NS_BEGAN != 0 {
+        1
+    } else if phase & (NS_CHANGED | NS_STATIONARY) != 0 {
+        2
+    } else if phase & NS_ENDED != 0 {
+        4
+    } else if phase & NS_CANCELLED != 0 {
+        8
+    } else {
+        0
+    }
+}
+
+/// The inertial phase, as `kCGScrollWheelEventMomentumPhase` spells it (`CGMomentumScrollPhase`):
+/// a sequence number rather than a mask — begin 1, continue 2, end 3.
+pub fn cg_momentum_phase(momentum: u64) -> i64 {
+    if momentum & NS_BEGAN != 0 {
+        1
+    } else if momentum & (NS_CHANGED | NS_STATIONARY) != 0 {
+        2
+    } else if momentum & (NS_ENDED | NS_CANCELLED) != 0 {
+        3
+    } else {
+        0
+    }
 }
 
 pub fn mouse(webview: &WKWebView, input: Mouse) {
@@ -153,7 +208,45 @@ fn wheel(webview: &WKWebView, input: &Mouse) {
         Some(&event),
         NSPoint::new(in_window.x, primary.frame().size.height - in_window.y),
     );
+    if input.gesture.precise {
+        // A trackpad's own deltas are fractional points; the integer wheel values above would
+        // round every small movement of a slow swipe to nothing. The fixed-point delta is what
+        // AppKit reads `scrollingDeltaY` from for a continuous event.
+        let event = Some(&*event);
+        CGEvent::set_integer_value_field(event, CGEventField::ScrollWheelEventIsContinuous, 1);
+        CGEvent::set_double_value_field(
+            event,
+            CGEventField::ScrollWheelEventFixedPtDeltaAxis1,
+            input.dy,
+        );
+        CGEvent::set_double_value_field(
+            event,
+            CGEventField::ScrollWheelEventFixedPtDeltaAxis2,
+            input.dx,
+        );
+        CGEvent::set_integer_value_field(
+            event,
+            CGEventField::ScrollWheelEventScrollPhase,
+            cg_scroll_phase(input.gesture.phase),
+        );
+        CGEvent::set_integer_value_field(
+            event,
+            CGEventField::ScrollWheelEventMomentumPhase,
+            cg_momentum_phase(input.gesture.momentum),
+        );
+    }
     if let Some(event) = NSEvent::eventWithCGEvent(&event) {
+        // What WebKit will read back, not what was asked for: the phases only count if the CGEvent
+        // fields above survive into the NSEvent.
+        if crate::protocol::profiling() {
+            crate::protocol::profile(format!(
+                "wheel dy={:.2} precise={} phase={} momentum={}",
+                event.scrollingDeltaY(),
+                event.hasPreciseScrollingDeltas(),
+                event.phase().0,
+                event.momentumPhase().0,
+            ));
+        }
         webview.scrollWheel(&event);
     }
 }
@@ -432,5 +525,23 @@ mod tests {
         assert_eq!(characters, "\r");
         let (characters, _) = key_characters(&key_input("A", "A", SHIFT));
         assert_eq!(characters, "A");
+    }
+
+    #[test]
+    fn appkit_phases_become_the_coregraphics_fields_that_read_back_as_them() {
+        assert_eq!(cg_scroll_phase(NS_BEGAN), 1);
+        assert_eq!(cg_scroll_phase(NS_CHANGED), 2);
+        assert_eq!(cg_scroll_phase(NS_ENDED), 4);
+        assert_eq!(cg_scroll_phase(NS_CANCELLED), 8);
+        assert_eq!(cg_scroll_phase(NS_MAY_BEGIN), 128);
+        assert_eq!(
+            cg_scroll_phase(0),
+            0,
+            "a momentum event has no finger phase"
+        );
+        assert_eq!(cg_momentum_phase(NS_BEGAN), 1);
+        assert_eq!(cg_momentum_phase(NS_CHANGED), 2);
+        assert_eq!(cg_momentum_phase(NS_ENDED), 3);
+        assert_eq!(cg_momentum_phase(0), 0);
     }
 }

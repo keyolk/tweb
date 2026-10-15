@@ -312,17 +312,27 @@ impl EngineHost {
                 return Err(reason);
             }
         }
-        let stdin = {
-            let mut inner = self.inner.lock();
-            inner.sinks.insert(key, sink);
-            inner.stdin.clone()
+        let Some(stdin) = self.register(&key, sink) else {
+            return Err("engine stdin closed".to_string());
         };
-        match stdin {
-            Some(stdin) => stdin
-                .send(line)
-                .map_err(|_| "engine stdin closed".to_string()),
-            None => Err("engine stdin closed".to_string()),
-        }
+        stdin.send(line).map_err(|_| {
+            self.inner.lock().sinks.remove(&key);
+            "engine stdin closed".to_string()
+        })
+    }
+
+    /// Puts a pane in the routing table and returns the engine's stdin — or, with no engine to feed
+    /// it, leaves the table alone and returns `None`.
+    ///
+    /// The engine can die between `spawn_engine` returning and this lock: `watch_exit` is already
+    /// running, and an engine that exits right after `READY` drains the table before this pane is in
+    /// it. A sink registered then would count as a hosted pane that nothing ever closes, while the
+    /// caller is already falling back to its own engine.
+    fn register(&self, key: &PaneKey, sink: PaneSink) -> Option<UnboundedSender<String>> {
+        let mut inner = self.inner.lock();
+        let stdin = inner.stdin.clone()?;
+        inner.sinks.insert(key.clone(), sink);
+        Some(stdin)
     }
 
     /// Forwards one control line to an already-hosted pane. A pane the engine does not have is not
@@ -512,6 +522,27 @@ pub fn is_orphaned(watched_pid: Option<u32>, parent_pid: u32) -> bool {
     matches!(watched_pid, Some(pid) if pid > 1) && parent_pid == 1
 }
 
+/// `spawn`, retried briefly when the executable is "busy".
+///
+/// Linux refuses to exec a file that some process holds open for writing (ETXTBSY). That happens
+/// for a moment after the file is written whenever another thread forks: the forked child holds a
+/// copy of the writer's descriptor until its own exec closes it. Measured in this crate's tests on
+/// Linux arm64: a freshly written fake engine failed to start in 5 of 10 full test runs, never
+/// alone. A real Electron binary is not written just before it runs, so this costs nothing there;
+/// Go's os/exec and cargo retry the same error for the same reason.
+fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<Child> {
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn start_process(launcher: &Launcher) -> Result<Child> {
     let (watch_variable, watch_pid) = orphan_watch_variable(std::process::id());
     let mut command = Command::new(&launcher.executable);
@@ -551,8 +582,18 @@ fn start_process(launcher: &Launcher) -> Result<Child> {
         .env_remove("TWEB_VIEWPORT")
         .env_remove("TWEB_PANE_ORIGIN")
         .env_remove("TWEB_IMAGE_ID");
-    command
-        .spawn()
+    // The pointer/trackpad helper beside this binary, so a hosted engine reads the same build's
+    // helper a per-pane one does (electron/native-input.cjs falls back to a checkout or PATH).
+    if std::env::var_os("TWEB_NATIVE_INPUT").is_none() {
+        if let Some(helper) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("tweb-native-input")))
+            .filter(|path| path.exists())
+        {
+            command.env("TWEB_NATIVE_INPUT", helper);
+        }
+    }
+    spawn_retrying_busy(&mut command)
         .with_context(|| format!("cannot start {}", launcher.executable.display()))
 }
 
@@ -945,7 +986,10 @@ mod tests {
         let launcher = fake_engine(
             "dies",
             &format!(
-                "#!/bin/sh\necho 'READY {}'\nexit 0\n",
+                // Dies once the pane's attach has reached it, not as soon as it is ready: an engine
+                // that exits straight after `READY` can be gone before `open` registers the pane,
+                // which is a refused open (covered below), not the death this test is about.
+                "#!/bin/sh\necho 'READY {}'\nread -r line\nexit 0\n",
                 crate::protocol::PROTOCOL_VERSION
             ),
         );
@@ -964,5 +1008,16 @@ mod tests {
             EngineEvent::Closed { ref pane, .. } if pane.is_empty()
         ));
         assert_eq!(host.hosted_pane_count(), 0, "the routing table is dropped");
+    }
+
+    // An engine gone before the pane is registered refuses it, and the pane is not left in the
+    // routing table: the race between `spawn_engine` and `watch_exit`, made deterministic by
+    // registering against a host whose engine is already gone.
+    #[test]
+    fn a_pane_is_not_routed_to_an_engine_that_is_gone() {
+        let host = EngineHost::new(fake_engine("never-started", "#!/bin/sh\n"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(host.register(&key(), tx).is_none(), "no engine, no stdin");
+        assert_eq!(host.hosted_pane_count(), 0, "and no pane left routed");
     }
 }

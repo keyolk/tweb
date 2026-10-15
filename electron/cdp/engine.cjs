@@ -11,10 +11,21 @@
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const path = require("node:path");
-const { CdpConnection, devtoolsOriginAllowed, devtoolsUrl, ensureChrome } = require("./connection.cjs");
+const { CdpConnection, devtoolsOriginAllowed, devtoolsUrl, ensureChrome, handOffToUserChrome } = require("./connection.cjs");
 const { CdpWebContents } = require("./web-contents.cjs");
 
 const HIDDEN_BOUNDS = { x: -10_000, y: -10_000 };
+
+// A tab Chrome opened for someone outside tweb: macOS routed an outside url open (Slack, `open URL`)
+// here because this Chrome has the same bundle id as the user's (see `handOffToUserChrome`).
+// Ownership is NOT "missing from this engine's byTarget": one Chrome serves every pane, each pane is
+// its own process with its own engine, so another pane's tab is missing too. What no pane does is
+// leave a page on an http(s) url with nobody attached: every tab tweb makes is created on
+// about:blank and attached (adoptTarget) before it navigates, and popups carry an openerId.
+function isForeignTab(info) {
+  return info.type === "page" && !info.openerId && info.attached === false
+    && /^https?:\/\//i.test(String(info.url || ""));
+}
 
 class CdpBrowserWindow extends EventEmitter {
   constructor(engine, options = {}) {
@@ -188,6 +199,8 @@ class CdpEngine extends EventEmitter {
     this.downloadListeners = [];
     this.downloads = new Map();
     this.browserContextId = undefined;
+    this.forwarding = new Set();
+    this.handOff = handOffToUserChrome;
   }
 
   // `scaleFactor` is the pane's device scale factor, for a Chrome this engine launches (see
@@ -321,6 +334,10 @@ class CdpEngine extends EventEmitter {
   // A popup Chrome opened on its own: `window.open`, `target=_blank`. Matched to the opener's
   // `Page.windowOpen` report, which carries the handler's decision.
   onTargetCreated(info) {
+    if (isForeignTab(info)) {
+      void this.forwardForeignTab(info);
+      return;
+    }
     if (info.type !== "page" || !info.openerId || this.byTarget.has(info.targetId)) return;
     const openerWindow = this.byTarget.get(info.openerId);
     if (!openerWindow) return;
@@ -353,7 +370,29 @@ class CdpEngine extends EventEmitter {
   // Titles come from the page itself (TITLE_PROBE in web-contents.cjs). Chrome's target title
   // is NOT the same thing: before a document sets one it reports the url or the file name — measured
   // as "page.html" and the full file:// url — and those landed in the history as if they were titles.
-  onTargetInfoChanged() {}
+  //
+  // A foreign tab can report its url here rather than at creation, so it is checked again.
+  onTargetInfoChanged(info) {
+    if (info && isForeignTab(info)) void this.forwardForeignTab(info);
+  }
+
+  // Every pane's engine sees the same foreign tab. Only the one whose close succeeds hands the url
+  // on; the others' close fails because the tab is already gone, so the url opens once.
+  async forwardForeignTab(info) {
+    if (this.forwarding.has(info.targetId)) return;
+    this.forwarding.add(info.targetId);
+    try {
+      const closed = await this.connection.send("Target.closeTarget", { targetId: info.targetId })
+        .then((result) => result?.success !== false, () => false);
+      if (!closed) return;
+      const handed = this.handOff(info.url);
+      if (this.debug || !handed) {
+        console.error(`tweb: ${handed ? "handed" : "could not hand"} an outside url to the user's Chrome: ${info.url}`);
+      }
+    } finally {
+      this.forwarding.delete(info.targetId);
+    }
+  }
 
   onTargetDestroyed(targetId) {
     const window = this.byTarget.get(targetId);
@@ -591,4 +630,4 @@ class CdpDownloadItem extends EventEmitter {
   }
 }
 
-module.exports = { CdpBrowserWindow, CdpEngine, CdpIpcMain, browserUserAgent };
+module.exports = { CdpBrowserWindow, CdpEngine, CdpIpcMain, browserUserAgent, isForeignTab };

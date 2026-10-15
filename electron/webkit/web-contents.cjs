@@ -495,6 +495,13 @@ class WebKitWebContents extends EventEmitter {
       modifiers: modifierMask(event.modifiers),
       dx: Number(event.deltaX) || 0,
       dy: Number(event.deltaY) || 0,
+      // A trackpad gesture from the native input helper carries its AppKit phases, which the host
+      // writes into the CGEvent it builds; a terminal notch carries none (see native-input.cjs).
+      ...(type === "mouseWheel" && event.hasPreciseScrollingDeltas === true ? {
+        phase: Number(event.phase) || 0,
+        momentum: Number(event.momentumPhase) || 0,
+        precise: true,
+      } : {}),
     });
   }
 
