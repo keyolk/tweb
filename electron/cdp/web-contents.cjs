@@ -66,22 +66,6 @@ const INVALIDATE_GRACE_MS = 50;
 // mid-scroll at a fraction of the bytes of 100.
 const SCREENCAST_QUALITY = 90;
 
-// Whether a screencast frame is a picture of the viewport. It comes at either of two sizes: CSS
-// pixels, and — once a device-pixel `captureScreenshot` has run on the tab — device pixels
-// (measured at dsf 1.6: 900x563, then 1440x900 for every frame after the first settle capture).
-// Accepting only the CSS size dropped every frame after that first capture, so nothing moved in
-// the pane until the 50ms capture behind the settle timer. A frame of the WINDOW instead
-// (900x476, 761x476 — see `fitWindowToViewport`) matches neither and is still refused.
-// A frame at the browser's own scale (`--force-device-scale-factor`, see `chromeArgs`) rather
-// than the emulated one. With the browser forced to the pane's 2 under an emulated 1.6, Chrome
-// sends the screencast at 2x the viewport: the whole viewport, sharper than the pane needs, not
-// the corner or the stretched picture a CSS-size frame can be. It is drawn scaled down.
-function isBrowserScaleFrame(got, viewport, browserScaleFactor) {
-  if (!(browserScaleFactor > 1)) return false;
-  return Math.abs(got.width - Math.round(viewport.width * browserScaleFactor)) <= 2
-    && Math.abs(got.height - Math.round(viewport.height * browserScaleFactor)) <= 2;
-}
-
 // The window's page area, in the DIPs `Browser.setWindowBounds` takes, from a screencast frame's
 // pixel size. A frame of the window is in device pixels once the browser's scale is forced; taken
 // as DIPs it sized the window's frame wrong by its height — measured: 1800x2010 frames for a
@@ -91,6 +75,14 @@ function windowArea(got, browserScaleFactor) {
   return { width: Math.round(got.width / scale), height: Math.round(got.height / scale) };
 }
 
+// Whether a screencast frame is a picture of the viewport. It comes at either of two sizes: CSS
+// pixels, and — once a device-pixel `captureScreenshot` has run on the tab — device pixels
+// (measured at dsf 1.6: 900x563, then 1440x900 for every frame after the first settle capture).
+// Accepting only the CSS size dropped every frame after that first capture, so nothing moved in
+// the pane until the 50ms capture behind the settle timer. A frame of the WINDOW instead
+// (900x476, 761x476 — see `fitWindowToViewport`) matches neither and is still refused.
+// A frame at the forced browser scale counts as the viewport too, so the window is not refitted
+// for it; it is still not drawn (see `presentScreencastFrame`).
 function isViewportFrame(got, viewport, deviceScaleFactor, browserScaleFactor = 1) {
   const near = (scale) => Math.abs(got.width - Math.round(viewport.width * scale)) <= 2
     && Math.abs(got.height - Math.round(viewport.height * scale)) <= 2;
@@ -1213,13 +1205,19 @@ class CdpWebContents extends EventEmitter {
       // namu.wiki, `j` reached the pane in ~20ms through a device frame and ~200ms when the first
       // frame after it was a CSS one and waited for the settle. A CSS-only stream — a video
       // playing after a resize — is drawn by those captures back to back.
-      let image = decoded;
+      //
+      // The same holds for a frame at the forced browser scale (`--force-device-scale-factor`, see
+      // `chromeArgs`), which #166 drew scaled down as the whole viewport. At zoom 0.8 (emulated 1.6
+      // under a forced 2) it is not: measured on a 1440x900 pane, the 1800x1126 frames held the
+      // 1440x900 device picture 1:1 in their top-left with the fixed header stretched across, so
+      // scaled down the page shrank to 80% and back on every scroll step — 54–103 such frames
+      // drawn per 40s run, ~30 of the pane's frames shrunk. Captured instead: none shrunk, `j`
+      // p50 105ms → 135ms at zoom 0.8. At zoom 1 the browser and emulated scales agree and these
+      // frames come at the pane's size, so nothing changes there.
+      const image = decoded;
       if (got.width !== want.width || got.height !== want.height) {
-        if (!isBrowserScaleFrame(got, this.viewport, this.engine.scaleFactor)) {
-          this.requestCapture();
-          return;
-        }
-        image = decoded.resize({ width: want.width, height: want.height, quality: "good" });
+        this.requestCapture();
+        return;
       }
       // A frame Chrome sent while a capture was running is not drawn either, whatever its size.
       // Some of them are the CSS-pixel picture stretched by the device scale factor to device
@@ -1716,7 +1714,6 @@ function scaleMouse(event, zoom) {
 
 module.exports = {
   isViewportFrame,
-  isBrowserScaleFrame,
   windowArea,
   PendingSession,
   CdpDebugger,
