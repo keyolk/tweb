@@ -375,9 +375,13 @@ pub fn socks_answers(address: SocketAddr) -> bool {
 
 fn log_tail(log: &Path) -> String {
     let text = std::fs::read_to_string(log).unwrap_or_default();
+    // ssh logs the host key it just accepted at the prompt as a warning, on the same stderr as the
+    // failure. Measured on a wrong passphrase: the tail read "Warning: Permanently added …" above
+    // "Permission denied (publickey)", and the first line is what a person reads as the cause.
     let lines: Vec<&str> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
+        .filter(|line| !line.starts_with("Warning: Permanently added"))
         .collect();
     if lines.is_empty() {
         return String::new();
@@ -555,6 +559,44 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// ssh asks for a passphrase, a password or a host-key decision on /dev/tty, and Ctrl-C at
+    /// that prompt has to reach it. Both hold only while ssh stays in the frontend's process group
+    /// on the frontend's terminal — a guard that started it with setsid or its own process group
+    /// would make the prompt fail with "read_passphrase: can't open /dev/tty" and leave Ctrl-C
+    /// killing the pane but not ssh. Measured end to end in a PTY against a throwaway sshd: the
+    /// host-key question and three passphrase prompts were shown and answered, and Ctrl-C at the
+    /// prompt left no ssh behind.
+    #[test]
+    fn ssh_stays_in_the_panes_process_group_so_it_can_prompt() {
+        let dir = std::env::temp_dir().join(format!("tweb-ssh-test-g-{}", std::process::id()));
+        let out = dir.join("pgid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tunnel = spawn_guarded(
+            "sh",
+            &[
+                "-c".to_string(),
+                format!("ps -o pgid= -p $$ > '{}'", out.display()),
+            ],
+            &dir.join("pgid.log"),
+            "box".into(),
+            1,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tunnel.alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let child: i32 = std::fs::read_to_string(&out)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: getpgrp(2) has no memory effects.
+        let ours = unsafe { libc::getpgrp() };
+        assert_eq!(child, ours, "the guarded ssh left the pane's process group");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn an_ssh_that_exits_early_is_reported_with_its_stderr() {
         let dir = std::env::temp_dir().join(format!("tweb-ssh-test-e-{}", std::process::id()));
@@ -563,7 +605,9 @@ mod tests {
             "sh",
             &[
                 "-c".to_string(),
-                "echo 'Permission denied (publickey).' >&2; exit 255".to_string(),
+                "echo \"Warning: Permanently added '[127.0.0.1]:22' (ED25519) to the list of known hosts.\" >&2; \
+                 echo 'Permission denied (publickey).' >&2; exit 255"
+                    .to_string(),
             ],
             &log,
             "box".into(),
@@ -572,6 +616,8 @@ mod tests {
         .unwrap();
         let error = wait_for_socks(&mut tunnel, &log, Duration::from_secs(5)).unwrap_err();
         assert!(error.to_string().contains("Permission denied"), "{error}");
+        // The accepted host key is ssh's own bookkeeping, not the cause.
+        assert!(!error.to_string().contains("Permanently added"), "{error}");
         std::fs::remove_dir_all(dir).ok();
     }
 }

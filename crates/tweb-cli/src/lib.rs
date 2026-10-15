@@ -708,6 +708,10 @@ pub async fn run() -> Result<()> {
                 if std::io::stdin().is_terminal() {
                     eprintln!("tweb: {error:#}\n\npress Enter to close this pane");
                     let _ = std::io::stdin().lock().read_line(&mut String::new());
+                    // Already reported. Returning the error would print it a second time, after
+                    // the person dismissed the first. The tunnel is gone with `run_pane`'s frame,
+                    // so there is nothing left for a destructor to do.
+                    std::process::exit(1);
                 }
             }
             result?;
