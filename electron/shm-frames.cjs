@@ -36,10 +36,30 @@ const CONSUMES_SHM = [/ghostty/i, /kitty/i];
 // terminal takes to read one.
 const SHM_RING = 4;
 
+// Patches get their own, longer ring. They bypass the pacer and arrive as fast as the page paints —
+// a drag on a whiteboard is one per paint — so a 4-deep ring could be reused while the terminal is
+// still behind on reading through tmux. 16 is ~270ms at 60 patches a second, and an unconsumed patch
+// is a few hundred KB, not a whole frame, so the bound stays small.
+const SHM_PATCH_RING = 16;
+
 // macOS rejects a shared-memory name longer than PSHMNAMLEN (31 bytes). `/twb.<pid>.<id>.<slot>`
 // stays well under it for any pid and image id this engine produces.
 function shmFrameName(pid, imageId, slot) {
   return `/twb.${pid}.${imageId}.${slot}`;
+}
+
+// Keyed on the pane's base image id like whole frames, not on the patch's own id: the patch ids
+// cycle through a pool, and one per-pane name space is what the marker below can enumerate.
+function shmPatchName(pid, imageId, slot) {
+  return `/twb.${pid}.${imageId}.p${slot}`;
+}
+
+// Every object name a pane may have created, for the exit path and the dead-engine sweep.
+function paneShmNames(pid, imageId) {
+  const names = [];
+  for (let slot = 0; slot < SHM_RING; slot += 1) names.push(shmFrameName(pid, imageId, slot));
+  for (let slot = 0; slot < SHM_PATCH_RING; slot += 1) names.push(shmPatchName(pid, imageId, slot));
+  return names;
 }
 
 /**
@@ -88,15 +108,12 @@ function abandonedShmFrames(names, selfPid, isAlive) {
     if (!match) continue;
     const pid = Number(match[1]);
     if (!Number.isSafeInteger(pid) || pid === Number(selfPid) || isAlive(pid)) continue;
-    const imageId = Number(match[2]);
-    const objects = [];
-    for (let slot = 0; slot < SHM_RING; slot += 1) objects.push(shmFrameName(pid, imageId, slot));
-    abandoned.push({ marker: name, objects });
+    abandoned.push({ marker: name, objects: paneShmNames(pid, Number(match[2])) });
   }
   return abandoned;
 }
 
 module.exports = {
-  shmFramesDecision, shmFrameName, shmMarkerName, abandonedShmFrames,
-  SHM_RING, SHM_MARKER_PATTERN, CONSUMES_SHM,
+  shmFramesDecision, shmFrameName, shmPatchName, paneShmNames, shmMarkerName, abandonedShmFrames,
+  SHM_RING, SHM_PATCH_RING, SHM_MARKER_PATTERN, CONSUMES_SHM,
 };
