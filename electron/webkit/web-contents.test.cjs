@@ -177,6 +177,19 @@ test("mouse events keep Electron's coordinates, buttons and wheel sign", () => {
   ]);
 });
 
+test("a trackpad gesture keeps its phases on the way to the host, and a notch carries none", () => {
+  const { created, sent } = contents();
+  created.sendInputEvent({
+    type: "mouseWheel", x: 5, y: 6, deltaX: 0, deltaY: -3.5,
+    hasPreciseScrollingDeltas: true, phase: 4, momentumPhase: 0,
+  });
+  created.sendInputEvent({ type: "mouseWheel", x: 5, y: 6, deltaX: 0, deltaY: 100, hasPreciseScrollingDeltas: false });
+  assert.deepStrictEqual(sent.map(({ dy, phase, momentum, precise }) => ({ dy, phase, momentum, precise })), [
+    { dy: -3.5, phase: 4, momentum: 0, precise: true },
+    { dy: 100, phase: undefined, momentum: undefined, precise: undefined },
+  ]);
+});
+
 test("the debugger cannot attach, so main.cjs takes its fallbacks", async () => {
   const { created } = contents();
   assert.throws(() => created.debugger.attach("1.3"));

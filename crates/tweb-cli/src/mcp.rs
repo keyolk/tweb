@@ -273,7 +273,41 @@ const TOOLS: &[Tool] = &[
         name: "tweb_inspect_element",
         method: "inspect-element",
         description: "The element the user picked in inspect mode —                       selector, HTML, text, bounding box and URL.                       Like Orca's design mode: the user selects an element                       in the browser, and the agent gets its context.",
-        fields: &[],
+        fields: &[(
+            "send",
+            "boolean",
+            "Also paste it, with an element screenshot path, into the coding \
+             agent pane in the browser pane's tmux window (no Enter is pressed).",
+            false,
+        )],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_record_start",
+        method: "record-start",
+        description: "Start recording the pane while the user reproduces something: \
+                      keyframes on navigation, after clicks and while the page changes, \
+                      plus navigations, clicks, field changes (password values are never \
+                      recorded), console errors and failed requests.",
+        fields: &[(
+            "interval",
+            "number",
+            "Seconds between keyframes while the page changes (default 5)",
+            false,
+        )],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_record_stop",
+        method: "record-stop",
+        description: "Stop recording and write timeline.md (timestamps, actions, keyframe \
+                      paths). Returns its path and a summary.",
+        fields: &[(
+            "send",
+            "boolean",
+            "Also paste the path and summary into the agent pane (default true)",
+            false,
+        )],
         fixed: &[],
     },
     Tool {

@@ -21,6 +21,7 @@ pub mod input;
 pub mod pane_writer;
 pub mod remote_terminal;
 pub mod resize;
+pub mod ssh;
 pub mod terminal;
 pub mod visibility;
 
@@ -42,12 +43,17 @@ pub enum BrowserEngine {
     Webkit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PaneOptions {
     pub engine: BrowserEngine,
     pub frame_rate: u16,
     pub adaptive_frame_rate: bool,
     pub restore_session: bool,
+    /// `--ssh`: the pane's network goes through this host (see `ssh`). Electron engine only.
+    pub ssh: Option<ssh::SshTarget>,
+    /// `--transparent`: clear page backgrounds for this pane (see electron/transparent-pages.cjs).
+    /// Only the flag; `page.transparent` in config.toml is read by the engine itself.
+    pub transparent: bool,
 }
 
 impl Default for PaneOptions {
@@ -57,6 +63,8 @@ impl Default for PaneOptions {
             frame_rate: 30,
             adaptive_frame_rate: true,
             restore_session: false,
+            ssh: None,
+            transparent: false,
         }
     }
 }
@@ -486,6 +494,23 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
 
     let pane = std::env::var("TMUX_PANE").unwrap_or_else(|_| "%0".to_string());
     tracing::info!(pane = %pane, "tmux pane identity");
+
+    // Before raw mode and the alternate screen, because ssh may need to ask the person in this
+    // pane for a password or a host-key decision, and this is the last point where they can see
+    // the question and type an answer. Held for the rest of this function: dropping it is what
+    // ends ssh, so the tunnel lives exactly as long as the pane does (see `ssh`).
+    let tunnel = match &options.ssh {
+        Some(target) => {
+            if options.engine != BrowserEngine::Electron {
+                // The CLI refuses this first; kept so `__pane` cannot be talked into it either.
+                anyhow::bail!("--ssh needs the Electron engine");
+            }
+            eprintln!("tweb: connecting to {} over ssh…", target.destination);
+            let log = ssh::log_path(engine_app::cache_root().join("logs"), &pane);
+            Some(ssh::open(target, &log)?)
+        }
+        None => None,
+    };
     let _pane_marker = TmuxPaneMarker::install(&pane);
 
     // Enable raw terminal mode and browser input (mouse/Kitty keyboard).
@@ -516,24 +541,32 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     // the spawn below, which is the path that ships — so a pane that opted in and found no daemon,
     // an incompatible daemon, or a daemon whose engine cannot host, behaves exactly as it does
     // today rather than degrading.
+    //
+    // A pane on a tunnel is not offered to the daemon: the hosted engine's panes share one session,
+    // and a proxy is a property of a session, so hosting it would reroute every other hosted pane
+    // through this pane's ssh. Its own engine has a session nobody else uses.
+    //
     // Where the terminal is decides how whole frames travel; see `remote_terminal`. Decided
     // before hosting is considered, because a hosted engine is a daemon's, and its frame medium is
     // one setting for every pane it serves.
     let medium = remote_terminal::decide(&remote_terminal::observe());
     tracing::info!(medium = medium.medium.as_str(), remote = medium.remote, reason = %medium.reason,
         "frame medium");
-    let hosted = if medium.medium == remote_terminal::Medium::File {
-        try_hosted(url, options, &pane, image_id).await
+    let hosted = if medium.medium != remote_terminal::Medium::File {
+        Some(HostedOutcome::Spawn(attach::SpawnReason::InlineFrames(
+            medium.reason.clone(),
+        )))
+    } else if tunnel.is_none() {
+        Some(try_hosted(url, options.clone(), &pane, image_id).await)
     } else {
-        HostedOutcome::Spawn(attach::SpawnReason::InlineFrames(medium.reason.clone()))
+        None
     };
     match hosted {
-        HostedOutcome::Finished => return Ok(()),
-        HostedOutcome::Spawn(reason) => {
-            if !matches!(reason, attach::SpawnReason::FlagOff) {
-                tracing::info!(reason = %reason, "spawning this pane's own engine");
-            }
+        Some(HostedOutcome::Finished) => return Ok(()),
+        Some(HostedOutcome::Spawn(reason)) if !matches!(reason, attach::SpawnReason::FlagOff) => {
+            tracing::info!(reason = %reason, "spawning this pane's own engine");
         }
+        Some(HostedOutcome::Spawn(_)) | None => {}
     }
 
     let (mut command, engine_description) = match options.engine {
@@ -563,8 +596,11 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 } else {
                     "0"
                 })
-                .arg(url)
                 .current_dir(electron_dir);
+            if options.transparent {
+                command.arg("--tweb-transparent").arg("1");
+            }
+            command.arg(url);
             match options.engine {
                 BrowserEngine::Chrome => {
                     command.env("TWEB_BROWSER", "chrome");
@@ -578,6 +614,11 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                     }
                 }
                 BrowserEngine::Electron => {}
+            }
+            // Every engine kind reads the pointer and trackpad the same way, through the helper
+            // beside this binary (electron/native-input.cjs falls back to a checkout or PATH).
+            if let Some(helper) = find_sibling("TWEB_NATIVE_INPUT", "tweb-native-input") {
+                command.env("TWEB_NATIVE_INPUT", helper);
             }
             (command, description)
         }
@@ -624,6 +665,13 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 command.env("TWEB_DEVICE_SCALE_FACTOR", scale.to_string());
             }
         }
+    }
+    if let Some(tunnel) = &tunnel {
+        // The engine applies the proxy to its session and moves its profile to one of its own
+        // for this destination; see `remoteNetwork` in electron/main.cjs.
+        command
+            .env("TWEB_PROXY_SERVER", tunnel.proxy_rules())
+            .env("TWEB_REMOTE", &tunnel.destination);
     }
     if let Some(geometry) = initial_geometry {
         if let Some((left, top)) = geometry.origin {
@@ -767,6 +815,8 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
 
     // Even if the engine died abnormally, drop this pane's image from the pane PTY and the real clients.
     write_kitty_delete(image_id, &pane);
+    // After the engine, so no page is left loading through a proxy that has already gone.
+    drop(tunnel);
 
     input_handle.abort();
     sig_handle.abort();
@@ -887,6 +937,11 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
     // A Chrome pane drives a browser that is already shared across panes, and a WebKit pane its
     // own page host; the supervisor hosts Electron pages only, so it is not consulted.
     if options.engine != BrowserEngine::Electron {
+        return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
+    }
+    // The host's ATTACH has no field for it, and a hosted engine reads `page.transparent` from
+    // config.toml for every pane anyway. Only the per-pane flag needs a per-pane engine.
+    if options.transparent {
         return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
     }
     // Decided BEFORE the daemon is started or consulted: a pane that opted out, or one asking for
@@ -1125,10 +1180,16 @@ async fn recv_any(stream: &mut Option<tokio::signal::unix::Signal>) {
 }
 
 fn find_webkit() -> Option<std::path::PathBuf> {
-    if let Some(path) = std::env::var_os("TWEB_WEBKIT") {
+    find_sibling("TWEB_WEBKIT", "tweb-webkit")
+}
+
+/// A helper binary: the variable naming it, else the file of that name beside this binary — so
+/// the engine and its helpers come from one build.
+fn find_sibling(variable: &str, name: &str) -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os(variable) {
         return Some(std::path::PathBuf::from(path));
     }
-    let sibling = std::env::current_exe().ok()?.parent()?.join("tweb-webkit");
+    let sibling = std::env::current_exe().ok()?.parent()?.join(name);
     sibling.exists().then_some(sibling)
 }
 
@@ -1212,6 +1273,13 @@ fn electron_app_directory() -> Result<std::path::PathBuf> {
     }
     for candidate in workspace_electron_dirs() {
         if candidate.join("main.cjs").exists() && candidate.join("package.json").exists() {
+            // A checkout's `electron/` has the app's text files but not the native addon, which
+            // only exists as build output. Without this a development binary — the one every
+            // measurement runs — silently loses the shm frame medium. Measured on Linux: a pane
+            // from `<checkout>/target/debug/tweb` sent every patch as an inline PNG.
+            if let Err(err) = engine_app::place_binary_files(&candidate) {
+                tracing::warn!(error = %err, "cannot place the native addon in the workspace app");
+            }
             return Ok(candidate);
         }
     }

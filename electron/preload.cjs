@@ -131,6 +131,8 @@ installPrintShim();
     // `engine.chrome_sites` reached by a link, which is told to the user but not moved for them.
     { name: "chrome-pane", label: "Reopen in Chrome pane", action: () => send("chrome-pane") },
     { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
+    // Starts a recording, or stops one and pastes its timeline into the agent pane (`gr`).
+    { name: "record", label: "Record for agent (start / stop)", action: () => send("record-toggle") },
     // Moving focus between the floating window and its pane, without closing either. Losing
     // one of them on a busy desktop is the case these exist for.
     { name: "terminal", label: "Focus terminal", action: () => send("focus-terminal") },
@@ -250,6 +252,8 @@ installPrintShim();
   // Per pane and per process, deliberately not persisted — DESIGN.md 16.5.
   let commandLineHistory = [];
   let promptHost = null;
+  // What the open omnibox has to undo when it goes: its suggestion listener and pending request.
+  let promptCleanup = null;
   let searchState = null;
   // Requests still waiting for a result, and the backstop that un-hides the bar if one
   // never arrives, and the backstop that closes a bar whose Enter never landed.
@@ -261,8 +265,12 @@ installPrintShim();
   let visualState = null;
   let inspectState = null;
   // The element context the user picked in inspect mode, kept so an agent that
-  // asks for it later still gets it. Cleared when inspect mode closes.
+  // asks for it later still gets it. Set by the pick, cleared by `Esc` — the keys that act on
+  // the pick close inspect mode, and they used to clear it on the way out, so
+  // `tweb inspect-element` answered "no element picked" for every pick ever made.
   let lastInspectPayload = null;
+  // The live element behind it, so a later request reports where it is NOW.
+  let lastInspectElement = null;
   let tabListState = null;
   let historyState = null;
   let helpHost = null;
@@ -275,6 +283,10 @@ installPrintShim();
   let audioBadge = null;
   let audioState = { muted: false, owner: null };
   let transferBadge = null;
+  let recordBadge = null;
+  // Whether this pane is being recorded (`gr`, `tweb record`). The engine says so on every new
+  // document; while it is on, clicks and committed field changes are reported (see recordClick).
+  let recordingOn = false;
   let transferState = null;
   let downloadsState = null;
   let fileChooserState = null;
@@ -723,12 +735,23 @@ installPrintShim();
     };
     popover.onmouseenter = () => clearTimeout(tabPopoverTimer);
     popover.onmouseleave = scheduleTabPopoverHide;
-    shadow.append(label, input, audio, transfer, badge, popover);
+    // Shown for the whole recording, so nobody types into a page without knowing it is logged.
+    const record = document.createElement("span");
+    record.style.cssText = [
+      "box-sizing:border-box", "display:none", "height:18px", "padding:1px 6px",
+      "border:1px solid #f28b8266", "border-radius:4px", "background:#111d", "color:#f28b82",
+      "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "white-space:nowrap", "backdrop-filter:blur(3px)",
+    ].join(";");
+    record.textContent = "● REC";
+    record.title = "Recording for the agent — gr stops and sends the timeline";
+    shadow.append(label, input, audio, record, transfer, badge, popover);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
     inputBadge = input;
     audioBadge = audio;
+    recordBadge = record;
     transferBadge = transfer;
     tabBadge = badge;
     tabPopover = popover;
@@ -838,6 +861,7 @@ installPrintShim();
       ? `Audio muted — ${audioState.owner || "another pane"} owns it · press m to take it back`
       : "";
     audioBadge.style.display = audioState.muted ? "" : "none";
+    recordBadge.style.display = recordingOn ? "" : "none";
     // The absolute path is what a terminal has instead of "Show in folder", and it is
     // strictly more useful: a path can be fed to the user's own tools, a Finder window
     // cannot. It goes in the tooltip rather than the badge because a full path would push
@@ -3134,7 +3158,14 @@ installPrintShim();
         // is built in the key handler rather than here because the element is gone by
         // the time this runs — inspect mode may have closed and the reference is to a
         // live DOM node.
-        return lastInspectPayload || null;
+        if (!lastInspectPayload) return null;
+        // Where the element is now: the page may have scrolled since the pick, and
+        // `--send` screenshots this box.
+        const now = lastInspectElement?.isConnected ? visibleRect(lastInspectElement) : null;
+        if (!now) return lastInspectPayload;
+        const origin = topViewportPoint({ x: now.left, y: now.top });
+        return { ...lastInspectPayload, rect: { width: Math.round(now.width), height: Math.round(now.height),
+                                                left: Math.round(origin.x), top: Math.round(origin.y) } };
       }
       default: throw new Error(`unknown agent method ${JSON.stringify(request.method)}`);
     }
@@ -3177,6 +3208,7 @@ installPrintShim();
       }],
       ["b", "list open tabs", { b: () => showTabList() }],
       ["gh · gd", "history page · downloads — search, copy the path, open"],
+      ["gr", "record for the agent · again to stop and send the timeline"],
       ["J · K", "previous · next tab", { J: () => send("previous-tab"), K: () => send("next-tab") }],
       ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
       ["r · gi", "reload · focus first input", { r: () => send("reload") }],
@@ -3193,7 +3225,7 @@ installPrintShim();
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
       ["D · o/O · p · d", "image download · open target · paste · inspect"],
-      ["I", "inspect picker", { I: () => startInspect() }],
+      ["I", "inspect picker — then y/h/t copy, a sends it to the agent pane", { I: () => startInspect() }],
     ]],
     ["Browser and modes", [
       ["zi · zo · zz", "zoom in · out · reset", {
@@ -3344,6 +3376,8 @@ installPrintShim();
   }
 
   function cancelPrompt(restoreMode = true) {
+    promptCleanup?.();
+    promptCleanup = null;
     promptHost?.remove();
     promptHost = null;
     if (restoreMode) normalMode();
@@ -3389,6 +3423,33 @@ installPrintShim();
     let model = { current: location.href, entries: [] };
     let matches = [];
     let selected = 0;
+    // Search suggestions for the current input, when `search.suggest` is on. Main fetches them (see
+    // `omniboxSuggestions`); `seq` drops a reply to a query the user has already typed past.
+    let suggestions = [];
+    let suggestSeq = 0;
+    let suggestTimer = null;
+    const SUGGEST_ROWS = 4;
+    const requestSuggestions = () => {
+      clearTimeout(suggestTimer);
+      const query = input.value.trim();
+      const seq = ++suggestSeq;
+      if (!query) {
+        suggestions = [];
+        return;
+      }
+      // Debounced so a word typed quickly is one request, not one per letter.
+      suggestTimer = setTimeout(() => send("omnibox-suggest", { query, seq }), 120);
+    };
+    const onSuggestions = (_event, reply) => {
+      if (promptHost !== host || reply?.seq !== suggestSeq) return;
+      suggestions = Array.isArray(reply.suggestions) ? reply.suggestions : [];
+      render();
+    };
+    ipcRenderer.on("tweb-omnibox-suggest", onSuggestions);
+    promptCleanup = () => {
+      clearTimeout(suggestTimer);
+      ipcRenderer.removeListener("tweb-omnibox-suggest", onSuggestions);
+    };
 
     const render = () => {
       const query = input.value.trim();
@@ -3398,9 +3459,13 @@ installPrintShim();
         const score = fuzzyScore(query, `${entry.title || ""} ${entry.url}`);
         if (!query || Number.isFinite(score)) deduped.set(entry.url, { ...entry, score });
       }
+      // History and tabs first, then up to SUGGEST_ROWS suggestions under them: what was visited
+      // is the likelier destination, and a suggestion row must never push it out of view.
+      const offered = query ? suggestions.filter((entry) => entry?.url && !deduped.has(entry.url)).slice(0, SUGGEST_ROWS) : [];
       matches = [...deduped.values()]
         .sort((left, right) => query ? right.score - left.score : (right.recency || 0) - (left.recency || 0))
-        .slice(0, 10);
+        .slice(0, 10 - offered.length)
+        .concat(offered);
       if (selected >= 0) selected = Math.min(selected, Math.max(0, matches.length - 1));
       list.replaceChildren();
       list.style.display = matches.length ? "block" : "none";
@@ -3412,7 +3477,7 @@ installPrintShim();
         title.textContent = entry.title || entry.url;
         title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:13px/1.35 system-ui,-apple-system,sans-serif";
         const detail = document.createElement("div");
-        detail.textContent = `${entry.kind === "tab" ? "TAB  " : ""}${entry.url}`;
+        detail.textContent = `${entry.kind === "tab" ? "TAB  " : entry.kind === "search" ? "SEARCH  " : ""}${entry.url}`;
         detail.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6;font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
         row.append(title, detail);
         row.onmousedown = (event) => {
@@ -3433,7 +3498,7 @@ installPrintShim();
       if (!newTab && entry?.kind === "tab" && Number.isInteger(entry.index)) send("activate-tab", entry.index);
       else send(newTab ? "new-tab" : "navigate", value);
     };
-    input.addEventListener("input", () => { selected = -1; render(); });
+    input.addEventListener("input", () => { selected = -1; requestSuggestions(); render(); });
     input.addEventListener("keydown", (event) => {
       event.stopPropagation();
       if (event.code === "Escape") {
@@ -4783,7 +4848,6 @@ installPrintShim();
     inspectState.outline.remove();
     inspectState.panel.remove();
     inspectState = null;
-    lastInspectPayload = null;
     if (restoreMode) normalMode();
   }
 
@@ -5005,7 +5069,7 @@ installPrintShim();
       `${Math.round(item.rect.width)}×${Math.round(item.rect.height)} @ ${Math.round(item.rect.left)},${Math.round(item.rect.top)}`,
       attributes,
       `display=${computed.display} position=${computed.position} color=${computed.color} font=${computed.fontSize}`,
-      "y selector · h HTML · t text · Esc",
+      "y selector · h HTML · t text · a agent · Esc",
     ].filter(Boolean).join("\n");
     panel.textContent = summary;
     panel.style.cssText = [
@@ -5016,7 +5080,23 @@ installPrintShim();
     ].join(";");
     document.documentElement.append(panel);
     inspectState = { ...item, selector, outline, panel };
+    lastInspectPayload = inspectPayload(inspectState);
+    lastInspectElement = element;
     setMode("inspect", element.localName);
+  }
+
+  // Everything an agent gets about a pick. All of it, whichever key acted on it: which part the
+  // agent leans on is its call.
+  function inspectPayload(item, rect = item.rect) {
+    return {
+      selector: item.selector,
+      html: item.element.outerHTML,
+      text: item.element.innerText || item.element.textContent || "",
+      rect: { width: Math.round(rect.width), height: Math.round(rect.height),
+              left: Math.round(rect.left), top: Math.round(rect.top) },
+      url: location.href,
+      tag: item.element.localName,
+    };
   }
 
   function startInspect() {
@@ -5028,22 +5108,28 @@ installPrintShim();
     event.preventDefault();
     event.stopImmediatePropagation();
     const item = inspectState;
-    if (key === "Escape") cancelInspect();
-    else if (key === "y" || key === "h" || key === "t") {
+    if (key === "Escape") {
+      cancelInspect();
+      lastInspectPayload = null;
+      lastInspectElement = null;
+    } else if (key === "a") {
+      // Push the pick to the coding agent in this tmux window (agent-handoff.cjs picks the pane).
+      // The outline and panel go first and the send waits two frames, because the engine
+      // screenshots the element and should not photograph tweb's own overlay over it.
+      const payload = inspectPayload(item, visibleRect(item.element) || item.rect);
+      const origin = topViewportPoint({ x: payload.rect.left, y: payload.rect.top });
+      payload.rect = { ...payload.rect, left: Math.round(origin.x), top: Math.round(origin.y) };
+      lastInspectPayload = payload;
+      cancelInspect(false);
+      flash("agent…");
+      requestAnimationFrame(() => requestAnimationFrame(() => send("inspect-to-agent", payload)));
+    } else if (key === "y" || key === "h" || key === "t") {
       // Clipboard stays — a person at the terminal can still paste. The agent gets the
       // same context as an Orca design-mode attachment: the selector, the HTML, the text,
       // and the element's box, all in one message, so it does not have to re-fetch what the
       // user already picked. Which of the three the agent leans on is its call; it gets all
       // three rather than just the one the key selected.
-      const payload = {
-        selector: item.selector,
-        html: item.element.outerHTML,
-        text: item.element.innerText || item.element.textContent || "",
-        rect: { width: Math.round(item.rect.width), height: Math.round(item.rect.height),
-                left: Math.round(item.rect.left), top: Math.round(item.rect.top) },
-        url: location.href,
-        tag: item.element.localName,
-      };
+      const payload = inspectPayload(item);
       if (key === "y") send("copy-text", item.selector);
       else if (key === "h") send("copy-text", item.element.outerHTML);
       else if (key === "t") send("copy-text", item.element.innerText || item.element.textContent || "");
@@ -5368,6 +5454,8 @@ installPrintShim();
       // almost every press wants, and silently promoting it to a paper job would surprise
       // someone who wanted the file.
       else if (key === "p") send("print-paper");
+      // Record for the agent: start, and again to stop and send the timeline.
+      else if (key === "r") send("record-toggle");
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
       else return;
       event.preventDefault();
@@ -5513,6 +5601,67 @@ installPrintShim();
     // The bar is a canvas, so a repaint is the only way its new contents reach the pane.
     paintNow();
     setMode("search", searchState.count);
+  });
+
+  // --- recording ---
+  //
+  // Clicks and COMMITTED field changes (the `change` event: a value is reported once, when the
+  // field is left or a choice is made, never per keystroke). A sensitive field's value never
+  // leaves this page: the rule below is applied here, and the engine applies the same rule again
+  // (recorder.cjs `sensitiveField`, kept equal by a test). This preload is sandboxed and cannot
+  // require that file.
+  const RECORD_SENSITIVE_NAME = /pass|pwd|secret|token|otp|cvc|cvv|card|ssn|security.?code/i;
+  const RECORD_SENSITIVE_AUTOCOMPLETE = /current-password|new-password|one-time-code|cc-/i;
+
+  function recordSensitiveField(field) {
+    if (String(field.type || "").toLowerCase() === "password") return true;
+    if (RECORD_SENSITIVE_AUTOCOMPLETE.test(String(field.autocomplete || ""))) return true;
+    return RECORD_SENSITIVE_NAME.test(`${field.name || ""} ${field.id || ""}`);
+  }
+
+  // tweb's own overlays (hints, palette, badges) are not the page; clicks on them are not recorded.
+  function fromTwebOverlay(event) {
+    return event.composedPath().some((node) => typeof node?.id === "string" && node.id.startsWith("__tweb_"));
+  }
+
+  function recordClick(event) {
+    if (!recordingOn || fromTwebOverlay(event)) return;
+    const element = event.composedPath().find(isElement);
+    if (!element) return;
+    const label = element.innerText || element.getAttribute?.("aria-label") || element.getAttribute?.("title") || "";
+    send("record-event", {
+      kind: "click", selector: cssSelector(element), text: String(label).slice(0, 120), url: location.href,
+    });
+  }
+
+  function recordFieldChange(event) {
+    if (!recordingOn || fromTwebOverlay(event)) return;
+    const element = event.composedPath().find(isElement);
+    if (!element || !/^(input|textarea|select)$/.test(element.localName)) return;
+    const type = element.localName === "input" ? String(element.type || "text").toLowerCase() : element.localName;
+    if (type === "hidden") return;
+    const field = { type, name: element.name || "", id: ownId(element) || "", autocomplete: element.autocomplete || "" };
+    if (!recordSensitiveField(field)) {
+      if (type === "checkbox" || type === "radio") field.checked = Boolean(element.checked);
+      else if (type !== "file") field.value = String(element.value ?? "").slice(0, 120);
+    }
+    send("record-event", { kind: "field", selector: cssSelector(element), field, url: location.href });
+  }
+
+  ipcRenderer.on("tweb-recording", (_event, state) => {
+    const on = Boolean(state?.recording);
+    if (on === recordingOn) return;
+    recordingOn = on;
+    // Capture phase, so a page that stops propagation still has its click recorded; the listener
+    // only reads, it never cancels.
+    if (on) {
+      document.addEventListener("click", recordClick, true);
+      document.addEventListener("change", recordFieldChange, true);
+    } else {
+      document.removeEventListener("click", recordClick, true);
+      document.removeEventListener("change", recordFieldChange, true);
+    }
+    if (topFrame) renderIndicator();
   });
 
   ipcRenderer.on("tweb-audio-state", (_event, state) => {

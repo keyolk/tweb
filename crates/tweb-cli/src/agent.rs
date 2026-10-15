@@ -489,10 +489,63 @@ pub fn render(method: &str, result: &Value) -> String {
             let tag = text_field(result, "tag");
             let url = text_field(result, "url");
             if selector.is_empty() {
-                "no element picked\n".to_string()
-            } else {
-                format!("{}  {}  {}\n", tag, selector, url)
+                return "no element picked\n".to_string();
             }
+            let mut out = format!("{}  {}  {}\n", tag, selector, url);
+            // `--send`: where the pick went, or why it went nowhere.
+            if let Some(sent) = result.get("sent") {
+                if sent.get("ok").and_then(Value::as_bool) == Some(true) {
+                    out.push_str(&format!(
+                        "sent to {} {}\n",
+                        text_field(sent, "agent"),
+                        text_field(sent, "pane")
+                    ));
+                } else {
+                    out.push_str(&format!("not sent: {}\n", text_field(sent, "reason")));
+                }
+                if let Some(Value::String(path)) = sent.get("screenshot") {
+                    out.push_str(&format!("screenshot: {path}\n"));
+                }
+            }
+            out
+        }
+        "record-start" | "record-status" => {
+            if result.get("recording").and_then(Value::as_bool) != Some(true) {
+                return "not recording\n".to_string();
+            }
+            let mut out = format!("recording to {}\n", text_field(result, "directory"));
+            // An engine that cannot see something says so up front, not as a silent zero later.
+            for limit in result
+                .get("unavailable")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                out.push_str(&format!("not recorded on this engine: {limit}\n"));
+            }
+            out
+        }
+        // The timeline path first: it is the thing to open. Then where it went.
+        "record-stop" => {
+            if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                return "not recording\n".to_string();
+            }
+            let mut out = text_field(result, "summary");
+            match result.get("sent") {
+                Some(sent) if sent.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    out.push_str(&format!(
+                        "sent to {} {}\n",
+                        text_field(sent, "agent"),
+                        text_field(sent, "pane")
+                    ));
+                }
+                Some(sent) if !sent.is_null() => {
+                    out.push_str(&format!("not sent: {}\n", text_field(sent, "reason")));
+                }
+                _ => {}
+            }
+            out
         }
         "float" => {
             if result.get("floating").and_then(|v| v.as_bool()) == Some(true) {
@@ -726,6 +779,59 @@ mod tests {
         assert!(
             rendered.contains("POST    -    https://example.com/api"),
             "{rendered}"
+        );
+    }
+
+    /// `--send` says where the pick went — or why it went nowhere, which is the line a user
+    /// with no agent pane needs to see rather than a silent success.
+    #[test]
+    fn inspect_send_reports_the_destination_or_the_reason() {
+        let picked = serde_json::json!({ "selector": "h1", "tag": "h1", "url": "https://a.test/" });
+        assert_eq!(
+            super::render("inspect-element", &picked),
+            "h1  h1  https://a.test/\n"
+        );
+        let mut sent = picked.clone();
+        sent["sent"] = serde_json::json!({ "ok": true, "agent": "claude", "pane": "%2",
+                                           "screenshot": "/c/handoff/x-element.png" });
+        let rendered = super::render("inspect-element", &sent);
+        assert!(rendered.contains("sent to claude %2\n"), "{rendered}");
+        assert!(
+            rendered.contains("screenshot: /c/handoff/x-element.png\n"),
+            "{rendered}"
+        );
+        let mut refused = picked;
+        refused["sent"] = serde_json::json!({ "ok": false,
+                                              "reason": "no coding agent pane in this tmux window" });
+        assert!(super::render("inspect-element", &refused)
+            .contains("not sent: no coding agent pane in this tmux window\n"));
+    }
+
+    /// A stopped recording prints the summary that was pasted, then where it went.
+    #[test]
+    fn record_stop_prints_the_timeline_and_the_destination() {
+        let stopped = serde_json::json!({ "ok": true, "summary": "tweb recording: /r/timeline.md\n1.0s\n",
+            "sent": { "ok": false, "reason": "no coding agent pane in this tmux window" } });
+        assert_eq!(
+            super::render("record-stop", &stopped),
+            "tweb recording: /r/timeline.md\n1.0s\nnot sent: no coding agent pane in this tmux window\n"
+        );
+        assert_eq!(
+            super::render("record-stop", &serde_json::json!({ "ok": false })),
+            "not recording\n"
+        );
+        assert_eq!(
+            super::render(
+                "record-start",
+                &serde_json::json!({ "recording": true, "directory": "/r" })
+            ),
+            "recording to /r\n"
+        );
+        let limited = serde_json::json!({ "recording": true, "directory": "/r",
+            "unavailable": ["failed requests (this engine cannot see a page's requests)"] });
+        assert_eq!(
+            super::render("record-start", &limited),
+            "recording to /r\nnot recorded on this engine: failed requests (this engine cannot see a page's requests)\n"
         );
     }
 

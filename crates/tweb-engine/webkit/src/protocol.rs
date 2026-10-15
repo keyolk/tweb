@@ -82,6 +82,14 @@ pub enum Command {
         dx: f64,
         #[serde(default)]
         dy: f64,
+        /// A trackpad gesture's AppKit phase masks (`NSEventPhase`), from the native input
+        /// helper. All zero for a terminal wheel notch, which stays a plain pixel scroll.
+        #[serde(default)]
+        phase: u64,
+        #[serde(default)]
+        momentum: u64,
+        #[serde(default)]
+        precise: bool,
     },
     Key {
         view: u32,

@@ -67,6 +67,16 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // reason: as a module-level counter it summed every pane's compressions and reported the sum
     // to each of them.
     compressedWholeFrames: 0,
+    // Whole frames that went out through shared memory (`t=s`), and which ring slot the next one
+    // takes. Per pane because the object names are: two panes sharing a slot counter would hand
+    // each other's names to the terminal. See shm-frames.cjs.
+    shmWholeFrames: 0,
+    shmSlot: 0,
+    shmPatches: 0,
+    shmPatchSlot: 0,
+    // Whether this pane's marker file is in userData yet — what lets a later engine find its
+    // objects if this one is killed before it can unlink them.
+    shmMarked: false,
     // How much of the byte budget this pane has earned above the default, found by trying
     // rather than guessed: raised while nothing is dropping, cut back the moment something
     // does. See `playbackHeadroom` in frame-rate-policy.cjs.

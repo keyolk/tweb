@@ -20,6 +20,24 @@ const os = require("node:os");
 const CHUNK = 3072;
 // What the last whole frame did, surfaced on the worker's reply — see `rawCommands`.
 let lastFrameCompressed = false;
+let lastFrameShm = false;
+let lastShmError = null;
+
+// The shared-memory frame addon, when the engine decided this terminal takes `t=s` — see
+// shm-frames.cjs for who does and why. Loaded here, in the thread that writes frames; a load that
+// fails leaves `null` and every frame on the file medium it shipped with.
+let native = null;
+if (workerData?.shmAddon) {
+  try {
+    native = require(workerData.shmAddon);
+  } catch (error) {
+    // Reported on the first frame's reply rather than lost: the engine logs it and `diag` shows it.
+    lastShmError = `addon load failed: ${error.message}`;
+  }
+}
+// Every object name this thread created, unlinked on exit. The terminal unlinks what it read, so
+// this is normally a no-op; it catches the frames a hidden pane never drew.
+const shmNames = new Set();
 const LITTLE_ENDIAN = os.endianness() === "LE";
 const frameFiles = new Set();
 
@@ -200,7 +218,33 @@ function maybeDeflate(rgba) {
 // memory-bandwidth bound: a bare memcpy of the same 20MB costs 0.347ms and the scalar loop
 // 0.431ms, so the whole headroom a SIMD rewrite could win is under 0.1ms — and that measurement
 // is why `tweb-native` was deleted rather than finished. See DETAIL.md 8.4.
+// `t=s`: the object name is the payload, and the swap happens inside the addon's copy into the
+// mapping, so the frame is one native pass from Chromium's bitmap to what the terminal reads. No
+// deflate: the shm medium exists for the terminal `o=z` crashes, and a compressible frame on
+// kitty is the one case where deflating into the object would still save anything.
+//
+// Returns null when the write failed; the caller falls back to the file medium for that frame, so
+// a broken shm (a full `/dev/shm` on Linux, a name collision) costs speed, never the frame.
+function shmCommands(message, bgra, addon = native) {
+  try {
+    addon.writeShmFrame(message.shmName, bgra, true);
+  } catch (error) {
+    lastShmError = error.message;
+    return null;
+  }
+  shmNames.add(message.shmName);
+  lastFrameShm = true;
+  return [{
+    header: `${message.header},f=32,s=${message.width},v=${message.height},t=s,q=2`,
+    payload: Buffer.from(message.shmName).toString("base64"),
+  }];
+}
+
 function rawCommands(message, bgra) {
+  if (native && message.shmName) {
+    const commands = shmCommands(message, bgra);
+    if (commands) return commands;
+  }
   const rgba = Buffer.allocUnsafe(bgra.length);
   // A Uint32Array view needs both ends 4-byte aligned; `Buffer.allocUnsafe` under 4KB comes out
   // of a shared pool at an arbitrary offset, so this is a real case and not a formality. A
@@ -251,6 +295,9 @@ function frameCommands(message) {
 // The frame files this thread wrote, removed on exit. They are named after the engine pid, so
 // an engine that never reaches this path leaves them collectable — see `abandonedFrameFiles`.
 function cleanup() {
+  for (const name of shmNames) {
+    try { native.unlinkShm(name); } catch {}
+  }
   for (const filePath of frameFiles) {
     try { unlinkSync(filePath); } catch {}
     try { unlinkSync(`${filePath}.tmp`); } catch {}
@@ -268,8 +315,14 @@ if (parentPort) {
     const paneKey = message?.paneKey ?? null;
     try {
       lastFrameCompressed = false;
+      lastFrameShm = false;
       const commands = message.type === "frame" ? frameCommands(message) : [];
-      parentPort.postMessage({ type: "ready", paneKey, commands, compressed: lastFrameCompressed });
+      // `shmError` is sent once and cleared, so the engine counts consecutive failures rather
+      // than re-reading one stale message on every frame.
+      const shmError = lastShmError;
+      lastShmError = null;
+      const shm = lastFrameShm;
+      parentPort.postMessage({ type: "ready", paneKey, commands, compressed: lastFrameCompressed, shm, shmError });
     } catch (error) {
       parentPort.postMessage({ type: "error", paneKey, message: error.message, commands: [] });
     }
@@ -277,6 +330,6 @@ if (parentPort) {
 }
 
 module.exports = {
-  directCommands, fileCommands, rawCommands, frameCommands, swapBytewise, swapU32,
+  directCommands, fileCommands, rawCommands, shmCommands, frameCommands, swapBytewise, swapU32,
   maybeDeflate, sampleRatio, CHUNK, MIN_RATIO,
 };
