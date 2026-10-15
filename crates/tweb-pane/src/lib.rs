@@ -20,6 +20,7 @@ pub mod image_id;
 pub mod input;
 pub mod pane_writer;
 pub mod resize;
+pub mod ssh;
 pub mod terminal;
 pub mod visibility;
 
@@ -41,12 +42,14 @@ pub enum BrowserEngine {
     Webkit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PaneOptions {
     pub engine: BrowserEngine,
     pub frame_rate: u16,
     pub adaptive_frame_rate: bool,
     pub restore_session: bool,
+    /// `--ssh`: the pane's network goes through this host (see `ssh`). Electron engine only.
+    pub ssh: Option<ssh::SshTarget>,
 }
 
 impl Default for PaneOptions {
@@ -56,6 +59,7 @@ impl Default for PaneOptions {
             frame_rate: 30,
             adaptive_frame_rate: true,
             restore_session: false,
+            ssh: None,
         }
     }
 }
@@ -471,6 +475,23 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
 
     let pane = std::env::var("TMUX_PANE").unwrap_or_else(|_| "%0".to_string());
     tracing::info!(pane = %pane, "tmux pane identity");
+
+    // Before raw mode and the alternate screen, because ssh may need to ask the person in this
+    // pane for a password or a host-key decision, and this is the last point where they can see
+    // the question and type an answer. Held for the rest of this function: dropping it is what
+    // ends ssh, so the tunnel lives exactly as long as the pane does (see `ssh`).
+    let tunnel = match &options.ssh {
+        Some(target) => {
+            if options.engine != BrowserEngine::Electron {
+                // The CLI refuses this first; kept so `__pane` cannot be talked into it either.
+                anyhow::bail!("--ssh needs the Electron engine");
+            }
+            eprintln!("tweb: connecting to {} over ssh…", target.destination);
+            let log = ssh::log_path(engine_app::cache_root().join("logs"), &pane);
+            Some(ssh::open(target, &log)?)
+        }
+        None => None,
+    };
     let _pane_marker = TmuxPaneMarker::install(&pane);
 
     // Enable raw terminal mode and browser input (mouse/Kitty keyboard).
@@ -501,11 +522,17 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     // the spawn below, which is the path that ships — so a pane that opted in and found no daemon,
     // an incompatible daemon, or a daemon whose engine cannot host, behaves exactly as it does
     // today rather than degrading.
-    match try_hosted(url, options, &pane, image_id).await {
-        HostedOutcome::Finished => return Ok(()),
-        HostedOutcome::Spawn(reason) => {
-            if !matches!(reason, attach::SpawnReason::FlagOff) {
-                tracing::info!(reason = %reason, "spawning this pane's own engine");
+    //
+    // A pane on a tunnel is not offered to the daemon: the hosted engine's panes share one session,
+    // and a proxy is a property of a session, so hosting it would reroute every other hosted pane
+    // through this pane's ssh. Its own engine has a session nobody else uses.
+    if tunnel.is_none() {
+        match try_hosted(url, options.clone(), &pane, image_id).await {
+            HostedOutcome::Finished => return Ok(()),
+            HostedOutcome::Spawn(reason) => {
+                if !matches!(reason, attach::SpawnReason::FlagOff) {
+                    tracing::info!(reason = %reason, "spawning this pane's own engine");
+                }
             }
         }
     }
@@ -569,6 +596,13 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             if options.restore_session { "1" } else { "0" },
         )
         .env("TWEB_URL", url);
+    if let Some(tunnel) = &tunnel {
+        // The engine applies the proxy to its session and moves its profile to one of its own
+        // for this destination; see `remoteNetwork` in electron/main.cjs.
+        command
+            .env("TWEB_PROXY_SERVER", tunnel.proxy_rules())
+            .env("TWEB_REMOTE", &tunnel.destination);
+    }
     if let Some(geometry) = initial_geometry {
         if let Some((left, top)) = geometry.origin {
             command.env("TWEB_PANE_ORIGIN", format!("{left},{top}"));
@@ -711,6 +745,8 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
 
     // Even if the engine died abnormally, drop this pane's image from the pane PTY and the real clients.
     write_kitty_delete(image_id, &pane);
+    // After the engine, so no page is left loading through a proxy that has already gone.
+    drop(tunnel);
 
     input_handle.abort();
     sig_handle.abort();

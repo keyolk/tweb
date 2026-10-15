@@ -71,6 +71,9 @@ tweb split --engine webkit https://localhost:5173
 # Run the pages in your own (managed) Google Chrome — Okta device trust, Endpoint Verification
 tweb split --engine chrome https://sendbird.okta.com/
 
+# Put the pane on a remote host's network: its localhost is the remote's (see "Remote network")
+tweb split --ssh coder.regular http://localhost:3000
+
 # Tune the active maximum frame rate
 # adaptive uses the given value while active and drops to at most 4fps when idle
 tweb open --frame-rate 24 --adaptive-frame-rate https://localhost:5173
@@ -276,6 +279,39 @@ there.
 the tab then joins this tmux window's Chrome tab group and the handoff stays part of the same
 workspace. Without it the URL still opens, through `open -a "Google Chrome"`. Neither path
 reads or writes the Chrome profile: they hand over a URL and nothing else.
+
+## Remote network (`--ssh`)
+
+`tweb open --ssh <dest>` and `tweb split --ssh <dest>` put the pane's network on a remote host. The
+pane runs `ssh -N -D 127.0.0.1:<free port> <dest>` and sends every request through that SOCKS
+proxy — `localhost` included, and host names are resolved on the far side — so a dev server
+bound to the remote's loopback opens as `http://localhost:<port>` with no `-L` per port.
+
+```sh
+tweb split --ssh me@box http://localhost:5173
+tweb split --ssh "-J bastion -p 2222 me@box" http://localhost:8080   # ssh flags pass through
+tweb split --ssh coder.regular http://localhost:3000                 # after `coder config-ssh`
+tweb split --ssh coder:owner/workspace http://localhost:3000         # without it: coder ssh --stdio
+```
+
+- **The tunnel is the pane's.** ssh starts before the pane takes the terminal, so a password,
+  passphrase or host-key question is asked in the pane and answered there. It stops when the pane
+  closes, and it cannot outlive the pane: ssh runs under a guard that kills it when the pane's
+  process is gone, however it went (verified with `kill -9`).
+- **A separate profile per destination.** Panes share one profile by design, but a proxied pane's
+  `localhost:3000` is a different site from the local one under the same name, so sharing would
+  send each one's cookies to the other and restore remote tabs onto the local network. The pane
+  uses `remote/<dest>/` inside the profile directory instead. It persists, so the remote app's
+  login survives a reconnect. The trade: it starts signed out of everything else and without the
+  shared profile's extensions.
+- **Electron engine only, and its own engine process.** The Chrome engine's browser is shared by
+  every Chrome pane, and the WebKit host has no per-pane proxy, so `--ssh` with either is refused
+  rather than quietly loading pages on the local network. A proxied pane is not hosted by `twebd`
+  either: a proxy is per session and hosted panes share one.
+- WebRTC is limited to the proxy, so a page cannot learn the local machine's addresses.
+- A tunnel that drops (three missed 15s keepalives) is not reconnected. Pages then fail with a
+  proxy error; reopen the pane. `tweb diag --json` reports `remote` (destination, proxy, profile),
+  and ssh's own stderr is in `~/.cache/tweb/logs/ssh-<pane>.log`.
 
 ## Agent control (CLI · MCP)
 
