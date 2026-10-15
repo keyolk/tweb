@@ -522,6 +522,27 @@ pub fn is_orphaned(watched_pid: Option<u32>, parent_pid: u32) -> bool {
     matches!(watched_pid, Some(pid) if pid > 1) && parent_pid == 1
 }
 
+/// `spawn`, retried briefly when the executable is "busy".
+///
+/// Linux refuses to exec a file that some process holds open for writing (ETXTBSY). That happens
+/// for a moment after the file is written whenever another thread forks: the forked child holds a
+/// copy of the writer's descriptor until its own exec closes it. Measured in this crate's tests on
+/// Linux arm64: a freshly written fake engine failed to start in 5 of 10 full test runs, never
+/// alone. A real Electron binary is not written just before it runs, so this costs nothing there;
+/// Go's os/exec and cargo retry the same error for the same reason.
+fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<Child> {
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn start_process(launcher: &Launcher) -> Result<Child> {
     let (watch_variable, watch_pid) = orphan_watch_variable(std::process::id());
     let mut command = Command::new(&launcher.executable);
@@ -561,8 +582,7 @@ fn start_process(launcher: &Launcher) -> Result<Child> {
         .env_remove("TWEB_VIEWPORT")
         .env_remove("TWEB_PANE_ORIGIN")
         .env_remove("TWEB_IMAGE_ID");
-    command
-        .spawn()
+    spawn_retrying_busy(&mut command)
         .with_context(|| format!("cannot start {}", launcher.executable.display()))
 }
 
