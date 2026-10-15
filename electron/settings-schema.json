@@ -18,6 +18,13 @@
       "description": "Pixels one wheel notch scrolls."
     },
     {
+      "key": "input.native",
+      "type": "bool",
+      "default": true,
+      "applies": "live",
+      "description": "On macOS, read the real pointer and trackpad (tweb-native-input) so a pane inside tmux gets pixel positions and precise, inertial scrolling instead of cells and wheel notches. Off uses the terminal's reports alone."
+    },
+    {
       "key": "zoom.default",
       "type": "float",
       "default": 0.8,

@@ -111,9 +111,11 @@ test("every schema entry is complete and its default has its type", () => {
 
 test("the engine reads each setting where it is used, so a live change needs no restart", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  const wheel = main.slice(main.indexOf("function dispatchMouse("), main.indexOf("const button = buttonCode === 0"));
+  const wheel = main.slice(main.indexOf("function dispatchTerminalWheel("), main.indexOf("// --- native pointer and trackpad"));
   assert.match(wheel, /settings\.get\("scroll\.invert"\)/);
   assert.match(wheel, /settings\.get\("scroll\.distance"\)/);
+  // Per event, so turning native input off takes effect on the next move.
+  assert.match(main, /function nativeEnabled\(\) \{\s*return process\.platform === "darwin" && settings\.get\("input\.native"\) === true;/);
   assert.match(main, /columns: settings\.get\("ime\.slot_cells"\)/);
   assert.match(main, /function defaultZoomFactor\(\) \{\s*return settings\.get\("zoom\.default"\);/);
   assert.match(main, /settings\.watch\(/);

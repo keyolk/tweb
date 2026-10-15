@@ -581,6 +581,11 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 }
                 BrowserEngine::Electron => {}
             }
+            // Every engine kind reads the pointer and trackpad the same way, through the helper
+            // beside this binary (electron/native-input.cjs falls back to a checkout or PATH).
+            if let Some(helper) = find_sibling("TWEB_NATIVE_INPUT", "tweb-native-input") {
+                command.env("TWEB_NATIVE_INPUT", helper);
+            }
             (command, description)
         }
     };
@@ -1117,10 +1122,16 @@ async fn recv_any(stream: &mut Option<tokio::signal::unix::Signal>) {
 }
 
 fn find_webkit() -> Option<std::path::PathBuf> {
-    if let Some(path) = std::env::var_os("TWEB_WEBKIT") {
+    find_sibling("TWEB_WEBKIT", "tweb-webkit")
+}
+
+/// A helper binary: the variable naming it, else the file of that name beside this binary — so
+/// the engine and its helpers come from one build.
+fn find_sibling(variable: &str, name: &str) -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os(variable) {
         return Some(std::path::PathBuf::from(path));
     }
-    let sibling = std::env::current_exe().ok()?.parent()?.join("tweb-webkit");
+    let sibling = std::env::current_exe().ok()?.parent()?.join(name);
     sibling.exists().then_some(sibling)
 }
 

@@ -582,6 +582,17 @@ fn start_process(launcher: &Launcher) -> Result<Child> {
         .env_remove("TWEB_VIEWPORT")
         .env_remove("TWEB_PANE_ORIGIN")
         .env_remove("TWEB_IMAGE_ID");
+    // The pointer/trackpad helper beside this binary, so a hosted engine reads the same build's
+    // helper a per-pane one does (electron/native-input.cjs falls back to a checkout or PATH).
+    if std::env::var_os("TWEB_NATIVE_INPUT").is_none() {
+        if let Some(helper) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("tweb-native-input")))
+            .filter(|path| path.exists())
+        {
+            command.env("TWEB_NATIVE_INPUT", helper);
+        }
+    }
     spawn_retrying_busy(&mut command)
         .with_context(|| format!("cannot start {}", launcher.executable.display()))
 }
