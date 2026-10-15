@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
+mod engine;
+
 const GHOSTTY_BEGIN: &str = "# >>> tweb doctor managed passthrough >>>";
 const GHOSTTY_END: &str = "# <<< tweb doctor managed passthrough <<<";
 const TMUX_BEGIN: &str = "# >>> tweb doctor managed terminal options >>>";
@@ -50,7 +52,9 @@ const TMUX_MANAGED_BASE: &str = r#"# Managed by `tweb doctor --fix`; edit the ma
 set-option -g allow-passthrough all
 set-option -g mouse on
 set-option -s extended-keys on
-set-option -s extended-keys-format csi-u
+# tmux 3.5+. Quiet (-q) because 3.4 — Ubuntu 24.04's — has no such option and would stop
+# sourcing this file at it; 3.4 sends xterm's CSI 27;m;k~ instead, which the engine also reads.
+set-option -sq extended-keys-format csi-u
 "#;
 
 /// Cmd combinations forwarded to the page, as (Ghostty trigger, private code,
@@ -297,7 +301,7 @@ pub async fn run(fix: bool) -> Result<()> {
         println!();
     }
 
-    let checks = vec![
+    let mut checks = vec![
         check_terminal(),
         check_tmux(),
         check_tmux_session(),
@@ -305,15 +309,20 @@ pub async fn run(fix: bool) -> Result<()> {
         check_tmux_passthrough(),
         check_tmux_extended_keys(),
         check_tmux_mouse(),
+    ];
+    checks.extend([
         check_ghostty_version(),
         check_ghostty_cmd_passthrough(),
         check_ghostty_terminal_copy(),
+    ]);
+    checks.extend([
         check_pixel_size_query(),
         check_kitty_graphics_probe(),
         check_tmux_user_keys(),
         check_tmux_environment(),
-        check_chrome_engine(),
-    ];
+    ]);
+    checks.extend(engine::linux_checks());
+    checks.push(check_chrome_engine());
 
     // Output.
     for check in &checks {
@@ -571,12 +580,20 @@ fn check_tmux_passthrough() -> Check {
 fn check_tmux_extended_keys() -> Check {
     let enabled = tmux_option(&["show-options", "-s", "extended-keys"]);
     let format = tmux_option(&["show-options", "-s", "extended-keys-format"]);
+    // No such option before tmux 3.5, and then nothing to set: 3.4 always reports modified keys
+    // as CSI 27;m;k~, which the engine parses as well as CSI u. Asking a 3.4 user to fix it
+    // sent `--fix` into an option the server rejects.
+    const NOT_BEFORE_3_5: &str = "extended-keys-format n/a before tmux 3.5 (CSI 27 keys)";
+    let format = format.or_else(|| {
+        (enabled.is_some() && !tmux_supports_option("extended-keys-format"))
+            .then(|| NOT_BEFORE_3_5.to_string())
+    });
     let ok = enabled
         .as_deref()
         .is_some_and(|value| value.ends_with(" on"))
         && format
             .as_deref()
-            .is_some_and(|value| value.ends_with(" csi-u"));
+            .is_some_and(|value| value.ends_with(" csi-u") || value == NOT_BEFORE_3_5);
     Check {
         name: "tmux extended keys",
         status: if ok {
@@ -743,7 +760,10 @@ fn check_kitty_graphics_probe() -> Check {
 fn check_tmux_user_keys() -> Check {
     // Derived from the tables rather than listed, so a key added there is checked here too: the
     // fixed list stopped at 131 and would have called the editing Cmd keys configured.
-    let mut slots: Vec<u16> = vec![100, 101];
+    // Not 100-101: those are the tmux-chrome bridge's (see CMD_PASSTHROUGH_KEYS), which
+    // `--fix` does not install — requiring them failed this check on every machine without
+    // tmux-chrome, with advice that could not fix it.
+    let mut slots: Vec<u16> = Vec::new();
     slots.extend(PRIVATE_SHORTCUT_KEYS.iter().map(|(_, slot, _)| *slot));
     slots.extend(
         CMD_PASSTHROUGH_KEYS
@@ -765,10 +785,7 @@ fn check_tmux_user_keys() -> Check {
         return Check {
             name: "tmux user-keys (private shortcuts)",
             status: CheckStatus::Ok,
-            detail: format!(
-                "{} slots registered (100-101, 110-118, 124-139)",
-                slots.len()
-            ),
+            detail: format!("{} slots registered (110-118, 124-139)", slots.len()),
         };
     }
     Check {
@@ -897,7 +914,7 @@ fn apply_tmux_fix() -> Result<String> {
         &["set-option", "-g", "allow-passthrough", "all"][..],
         &["set-option", "-g", "mouse", "on"][..],
         &["set-option", "-s", "extended-keys", "on"][..],
-        &["set-option", "-s", "extended-keys-format", "csi-u"][..],
+        &["set-option", "-sq", "extended-keys-format", "csi-u"][..],
     ] {
         live &= Command::new("tmux")
             .args(args)
@@ -1407,6 +1424,14 @@ fn command_output(command: &str, args: &[&str]) -> Option<String> {
 
 fn tmux_option(args: &[&str]) -> Option<String> {
     command_output("tmux", args)
+}
+
+/// Whether the running tmux knows a server option at all, as opposed to having it unset.
+fn tmux_supports_option(name: &str) -> bool {
+    Command::new("tmux")
+        .args(["show-options", "-s", name])
+        .output()
+        .is_ok_and(|output| !String::from_utf8_lossy(&output.stderr).contains("invalid option"))
 }
 
 #[cfg(test)]

@@ -3606,8 +3606,21 @@ function writeFloatStatus() {
   writerFor(currentPane()).write(centeredStatusSequence(label, cells.cols, cells.rows));
 }
 
+// No display server: Linux reached over SSH, where the engine runs on Ozone headless (see
+// crates/twebd/src/chromium_platform.rs). Anything that needs a real OS window has nowhere to go.
+const headlessEngine = process.platform === "linux"
+  && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+
 function toggleFloat(fullscreen = false) {
   const state = inputState();
+  // Floating moves the page into an OS window on the machine the ENGINE runs on. Headless, that
+  // window exists and is drawn into nothing, so the pane would show "FLOATING" over a page no one
+  // can see or reach — said instead, and the page stays in the pane.
+  if (!state.floating && headlessEngine) {
+    sendToMainTabFrame(currentWindows().win, "tweb-flash",
+      "Floating needs a display; this engine runs headless");
+    return;
+  }
   const wasFullscreen = fullscreenFloat;
   state.floating = !state.floating;
   fullscreenFloat = state.floating ? fullscreen : false;
@@ -4420,6 +4433,9 @@ function agentDiagnostics() {
     pane: ownTmuxPane,
     pid: process.pid,
     engineApp: __dirname,
+    // False only where the frontend found no way to sandbox the renderers and the user allowed
+    // running without (TWEB_NO_SANDBOX=1); see crates/twebd/src/chromium_platform.rs.
+    sandboxed: !app.commandLine.hasSwitch("no-sandbox"),
     pane_geometry: {
       cells: currentFrames().cells,
       pixels: currentFrames().viewport ? { width: currentFrames().viewport.width, height: currentFrames().viewport.height } : null,

@@ -195,6 +195,9 @@ struct HostState {
 pub struct Launcher {
     pub executable: PathBuf,
     pub app_dir: PathBuf,
+    /// Chromium switches the platform needs, from `chromium_platform::engine_switches`. Decided
+    /// once where the launcher is built, not per start: the answer is about the machine.
+    pub switches: Vec<String>,
 }
 
 impl EngineHost {
@@ -216,6 +219,7 @@ impl EngineHost {
         let host = Self::new(Launcher {
             executable: PathBuf::new(),
             app_dir: PathBuf::new(),
+            switches: Vec::new(),
         });
         host.inner.lock().state = EngineState::Unavailable {
             reason: reason.into(),
@@ -516,6 +520,7 @@ fn start_process(launcher: &Launcher) -> Result<Child> {
     let (watch_variable, watch_pid) = orphan_watch_variable(std::process::id());
     let mut command = Command::new(&launcher.executable);
     command
+        .args(&launcher.switches)
         .arg(".")
         .current_dir(&launcher.app_dir)
         .stdin(Stdio::piped())
@@ -772,6 +777,7 @@ mod tests {
         Launcher {
             executable,
             app_dir: dir,
+            switches: Vec::new(),
         }
     }
 

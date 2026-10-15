@@ -70,10 +70,16 @@ impl Supervisor {
                 app_dir.display()
             )))
         } else {
-            Arc::new(EngineHost::new(Launcher {
-                executable: PathBuf::from(executable),
-                app_dir,
-            }))
+            // A machine that cannot sandbox the renderers is an engine that cannot host, with the
+            // reason; each pane then falls back to its own engine and stops on the same message.
+            match crate::chromium_platform::engine_switches(Path::new(executable)) {
+                Ok(switches) => Arc::new(EngineHost::new(Launcher {
+                    executable: PathBuf::from(executable),
+                    app_dir,
+                    switches,
+                })),
+                Err(reason) => Arc::new(EngineHost::unavailable(reason)),
+            }
         };
         *slot = Some(engine.clone());
         engine

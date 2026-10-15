@@ -12,7 +12,10 @@ mod app;
 mod delegates;
 #[cfg(target_os = "macos")]
 mod input;
+// Platform-neutral, so their tests run everywhere; only the macOS host calls into them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod pixels;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod protocol;
 
 #[cfg(target_os = "macos")]
