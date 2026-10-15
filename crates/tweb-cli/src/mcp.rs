@@ -273,7 +273,13 @@ const TOOLS: &[Tool] = &[
         name: "tweb_inspect_element",
         method: "inspect-element",
         description: "The element the user picked in inspect mode —                       selector, HTML, text, bounding box and URL.                       Like Orca's design mode: the user selects an element                       in the browser, and the agent gets its context.",
-        fields: &[],
+        fields: &[(
+            "send",
+            "boolean",
+            "Also paste it, with an element screenshot path, into the coding \
+             agent pane in the browser pane's tmux window (no Enter is pressed).",
+            false,
+        )],
         fixed: &[],
     },
     Tool {

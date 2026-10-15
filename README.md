@@ -112,6 +112,9 @@ tweb capture --pane %3
 # The element the user picked in inspect mode (selector, HTML, text, box)
 tweb inspect-element --pane %3
 
+# ...and paste it, with a screenshot of the element, into the agent pane beside it
+tweb inspect-element --send --pane %3
+
 # Supervisor status, stop and restart
 tweb daemon status
 tweb daemon restart
@@ -690,7 +693,7 @@ composition area and the terminal cursor are removed with it.
 | `/`, `n`, `N` | Find in page (`Enter` confirms) / next / previous match — **broken, see [Status](#status): the bar opens and accepts typing but matches nothing** |
 | `v` / `V` | Pick a target with the visual picker / open the whole page's text as a Visual selection (inside visual, `c` enters caret mode; from caret, `v` selects from that point). Teal labels in `v` are inner scroll or drag-pan areas: picking one points `h`/`j`/`k`/`l` at it — the mode indicator gains a `⇅` — and `Esc` hands them back to the page |
 | `b` | The open browser tab list (`j`/`k`, `1`–`9`, `Enter`, `x` closes, `Esc`) |
-| `I` | inspect picker: check element info and selectors |
+| `I` | inspect picker: check element info and selectors; `a` on a pick sends it to the agent pane |
 | `h` / `l` | Scroll left / right |
 | `j` / `k` | Scroll down / up |
 | `d` / `u` | Scroll half a page down / up |
@@ -743,8 +746,26 @@ selection into the next text block, and the view scrolls along when the selectio
 caret mode, `y` copies the whole block the caret sits in.
 
 After picking a target in Inspect, `y` copies the CSS selector, `h` the outer HTML and `t` the text,
-while `d` opens DevTools. Electron selects that element directly in detached Chromium DevTools; WebKit
+`a` hands the element to the coding agent beside the pane (below), while `d` opens DevTools. Electron selects that element directly in detached Chromium DevTools; WebKit
 opens the Safari Web Inspector on the page without selecting the element.
+
+### Handing a pick to the agent (`I` then `a`)
+
+`a` on an inspect pick pastes it into the coding agent in the same tmux window: the page URL, the
+selector, the box, the text (500 chars), the trimmed outer HTML (2000 chars), and the absolute path
+of a PNG of just that element under `~/.cache/tweb/handoff/` — Claude Code and Codex read an image
+given its path. The paste is one bracketed paste and nothing is pressed after it, so the message
+sits in the agent's input until you add what you want done and send it yourself. Focus then moves
+to the agent pane.
+
+The agent pane is found from each pane's processes (`tmux list-panes` plus `ps -t <tty>`), looking
+for `claude`, `codex`, `gemini`, `cursor-agent`, `opencode` or `aider`, including when run as
+`node .../@anthropic-ai/claude-code/...` or under a wrapper in the same pane. With two, the pane you
+were in last wins. **Nothing is ever typed into a shell**: with no agent in the window, or an agent
+that has not asked for bracketed paste (busy, not at its prompt), the toast says so and nothing is
+sent. `tweb inspect-element --send` does the same from the CLI or for an agent in another pane.
+
+The element PNGs are kept (the newest 200), mode 0600, because the agent may read them later.
 
 The omnibox's visit history is appended to a per-profile file, so it is shared across panes and
 restarts. `o` prefills the current URL, so it opens filtered to that URL; use `t`/`O` to start from an
@@ -838,7 +859,7 @@ contradict them, but most of their mechanics were not re-exercised.
 | Full-page screenshot | `tweb full-screenshot` captures a page taller than the viewport by scrolling and stitching, rather than by resizing the window (which the surface watchdog would fight). |
 | Device emulation | `tweb device` emulates a mobile viewport (iPhone 12, iPad, Pixel 5) via `enableDeviceEmulation`. `--reset` clears it. |
 | Combined capture | `tweb capture` returns console + network + screenshot in one call, so the logs and the picture describe the same moment. |
-| Inspect → agent | Inspect mode's `y`/`h`/`t` keys now send the element context (selector, HTML, text, bounding box, URL) to an agent as well as the clipboard — Orca design-mode parity. Exposed as `tweb inspect-element` (CLI) and `tweb_inspect_element` (MCP). |
+| Inspect → agent | Inspect mode's `y`/`h`/`t` keys now send the element context (selector, HTML, text, bounding box, URL) to an agent as well as the clipboard — Orca design-mode parity. Exposed as `tweb inspect-element` (CLI) and `tweb_inspect_element` (MCP). `a` (or `--send`) pushes it into the agent pane as a bracketed paste with an element screenshot. |
 | Daemon control | `tweb daemon status` / `stop` / `restart` — the supervisor's pid, socket, uptime, pane count and engine state, plus a one-command restart that panes reattach from automatically. |
 | Chrome handoff | `tweb chrome open <url>` hands a site that needs real Chrome (Okta Device Trust, etc.) to Chrome via tmux-chrome or `open -a`. Neither path reads or writes the Chrome profile. |
 

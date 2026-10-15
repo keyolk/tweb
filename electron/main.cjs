@@ -52,6 +52,7 @@ const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { waitFor } = require("./agent-wait.cjs");
+const { elementCrop, findAgentPane, pasteToAgent, inspectMessage } = require("./agent-handoff.cjs");
 const { evaluate } = require("./agent-eval.cjs");
 const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
@@ -4081,6 +4082,10 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "copy-text":
       clipboard.writeText(String(value || ""));
       break;
+    // Inspect mode's `a`: the pick goes to the agent pane, not the clipboard.
+    case "inspect-to-agent":
+      void sendInspectToAgent(tab, value);
+      break;
     // The address the tab actually settled on, which the page cannot always see:
     // a subframe reports its own URL, and a cross-origin one cannot read the top.
     case "copy-url":
@@ -5029,6 +5034,110 @@ async function agentCapture(params) {
   return { console: messages, network: requests, screenshot: await agentScreenshot(params) };
 }
 
+// --- handing a pick to the coding agent beside this pane ---
+//
+// The rules (which pane is an agent, which one gets it, what the text may contain) are in
+// agent-handoff.cjs. This half owns the side effects: the element's screenshot on disk, the
+// tmux calls, and telling the user where it went.
+
+// Where handed-off files live: the same cache root the frontend uses (`engine_app::cache_root`),
+// so `TWEB_CACHE_DIR` moves both. The agent reads these by path, so they outlive the pane.
+function twebCacheRoot() {
+  if (process.env.TWEB_CACHE_DIR) return process.env.TWEB_CACHE_DIR;
+  if (process.env.XDG_CACHE_HOME) return path.join(process.env.XDG_CACHE_HOME, "tweb");
+  return path.join(os.homedir(), ".cache", "tweb");
+}
+
+function handoffDirectory() {
+  return path.join(twebCacheRoot(), "handoff");
+}
+
+// Enough for weeks of picks, bounded so a directory nobody looks at does not grow forever.
+const HANDOFF_KEEP_FILES = 200;
+
+function pruneHandoffDirectory(directory) {
+  try {
+    const files = readdirSync(directory)
+      .filter((name) => name.endsWith(".png"))
+      .map((name) => ({ name, at: statSync(path.join(directory, name)).mtimeMs }))
+      .sort((left, right) => right.at - left.at);
+    for (const file of files.slice(HANDOFF_KEEP_FILES)) rmSync(path.join(directory, file.name), { force: true });
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: handoff prune failed: ${error.message}`);
+  }
+}
+
+function handoffStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+// The element's pixels, as the page shows them right now: the whole viewport is captured and the
+// element cut out of it, which is the same arithmetic on every page engine (see `elementCrop`).
+// `rect` is in the top frame's CSS pixels.
+async function saveElementScreenshot(contents, rect) {
+  if (![rect?.left, rect?.top, rect?.width, rect?.height].every(Number.isFinite)) return null;
+  const viewportWidth = Number(await contents.executeJavaScript("innerWidth", true));
+  const whole = await contents.capturePage();
+  if (!whole || whole.isEmpty()) return null;
+  const area = elementCrop(rect, whole.getSize(), viewportWidth);
+  if (!area) return null;
+  const image = whole.crop(area);
+  const directory = handoffDirectory();
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, `${handoffStamp()}-element.png`);
+  writeFileSync(file, image.toPNG(), { mode: 0o600 });
+  pruneHandoffDirectory(directory);
+  return file;
+}
+
+function handoffRun(command, args, input) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)));
+    child.stdin?.end(input ?? "");
+  });
+}
+
+// This pane's tmux id. A hosted pane has no TMUX_PANE of its own; its placement says where it is.
+function handoffSelfPane() {
+  return vis().placement?.paneId || ownTmuxPane;
+}
+
+function findHandoffTarget() {
+  return findAgentPane({ selfPane: handoffSelfPane(), run: handoffRun });
+}
+
+function pasteHandoff(target, text) {
+  return pasteToAgent({ target, text, run: handoffRun });
+}
+
+// The user's answer to "where did it go", shown where they pressed the key.
+function handoffToast(tab, what, result) {
+  const message = result.ok ? `${what} → ${result.agent} ${result.pane}` : `✕ ${result.reason}`;
+  console.error(`tweb: handoff ${what}: ${result.ok ? `pasted into ${result.agent} ${result.pane}` : result.reason}`);
+  if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", message);
+}
+
+/// The picked element, pasted into the agent pane with a screenshot of it.
+async function sendInspectToAgent(tab, payload) {
+  if (!payload || typeof payload !== "object") return { ok: false, reason: "no element picked" };
+  const target = await findHandoffTarget();
+  if (!target.ok) {
+    handoffToast(tab, "element", target);
+    return target;
+  }
+  let screenshot = null;
+  try {
+    screenshot = await saveElementScreenshot(tab.webContents, payload.rect);
+  } catch (error) {
+    // The text is the handoff; a missing picture is worth a line in the log, not a failed send.
+    console.error(`tweb: element screenshot failed: ${error.message}`);
+  }
+  const result = await pasteHandoff(target, inspectMessage(payload, screenshot));
+  handoffToast(tab, "element", result);
+  return { ...result, screenshot };
+}
+
 /**
  * `tweb device` — lay the page out as a phone or tablet does.
  *
@@ -5254,9 +5363,12 @@ async function dispatchAgentCommand(method, params) {
     }
     case "inspect-element": {
       // The user picked an element in inspect mode. Forward the payload the preload
-      // collected to the agent — or answer null if inspect mode is closed.
+      // collected to the agent — or answer null if nothing has been picked.
       const result = await agentPageRequest("inspect-element", {}, 3000);
-      return result || { ok: false, message: "no element picked" };
+      if (!result) return { ok: false, message: "no element picked" };
+      // `--send`: the same push the inspect `a` key does, for a caller in another pane.
+      if (params?.send) return { ...result, sent: await sendInspectToAgent(agentTab(), result) };
+      return result;
     }
     case "float": {
       inputState().floating = true;

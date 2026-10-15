@@ -1411,11 +1411,32 @@ class CdpWebContents extends EventEmitter {
     this.emit("paint", {}, dirty ? clampRect(dirty, size) : whole, image);
   }
 
+  // A capture asked for from outside — an agent's screenshot, an inspect handoff, a recording's
+  // keyframe — takes the same single in-flight slot as the frame pump (`pumpCapture`). Two
+  // captures at once came back with the page shrunk into a corner, and a screencast frame sent
+  // during a capture can be the stretched one; with the slot held, `onScreencastFrame` treats
+  // such a frame as a signal rather than drawing it. The wait is bounded: a pump capture that
+  // never answers gives the slot up after CAPTURE_TIMEOUT_MS anyway.
   async capturePage(rect) {
-    const params = { format: "png" };
-    if (rect) params.clip = { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scale: 1 };
-    const shot = await this.session.send("Page.captureScreenshot", params);
-    return nativeImage.createFromBuffer(Buffer.from(shot.data, "base64"));
+    const capture = this.capture;
+    const deadline = Date.now() + 2 * CAPTURE_TIMEOUT_MS;
+    while (capture.inFlight > 0 && Date.now() < deadline && !this.destroyed) {
+      await new Promise((resolve) => setTimeout(resolve, 16));
+    }
+    capture.inFlight += 1;
+    try {
+      const params = { format: "png" };
+      if (rect) params.clip = { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scale: 1 };
+      const shot = await this.session.send("Page.captureScreenshot", params);
+      return nativeImage.createFromBuffer(Buffer.from(shot.data, "base64"));
+    } finally {
+      capture.inFlight -= 1;
+      if (capture.metricsBehind && capture.inFlight === 0) {
+        capture.metricsBehind = false;
+        void this.applyMetrics();
+      }
+      this.pumpCapture();
+    }
   }
 
   setFrameRate(rate) {

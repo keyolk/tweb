@@ -1266,6 +1266,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tweb-frame-native"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "napi",
+ "napi-build",
+ "napi-derive",
+]
+
+[[package]]
 name = "tweb-native-input"
 version = "0.1.0"
 dependencies = [
@@ -1276,16 +1286,6 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation",
  "serde_json",
-]
-
-[[package]]
-name = "tweb-frame-native"
-version = "0.1.0"
-dependencies = [
- "libc",
- "napi",
- "napi-build",
- "napi-derive",
 ]
 
 [[package]]
