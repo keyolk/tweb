@@ -26,6 +26,7 @@ import ctypes
 import ctypes.util
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -89,7 +90,10 @@ def run_arm(args, arm):
         f"--window-width={args.cols}", f"--window-height={args.rows}",
         # Without this a macOS Ghostty instance outlives its window, and every arm would leave one.
         "--confirm-close-surface=false", "--quit-after-last-window-closed=true",
-        "-e", *command,
+        # One `--command=` argument, not `-e <argv>`: LaunchServices reads a bare executable path
+        # among `open --args` as a document to open, and Ghostty then opens a second tab running it,
+        # which comes to the front and hides — so stops drawing — the pane under test.
+        "--command=" + shlex.join(command),
     ])
     ghostty.wait()
     socket = None
