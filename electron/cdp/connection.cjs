@@ -37,6 +37,22 @@ function findChrome(env = process.env, exists = fs.existsSync) {
   return CHROME_CANDIDATES.find((candidate) => exists(candidate)) || null;
 }
 
+// macOS gives an outside url open (a Slack link, `open URL`) to whichever running process has
+// Chrome's bundle id, and the engine's headless Chrome has the same one, so the tab can open where
+// nobody sees it. Starting the installed Chrome binary directly, on its default profile, is not
+// routed by LaunchServices: Chrome's ProcessSingleton passes the url to the user's own Chrome and
+// exits (measured: gone in under 4s, no new instance). With no user Chrome running, it starts one.
+// TWEB_CHROME is ignored here on purpose: the user's browser is the installed one, not the binary
+// this engine was pointed at.
+function handOffToUserChrome(url, { exists = fs.existsSync, spawnFn = spawn } = {}) {
+  const binary = findChrome({}, exists);
+  if (!binary) return false;
+  const child = spawnFn(binary, [url], { detached: true, stdio: "ignore" });
+  child.on?.("error", () => {});
+  child.unref?.();
+  return true;
+}
+
 // Headless by default. A headed Chrome is a real window the user can Cmd-Tab to, which is not
 // what a pane is; and headless keeps the policy extensions and the Okta SSO path (measured).
 // `TWEB_CHROME_HEADED=1` is the escape hatch for a site that refuses headless.
@@ -345,5 +361,6 @@ module.exports = {
   ensureChrome,
   freePort,
   findChrome,
+  handOffToUserChrome,
   readActivePort,
 };
