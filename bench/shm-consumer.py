@@ -9,6 +9,7 @@ exactly `s * v * 4`, that its pixels are not garbage — and unlinks it, as Ghos
 
     python3 bench/shm-consumer.py --tweb target/debug/tweb --page fullpaint    # whole frames
     python3 bench/shm-consumer.py --tweb target/debug/tweb --page smallpaint   # patches
+    python3 bench/shm-consumer.py --tweb target/debug/tweb --tmux              # through passthrough
 
 Exits non-zero when any transmit names a missing or wrongly sized object, or when nothing went
 through shared memory at all. It cannot judge drawing order or what is on screen; that is
@@ -26,7 +27,9 @@ import os
 import pty
 import re
 import select
+import shlex
 import signal
+import subprocess
 import struct
 import sys
 import termios
@@ -82,6 +85,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=12)
     parser.add_argument("--pixels", default="1440x900", help="PTY pixel size, WxH")
     parser.add_argument("--cells", default="180x50", help="PTY cell size, COLSxROWS")
+    parser.add_argument("--tmux", action="store_true", help="run tweb in a private tmux server and read its client")
     args = parser.parse_args()
     width, height = (int(v) for v in args.pixels.split("x"))
     cols, rows = (int(v) for v in args.cells.split("x"))
@@ -91,9 +95,22 @@ def main():
                TWEB_RUNTIME_DIR="/tmp/twb-shm-consumer", TERM="xterm-ghostty")
     Path("/tmp/twb-shm-consumer").mkdir(exist_ok=True)
     tweb = str(Path(args.tweb).resolve())
+    command = [tweb, "open", "--frame-rate", "30", "--no-adaptive-frame-rate", page]
+    socket = "twb-shm-consumer"
+    if args.tmux:
+        # The harness is the terminal tmux's client draws on: a private server whose one window runs
+        # tweb, a client attached on this PTY. Graphics reach the harness only through passthrough,
+        # and only while that window is the one the client shows — exactly the shipping path.
+        subprocess.run(["tmux", "-L", socket, "kill-server"], capture_output=True)
+        exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items() if k.startswith("TWEB_"))
+        subprocess.run(["tmux", "-L", socket, "-f", "/dev/null", "new-session", "-d", "-x", str(cols),
+                        "-y", str(rows), f"env {exports} {shlex.join(command)}"], check=True, env=env)
+        subprocess.run(["tmux", "-L", socket, "set", "-g", "allow-passthrough", "on"], check=True)
     pid, fd = pty.fork()
     if pid == 0:
-        os.execve(tweb, [tweb, "open", "--frame-rate", "30", "--no-adaptive-frame-rate", page], env)
+        if args.tmux:
+            os.execvpe("tmux", ["tmux", "-L", socket, "attach"], env)
+        os.execve(tweb, command, env)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, width, height))
     buffer = b""
     seen = {"whole": [], "patch": [], "errors": [], "inline_png_patches": 0}
@@ -122,6 +139,8 @@ def main():
             kind = "patch" if ".p" in name.rsplit(".", 1)[-1] or name.rsplit(".", 1)[-1].startswith("p") else "whole"
             (seen[kind] if ok else seen["errors"]).append(detail)
         buffer = buffer[last:] if last else buffer[-65536:]
+    if args.tmux:
+        subprocess.run(["tmux", "-L", socket, "kill-server"], capture_output=True)
     os.kill(pid, signal.SIGTERM)
     time.sleep(2)
     try:
