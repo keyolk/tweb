@@ -1153,6 +1153,41 @@ control to stage. And a `host` request missing one field (`frame_rate`) came bac
 surfacing errors: the daemon answers a malformed request rather than disconnecting, deliberately, so
 a client built against a later protocol degrades instead of failing opaquely.
 
+### 8.8 Addendum — SHM after all, for the terminal `o=z` kills (2026-10-15)
+
+8.6 fixed the drops with `o=z`, and deflate-policy.cjs then had to turn `o=z` off for Ghostty,
+which aborts in its inflater. That put Ghostty — the default terminal — back on the 8.5 numbers:
+every whole frame through a 20MB+ file write, and the drops that come with it. 8.5 had already priced
+the way out (`t=s`) and named what blocked it: no `shm_open` from Node, so a native addon and its
+toolchain. zenbu-labs/terminal-browser ships exactly that shape — a Rust Node-API addon — which settled
+the toolchain question: napi-rs links with `-undefined dynamic_lookup`, needs no Node headers, and the
+same `.node` loads in stock Electron 43's worker threads (verified).
+
+`crates/tweb-frame-native` is that addon: `writeShmFrame(name, pixels, swap)` creates a fresh object,
+maps it, and does the BGRA->RGBA swap during the copy into the mapping; `unlinkShm(name)`. `tweb-pane`'s
+build script compiles it (release, own target dir) and the binary unpacks it to `native/` beside the
+app code. Measured in an Electron 43 worker, 2880x1800: **3.36ms per frame** for swap + write, against
+the shipped JS swap (2.9ms) plus the file write (p50 9.8ms, p99 54ms).
+
+On a real Ghostty window, outside tmux, `bench/pages/fullpaint.html` (every pixel repainted every frame),
+3456x2104 frames (29MB), 30fps pinned, 20s — `bench/shm-frames.py`:
+
+```text
+arm    whole sent   dropped to backpressure   via shm   shm objects left after exit
+file   401          155  (28% of attempts)     0         -
+shm    411            0                       412         0
+```
+
+The terminal consumed and unlinked every object. Who gets it is shm-frames.cjs: a terminal known to
+consume `t=s` (Ghostty, kitty), on this machine (not SSH), with the addon loaded; anything else keeps
+the file medium, because a terminal that ignores `t=s` never unlinks and the object stays in the kernel
+until reboot. Names cycle through a 4-slot ring per pane (`/twb.<pid>.<image>.<slot>`, under macOS's
+31-byte limit), unlinked before reuse, so an unconsumed stream is bounded at 4 objects; a zero-byte
+marker in userData makes a SIGKILLed engine's objects collectable by the next engine, by the same
+dead-pid rule as frame files. A failed shm write falls back to the file medium for that frame, and three
+in a row turn shm off for the session. `tweb diag` reports `wholeMedium`, `shmReason`, `shmError`,
+`wholeShm`.
+
 ## 9. A component and interface structure built for extension
 
 > **The traits below exist as Rust source; almost none of them have an implementation.**

@@ -32,6 +32,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/deflate-policy.cjs"),
     ),
     (
+        "shm-frames.cjs",
+        include_str!("../../../electron/shm-frames.cjs"),
+    ),
+    (
         "profile-hygiene.cjs",
         include_str!("../../../electron/profile-hygiene.cjs"),
     ),
@@ -269,12 +273,24 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Binary files that ship beside the app code. Kept apart from `FILES` because those are text and
+/// are read as such — the require-closure and syntax-check tests below walk their lines.
+///
+/// `native/tweb-frame.node` is the shared-memory frame addon `build.rs` compiles from
+/// `crates/tweb-frame-native`. It is empty when that build was skipped or failed, and an empty
+/// entry is simply not written: the engine then finds no addon and keeps the frame-file medium.
+const BINARY_FILES: &[(&str, &[u8])] = &[(
+    "native/tweb-frame.node",
+    include_bytes!(concat!(env!("OUT_DIR"), "/tweb-frame.node")),
+)];
+
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.
 /// What is needed is not collision resistance but only "different contents, different directory".
 fn content_tag() -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (name, body) in FILES {
-        for byte in name.as_bytes().iter().chain(body.as_bytes()) {
+    let text = FILES.iter().map(|(name, body)| (*name, body.as_bytes()));
+    for (name, body) in text.chain(BINARY_FILES.iter().copied()) {
+        for byte in name.as_bytes().iter().chain(body) {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
@@ -297,14 +313,44 @@ pub fn cache_root() -> PathBuf {
 fn write_app(directory: &Path) -> Result<()> {
     std::fs::create_dir_all(directory)
         .with_context(|| format!("cannot create {}", directory.display()))?;
-    for (name, body) in FILES {
+    let text = FILES.iter().map(|(name, body)| (*name, body.as_bytes()));
+    for (name, body) in text.chain(BINARY_FILES.iter().copied()) {
+        if body.is_empty() {
+            continue;
+        }
         let path = directory.join(name);
-        // `cdp/…` and any other subdirectory the app keeps.
+        // `cdp/…`, `native/` and any other subdirectory the app keeps.
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         std::fs::write(&path, body).with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Writes the embedded binary files (the native addon) into an app directory that was not unpacked
+/// from this binary — a checkout's `electron/` in development. Only when the bytes differ, so a
+/// running engine never has its loaded addon replaced underneath it by an identical copy; the write
+/// is a rename, so an engine starting concurrently sees the old file or the new one, never half.
+pub fn place_binary_files(directory: &Path) -> Result<()> {
+    for (name, body) in BINARY_FILES {
+        if body.is_empty() {
+            continue;
+        }
+        let path = directory.join(name);
+        if std::fs::read(&path).is_ok_and(|current| current == *body) {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let staging = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&staging, body)
+            .with_context(|| format!("cannot write {}", staging.display()))?;
+        std::fs::rename(&staging, &path)
+            .with_context(|| format!("cannot place {}", path.display()))?;
     }
     Ok(())
 }
@@ -546,6 +592,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_workspace_app_dir_gets_the_addon_once() {
+        let directory = std::env::temp_dir().join(format!("tweb-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        super::place_binary_files(&directory).expect("place");
+        for (name, body) in super::BINARY_FILES {
+            let path = directory.join(name);
+            if body.is_empty() {
+                assert!(!path.exists(), "an empty (unbuilt) addon is not written");
+                continue;
+            }
+            assert_eq!(std::fs::read(&path).expect("placed"), *body);
+            let placed = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .expect("mtime");
+            super::place_binary_files(&directory).expect("place again");
+            let again = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .expect("mtime");
+            assert_eq!(placed, again, "identical bytes are not rewritten");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The runtime download is named after this, so a range prefix left in place

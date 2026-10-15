@@ -272,3 +272,21 @@ test("a raw frame that cannot be written throws rather than degrading", () => {
     byteLength: 4,
   }));
 });
+
+test("a shm frame names the object in its payload and lets the addon do the swap", () => {
+  const { shmCommands } = require("./gfx-worker.cjs");
+  const calls = [];
+  const addon = { writeShmFrame: (...args) => calls.push(args) };
+  const bgra = Buffer.from([1, 2, 3, 4]);
+  const commands = shmCommands({ header: "a=T,i=7", shmName: "/twb.1.7.0", width: 1, height: 1 }, bgra, addon);
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].header, "a=T,i=7,f=32,s=1,v=1,t=s,q=2");
+  assert.equal(Buffer.from(commands[0].payload, "base64").toString(), "/twb.1.7.0");
+  assert.deepEqual(calls, [["/twb.1.7.0", bgra, true]]);
+});
+
+test("a failed shm write returns nothing, so the caller keeps the frame on the file medium", () => {
+  const { shmCommands } = require("./gfx-worker.cjs");
+  const addon = { writeShmFrame: () => { throw new Error("ENOSPC"); } };
+  assert.equal(shmCommands({ header: "a=T", shmName: "/twb.1.7.0", width: 1, height: 1 }, Buffer.alloc(4), addon), null);
+});

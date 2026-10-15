@@ -23,6 +23,7 @@ shipping configuration, which does not set that switch.
 | `worker-encode.cjs` | Whether moving the PNG encode to a worker thread helps (it does not) |
 | `gfxprobe.py` | Whether the terminal really reads a `t=s` shm transfer, and whether a patch image can be placed over a base and deleted independently |
 | `stacking.py` | Whether a patch placed after a base actually draws *on top* of it (judged by eye — the protocol only reports lifetime) |
+| `shm-frames.py` | Whether whole frames through the shm addon (`t=s`) still drop at Retina size on a real Ghostty window, against the frame file, and whether every object is consumed — see DETAIL.md 8.8 |
 | `shm-through-tmux.py` | Whether `t=s` survives tmux passthrough, with a temp-file transfer as the control |
 | `raw-render.py` | Whether `f=32` raw pixels render correctly over the file medium (judged by eye) |
 | `convert-bench.cjs` | How the gfx worker's per-frame time splits between the BGRA→RGBA swap and the 20MB write |
