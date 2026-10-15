@@ -4351,6 +4351,7 @@ function watchNetwork() {
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
     networkLog.push({
       id: details.id,
+      webContentsId: details.webContentsId ?? null,
       url: details.url,
       method: details.method,
       resourceType: details.resourceType,
@@ -4370,14 +4371,21 @@ function watchNetwork() {
     if (!entry) return;
     entry.statusCode = details.statusCode;
     entry.fromCache = Boolean(details.fromCache);
-    if (details.statusCode >= 400) recordNetworkFailure(details, details.statusCode, null);
+    if (details.statusCode >= 400) recordNetworkFailure(details, entry, details.statusCode, null);
   });
   // A request that never got a response at all — DNS, refused, blocked, aborted. Only a recording
-  // reads these; `tweb network` shows such a request as one with no status.
-  session.defaultSession.webRequest.onErrorOccurred((details) => {
-    if (details.error === "net::ERR_ABORTED") return;
-    recordNetworkFailure(details, null, details.error);
-  });
+  // reads these; `tweb network` shows such a request as one with no status. Each page engine's
+  // session shim provides it (cdp/engine.cjs, webkit/engine.cjs); checked anyway, because a shim
+  // without it threw here and took the engine's whole startup down with it — measured on the
+  // Chrome engine: no agent socket, no page.
+  const { webRequest } = session.defaultSession;
+  if (typeof webRequest.onErrorOccurred === "function") {
+    webRequest.onErrorOccurred((details) => {
+      if (details.error === "net::ERR_ABORTED") return;
+      const entry = networkLog.findLast((candidate) => candidate.id === details.id);
+      recordNetworkFailure(details, entry, null, details.error);
+    });
+  }
 }
 
 ipcMain.on("tweb-agent-response", (_event, response) => {
@@ -5080,10 +5088,15 @@ function recordConsoleError(contents, entry) {
   });
 }
 
-function recordNetworkFailure(details, status, error) {
-  const recording = recordingForTab(tabForWebContentsId(details.webContentsId));
+// `entry` is the request's line in the network log. A page engine's completion events do not all
+// carry the URL and method again (Chrome's loadingFailed has neither), and the log has both.
+function recordNetworkFailure(details, entry, status, error) {
+  const recording = recordingForTab(tabForWebContentsId(details.webContentsId ?? entry?.webContentsId));
   recording?.record("network-failure", {
-    method: details.method, url: oneLine(details.url, 300), status: status ?? null, error: error || null,
+    method: details.method || entry?.method || "GET",
+    url: oneLine(details.url || entry?.url || "", 300),
+    status: status ?? null,
+    error: error || null,
   });
 }
 
@@ -5101,6 +5114,7 @@ function startRecording(params = {}) {
     directory,
     pane: handoffSelfPane() || record.id || null,
     intervalMs: Number.isFinite(params.interval) ? params.interval * 1000 : undefined,
+    unavailable: recordingLimits(),
   });
   recordings.set(record, recording);
   const tab = windowsFor(record).win;
@@ -5112,7 +5126,15 @@ function startRecording(params = {}) {
   }, KEYFRAME_TIMER_MS);
   broadcastRecordingState(record);
   console.error(`tweb: recording to ${directory}`);
-  return { ok: true, recording: true, directory };
+  return { ok: true, recording: true, directory, unavailable: recording.unavailable };
+}
+
+// What this pane's page engine cannot record. Asked of the session rather than of the engine's
+// name, so an engine that gains request events stops being listed without an edit here.
+function recordingLimits() {
+  return session.defaultSession.webRequest?.observesRequests === false
+    ? ["failed requests (this engine cannot see a page's requests)"]
+    : [];
 }
 
 async function stopRecording(params = {}) {
@@ -5153,9 +5175,10 @@ async function stopRecording(params = {}) {
 function toggleRecording() {
   if (activeRecording()) void stopRecording();
   else {
-    startRecording();
+    const started = startRecording();
     const tab = currentWindows().win;
-    if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", "● recording — gr stops");
+    const note = started.unavailable?.length ? " · no failed requests on this engine" : "";
+    if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", `● recording — gr stops${note}`);
   }
 }
 

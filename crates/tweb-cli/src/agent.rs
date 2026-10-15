@@ -513,7 +513,18 @@ pub fn render(method: &str, result: &Value) -> String {
             if result.get("recording").and_then(Value::as_bool) != Some(true) {
                 return "not recording\n".to_string();
             }
-            format!("recording to {}\n", text_field(result, "directory"))
+            let mut out = format!("recording to {}\n", text_field(result, "directory"));
+            // An engine that cannot see something says so up front, not as a silent zero later.
+            for limit in result
+                .get("unavailable")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                out.push_str(&format!("not recorded on this engine: {limit}\n"));
+            }
+            out
         }
         // The timeline path first: it is the thing to open. Then where it went.
         "record-stop" => {
@@ -815,6 +826,12 @@ mod tests {
                 &serde_json::json!({ "recording": true, "directory": "/r" })
             ),
             "recording to /r\n"
+        );
+        let limited = serde_json::json!({ "recording": true, "directory": "/r",
+            "unavailable": ["failed requests (this engine cannot see a page's requests)"] });
+        assert_eq!(
+            super::render("record-start", &limited),
+            "recording to /r\nnot recorded on this engine: failed requests (this engine cannot see a page's requests)\n"
         );
     }
 

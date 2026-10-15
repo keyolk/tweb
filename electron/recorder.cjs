@@ -68,8 +68,11 @@ function cleanPageEvent(event) {
 
 class Recording {
   constructor({ directory, pane = null, startedAt = Date.now(), intervalMs = DEFAULT_INTERVAL_MS,
-    maxEvents = MAX_EVENTS, maxKeyframes = MAX_KEYFRAMES } = {}) {
+    maxEvents = MAX_EVENTS, maxKeyframes = MAX_KEYFRAMES, unavailable = [] } = {}) {
     this.directory = directory;
+    // What this page engine cannot observe at all. Said in the timeline and the summary, so "0
+    // failed requests" from an engine that never sees requests is not read as "none failed".
+    this.unavailable = [...unavailable];
     this.pane = pane;
     this.startedAt = startedAt;
     this.intervalMs = Math.max(MIN_INTERVAL_MS, Number(intervalMs) || DEFAULT_INTERVAL_MS);
@@ -135,7 +138,8 @@ class Recording {
     return `tweb recording: ${timelinePath}\n`
       + `${seconds.toFixed(1)}s from ${first}: ${c.navigations} navigations, ${c.clicks} clicks, `
       + `${c.fields} field changes, ${c.consoleErrors} console errors, ${c.failedRequests} failed requests, `
-      + `${c.keyframes} keyframes.\n`;
+      + `${c.keyframes} keyframes.`
+      + `${this.unavailable.length ? ` Not recorded on this engine: ${this.unavailable.join("; ")}.` : ""}\n`;
   }
 }
 
@@ -180,6 +184,7 @@ function timelineMarkdown(recording, joinPath) {
     "- Not captured: password, card, one-time-code and token-like field values (shown as \"value not"
       + " recorded\"), keystrokes, request bodies, cookies.",
   ];
+  if (recording.unavailable.length) lines.push(`- Not recorded on this engine: ${recording.unavailable.join("; ")}`);
   if (recording.droppedEvents) lines.push(`- ${recording.droppedEvents} events dropped after the ${recording.maxEvents}-event cap`);
   if (recording.skippedKeyframes) lines.push(`- ${recording.skippedKeyframes} keyframes skipped after the ${recording.maxKeyframes}-keyframe cap`);
   lines.push("", "| t | action | detail | keyframe |", "|---|---|---|---|");

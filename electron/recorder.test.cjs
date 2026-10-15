@@ -91,3 +91,12 @@ test("the preload redacts with the very same rule before anything leaves the pag
   assert.match(change, /if \(!recordSensitiveField\(field\)\) \{[^}]*field\.value = /);
   assert.equal((change.match(/element\.value/g) || []).length, 1);
 });
+
+test("what the engine cannot record is said in the timeline and the summary", () => {
+  const recording = new Recording({ directory: "/r", startedAt: 0, unavailable: ["failed requests (x)"] });
+  recording.record("start", { url: "https://a.test/" }, 0);
+  recording.endedAt = 1000;
+  assert.match(timelineMarkdown(recording, path.join), /\n- Not recorded on this engine: failed requests \(x\)\n/);
+  assert.match(recording.summary("/r/timeline.md"), / Not recorded on this engine: failed requests \(x\)\.\n$/);
+  assert.doesNotMatch(new Recording({ directory: "/r" }).summary("/t"), /Not recorded/);
+});
