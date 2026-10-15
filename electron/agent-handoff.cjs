@@ -121,6 +121,29 @@ function clip(text, limit) {
 const TEXT_LIMIT = 500;
 const HTML_LIMIT = 2000;
 
+/// The element's box in the pixels of a capture of the whole viewport, clamped to that capture.
+///
+/// From the capture's own width over the viewport's CSS width rather than from a zoom factor,
+/// because the page engines do not agree on what the zoom is: Electron zooms the page inside a
+/// fixed window (a CSS pixel is `zoom` DIPs), the Chrome engine lays the page out in a narrower CSS
+/// viewport at a larger device scale, and WebKit zooms its own view. A capture of the viewport and
+/// `innerWidth` mean the same thing in all three. Multiplying by the zoom, as this first did,
+/// cropped the top-left 80% of the element on the Chrome engine.
+/// Null when the element is entirely outside the capture.
+function elementCrop(rect, imageSize, viewportWidth) {
+  const width = Number(imageSize?.width);
+  const height = Number(imageSize?.height);
+  if (![rect?.left, rect?.top, rect?.width, rect?.height, width, height, viewportWidth].every(Number.isFinite)) return null;
+  if (viewportWidth <= 0 || width <= 0 || height <= 0) return null;
+  const scale = width / viewportWidth;
+  const left = Math.max(0, Math.floor(rect.left * scale));
+  const top = Math.max(0, Math.floor(rect.top * scale));
+  const right = Math.min(width, Math.ceil((rect.left + rect.width) * scale));
+  const bottom = Math.min(height, Math.ceil((rect.top + rect.height) * scale));
+  if (right <= left || bottom <= top) return null;
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
 /// The message for one picked element. Labelled lines rather than JSON: it lands in a chat input
 /// that a person reads before sending.
 function inspectMessage(payload, screenshotPath) {
@@ -206,6 +229,7 @@ module.exports = {
   agentFromArgs,
   chooseAgentPane,
   deliverToAgent,
+  elementCrop,
   findAgentPane,
   pasteToAgent,
   inspectMessage,

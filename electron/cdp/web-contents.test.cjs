@@ -330,6 +330,43 @@ test("only one capture is ever in flight", () => {
   assert.strictEqual(created.capture.inFlight, 1);
 });
 
+// `capturePage` is what an agent screenshot, an inspect handoff and a recording keyframe use. It
+// ran beside the frame pump, which is the two-in-flight case above.
+test("an outside capture waits for the frame pump's capture and holds the slot while it runs", async () => {
+  const { created } = contents();
+  created.painting = true;
+  created.frameRate = 1000;
+  const sent = [];
+  let answerShot;
+  created.session.send = (method) => {
+    sent.push(method);
+    return method === "Page.captureScreenshot"
+      ? new Promise((resolve) => { answerShot = resolve; })
+      : Promise.resolve({});
+  };
+  let finishPump;
+  let pumped = 0;
+  created.captureFrame = () => { pumped += 1; return new Promise((resolve) => { finishPump = resolve; }); };
+  created.capture.dirty = true;
+  created.pumpCapture();
+  assert.strictEqual(pumped, 1);
+  const shot = created.capturePage();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepStrictEqual(sent, [], "asked for a screenshot while the pump's was in flight");
+  finishPump();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepStrictEqual(sent, ["Page.captureScreenshot"]);
+  // While it runs the pump does not start another.
+  created.capture.dirty = true;
+  created.capture.lastAt = 0;
+  created.pumpCapture();
+  assert.strictEqual(pumped, 1);
+  answerShot({ data: "" });
+  await shot.catch(() => {});
+  assert.strictEqual(created.capture.inFlight, 1, "the slot went back to the pump");
+  assert.strictEqual(pumped, 2);
+});
+
 // --- the user agent ---
 //
 // Measured on dogdrip.net: nginx answered 403 to `HeadlessChrome/155.0.0.0` and 200 to the same

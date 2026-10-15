@@ -51,7 +51,7 @@ const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { waitFor } = require("./agent-wait.cjs");
-const { findAgentPane, pasteToAgent, inspectMessage } = require("./agent-handoff.cjs");
+const { elementCrop, findAgentPane, pasteToAgent, inspectMessage } = require("./agent-handoff.cjs");
 const { evaluate } = require("./agent-eval.cjs");
 const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
@@ -4851,21 +4851,17 @@ function handoffStamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-// The element's pixels, as the page shows them right now. `rect` is in CSS pixels; the window
-// works in DIPs, which differ by the tab's zoom (`pageToWindowPoint` does the same for a click).
+// The element's pixels, as the page shows them right now: the whole viewport is captured and the
+// element cut out of it, which is the same arithmetic on every page engine (see `elementCrop`).
+// `rect` is in the top frame's CSS pixels.
 async function saveElementScreenshot(contents, rect) {
   if (![rect?.left, rect?.top, rect?.width, rect?.height].every(Number.isFinite)) return null;
-  const zoom = contents.getZoomFactor?.() || 1;
-  const left = Math.max(0, rect.left);
-  const top = Math.max(0, rect.top);
-  const area = {
-    x: Math.floor(left * zoom),
-    y: Math.floor(top * zoom),
-    width: Math.max(1, Math.ceil((rect.width - (left - rect.left)) * zoom)),
-    height: Math.max(1, Math.ceil((rect.height - (top - rect.top)) * zoom)),
-  };
-  const image = await contents.capturePage(area);
-  if (!image || image.isEmpty()) return null;
+  const viewportWidth = Number(await contents.executeJavaScript("innerWidth", true));
+  const whole = await contents.capturePage();
+  if (!whole || whole.isEmpty()) return null;
+  const area = elementCrop(rect, whole.getSize(), viewportWidth);
+  if (!area) return null;
+  const image = whole.crop(area);
   const directory = handoffDirectory();
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = path.join(directory, `${handoffStamp()}-element.png`);

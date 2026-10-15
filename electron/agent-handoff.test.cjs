@@ -123,3 +123,20 @@ test("no agent, or an agent not at its prompt, is reported and nothing is typed"
 
   assert.match((await deliverToAgent({ selfPane: null, text: "x", run: busy.run })).reason, /not in tmux/);
 });
+
+// The same element, as each page engine presents it at zoom 0.8 on a 2x pane 700 points wide.
+// Electron: the window is 700 DIPs, the capture 1400px, and the page 875 CSS px wide. Chrome: the
+// CSS viewport is 875 at device scale 1.6, so the capture is also 1400px. The crop is the same.
+test("the element crop comes from the capture's width over the CSS viewport, on every engine", () => {
+  const { elementCrop } = require("./agent-handoff.cjs");
+  const rect = { left: 100, top: 120, width: 300, height: 120 };
+  assert.deepEqual(elementCrop(rect, { width: 1400, height: 980 }, 875), { x: 160, y: 192, width: 480, height: 192 });
+  // No zoom on a 1x pane: CSS pixels are capture pixels.
+  assert.deepEqual(elementCrop(rect, { width: 700, height: 490 }, 700), { x: 100, y: 120, width: 300, height: 120 });
+  // Partly off screen is clamped; wholly off screen is nothing.
+  assert.deepEqual(elementCrop({ left: -50, top: 400, width: 200, height: 200 }, { width: 700, height: 490 }, 700),
+    { x: 0, y: 400, width: 150, height: 90 });
+  assert.equal(elementCrop({ left: 0, top: 600, width: 10, height: 10 }, { width: 700, height: 490 }, 700), null);
+  assert.equal(elementCrop(rect, { width: 700, height: 490 }, 0), null);
+  assert.equal(elementCrop(rect, null, 700), null);
+});
