@@ -71,6 +71,15 @@ tweb split --engine webkit https://localhost:5173
 # Run the pages in your own (managed) Google Chrome — Okta device trust, Endpoint Verification
 tweb split --engine chrome https://sendbird.okta.com/
 
+# Put the pane on a remote host's network: its localhost is the remote's (see "Remote network")
+tweb split --ssh coder.regular http://localhost:3000
+
+# A local Markdown file opens rendered (GFM), with its relative links and images working
+tweb split ./README.md
+
+# Let the terminal background show through pages without a background colour
+tweb open --transparent ./notes.html
+
 # Tune the active maximum frame rate
 # adaptive uses the given value while active and drops to at most 4fps when idle
 tweb open --frame-rate 24 --adaptive-frame-rate https://localhost:5173
@@ -141,19 +150,38 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 |---|---|---|
 | `scroll.invert` | `false` | live |
 | `scroll.distance` | `100` | live |
+| `input.native` | `true` | live |
 | `zoom.default` | `0.8` | next new tab |
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
+| `page.transparent` | `false` | next new tab |
 | `downloads.dir` | system Downloads | next engine start |
 | `ime.slot_cells` | `3` | live |
+| `search.engine` | `google` (or `duckduckgo`, `bing`, `brave`, `kagi`, `ecosia`, `perplexity`, or a URL with `%s`) | live |
+| `search.suggest` | `off` (an engine name or a URL with `%s` turns on omnibox suggestions; every keystroke typed there then goes to that provider) | live |
 
 "Live" means a running pane picks the change up within a second, no restart. An environment variable
 that already set one of these (`TWEB_DEFAULT_ZOOM`, `TWEB_FRAME_RATE`, `TWEB_ADAPTIVE_FRAME_RATE`,
 `TWEB_DOWNLOAD_DIR`, `TWEB_IME_SLOT_CELLS`) still wins over the file, and a flag on `tweb open` wins
 over both. The list itself is `electron/settings-schema.json`, shared by the CLI and the engine.
 
+`page.transparent` (or `tweb open --transparent` for one pane) lets the terminal show through pages
+that paint no background of their own: the frame keeps its alpha channel and is placed under the
+text, so the terminal's background colour, opacity and blur show wherever the page is clear. Pages
+with a background of their own are unaffected. A transparent tab sends whole frames only, because a
+damage patch is a second image over the base one and its clear pixels would show the stale frame
+beneath. Electron engine only (Chrome's screencast is JPEG; the WebKit host has no transparent
+path). The floating window (`w`) relays JPEG, so a clear page is black there.
+
 Wheel direction needs no setting to match macOS: the terminal has already applied natural scrolling
 when it reports the wheel, and TWeb follows the report. `scroll.invert` is for wanting it the other way.
+
+Inside tmux the terminal can only report the mouse in cells and a trackpad as wheel notches. On macOS
+`tweb-native-input` (installed beside `tweb`) watches the real pointer and the real scroll gesture, so a
+drag is drawn pixel by pixel and a trackpad scrolls by its own deltas, inertia included. It needs no
+permission: mouse and scroll events are readable by any process, and it reads nothing else. It only acts
+while the pointer is over the pane in the window in front, and leaves the terminal's reports alone
+otherwise. `tweb config set input.native false` turns it off.
 
 ## Extensions
 
@@ -280,6 +308,50 @@ the tab then joins this tmux window's Chrome tab group and the handoff stays par
 workspace. Without it the URL still opens, through `open -a "Google Chrome"`. Neither path
 reads or writes the Chrome profile: they hand over a URL and nothing else.
 
+## Remote network (`--ssh`)
+
+`tweb open --ssh <dest>` and `tweb split --ssh <dest>` put the pane's network on a remote host. The
+pane runs `ssh -N -D 127.0.0.1:<free port> <dest>` and sends every request through that SOCKS
+proxy — `localhost` included, and host names are resolved on the far side — so a dev server
+bound to the remote's loopback opens as `http://localhost:<port>` with no `-L` per port.
+
+```sh
+tweb split --ssh me@box http://localhost:5173
+tweb split --ssh "-J bastion -p 2222 me@box" http://localhost:8080   # ssh flags pass through
+tweb split --ssh coder.regular http://localhost:3000                 # after `coder config-ssh`
+tweb split --ssh coder:owner/workspace http://localhost:3000         # without it: coder ssh --stdio
+```
+
+- **The tunnel is the pane's.** ssh starts before the pane takes the terminal, so a password,
+  passphrase or host-key question is asked in the pane and answered there. It stops when the pane
+  closes, and it cannot outlive the pane: ssh runs under a guard that kills it when the pane's
+  process is gone, however it went (verified with `kill -9`).
+- **A separate profile per destination.** Panes share one profile by design, but a proxied pane's
+  `localhost:3000` is a different site from the local one under the same name, so sharing would
+  send each one's cookies to the other and restore remote tabs onto the local network. The pane
+  uses `remote/<dest>/` inside the profile directory instead. It persists, so the remote app's
+  login survives a reconnect. The trade: it starts signed out of everything else and without the
+  shared profile's extensions.
+- **Electron engine only, and its own engine process.** The Chrome engine's browser is shared by
+  every Chrome pane, and the WebKit host has no per-pane proxy, so `--ssh` with either is refused
+  rather than quietly loading pages on the local network. A proxied pane is not hosted by `twebd`
+  either: a proxy is per session and hosted panes share one.
+- WebRTC is limited to the proxy, so a page cannot learn the local machine's addresses.
+- A tunnel that drops (three missed 15s keepalives) is not reconnected. Pages then fail with a
+  proxy error; reopen the pane. `tweb diag --json` reports `remote` (destination, proxy, profile),
+  and ssh's own stderr is in `~/.cache/tweb/logs/ssh-<pane>.log`.
+
+## Local Markdown
+
+A local `.md`/`.markdown` file — a path or a `file://` URL — opens rendered as GitHub-flavoured
+Markdown (tables, task lists, strikethrough, autolinks, heading anchors) instead of as raw text.
+The engine answers `file:` itself and renders a Markdown document requested as a page, so the
+page's URL stays the file's own: `./docs/setup.md` and `images/arch.png` resolve as they do on disk,
+a link to another `.md` opens rendered too, and reload re-reads the file. A script that `fetch()`es
+a `.md` still gets its source. Raw HTML in the document is kept (`<details>`, `<img width>`) but the
+page runs no script and loads no frame. The renderer is [marked](https://github.com/markedjs/marked)
+18.0.14, vendored as its single published file (`electron/vendor/`, MIT). Electron engine only.
+
 ## Agent control (CLI · MCP)
 
 Finishing frontend work in the terminal means agents have to be able to drive the same browser. A
@@ -348,13 +420,27 @@ Register it with an MCP client as a stdio server.
 The agent socket is provided by the Electron engine, which also hosts the Chrome and WebKit engines'
 pages — so it serves all three.
 
+To teach a coding agent all of this, install the agent skill (`skill/tweb/SKILL.md`, compiled into
+the binary so it always matches the `tweb` that wrote it):
+
+```sh
+tweb skill install            # for each of Claude Code (~/.claude) and Codex (~/.codex) found here
+tweb skill install --claude   # ~/.claude/skills/tweb/SKILL.md ($CLAUDE_CONFIG_DIR when set)
+tweb skill install --codex    # ~/.codex/skills/tweb/SKILL.md ($CODEX_HOME), plus a sandbox note
+tweb skill print              # to stdout, for any other agent
+tweb skill uninstall
+```
+
+Rerun `install` after upgrading tweb. It replaces only a copy it wrote itself; a SKILL.md you wrote
+is left alone unless you pass `--force`.
+
 ## Browser engines and frame policy
 
 `open` and `split` both accept `--engine electron|chrome|webkit`. The default is `electron`, which
 provides every existing feature.
 
 - **Electron**: built on Chromium offscreen paint. Provides all current TWeb browser features — Vimium-style modes, tabs/omnibox, visual/inspect, smart copy, detached DevTools. This is the engine every measurement in [Status](#status) was taken on.
-- **Chrome**: the pages run in the installed Google Chrome, headless, on a profile of TWeb's own (`<userData>/chrome-profile`, or `TWEB_CHROME_PROFILE`), driven over CDP. Use it for sites that only work in managed Chrome — see [Sites that need real Chrome](#sites-that-need-real-chrome). The Electron process stays the host and the pane logic is the same code: `electron/cdp/` presents each Chrome tab to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, is injected into each frame's isolated world. One Chrome serves every pane on the profile and exits with the last of them. `TWEB_CHROME` picks the binary, `TWEB_CHROME_HEADED=1` runs it with a (hidden) window, `TWEB_CDP_TRACE=1` logs the protocol.
+- **Chrome**: the pages run in the installed Google Chrome, headless, on a profile of TWeb's own (`<userData>/chrome-profile`, or `TWEB_CHROME_PROFILE`), driven over CDP. Use it for sites that only work in managed Chrome — see [Sites that need real Chrome](#sites-that-need-real-chrome). The Electron process stays the host and the pane logic is the same code: `electron/cdp/` presents each Chrome tab to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, is injected into each frame's isolated world. One Chrome serves every pane on the profile and exits with the last of them. `TWEB_CHROME` picks the binary, `TWEB_CHROME_HEADED=1` runs it with a (hidden) window, `TWEB_CDP_TRACE=1` logs the protocol. Because this Chrome has the installed Chrome's bundle id, macOS can send an outside link (Slack, `open URL`) to it instead of to your own Chrome; such a tab — no opener, nobody attached — is closed and its url handed to your Chrome.
 - **WebKit (macOS)**: the pages are `WKWebView`s in `tweb-webkit`, a small Rust host the Electron engine starts beside itself. As with Chrome, the Electron process stays the host and the pane logic is the same code: `electron/webkit/` presents each view to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, runs in each frame's isolated content world. Input is native `NSEvent`s, so WebKit routes clicks, keys and the wheel into cross-origin frames itself and they arrive trusted. WebKit has no paint event: the host snapshots at the pane's frame rate, drops unchanged pictures, and sends a changed one's dirty box only. `TWEB_WEBKIT` picks the host binary; `TWEB_WEBKIT_PROFILE=1` logs where each frame and eval spent its time.
 
 What the WebKit engine does not have that Electron does — measured where a number is given:

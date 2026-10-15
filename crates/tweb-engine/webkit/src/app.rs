@@ -405,7 +405,25 @@ fn handle(command: Command) {
             modifiers,
             dx,
             dy,
-        } => mouse(view, &kind, x, y, button, clicks, modifiers, dx, dy),
+            phase,
+            momentum,
+            precise,
+        } => mouse(
+            view,
+            &kind,
+            x,
+            y,
+            button,
+            clicks,
+            modifiers,
+            dx,
+            dy,
+            input::Gesture {
+                phase,
+                momentum,
+                precise,
+            },
+        ),
         Command::Key {
             view,
             kind,
@@ -898,6 +916,7 @@ fn mouse(
     modifiers: u32,
     dx: f64,
     dy: f64,
+    gesture: input::Gesture,
 ) {
     let Some((webview, held)) = with_state(|state| {
         let v = state.views.get_mut(&view)?;
@@ -926,6 +945,7 @@ fn mouse(
             dx,
             dy,
             held,
+            gesture,
         },
     );
 }
