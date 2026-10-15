@@ -9,6 +9,9 @@
 
 #[cfg(target_os = "macos")]
 mod mac;
+// The window choice, probe pacing and phase mapping are plain logic, built and unit-tested on every
+// platform; only the macOS monitor drives them, so elsewhere they are unused rather than dead.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod wire;
 
 #[cfg(target_os = "macos")]

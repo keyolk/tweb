@@ -144,8 +144,6 @@ pub fn scroll_line(scroll: Scroll) -> Value {
 }
 
 /// `NSEventPhaseBegan`. The gesture's first event, where the window under it is re-read.
-// Only the macOS monitor reads this; elsewhere the helper is a stub that exits.
-#[cfg(target_os = "macos")]
 pub const PHASE_BEGAN: u64 = 1;
 
 /// The control lines the engine writes. `arm <seconds>` asks for pointer and scroll events for
@@ -161,8 +159,6 @@ pub fn parse_arm(line: &str) -> Option<f64> {
 
 /// Pointer moves arrive at the trackpad's rate, up to 120 a second and more with a gaming mouse.
 /// One per 8ms is a frame at 120Hz: as fine as anything can be drawn, and no more lines to parse.
-// Only the macOS monitor reads this; elsewhere the helper is a stub that exits.
-#[cfg(target_os = "macos")]
 pub const MOVE_INTERVAL: f64 = 0.008;
 
 #[cfg(test)]
