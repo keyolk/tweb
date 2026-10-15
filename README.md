@@ -709,6 +709,12 @@ cookies are never recorded. Keyframes are pictures of the pane, so anything **vi
 (text you typed into an ordinary field, for one) is in them; password fields show only dots.
 Files are mode 0600 in a 0700 directory, and nothing is deleted automatically.
 
+Per engine: Electron and Chrome record all of the above. On the Chrome engine the console also
+carries errors from the managed Chrome profile's extensions' content scripts, which are real errors
+on that page. The WebKit engine cannot see a page's requests at all, so a recording there has no
+failed requests and says so — in the start toast, `tweb record start`, the timeline header and
+the pasted summary — rather than reporting zero.
+
 The omnibox's visit history is appended to a per-profile file, so it is shared across panes and
 restarts. `o` prefills the current URL, so it opens filtered to that URL; use `t`/`O` to start from an
 empty list.
