@@ -509,6 +509,44 @@ pub fn render(method: &str, result: &Value) -> String {
             }
             out
         }
+        "record-start" | "record-status" => {
+            if result.get("recording").and_then(Value::as_bool) != Some(true) {
+                return "not recording\n".to_string();
+            }
+            let mut out = format!("recording to {}\n", text_field(result, "directory"));
+            // An engine that cannot see something says so up front, not as a silent zero later.
+            for limit in result
+                .get("unavailable")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                out.push_str(&format!("not recorded on this engine: {limit}\n"));
+            }
+            out
+        }
+        // The timeline path first: it is the thing to open. Then where it went.
+        "record-stop" => {
+            if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                return "not recording\n".to_string();
+            }
+            let mut out = text_field(result, "summary");
+            match result.get("sent") {
+                Some(sent) if sent.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    out.push_str(&format!(
+                        "sent to {} {}\n",
+                        text_field(sent, "agent"),
+                        text_field(sent, "pane")
+                    ));
+                }
+                Some(sent) if !sent.is_null() => {
+                    out.push_str(&format!("not sent: {}\n", text_field(sent, "reason")));
+                }
+                _ => {}
+            }
+            out
+        }
         "float" => {
             if result.get("floating").and_then(|v| v.as_bool()) == Some(true) {
                 "floating\n".to_string()
@@ -767,6 +805,34 @@ mod tests {
                                               "reason": "no coding agent pane in this tmux window" });
         assert!(super::render("inspect-element", &refused)
             .contains("not sent: no coding agent pane in this tmux window\n"));
+    }
+
+    /// A stopped recording prints the summary that was pasted, then where it went.
+    #[test]
+    fn record_stop_prints_the_timeline_and_the_destination() {
+        let stopped = serde_json::json!({ "ok": true, "summary": "tweb recording: /r/timeline.md\n1.0s\n",
+            "sent": { "ok": false, "reason": "no coding agent pane in this tmux window" } });
+        assert_eq!(
+            super::render("record-stop", &stopped),
+            "tweb recording: /r/timeline.md\n1.0s\nnot sent: no coding agent pane in this tmux window\n"
+        );
+        assert_eq!(
+            super::render("record-stop", &serde_json::json!({ "ok": false })),
+            "not recording\n"
+        );
+        assert_eq!(
+            super::render(
+                "record-start",
+                &serde_json::json!({ "recording": true, "directory": "/r" })
+            ),
+            "recording to /r\n"
+        );
+        let limited = serde_json::json!({ "recording": true, "directory": "/r",
+            "unavailable": ["failed requests (this engine cannot see a page's requests)"] });
+        assert_eq!(
+            super::render("record-start", &limited),
+            "recording to /r\nnot recorded on this engine: failed requests (this engine cannot see a page's requests)\n"
+        );
     }
 
     /// `undefined` used to come back as `{}` — the engine's `{ value: undefined }` loses its key

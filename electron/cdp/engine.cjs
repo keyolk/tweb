@@ -195,7 +195,7 @@ class CdpEngine extends EventEmitter {
     this.readyByWindow = new WeakMap();
     this.ipcMain = new CdpIpcMain();
     this.pendingOpens = [];
-    this.webRequestListeners = { beforeRequest: null, completed: null };
+    this.webRequestListeners = { beforeRequest: null, completed: null, errorOccurred: null };
     this.downloadListeners = [];
     this.downloads = new Map();
     this.browserContextId = undefined;
@@ -453,31 +453,41 @@ class CdpEngine extends EventEmitter {
 
   // --- network log (session.defaultSession.webRequest) -----------------------------------
 
-  onRequest(_contents, params) {
+  // Each callback carries `webContentsId`, as Electron's do: main.cjs uses it to tell which tab —
+  // and so which pane's recording — a request belongs to.
+  onRequest(contents, params) {
     const listener = this.webRequestListeners.beforeRequest;
     if (!listener) return;
     listener({
       id: params.requestId,
+      webContentsId: contents?.id ?? null,
       url: params.request?.url || "",
       method: params.request?.method || "GET",
       resourceType: String(params.type || "other").toLowerCase(),
     }, () => {});
   }
 
-  onResponse(_contents, params) {
+  onResponse(contents, params) {
     const listener = this.webRequestListeners.completed;
     if (!listener) return;
     listener({
       id: params.requestId,
+      webContentsId: contents?.id ?? null,
+      url: params.response?.url || "",
       statusCode: params.response?.status ?? 0,
       fromCache: Boolean(params.response?.fromDiskCache || params.response?.fromServiceWorker),
     });
   }
 
-  onRequestFailed(_contents, params) {
-    const listener = this.webRequestListeners.completed;
-    if (!listener) return;
-    listener({ id: params.requestId, statusCode: 0, fromCache: false, error: params.errorText });
+  // A request with no response. The network log keeps treating it as completed with status 0, as
+  // it always has; `onErrorOccurred` is Electron's event for the same thing, and the one a
+  // recording listens to.
+  onRequestFailed(contents, params) {
+    const failure = {
+      id: params.requestId, webContentsId: contents?.id ?? null, error: params.errorText || "failed",
+    };
+    this.webRequestListeners.completed?.({ ...failure, statusCode: 0, fromCache: false });
+    this.webRequestListeners.errorOccurred?.(failure);
   }
 
   // --- downloads (session.defaultSession "will-download") --------------------------------
@@ -506,6 +516,7 @@ class CdpEngine extends EventEmitter {
       webRequest: {
         onBeforeRequest(listener) { engine.webRequestListeners.beforeRequest = listener; },
         onCompleted(listener) { engine.webRequestListeners.completed = listener; },
+        onErrorOccurred(listener) { engine.webRequestListeners.errorOccurred = listener; },
       },
       on(event, listener) {
         if (event === "will-download") engine.downloadListeners.push(listener);

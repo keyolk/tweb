@@ -369,6 +369,12 @@ pub enum Command {
         #[command(subcommand)]
         action: TabAction,
     },
+    /// Record the pane for a coding agent: keyframes plus an interaction log, written as a
+    /// timeline. `gr` in the pane does the same.
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
     /// screenshot.
     Screenshot {
         /// Where to save it. Without a path, a base64 PNG is printed.
@@ -590,6 +596,33 @@ pub enum TabAction {
     /// Close a tab.
     Close {
         index: Option<usize>,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RecordAction {
+    /// Start recording: keyframes on navigation, after clicks and while the page changes, and
+    /// a log of navigations, clicks, field changes (never password values), console errors and
+    /// failed requests.
+    Start {
+        /// Seconds between keyframes while the page keeps changing (at least 1).
+        #[arg(long, default_value_t = 5.0)]
+        interval: f64,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// Stop, write `timeline.md`, and paste its path and a summary into the coding agent pane.
+    Stop {
+        /// Write the recording but do not paste it anywhere.
+        #[arg(long)]
+        no_send: bool,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
+    /// Whether the pane is recording, and where to.
+    Status {
         #[command(flatten)]
         agent: AgentOptions,
     },
@@ -873,6 +906,18 @@ pub async fn run() -> Result<()> {
             action: ProfileAction::List { json },
         } => chrome::list_profiles(json)?,
         Command::Mcp { agent } => mcp::serve(agent.pane.as_deref())?,
+        Command::Record { action } => {
+            let (method, params, agent) = match action {
+                RecordAction::Start { interval, agent } => {
+                    ("record-start", json!({ "interval": interval }), agent)
+                }
+                RecordAction::Stop { no_send, agent } => {
+                    ("record-stop", json!({ "send": !no_send }), agent)
+                }
+                RecordAction::Status { agent } => ("record-status", json!({}), agent),
+            };
+            agent::run(agent.pane.as_deref(), method, params, agent.json)?;
+        }
         Command::Tab { action } => {
             let (method, params, agent) = match action {
                 TabAction::Switch { index, agent } => ("tab", json!({ "index": index }), agent),

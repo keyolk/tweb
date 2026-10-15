@@ -283,6 +283,34 @@ const TOOLS: &[Tool] = &[
         fixed: &[],
     },
     Tool {
+        name: "tweb_record_start",
+        method: "record-start",
+        description: "Start recording the pane while the user reproduces something: \
+                      keyframes on navigation, after clicks and while the page changes, \
+                      plus navigations, clicks, field changes (password values are never \
+                      recorded), console errors and failed requests.",
+        fields: &[(
+            "interval",
+            "number",
+            "Seconds between keyframes while the page changes (default 5)",
+            false,
+        )],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_record_stop",
+        method: "record-stop",
+        description: "Stop recording and write timeline.md (timestamps, actions, keyframe \
+                      paths). Returns its path and a summary.",
+        fields: &[(
+            "send",
+            "boolean",
+            "Also paste the path and summary into the agent pane (default true)",
+            false,
+        )],
+        fixed: &[],
+    },
+    Tool {
         name: "tweb_float",
         method: "float",
         description: "Show the current pane's page as an OS desktop window,                       detached from the tmux pane. The page state and                       profile stay with the pane; only the display moves.",

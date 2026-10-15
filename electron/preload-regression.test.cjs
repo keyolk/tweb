@@ -3082,3 +3082,22 @@ test("inspect `a` sends the pick to the agent and leaves the other inspect keys 
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "inspect-to-agent":\n\s+void sendInspectToAgent\(tab, value\);/);
 });
+
+// `gr` starts and stops a recording. It is a new `g` chord, so it must not take a chord or a key
+// that already meant something.
+test("gr toggles recording and leaves the other g chords alone", () => {
+  const from = electron.indexOf("    if (pendingG) {");
+  const chord = electron.slice(from, electron.indexOf("    if (pendingZ) {", from));
+  assert.match(chord, /else if \(key === "r"\) send\("record-toggle"\);/);
+  for (const [key, action] of [["g", /scrollSurfaceTo\(0\)/], ["h", /showHistory\(\)/], ["d", /showDownloads\(\)/],
+    ["p", /send\("print-paper"\)/], ["i", /document\.querySelector/]]) {
+    assert.match(chord, new RegExp(`key === "${key}"\\) ${action.source}`), `g${key} changed`);
+  }
+  assert.equal((chord.match(/key === "r"/g) || []).length, 1);
+  // A bare `r` is still reload; only the chord records.
+  assert.match(electron, /\["r · gi", "reload · focus first input", \{ r: \(\) => send\("reload"\) \}\]/);
+  // The palette row and `:record` reach the same action.
+  assert.match(electron, /\{ name: "record", label: "Record for agent \(start \/ stop\)", action: \(\) => send\("record-toggle"\) \}/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "record-toggle":\n\s+toggleRecording\(\);/);
+});
