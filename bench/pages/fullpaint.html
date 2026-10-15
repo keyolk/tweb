@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fullpaint</title>
+<!--
+  Repaints every pixel on every animation frame, so each paint is a whole frame at the pane's full
+  size. A static page does not repaint without input and a scroll produces frames unevenly
+  (memory: tweb-frame-measurement-harness), so neither loads the whole-frame path the way this does.
+  The content is noisy on purpose: a flat fill compresses to nothing and would hide what a medium
+  costs per byte.
+-->
+<style>html,body{margin:0;overflow:hidden;background:#000}canvas{display:block}</style>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById("c");
+const context = canvas.getContext("2d");
+function resize() {
+  canvas.width = Math.round(innerWidth * devicePixelRatio);
+  canvas.height = Math.round(innerHeight * devicePixelRatio);
+  canvas.style.width = `${innerWidth}px`;
+  canvas.style.height = `${innerHeight}px`;
+}
+addEventListener("resize", resize);
+resize();
+let frame = 0;
+function paint() {
+  frame += 1;
+  const { width, height } = canvas;
+  const image = context.createImageData(width, height);
+  const data = image.data;
+  let seed = frame * 2654435761;
+  for (let i = 0; i < data.length; i += 4) {
+    seed = (seed * 1103515245 + 12345) >>> 0;
+    data[i] = seed & 0xff;
+    data[i + 1] = (seed >>> 8) & 0xff;
+    data[i + 2] = (i >>> 10) & 0xff;
+    data[i + 3] = 255;
+  }
+  context.putImageData(image, 0, 0);
+  context.fillStyle = "#fff";
+  context.font = `${48 * devicePixelRatio}px monospace`;
+  context.fillText(`frame ${frame}`, 40, 80 * devicePixelRatio);
+  requestAnimationFrame(paint);
+}
+requestAnimationFrame(paint);
+</script>
