@@ -290,9 +290,23 @@ impl CheckStatus {
 pub async fn run(fix: bool) -> Result<()> {
     println!("tweb doctor — environment diagnosis\n");
 
+    // Over SSH the terminal — and so Ghostty and its config — is on the machine the user connects
+    // FROM. Configuring or checking a Ghostty here would be checking the wrong computer: on a
+    // Coder workspace there is none, and the honest answer is "run doctor --fix on your laptop".
+    let remote = tweb_pane::remote_terminal::decide(&tweb_pane::remote_terminal::observe()).remote;
+
     if fix {
         println!("Applying managed terminal configuration:");
-        for result in [apply_tmux_fix(), apply_ghostty_fix()] {
+        let ghostty = if remote {
+            Ok(
+                "Ghostty skipped: the terminal is remote; run `tweb doctor --fix` on the machine \
+                you connect from for its Cmd passthrough"
+                    .to_string(),
+            )
+        } else {
+            apply_ghostty_fix()
+        };
+        for result in [apply_tmux_fix(), ghostty] {
             match result {
                 Ok(message) => println!("  [ FIX] {message}"),
                 Err(error) => println!("  [WARN] {error:#}"),
@@ -310,16 +324,27 @@ pub async fn run(fix: bool) -> Result<()> {
         check_tmux_extended_keys(),
         check_tmux_mouse(),
     ];
-    checks.extend([
-        check_ghostty_version(),
-        check_ghostty_cmd_passthrough(),
-        check_ghostty_terminal_copy(),
-    ]);
+    if remote {
+        checks.push(Check {
+            name: "Ghostty",
+            status: CheckStatus::Ok,
+            detail: "not checked here: the terminal is remote, so its config lives on the \
+                     machine you connect from"
+                .to_string(),
+        });
+    } else {
+        checks.extend([
+            check_ghostty_version(),
+            check_ghostty_cmd_passthrough(),
+            check_ghostty_terminal_copy(),
+        ]);
+    }
     checks.extend([
         check_pixel_size_query(),
         check_kitty_graphics_probe(),
         check_tmux_user_keys(),
         check_tmux_environment(),
+        engine::check_frame_medium(),
     ]);
     checks.extend(engine::linux_checks());
     checks.push(check_chrome_engine());

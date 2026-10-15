@@ -19,6 +19,7 @@ pub mod hosted;
 pub mod image_id;
 pub mod input;
 pub mod pane_writer;
+pub mod remote_terminal;
 pub mod resize;
 pub mod terminal;
 pub mod visibility;
@@ -477,6 +478,12 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         return Ok(());
     }
 
+    // Before the input loop takes stdin, for the same reason as the probe above: the reply is
+    // read here or it arrives at the page as typing. A no-op unless the pixel size is unknown.
+    if let Some(cell) = terminal::learn_cell_size() {
+        tracing::info!(?cell, "cell size learned from the terminal");
+    }
+
     let pane = std::env::var("TMUX_PANE").unwrap_or_else(|_| "%0".to_string());
     tracing::info!(pane = %pane, "tmux pane identity");
     let _pane_marker = TmuxPaneMarker::install(&pane);
@@ -509,7 +516,18 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     // the spawn below, which is the path that ships — so a pane that opted in and found no daemon,
     // an incompatible daemon, or a daemon whose engine cannot host, behaves exactly as it does
     // today rather than degrading.
-    match try_hosted(url, options, &pane, image_id).await {
+    // Where the terminal is decides how whole frames travel; see `remote_terminal`. Decided
+    // before hosting is considered, because a hosted engine is a daemon's, and its frame medium is
+    // one setting for every pane it serves.
+    let medium = remote_terminal::decide(&remote_terminal::observe());
+    tracing::info!(medium = medium.medium.as_str(), remote = medium.remote, reason = %medium.reason,
+        "frame medium");
+    let hosted = if medium.medium == remote_terminal::Medium::File {
+        try_hosted(url, options, &pane, image_id).await
+    } else {
+        HostedOutcome::Spawn(attach::SpawnReason::InlineFrames(medium.reason.clone()))
+    };
+    match hosted {
         HostedOutcome::Finished => return Ok(()),
         HostedOutcome::Spawn(reason) => {
             if !matches!(reason, attach::SpawnReason::FlagOff) {
@@ -582,7 +600,31 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             "TWEB_RESTORE_SESSION",
             if options.restore_session { "1" } else { "0" },
         )
-        .env("TWEB_URL", url);
+        .env("TWEB_URL", url)
+        .env(remote_terminal::TRANSPORT_VARIABLE, medium.medium.as_str())
+        .env(remote_terminal::REASON_VARIABLE, &medium.reason)
+        .env(
+            remote_terminal::REMOTE_VARIABLE,
+            if medium.remote { "1" } else { "0" },
+        );
+    // A headless engine has no display to read its scale from, and would render a Retina pane at
+    // 1x — every page at half size. The cell height stands in; an explicit setting still wins.
+    if twebd::chromium_platform::is_headless(
+        std::env::var("DISPLAY").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+    ) && cfg!(target_os = "linux")
+        && std::env::var_os("TWEB_DEVICE_SCALE_FACTOR").is_none()
+    {
+        if let Some(size) = initial_geometry.as_ref().map(|geometry| geometry.size) {
+            if size.rows > 0 {
+                let scale = remote_terminal::scale_for_cell_height(
+                    f64::from(size.height) / f64::from(size.rows),
+                );
+                tracing::info!(scale, "headless engine: scale from the cell height");
+                command.env("TWEB_DEVICE_SCALE_FACTOR", scale.to_string());
+            }
+        }
+    }
     if let Some(geometry) = initial_geometry {
         if let Some((left, top)) = geometry.origin {
             command.env("TWEB_PANE_ORIGIN", format!("{left},{top}"));

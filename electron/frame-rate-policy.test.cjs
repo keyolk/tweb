@@ -13,6 +13,9 @@ const {
   PLAYBACK_MIN_PAINTS,
   PLAYBACK_MIN_RATE,
   PLAYBACK_BYTE_BUDGET,
+  remoteFrameRateTiers,
+  nextWireEstimate,
+  REMOTE_MIN_RATE,
 } = require("./frame-rate-policy.cjs");
 
 test("adaptive mode has three tiers, fixed mode has one", () => {
@@ -278,4 +281,39 @@ test("the tiers carry the headroom through", () => {
   assert.equal(frameRateTiers(30, true, area, 2.5).playback, 21);
   // Non-adaptive panes have no playback tier to raise.
   assert.equal(frameRateTiers(30, false, area, 4).playback, 30);
+});
+
+test("a remote pane runs at the configured rates until a frame has been measured", () => {
+  assert.deepEqual(remoteFrameRateTiers(30, true, null, 4e6), frameRateTiers(30, true));
+  assert.deepEqual(remoteFrameRateTiers(30, true, 0, 4e6), frameRateTiers(30, true));
+});
+
+test("a remote pane is capped by what its frames cost on the link, maximum included", () => {
+  // A text page: 40KB a frame fits 100 a second, so nothing changes.
+  assert.deepEqual(remoteFrameRateTiers(30, true, 40e3, 4e6), { max: 30, playback: 30, idle: 4 });
+  // A busy 2880x1800 page as base64 PNG: 1.6MB a frame affords 2 a second, and interaction —
+  // which raises the pane to `max` — must not lift it above that.
+  const busy = remoteFrameRateTiers(30, true, 1.6e6, 4e6);
+  assert.deepEqual(busy, { max: 2, playback: 2, idle: 2 });
+  // 400KB affords 10: playback and the maximum both come down, idle stays where it was.
+  assert.deepEqual(remoteFrameRateTiers(30, true, 400e3, 4e6), { max: 10, playback: 10, idle: 4 });
+});
+
+test("the remote floor holds for frames larger than the budget", () => {
+  const huge = remoteFrameRateTiers(30, true, 20e6, 4e6);
+  assert.equal(huge.max, REMOTE_MIN_RATE);
+  // ...but never above a configured maximum lower than the floor.
+  assert.equal(remoteFrameRateTiers(1, true, 20e6, 4e6).max, 1);
+});
+
+test("a pinned rate is the user overriding the policy, remote or not", () => {
+  assert.deepEqual(remoteFrameRateTiers(30, false, 20e6, 4e6), { max: 30, playback: 30, idle: 30 });
+});
+
+test("the wire estimate starts at the first frame and moves halfway toward each next one", () => {
+  assert.equal(nextWireEstimate(null, 1000), 1000);
+  assert.equal(nextWireEstimate(1000, 3000), 2000);
+  // A frame with no size leaves the estimate alone.
+  assert.equal(nextWireEstimate(2000, 0), 2000);
+  assert.equal(nextWireEstimate(null, undefined), null);
 });
