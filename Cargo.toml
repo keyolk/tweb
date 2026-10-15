@@ -9,6 +9,7 @@ members = [
     "crates/tweb-platform",
     "crates/tweb-agent",
     "crates/tweb-cli",
+    "crates/tweb-frame-native",
 ]
 
 [workspace.package]

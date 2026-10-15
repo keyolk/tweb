@@ -1153,6 +1153,89 @@ control to stage. And a `host` request missing one field (`frame_rate`) came bac
 surfacing errors: the daemon answers a malformed request rather than disconnecting, deliberately, so
 a client built against a later protocol degrades instead of failing opaquely.
 
+### 8.8 Addendum — SHM after all, for the terminal `o=z` kills (2026-10-15)
+
+8.6 fixed the drops with `o=z`, and deflate-policy.cjs then had to turn `o=z` off for Ghostty,
+which aborts in its inflater. That put Ghostty — the default terminal — back on the 8.5 numbers:
+every whole frame through a 20MB+ file write, and the drops that come with it. 8.5 had already priced
+the way out (`t=s`) and named what blocked it: no `shm_open` from Node, so a native addon and its
+toolchain. zenbu-labs/terminal-browser ships exactly that shape — a Rust Node-API addon — which settled
+the toolchain question: napi-rs links with `-undefined dynamic_lookup`, needs no Node headers, and the
+same `.node` loads in stock Electron 43's worker threads (verified).
+
+`crates/tweb-frame-native` is that addon: `writeShmFrame(name, pixels, swap)` creates a fresh object,
+maps it, and does the BGRA->RGBA swap during the copy into the mapping; `unlinkShm(name)`. `tweb-pane`'s
+build script compiles it (release, own target dir) and the binary unpacks it to `native/` beside the
+app code. Measured in an Electron 43 worker, 2880x1800: **3.36ms per frame** for swap + write, against
+the shipped JS swap (2.9ms) plus the file write (p50 9.8ms, p99 54ms).
+
+On a real Ghostty window, outside tmux, `bench/pages/fullpaint.html` (every pixel repainted every frame),
+3456x2104 frames (29MB), 30fps pinned, 20s — `bench/shm-frames.py`:
+
+```text
+arm    whole sent   dropped to backpressure   via shm   shm objects left after exit
+file   401          155  (28% of attempts)     0         -
+shm    411            0                       412         0
+```
+
+The terminal consumed and unlinked every object. Who gets it is shm-frames.cjs: a terminal known to
+consume `t=s` (Ghostty, kitty), on this machine (not SSH), with the addon loaded; anything else keeps
+the file medium, because a terminal that ignores `t=s` never unlinks and the object stays in the kernel
+until reboot. Names cycle through a 4-slot ring per pane (`/twb.<pid>.<image>.<slot>`, under macOS's
+31-byte limit), unlinked before reuse, so an unconsumed stream is bounded at 4 objects; a zero-byte
+marker in userData makes a SIGKILLed engine's objects collectable by the next engine, by the same
+dead-pid rule as frame files. A failed shm write falls back to the file medium for that frame, and three
+in a row turn shm off for the session. `tweb diag` reports `wholeMedium`, `shmReason`, `shmError`,
+`wholeShm`.
+
+**Patches too (2026-10-15).** With the addon loaded, `sendPatch` takes the crop's raw pixels
+(`crop().toBitmap()`), writes them into a per-pane 16-slot patch ring (`/twb.<pid>.<image>.p<slot>`),
+and puts only the name on the tty. That removes both things that bounded patches: the synchronous
+`toPNG()` on the main thread (p90 24ms at the 0.2 area limit) and the inline base64 that blocked the
+main thread in `write()` on whiteboard damage. `PATCH_AREA_LIMIT` is unchanged — raising it is its own
+measured change. `bench/shm-consumer.py` checks the engine side on a bare PTY by acting as the terminal:
+fullpaint 186 whole frames, smallpaint 136 patches, all through shm, every object present and sized
+`s*v*4`, red and green read back as `ff0000`/`00ff00` (no blue, so the swap is right), 0 inline PNG
+patches.
+
+**And the shared-texture path, measured and not taken (2026-10-15).** zenbu-labs/terminal-browser runs
+macOS frames through `offscreen.useSharedTexture` and reads the IOSurface in native code. Adopting it
+here would mean reworking everything that holds a `paint` NativeImage (frame cache, patch crops,
+repaints), so it was priced first: `bench/shared-texture.cjs`, Electron 43, 2880x1800 at 30fps, the
+addon's `readIOSurface` against `toBitmap()`, two interleaved runs per page:
+
+```text
+page       path       main thread p50 / p90 / p99      Browser / GPU process CPU
+fullpaint  toBitmap   1.75 / 3.6 / 5.3 ms              1.5% / 0.6%
+fullpaint  IOSurface  4.57 / 6.0 / 8.0 ms              1.2% / 0.5%
+webgl      toBitmap   1.78 / 3.4 / 5.5 ms              1.4% / 0.4%
+webgl      IOSurface  4.70 / 5.9 / 7.7 ms              1.2% / 0.3%
+```
+
+Reading a GPU surface on the CPU costs more on the main thread than the copy `toBitmap()` makes, even
+for GPU-drawn content, and the process CPU it would save is within noise. tweb needs CPU pixels either
+way (for `t=s`), so the default path stays. `readIOSurface` stays in the addon so this can be re-run
+on a later Electron; nothing in the engine calls it.
+
+**Nor the patched Electron (2026-10-15).** zenbu-labs/terminal-browser publishes Electron builds with
+three offscreen patches (GitHub releases `electron-v<version>`, same zip layout as upstream, Developer
+ID-signed; their fuses leave `OnlyLoadAppFromAsar` off, so `TWEB_ELECTRON=<…>/MacOS/pixel` would run
+tweb's app as is). On macOS only one of them is active — `osr-shm-frame` is `#if BUILDFLAG(IS_LINUX)`,
+and `osr-wayland-scale` is Linux too. The remaining one, `osr-vsync-display`, says input clamps an
+offscreen window's begin frames to 60 and the clamp sticks. `bench/frame-rate-after-input.cjs`, stock
+against patched 44.2.0, two runs each:
+
+```text
+requested   stock: before -> input -> after      patched: before -> input -> after
+30          30 -> 29.8 -> 30                      30 -> 30 -> 30
+60          60 -> 60   -> 60                      60 -> 60 -> 60
+120         120 -> 62  -> 60  (stuck)             120 -> 120 -> 120
+```
+
+The bug is real and only exists above 60fps. tweb asks for 4-30, so the patched build buys nothing here
+and would cost a pinned third-party runtime (and its bundle id, `dev.zenbu.pixel`, owning the camera and
+microphone grants). Stock Electron stays.
+
 ## 9. A component and interface structure built for extension
 
 > **The traits below exist as Rust source; almost none of them have an implementation.**

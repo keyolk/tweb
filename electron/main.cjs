@@ -59,6 +59,10 @@ const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
+const {
+  shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
+  SHM_RING, SHM_PATCH_RING,
+} = require("./shm-frames.cjs");
 const { mouseEventParams, pointerTarget, nextCapture } = require("./oopif-input.cjs");
 const { interpolatePoints } = require("./pointer-interpolation.cjs");
 const { shareLabels } = require("./hint-labels.cjs");
@@ -819,15 +823,43 @@ function attachedTerminalName() {
 
 // Decided once, here, rather than in the worker: the worker has no tmux and no terminal of its
 // own, and this is the process that knows which one the frames are going to.
+const clientTermname = attachedTerminalName();
 const deflateFrames = deflateFramesAllowed({
-  clientTermname: attachedTerminalName(),
+  clientTermname,
   term: process.env.TERM,
   termProgram: process.env.TERM_PROGRAM,
   override: process.env.TWEB_DEFLATE_FRAMES,
 });
 
+// The shared-memory frame addon (`crates/tweb-frame-native`), unpacked beside this file by the
+// binary. The main thread loads it too — not to write frames, which the worker does, but to unlink
+// a dead engine's objects at startup, which only native code can do.
+const shmAddonPath = process.env.TWEB_SHM_ADDON || path.join(__dirname, "native", "tweb-frame.node");
+let shmAddon = null;
+let shmAddonError = null;
+if (existsSync(shmAddonPath)) {
+  try {
+    shmAddon = require(shmAddonPath);
+  } catch (error) {
+    shmAddonError = error.message;
+    console.error(`tweb: shm frame addon failed to load: ${error.message}`);
+  }
+}
+const shmDecision = shmFramesDecision({
+  addonLoaded: Boolean(shmAddon),
+  clientTermname,
+  term: process.env.TERM,
+  termProgram: process.env.TERM_PROGRAM,
+  remote: Boolean(process.env.SSH_CONNECTION || process.env.SSH_TTY),
+  override: process.env.TWEB_SHM_FRAMES,
+});
+// Raw only: `t=s` carries `f=32` pixels, and the PNG path has no use for it. Turned off for the
+// rest of the session after repeated write failures — see `noteShmFrameResult`.
+let shmFramesEnabled = rawFramesEnabled && shmDecision.allowed;
+console.error(`tweb: whole-frame medium ${shmFramesEnabled ? "shm" : frameTransport} (${shmDecision.reason})`);
+
 const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"), {
-  workerData: { deflateFrames },
+  workerData: { deflateFrames, shmAddon: shmFramesEnabled ? shmAddonPath : null },
 });
 gfxWorker.unref();
 
@@ -1410,6 +1442,57 @@ function syncTmuxVisibility() {
 // pane's view of what it has in flight there is its own, which is what `frame-context.cjs`
 // keeps. The pane a completion belongs to travels with the message rather than being inferred,
 // because inferring it is how one pane's frame ends up placed in another pane's rectangle.
+// The next ring slot's object name for this pane, or null when frames are not going through
+// shared memory. The first one also drops the pane's marker file, so a later engine can find and
+// unlink these objects if this one dies before its worker's exit path runs.
+function markShmPane(frames) {
+  if (frames.shmMarked) return;
+  frames.shmMarked = true;
+  try {
+    writeFileSync(path.join(app.getPath("userData"), shmMarkerName(process.pid, frames.imageIds.base)), "");
+  } catch (error) {
+    console.error(`tweb: shm marker write failed: ${error.message}`);
+  }
+}
+
+function nextShmFrameName(frames) {
+  if (!shmFramesEnabled) return null;
+  markShmPane(frames);
+  const slot = frames.shmSlot;
+  frames.shmSlot = (slot + 1) % SHM_RING;
+  return shmFrameName(process.pid, frames.imageIds.base, slot);
+}
+
+function nextShmPatchName(frames) {
+  markShmPane(frames);
+  const slot = frames.shmPatchSlot;
+  frames.shmPatchSlot = (slot + 1) % SHM_PATCH_RING;
+  return shmPatchName(process.pid, frames.imageIds.base, slot);
+}
+
+// A frame whose shm write failed already went out through the file medium inside the worker, so a
+// failure costs speed rather than the frame. Repeated failures mean shm is broken here — a full
+// `/dev/shm`, a sandbox refusing `shm_open` — and paying a failed attempt per frame would be pure
+// waste, so the medium is given up for the session.
+const SHM_FRAME_FAILURE_LIMIT = 3;
+let shmFrameFailures = 0;
+let lastShmFrameError = shmAddonError;
+
+function noteShmFrameResult(message, frames) {
+  if (message?.shm) {
+    shmFrameFailures = 0;
+    frames.shmWholeFrames += 1;
+  }
+  if (!message?.shmError) return;
+  lastShmFrameError = message.shmError;
+  console.error(`tweb: shm frame failed: ${message.shmError}`);
+  shmFrameFailures += 1;
+  if (shmFramesEnabled && shmFrameFailures >= SHM_FRAME_FAILURE_LIMIT) {
+    shmFramesEnabled = false;
+    console.error(`tweb: shm frames off for this session after ${shmFrameFailures} failures`);
+  }
+}
+
 function sendGfxFrameToWorker(frame, frames = currentFrames()) {
   const pixels = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
     ? frame.png
@@ -1427,6 +1510,7 @@ function sendGfxFrameToWorker(frame, frames = currentFrames()) {
       height: frame.height,
       transport: frameTransport,
       filePath: frameFilePathFor(frames, frame.format),
+      shmName: frame.format === "raw" ? nextShmFrameName(frames) : null,
     }, [pixels.buffer]);
   } catch (error) {
     // The hand-off never happened, so the pane must not be left believing the worker is busy —
@@ -1521,6 +1605,7 @@ gfxWorker.on("message", (message) => {
   // Counted after the routing, not before it: the key is what says whose compression this was,
   // and a count taken above would land on whichever pane happened to ask for its diag.
   if (message?.type !== "error" && message?.compressed) frames.compressedWholeFrames += 1;
+  noteShmFrameResult(message, frames);
   // Scoped to the pane the completion belongs to: dispatching the queue reads the frame-rate state
   // and the window, and doing that against another pane's is how one pane's frame lands in
   // another's rectangle.
@@ -1851,8 +1936,10 @@ function deletePatches(frames = currentFrames()) {
 
 // Kitty places an image at the cursor. Patches address their cell against the pane's own
 // origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
-function patchPlacementSequence(id, place, frames = currentFrames()) {
-  const header = `a=T,f=100,i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
+// `format` is the transmission half of the header: `f=100` for a PNG sent inline, or the raw
+// `f=32,s=,v=,t=s` of a shared-memory patch.
+function patchPlacementSequence(id, place, frames = currentFrames(), format = "f=100") {
+  const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
@@ -1885,6 +1972,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   if (!geometry) return false;
 
   const patchStarted = frameProbeMark();
+  if (shmFramesEnabled && sendShmPatch(image, damage, geometry, frames, record, patchStarted)) return true;
   let png;
   try {
     png = image.crop(geometry.crop).toPNG();
@@ -1931,6 +2019,56 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
     console.error(`tweb: patch sent #${patchFramesSent} `
       + `cells=${geometry.place.cols}x${geometry.place.rows}`
       + `@${geometry.place.col},${geometry.place.row} bytes=${png.length}`);
+  }
+  return true;
+}
+
+// A patch through shared memory: the crop's raw pixels go into an object and only its name goes
+// over the tty.
+//
+// What this removes is everything that kept patches small. The PNG path pays a SYNCHRONOUS
+// `toPNG()` on this thread that scales with area (patch-geometry.cjs: p90 24ms at the 0.2 limit,
+// 422ms at 0.85), and then writes the base64 inline — the 360-430KB whiteboard patches that
+// blocked this thread in `write()` (see `IMMEDIATE_PATCH_MAX_BYTES`). Here the cost is the crop's
+// copy plus one more copy into the mapping, and the tty sees a few dozen bytes, so neither the
+// encode nor the byte cap applies. The area limit is left as it is: raising it is a separate,
+// measured change.
+//
+// Returns false when the shm write failed, and the caller carries on down the PNG path with the
+// same geometry, so a broken shm costs a frame's worth of speed and never the patch.
+function sendShmPatch(image, damage, geometry, frames, record, patchStarted) {
+  let bitmap;
+  const name = nextShmPatchName(frames);
+  try {
+    bitmap = image.crop(geometry.crop).toBitmap();
+    // `s=`/`v=` are taken from the crop rect, so a bitmap of any other size would be read with the
+    // wrong stride — a sheared patch rather than an error. The PNG path carries its own size.
+    if (bitmap.length !== geometry.crop.width * geometry.crop.height * 4) return false;
+    shmAddon.writeShmFrame(name, bitmap, true);
+  } catch (error) {
+    noteShmFrameResult({ shmError: `patch: ${error.message}` }, frames);
+    return false;
+  }
+  const patchEncoded = frameProbeMark();
+  const id = takeNextPatchId(frames);
+  const { width, height } = geometry.crop;
+  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames,
+    `f=32,s=${width},v=${height},t=s`);
+  writeGfx(`a=d,d=I,i=${id},q=2`, "");
+  writeGfxChunked(header, Buffer.from(name).toString("base64"), prefix, suffix);
+  frameProbeRecord("patch", {
+    patch: frameProbeMs(patchStarted, patchEncoded),
+    transfer: frameProbeMs(patchEncoded, frameProbeMark()),
+    total: frameProbeMs(patchStarted, frameProbeMark()),
+  }, bitmap.length);
+  notePatch(frames, id, damage);
+  inputTrace.mark("frame", { kind: "patch", bytes: bitmap.length, medium: "shm" });
+  record.frames.patches += 1;
+  frames.shmPatches += 1;
+  if (record.frames.patches <= 12) {
+    console.error(`tweb: patch sent #${record.frames.patches} shm `
+      + `cells=${geometry.place.cols}x${geometry.place.rows}`
+      + `@${geometry.place.col},${geometry.place.row} bytes=${bitmap.length}`);
   }
   return true;
 }
@@ -4522,6 +4660,16 @@ function agentDiagnostics() {
       transportFromDaemonEnv: hostedRuntime,
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
       wholeCompressed: currentFrames().compressedWholeFrames,
+      // Whether whole frames go through shared memory (`t=s`), why or why not, and how many of
+      // `whole` did. See shm-frames.cjs.
+      wholeMedium: shmFramesEnabled ? "shm" : frameTransport,
+      shmReason: shmDecision.reason,
+      shmError: lastShmFrameError,
+      wholeShm: currentFrames().shmWholeFrames,
+      // Of `patches`, how many went through shared memory rather than as an inline PNG.
+      patchesShm: currentFrames().shmPatches,
+      // The base image id, which is also what this pane's shm object names are built from.
+      imageId: currentFrames().imageIds.base,
       // How much of the byte budget this pane has earned above the default. 1 means it is on
       // the conservative floor; above that, nothing has been dropped and it is spending more.
       // The budget is a guess about the machine and this is what corrects it.
@@ -8493,6 +8641,24 @@ function cleanupFrameFiles() {
   removeFrameFiles(paneFrameFilePaths([...paneRegistry.list(), solePane]));
 }
 
+// This engine's own shared-memory objects and markers. The terminal unlinks every object it read,
+// so normally only the markers are left; the objects matter when a pane was hidden with a frame in
+// flight. Done here as well as in the worker because a worker torn down with the process is not
+// guaranteed to run its own exit handler.
+function cleanupShmFrames() {
+  if (!shmAddon) return;
+  const seen = new Set();
+  for (const frames of [...frameContexts.values(), soleFrames]) {
+    const imageId = frames?.imageIds?.base;
+    if (!frames?.shmMarked || seen.has(imageId)) continue;
+    seen.add(imageId);
+    for (const name of paneShmNames(process.pid, imageId)) {
+      try { shmAddon.unlinkShm(name); } catch {}
+    }
+    try { unlinkSync(path.join(app.getPath("userData"), shmMarkerName(process.pid, imageId))); } catch {}
+  }
+}
+
 // The above only removes this engine's own files, and only if it reaches its exit path. An
 // engine that is SIGKILLed — or orphaned, which is the case `orphan-watch.cjs` exists for —
 // leaves its last whole frame behind at up to 20MB, and nothing collects it. Observed: four
@@ -8522,6 +8688,25 @@ function sweepAbandonedFrameFiles() {
     }
   }
   if (removed > 0) console.error(`tweb: swept ${removed} frame files from dead engines`);
+  sweepAbandonedShmFrames(directory, names);
+}
+
+// The shared-memory objects a dead engine's panes may have left, found through their markers.
+// Without the addon they cannot be unlinked, so the markers stay for an engine that can.
+function sweepAbandonedShmFrames(directory, names) {
+  if (!shmAddon) return;
+  let unlinked = 0;
+  for (const { marker, objects } of abandonedShmFrames(names, process.pid, processAlive)) {
+    for (const object of objects) {
+      try {
+        if (shmAddon.unlinkShm(object)) unlinked += 1;
+      } catch (error) {
+        if (debugLogging) console.error(`tweb: shm sweep failed ${object}: ${error.message}`);
+      }
+    }
+    try { unlinkSync(path.join(directory, marker)); } catch {}
+  }
+  if (unlinked > 0) console.error(`tweb: swept ${unlinked} shm frames from dead engines`);
 }
 
 // The claim counterpart to `sweepAbandonedFrameFiles`, and here for the same reason: the slot
@@ -8660,6 +8845,7 @@ app.on("before-quit", () => {
           }
         }],
         [`${label} frame files`, cleanupFrameFiles],
+        [`${label} shm frames`, cleanupShmFrames],
         [`${label} stop painting`, () => {
           for (const tab of currentWindows().tabs) {
             if (!tab.isDestroyed()) tab.webContents.stopPainting();
@@ -8686,6 +8872,7 @@ app.on("before-quit", () => {
 process.on("exit", () => {
   runTeardown([
     ["exit frame files", cleanupFrameFiles],
+    ["exit shm frames", cleanupShmFrames],
     // The delete that takes each pane's image off the terminal. An exit handler cannot await, so
     // this only works because every pane writer has a synchronous sink — see `fdSink`. Give a
     // writer an async sink and these deletes are dropped, stranding the images.
