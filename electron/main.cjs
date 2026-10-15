@@ -61,6 +61,7 @@ const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
+const { passthroughRuns } = require("./tmux-passthrough.cjs");
 const {
   shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
   SHM_RING, SHM_PATCH_RING,
@@ -87,6 +88,9 @@ const {
   settledFrameRate,
   interactionRate,
   PLAYBACK_BYTE_BUDGET,
+  remoteFrameRateTiers,
+  nextWireEstimate,
+  REMOTE_BYTE_BUDGET,
 } = require("./frame-rate-policy.cjs");
 const { isOrphaned, watchedPid, abandonedFrameFiles } = require("./orphan-watch.cjs");
 const {
@@ -791,6 +795,13 @@ function paneWrite(text) {
 }
 
 const frameTransport = process.env.TWEB_FRAME_TRANSPORT === "direct" ? "direct" : "file";
+// Why, as the frontend decided it (crates/tweb-pane/src/remote_terminal.rs). The frontend is the
+// process standing in the pane, so it is the one that can tell an SSH session from a local one;
+// this engine only carries the answer to `tweb diag`.
+const frameTransportReason = process.env.TWEB_FRAME_TRANSPORT_REASON
+  || (process.env.TWEB_FRAME_TRANSPORT ? "TWEB_FRAME_TRANSPORT" : "default");
+// The terminal is on another machine: whole frames are paced by the bytes they put on the link.
+const remoteTerminal = process.env.TWEB_REMOTE_TERMINAL === "1";
 
 // Where a pane's whole frames are staged for the terminal to read.
 //
@@ -953,6 +964,15 @@ function paneIsInTmux(record = currentPane()) {
 function graphicsPassthrough(sequence, record = currentPane()) {
   if (!paneIsInTmux(record)) return sequence;
   return anchorTmuxGraphics(sequence);
+}
+
+/// The bytes for a run of complete graphics commands, in as many passthroughs as tmux needs.
+///
+/// One passthrough per run (see tmux-passthrough.cjs for why there can be several), each anchored
+/// at the pane origin the way the single run used to be.
+function graphicsPassthroughRuns(commands, record = currentPane()) {
+  if (!paneIsInTmux(record)) return commands.join("");
+  return passthroughRuns(commands).map(anchorTmuxGraphics).join("");
 }
 
 function rawKittyDelete(record = currentPane()) {
@@ -1560,14 +1580,11 @@ function sendGfxFrameToWorker(frame, frames = currentFrames()) {
 // separately would let a caret sequence land in the middle of one.
 function writeGfxCommands(commands) {
   if (!commands || commands.length === 0) return;
-  let raw = "";
-  for (const command of commands) {
-    raw += `${ESC}_G${command.header}`;
-    if (command.payload && command.payload.length > 0) raw += `;${command.payload}`;
-    raw += `${ESC}\\`;
-  }
+  const raw = commands.map((command) => `${ESC}_G${command.header}`
+    + (command.payload && command.payload.length > 0 ? `;${command.payload}` : "")
+    + `${ESC}\\`);
   try {
-    paneWrite(graphicsPassthrough(raw));
+    paneWrite(graphicsPassthroughRuns(raw));
   } catch (error) {
     void error;
   }
@@ -1575,6 +1592,15 @@ function writeGfxCommands(commands) {
   // continuous — so without this the caret is dragged back to the corner several times a
   // second. `writeGfx` does the same for everything that does not come from the worker.
   reassertTerminalCaret();
+}
+
+// What a run of graphics commands puts on the wire: `ESC _ G`, header, `;`, payload, `ESC \`.
+function wireBytesOf(commands) {
+  let bytes = 0;
+  for (const command of commands || []) {
+    bytes += 5 + command.header.length + (command.payload ? 1 + command.payload.length : 0);
+  }
+  return bytes;
 }
 
 function handleGfxWorkerReady(commands, frames = currentFrames()) {
@@ -1588,6 +1614,9 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
     writeGfx(`a=d,d=I,i=${frames.imageIds.base},q=2`, "");
   } else {
     writeGfxCommands(commands);
+    const bytes = wireBytesOf(commands);
+    frames.wholeWireBytes += bytes;
+    frames.wireBytesPerWhole = nextWireEstimate(frames.wireBytesPerWhole, bytes);
   }
   // `writeGfxCommands` reasserts the caret itself; the stale branch above wrote a delete
   // through `writeGfx`, which does the same. So there is nothing left to do here.
@@ -1692,7 +1721,7 @@ function writeGfxChunked(header, payload, prefix = "", suffix = "") {
     writeGfx(header, "");
     return;
   }
-  let raw = "";
+  const raw = [];
   let first = true;
   for (let offset = 0; offset < payload.length; offset += GFX_CHUNK) {
     const chunk = payload.slice(offset, offset + GFX_CHUNK);
@@ -1701,10 +1730,15 @@ function writeGfxChunked(header, payload, prefix = "", suffix = "") {
       ? `${header}${more ? ",m=1" : ""}`
       : `${more ? "m=1," : ""}q=2`;
     first = false;
-    raw += `${ESC}_G${chunkHeader};${chunk}${ESC}\\`;
+    raw.push(`${ESC}_G${chunkHeader};${chunk}${ESC}\\`);
   }
+  // The cursor walk goes on the first command and the walk back on the last, so each travels in
+  // the same passthrough as the command it positions. Patches are capped at 64KB, so in practice
+  // this is still one passthrough.
+  raw[0] = `${prefix}${raw[0]}`;
+  raw[raw.length - 1] = `${raw[raw.length - 1]}${suffix}`;
   try {
-    paneWrite(graphicsPassthrough(`${prefix}${raw}${suffix}`));
+    paneWrite(graphicsPassthroughRuns(raw));
   } catch (e) {}
   reassertTerminalCaret();
 }
@@ -1874,6 +1908,12 @@ function currentPlaybackTiers() {
   // hard: at dsf2 every floating window, whatever its size, resolved to the 8fps floor, which is
   // what a 60fps video looked like through the viewer. See `floatingFrameRateTiers`.
   if (inputState().floating) return floatingFrameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
+  // A remote terminal's limit is the link, and what a frame costs on it is measured, not derived
+  // from the area — see `remoteFrameRateTiers`.
+  if (remoteTerminal) {
+    return remoteFrameRateTiers(maxActiveFrameRate, adaptiveFrameRate,
+      currentFrames().wireBytesPerWhole);
+  }
   const viewport = currentFrames().viewport;
   if (!viewport) return frameRates;
   const size = renderedFrameSize(viewport);
@@ -2032,7 +2072,9 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames);
   // The id may still hold an older patch from a previous cycle through the pool.
   writeGfx(`a=d,d=I,i=${id},q=2`, "");
-  writeGfxChunked(header, png.toString("base64"), prefix, suffix);
+  const encoded = png.toString("base64");
+  writeGfxChunked(header, encoded, prefix, suffix);
+  frames.patchWireBytes += encoded.length + header.length;
   frameProbeRecord("patch", {
     // No `pace`: a patch deliberately bypasses the pacer, which is the whole reason it
     // exists. `patch` is the crop+encode, `transfer` the base64 and escape-sequence write.
@@ -4705,13 +4747,14 @@ function agentDiagnostics() {
       tiers: {
         idle: idleFrameRate,
         playback: currentPlaybackTiers().playback,
-        max: maxActiveFrameRate,
+        // The ceiling in force, which a remote pane's link can hold below the configured one.
+        max: currentPlaybackTiers().max,
       },
       // Which of the three adaptive rates is in force. `playback` means the page is
       // painting on its own — a video, an animation — which is what separates "the pane
       // is throttled" from "the page has nothing new to show".
       rateKind: !adaptiveFrameRate ? "fixed"
-        : currentWindows().activeFrameRate >= maxActiveFrameRate ? "active"
+        : currentWindows().activeFrameRate >= currentPlaybackTiers().max ? "active"
           : currentWindows().activeFrameRate >= currentPlaybackTiers().playback ? "playback" : "idle",
       droppedByBackpressure: currentFrames().droppedGfxFrames,
       imageId: currentFrames().imageIds.base,
@@ -4740,7 +4783,17 @@ function agentDiagnostics() {
       // Measured the hard way: an experiment run with the variable set on the pane produced a
       // fresh engine that still wrote frame files, and nothing anywhere said so.
       transport: frameTransport,
+      transportReason: frameTransportReason,
       transportFromDaemonEnv: hostedRuntime,
+      // Whether the terminal is on another machine, and what this pane's graphics have cost on
+      // the wire. Remotely, `wire.perWhole` against `remoteBudget` is what sets `tiers.max`.
+      remoteTerminal,
+      remoteBudget: remoteTerminal ? REMOTE_BYTE_BUDGET : null,
+      wire: {
+        whole: currentFrames().wholeWireBytes,
+        patches: currentFrames().patchWireBytes,
+        perWhole: currentFrames().wireBytesPerWhole,
+      },
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
       wholeCompressed: currentFrames().compressedWholeFrames,
       // Whether whole frames go through shared memory (`t=s`), why or why not, and how many of
@@ -9272,7 +9325,10 @@ app.whenReady().then(async () => {
     ? `adaptive ${idleFrameRate}/≤${maxActiveFrameRate} (playback ≤${
       Math.round(PLAYBACK_BYTE_BUDGET / 1e6)}MB/s)`
     : `fixed ${maxActiveFrameRate}`}fps`
+    + ` · frames ${frameTransport}${remoteTerminal
+      ? ` (remote, ≤${(REMOTE_BYTE_BUDGET / 1e6).toFixed(1)}MB/s on the link)` : ""}`
     + ` · zoom ${Math.round(defaultZoomFactor() * 100)}%`);
+  console.error(`tweb: frame medium ${frameTransport}: ${frameTransportReason}`);
 });
 
 // The frame files a set of panes owns, as paths. The naming rule and the enumeration live in

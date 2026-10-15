@@ -45,6 +45,9 @@ pub enum SpawnReason {
     UnexpectedAnswer(String),
     /// Hosting was working and stopped. The pane keeps running, on its own engine.
     HostedSessionLost(String),
+    /// Frames for this pane must go inline (`t=d`), and a hosted engine's medium is the daemon's,
+    /// shared by every pane it serves. See `remote_terminal`.
+    InlineFrames(String),
 }
 
 impl std::fmt::Display for SpawnReason {
@@ -57,6 +60,7 @@ impl std::fmt::Display for SpawnReason {
             Self::Refused(reason, detail) => write!(f, "twebd declined ({reason:?}): {detail}"),
             Self::UnexpectedAnswer(answer) => write!(f, "twebd answered {answer}"),
             Self::HostedSessionLost(reason) => write!(f, "the hosted page was lost: {reason}"),
+            Self::InlineFrames(reason) => write!(f, "frames go inline here ({reason})"),
         }
     }
 }

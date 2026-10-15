@@ -32,6 +32,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/deflate-policy.cjs"),
     ),
     (
+        "tmux-passthrough.cjs",
+        include_str!("../../../electron/tmux-passthrough.cjs"),
+    ),
+    (
         "shm-frames.cjs",
         include_str!("../../../electron/shm-frames.cjs"),
     ),

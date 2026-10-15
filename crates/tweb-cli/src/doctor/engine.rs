@@ -1,16 +1,42 @@
-//! Doctor checks about what the engine needs from the machine it runs on: on Linux, the display
-//! backend, the renderer sandbox and Electron's shared libraries.
+//! Doctor checks about where the engine runs relative to the terminal, and what the engine
+//! needs from the machine: the frame medium on every platform, and on Linux the display backend,
+//! the renderer sandbox and Electron's shared libraries.
 //!
-//! Each of these fails in a way the pane cannot report on its own. A missing `libnss3` kills
-//! Electron before it logs anything a user would read, and a sandbox Chromium cannot build aborts
-//! the engine.
+//! Each of these fails in a way the pane cannot report on its own. A frame file the terminal
+//! cannot open is answered with silence (`q=2`); a missing `libnss3` kills Electron before it
+//! logs anything a user would read; and a sandbox Chromium cannot build aborts the engine.
 
 use std::path::Path;
 use std::process::Command;
 
+use tweb_pane::remote_terminal::{self, Medium};
 use twebd::chromium_platform::{self, Sandbox};
 
 use super::{Check, CheckStatus};
+
+/// How whole frames would reach this terminal, and why — the decision a pane opened here makes.
+pub(super) fn check_frame_medium() -> Check {
+    medium_check(&remote_terminal::decide(&remote_terminal::observe()))
+}
+
+fn medium_check(choice: &remote_terminal::Choice) -> Check {
+    // Forcing frame files onto a remote terminal is the one combination that cannot work: the
+    // terminal opens a path on its own machine, finds nothing, and `q=2` keeps it quiet.
+    let status = if choice.remote && choice.medium == Medium::File {
+        CheckStatus::Fail
+    } else {
+        CheckStatus::Ok
+    };
+    let what = match choice.medium {
+        Medium::File => "t=f frame files",
+        Medium::Direct => "t=d inline PNG, paced to the link budget",
+    };
+    Check {
+        name: "frame medium",
+        status,
+        detail: format!("{what} — {}", choice.reason),
+    }
+}
 
 /// Whether the engine will have a display server or run on Ozone's headless platform.
 pub(super) fn check_engine_display() -> Check {
@@ -139,7 +165,8 @@ pub(super) fn linux_checks() -> Vec<Check> {
 
 #[cfg(test)]
 mod tests {
-    use super::missing_libraries;
+    use super::{medium_check, missing_libraries};
+    use tweb_pane::remote_terminal::{Choice, Medium};
 
     #[test]
     fn ldd_output_yields_only_the_unresolved_names() {
@@ -149,5 +176,27 @@ mod tests {
                       \tlibgbm.so.1 => not found\n";
         assert_eq!(missing_libraries(output), vec!["libnss3.so", "libgbm.so.1"]);
         assert!(missing_libraries("").is_empty());
+    }
+
+    #[test]
+    fn frame_files_to_a_remote_terminal_fail_and_everything_else_passes() {
+        let forced = medium_check(&Choice {
+            medium: Medium::File,
+            remote: true,
+            reason: "TWEB_FRAME_TRANSPORT=file (SSH_CONNECTION is set)".into(),
+        });
+        assert!(matches!(forced.status, super::CheckStatus::Fail));
+        let remote = medium_check(&Choice {
+            medium: Medium::Direct,
+            remote: true,
+            reason: "remote terminal: SSH_CONNECTION is set".into(),
+        });
+        assert!(matches!(remote.status, super::CheckStatus::Ok));
+        assert!(remote.detail.contains("t=d"), "{}", remote.detail);
+        assert!(
+            remote.detail.contains("SSH_CONNECTION"),
+            "{}",
+            remote.detail
+        );
     }
 }

@@ -84,6 +84,13 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // Frames dropped to backpressure as of the last judgement, so the next one can tell
     // whether anything was dropped SINCE rather than ever.
     droppedAtLastSettle: 0,
+    // What this pane's graphics have cost on the wire, in escape-sequence bytes before any tmux
+    // wrapping. For a local terminal reading frame files these are small and only diagnostic;
+    // for a remote one they ARE the link load, and `wireBytesPerWhole` — a moving average of the
+    // whole frames just sent — is what the remote rate cap divides the budget by.
+    wholeWireBytes: 0,
+    patchWireBytes: 0,
+    wireBytesPerWhole: null,
 
     frameRate,
     framesSentCount: 0,

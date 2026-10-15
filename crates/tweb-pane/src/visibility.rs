@@ -108,8 +108,8 @@ pub fn parse_probe(stdout: &str, pane: &str) -> TmuxProbe {
                 if cols == 0 || rows == 0 {
                     continue;
                 }
-                let (width, height) =
-                    parse_pixel_size(cols, rows, fields[4], fields[5]).unwrap_or((0, 0));
+                let (width, height) = parse_pixel_size(cols, rows, fields[4], fields[5])
+                    .unwrap_or_else(|| crate::terminal::learned_pixel_size(cols, rows));
                 geometry = Some(WindowGeometry {
                     size: WindowSize {
                         cols,

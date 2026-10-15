@@ -48,6 +48,7 @@ pub fn window_geometry() -> Option<WindowGeometry> {
     }
 
     let origin = tmux.and_then(|geometry| geometry.origin);
+    let learned = learned_pixel_size(size.ws_col, size.ws_row);
     Some(WindowGeometry {
         origin,
         size: WindowSize {
@@ -55,11 +56,15 @@ pub fn window_geometry() -> Option<WindowGeometry> {
             rows: size.ws_row,
             width: if size.ws_xpixel > 0 {
                 size.ws_xpixel
+            } else if learned.0 > 0 {
+                learned.0
             } else {
                 size.ws_col.saturating_mul(8)
             },
             height: if size.ws_ypixel > 0 {
                 size.ws_ypixel
+            } else if learned.1 > 0 {
+                learned.1
             } else {
                 size.ws_row.saturating_mul(16)
             },
@@ -133,7 +138,7 @@ fn parse_pane_geometry(value: &str) -> Option<WindowGeometry> {
         .next()
         .zip(fields.next())
         .and_then(|(w, h)| pixel_size_from_cells(cols, rows, &format!("{w} {h}")))
-        .unwrap_or((0, 0));
+        .unwrap_or_else(|| learned_pixel_size(cols, rows));
     Some(WindowGeometry {
         size: WindowSize {
             cols,
@@ -170,7 +175,7 @@ fn query_tmux_window_geometry() -> Option<WindowGeometry> {
     let cells = tmux_query(&pane, "#{client_cell_width} #{client_cell_height}");
     let (width, height) = cells
         .and_then(|value| pixel_size_from_cells(cols, rows, &value))
-        .unwrap_or((0, 0));
+        .unwrap_or_else(|| learned_pixel_size(cols, rows));
 
     Some(WindowGeometry {
         size: WindowSize {
@@ -181,6 +186,92 @@ fn query_tmux_window_geometry() -> Option<WindowGeometry> {
         },
         origin: Some((left, top)),
     })
+}
+
+/// The cell size learned from the outer terminal when neither the pty nor tmux knows it.
+///
+/// Set once, at pane startup, by [`learn_cell_size`]. An SSH server that drops the pixel half of
+/// the window size — Coder's does: `TIOCGWINSZ` reads `(rows, cols, 0, 0)` on the workspace however
+/// the laptop's pty is sized — leaves tmux with `client_cell_width` 0 as well, and every geometry
+/// below would otherwise report a pane 0 pixels wide. The engine then renders 2x2 frames.
+static LEARNED_CELL: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+
+/// The pane's pixel size from the learned cell size, or `(0, 0)` when nothing was learned —
+/// the "unknown" every caller already handles.
+pub fn learned_pixel_size(cols: u16, rows: u16) -> (u16, u16) {
+    LEARNED_CELL
+        .get()
+        .and_then(|(width, height)| pixel_size_from_cells(cols, rows, &format!("{width} {height}")))
+        .unwrap_or((0, 0))
+}
+
+/// `TWEB_CELL_SIZE=18x36`: a cell's width and height in device pixels.
+fn parse_cell_size(value: &str) -> Option<(f64, f64)> {
+    let (width, height) = value.trim().split_once(['x', 'X'])?;
+    let width = width.trim().parse::<f64>().ok()?;
+    let height = height.trim().parse::<f64>().ok()?;
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some((width, height))
+}
+
+/// The cell height from a `CSI 6 ; height ; width t` reply.
+fn cell_size_reply(response: &[u8]) -> Option<(f64, f64)> {
+    parse_pixel_probe(response)
+        .cell_size
+        .map(|(width, height)| (f64::from(width), f64::from(height)))
+}
+
+/// Whether this pane's pixel size is unknown to every source the geometry reads.
+fn pixel_size_unknown() -> bool {
+    if let Ok(pane) = std::env::var("TMUX_PANE") {
+        return tmux_query(&pane, "#{client_cell_width} #{client_cell_height}")
+            .and_then(|value| pixel_size_from_cells(1, 1, &value))
+            .is_none();
+    }
+    let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
+    let fd = io::stdin().as_raw_fd();
+    let measured = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0;
+    measured && size.ws_xpixel == 0
+}
+
+/// Learns the cell size when the pty and tmux cannot say it, by asking the terminal itself.
+///
+/// Inside tmux the question is wrapped in passthrough: asked plainly, tmux answers on the
+/// terminal's behalf with its built-in default (measured on tmux 3.4: `6;32;16`, a cell 16x32 no
+/// terminal on the far end had), while through passthrough the real terminal answers and tmux
+/// hands the reply to the active pane — which, at startup, is this one. No DA1 terminator inside
+/// tmux: tmux consumes a client's DA replies itself, so the read waits on the `t` reply instead,
+/// with a deadline long enough for a reply that crosses the network twice.
+///
+/// Called before the input loop owns stdin, so the reply is never mistaken for typing.
+/// `TWEB_CELL_SIZE` skips the question for a terminal that cannot answer it.
+pub fn learn_cell_size() -> Option<(f64, f64)> {
+    if let Some(cell) = std::env::var("TWEB_CELL_SIZE")
+        .ok()
+        .as_deref()
+        .and_then(parse_cell_size)
+    {
+        return Some(*LEARNED_CELL.get_or_init(|| cell));
+    }
+    if !pixel_size_unknown() {
+        return None;
+    }
+    let in_tmux = std::env::var_os("TMUX").is_some();
+    let response = if in_tmux {
+        query_until(
+            b"\x1bPtmux;\x1b\x1b[16t\x1b\\",
+            std::time::Duration::from_millis(800),
+            |reply| cell_size_reply(reply).is_some(),
+        )
+    } else {
+        query_until(
+            b"\x1b[16t\x1b[c",
+            std::time::Duration::from_millis(800),
+            has_da1_reply,
+        )
+    }?;
+    let cell = cell_size_reply(&response)?;
+    Some(*LEARNED_CELL.get_or_init(|| cell))
 }
 
 fn pixel_size_from_cells(cols: u16, rows: u16, value: &str) -> Option<(u16, u16)> {
@@ -495,6 +586,15 @@ pub fn probe_terminal_pixels() -> PixelProbe {
 
 /// Writes `query` and reads the reply up to the terminating DA1 response.
 fn query_with_da1(query: &[u8]) -> Option<Vec<u8>> {
+    query_until(query, std::time::Duration::from_millis(200), has_da1_reply)
+}
+
+/// Writes `query` and reads until `done` says the reply is complete, or the deadline passes.
+fn query_until(
+    query: &[u8],
+    timeout: std::time::Duration,
+    done: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
     let fd = io::stdin().as_raw_fd();
     if unsafe { libc::isatty(fd) } != 1 {
         return None;
@@ -516,7 +616,7 @@ fn query_with_da1(query: &[u8]) -> Option<Vec<u8>> {
         let _ = lock.flush();
     }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let deadline = std::time::Instant::now() + timeout;
     let mut response = Vec::new();
     let mut chunk = [0u8; 256];
     let mut stdin = io::stdin();
@@ -525,7 +625,7 @@ fn query_with_da1(query: &[u8]) -> Option<Vec<u8>> {
             Ok(0) => {}
             Ok(n) => {
                 response.extend_from_slice(&chunk[..n]);
-                if has_da1_reply(&response) {
+                if done(&response) {
                     break;
                 }
                 continue;
@@ -643,8 +743,8 @@ pub fn classify_graphics_reply(response: &[u8]) -> crate::graphics::GraphicsSupp
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_graphics_reply, has_da1_reply, parse_pane_geometry, parse_pane_placement,
-        parse_pixel_probe, pixel_size_from_cells,
+        cell_size_reply, classify_graphics_reply, has_da1_reply, parse_cell_size,
+        parse_pane_geometry, parse_pane_placement, parse_pixel_probe, pixel_size_from_cells,
     };
     use crate::graphics::GraphicsSupport;
     use tweb_core::geometry::PixelSize;
@@ -778,5 +878,22 @@ mod tests {
         assert!(!has_da1_reply(b"\x1b[4;1050;1680t"));
         // A 'c' before the DA introducer is not the DA terminator.
         assert!(!has_da1_reply(b"c\x1b[?62;22"));
+    }
+
+    #[test]
+    fn a_cell_size_override_reads_width_by_height() {
+        assert_eq!(parse_cell_size("18x36"), Some((18.0, 36.0)));
+        assert_eq!(parse_cell_size(" 7.5X15 "), Some((7.5, 15.0)));
+        for bad in ["", "18", "0x36", "18x-1", "axb"] {
+            assert_eq!(parse_cell_size(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_passthrough_cell_reply_is_read_without_a_da1_terminator() {
+        // What a terminal sends back through tmux passthrough, as measured on tmux 3.4.
+        assert_eq!(cell_size_reply(b"\x1b[6;36;18t"), Some((18.0, 36.0)));
+        assert_eq!(cell_size_reply(b"\x1b[4;1800;2880t"), None);
+        assert_eq!(cell_size_reply(b""), None);
     }
 }

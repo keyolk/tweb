@@ -1344,7 +1344,9 @@ test("whole frames reach the terminal through the pane's writer, not the worker"
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const commands = main.slice(main.indexOf("function writeGfxCommands(commands)"),
     main.indexOf("// --- terminal setup ---"));
-  assert.match(commands, /paneWrite\(graphicsPassthrough\(raw\)\)/);
+  // `Runs`: a run of commands may go out as several passthroughs (tmux-passthrough.cjs), but
+  // every one of them still goes through the pane's own writer.
+  assert.match(commands, /paneWrite\(graphicsPassthroughRuns\(raw\)\)/);
 });
 
 // Wire names are matched by string equality across three process boundaries, so a rename on one

@@ -186,6 +186,69 @@ function frameRateTiers(maxRate, adaptive, area, headroom = 1) {
   };
 }
 
+// How many bytes of graphics a pane may send per second when the terminal is on another machine.
+//
+// The local budget above bounds bytes written to a FILE the terminal reads; over SSH there is no
+// shared file, every frame travels inline (`t=d`) as base64 PNG down the link, and the link is the
+// limit. It is also a limit the engine feels directly rather than through the terminal's CPU: the
+// pane's tty is written synchronously on the main thread, so a burst the link cannot drain blocks
+// the write, and with it input, the agent socket and every paint, until sshd catches up.
+//
+// Measured from a Mac to a Coder workspace (relayed, 83ms RTT): ~6.5MB/s of bulk output through
+// `coder ssh`. 4MB/s leaves headroom for the keystrokes and patches that share the link, and it
+// still covers what most moments need — a text page's whole frame at 1200x800 is tens of KB, so
+// it runs at the full rate; only a large busy pane is slowed, to what actually arrives.
+//
+// `TWEB_REMOTE_BUDGET` (bytes per second) overrides it for a faster or slower link.
+const REMOTE_BYTE_BUDGET = Number.parseInt(process.env.TWEB_REMOTE_BUDGET || "", 10) || 4e6;
+
+// Lower than the local floor, on purpose. Locally a floor protects the picture because the budget
+// is a guess about a machine with slack; remotely the budget is the pipe, and a frame sent above
+// it does not arrive sooner, it queues — and queued frames are latency on every keystroke.
+const REMOTE_MIN_RATE = 2;
+
+/**
+ * Rates for a pane whose terminal is remote, given what its whole frames have actually cost.
+ *
+ * Bounded by wire bytes per frame, which is measured rather than derived from the area: a PNG of
+ * a text page is a few percent of the raw pixels and a photo is most of them, so the area says
+ * nothing useful about the bytes on the link. Until a frame has been sent there is no measurement
+ * and the rates are the configured ones; the first frame is what calibrates them.
+ *
+ * Every tier is capped, the maximum included: interaction raises the pane to `max`, and scrolling
+ * a page sends whole frames as fast as the rate allows, which is exactly the burst that blocks.
+ * A pinned rate (`adaptive` false) is left alone — that is the user overriding the policy.
+ *
+ * @param {number} maxRate the configured maximum, 1-60
+ * @param {boolean} adaptive false pins everything to the maximum
+ * @param {number|null} wireBytesPerFrame recent whole frames' size on the wire, null if none yet
+ * @param {number} [budget] bytes per second
+ */
+function remoteFrameRateTiers(maxRate, adaptive, wireBytesPerFrame, budget = REMOTE_BYTE_BUDGET) {
+  const base = frameRateTiers(maxRate, adaptive);
+  if (!adaptive) return base;
+  const bytes = Number(wireBytesPerFrame);
+  if (!Number.isFinite(bytes) || bytes <= 0) return base;
+  const affordable = Math.floor(budget / bytes);
+  const cap = Math.min(base.max, Math.max(Math.min(REMOTE_MIN_RATE, base.max), affordable));
+  return { max: cap, playback: Math.min(base.playback, cap), idle: Math.min(base.idle, cap) };
+}
+
+/**
+ * The size estimate for the next frame, from the one just sent.
+ *
+ * A moving average rather than the last value, so one blank frame between two photos does not
+ * open the rate up for a burst the link cannot take. Weighted toward the new value (0.5) because
+ * a pane's content does change — navigating from a photo to a text page should be felt within a
+ * couple of frames.
+ */
+function nextWireEstimate(previous, bytes) {
+  const sent = Number(bytes);
+  if (!Number.isFinite(sent) || sent <= 0) return previous ?? null;
+  if (!Number.isFinite(previous) || previous <= 0) return sent;
+  return Math.round(previous * 0.5 + sent * 0.5);
+}
+
 /**
  * The rate an interaction may raise this pane to.
  *
@@ -236,6 +299,7 @@ function settledFrameRate(paints, tiers) {
 }
 
 module.exports = {
+  remoteFrameRateTiers, nextWireEstimate, REMOTE_BYTE_BUDGET, REMOTE_MIN_RATE,
   playbackHeadroom,
   frameRateTiers, floatingFrameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea,
   interactionRate, PLAYBACK_MIN_PAINTS, PLAYBACK_MIN_RATE, PLAYBACK_BYTE_BUDGET,
