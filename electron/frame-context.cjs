@@ -72,6 +72,8 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // each other's names to the terminal. See shm-frames.cjs.
     shmWholeFrames: 0,
     shmSlot: 0,
+    shmPatches: 0,
+    shmPatchSlot: 0,
     // Whether this pane's marker file is in userData yet — what lets a later engine find its
     // objects if this one is killed before it can unlink them.
     shmMarked: false,

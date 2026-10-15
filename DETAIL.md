@@ -1188,6 +1188,16 @@ dead-pid rule as frame files. A failed shm write falls back to the file medium f
 in a row turn shm off for the session. `tweb diag` reports `wholeMedium`, `shmReason`, `shmError`,
 `wholeShm`.
 
+**Patches too (2026-10-15).** With the addon loaded, `sendPatch` takes the crop's raw pixels
+(`crop().toBitmap()`), writes them into a per-pane 16-slot patch ring (`/twb.<pid>.<image>.p<slot>`),
+and puts only the name on the tty. That removes both things that bounded patches: the synchronous
+`toPNG()` on the main thread (p90 24ms at the 0.2 area limit) and the inline base64 that blocked the
+main thread in `write()` on whiteboard damage. `PATCH_AREA_LIMIT` is unchanged — raising it is its own
+measured change. `bench/shm-consumer.py` checks the engine side on a bare PTY by acting as the terminal:
+fullpaint 186 whole frames, smallpaint 136 patches, all through shm, every object present and sized
+`s*v*4`, red and green read back as `ff0000`/`00ff00` (no blue, so the swap is right), 0 inline PNG
+patches.
+
 ## 9. A component and interface structure built for extension
 
 > **The traits below exist as Rust source; almost none of them have an implementation.**

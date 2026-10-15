@@ -59,7 +59,8 @@ const {
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const {
-  shmFramesDecision, shmFrameName, shmMarkerName, abandonedShmFrames, SHM_RING,
+  shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
+  SHM_RING, SHM_PATCH_RING,
 } = require("./shm-frames.cjs");
 const { mouseEventParams, pointerTarget, nextCapture } = require("./oopif-input.cjs");
 const { interpolatePoints } = require("./pointer-interpolation.cjs");
@@ -1443,19 +1444,29 @@ function syncTmuxVisibility() {
 // The next ring slot's object name for this pane, or null when frames are not going through
 // shared memory. The first one also drops the pane's marker file, so a later engine can find and
 // unlink these objects if this one dies before its worker's exit path runs.
+function markShmPane(frames) {
+  if (frames.shmMarked) return;
+  frames.shmMarked = true;
+  try {
+    writeFileSync(path.join(app.getPath("userData"), shmMarkerName(process.pid, frames.imageIds.base)), "");
+  } catch (error) {
+    console.error(`tweb: shm marker write failed: ${error.message}`);
+  }
+}
+
 function nextShmFrameName(frames) {
   if (!shmFramesEnabled) return null;
-  if (!frames.shmMarked) {
-    frames.shmMarked = true;
-    try {
-      writeFileSync(path.join(app.getPath("userData"), shmMarkerName(process.pid, frames.imageIds.base)), "");
-    } catch (error) {
-      console.error(`tweb: shm marker write failed: ${error.message}`);
-    }
-  }
+  markShmPane(frames);
   const slot = frames.shmSlot;
   frames.shmSlot = (slot + 1) % SHM_RING;
   return shmFrameName(process.pid, frames.imageIds.base, slot);
+}
+
+function nextShmPatchName(frames) {
+  markShmPane(frames);
+  const slot = frames.shmPatchSlot;
+  frames.shmPatchSlot = (slot + 1) % SHM_PATCH_RING;
+  return shmPatchName(process.pid, frames.imageIds.base, slot);
 }
 
 // A frame whose shm write failed already went out through the file medium inside the worker, so a
@@ -1924,8 +1935,10 @@ function deletePatches(frames = currentFrames()) {
 
 // Kitty places an image at the cursor. Patches address their cell against the pane's own
 // origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
-function patchPlacementSequence(id, place, frames = currentFrames()) {
-  const header = `a=T,f=100,i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
+// `format` is the transmission half of the header: `f=100` for a PNG sent inline, or the raw
+// `f=32,s=,v=,t=s` of a shared-memory patch.
+function patchPlacementSequence(id, place, frames = currentFrames(), format = "f=100") {
+  const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
@@ -1958,6 +1971,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   if (!geometry) return false;
 
   const patchStarted = frameProbeMark();
+  if (shmFramesEnabled && sendShmPatch(image, damage, geometry, frames, record, patchStarted)) return true;
   let png;
   try {
     png = image.crop(geometry.crop).toPNG();
@@ -2004,6 +2018,56 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
     console.error(`tweb: patch sent #${patchFramesSent} `
       + `cells=${geometry.place.cols}x${geometry.place.rows}`
       + `@${geometry.place.col},${geometry.place.row} bytes=${png.length}`);
+  }
+  return true;
+}
+
+// A patch through shared memory: the crop's raw pixels go into an object and only its name goes
+// over the tty.
+//
+// What this removes is everything that kept patches small. The PNG path pays a SYNCHRONOUS
+// `toPNG()` on this thread that scales with area (patch-geometry.cjs: p90 24ms at the 0.2 limit,
+// 422ms at 0.85), and then writes the base64 inline — the 360-430KB whiteboard patches that
+// blocked this thread in `write()` (see `IMMEDIATE_PATCH_MAX_BYTES`). Here the cost is the crop's
+// copy plus one more copy into the mapping, and the tty sees a few dozen bytes, so neither the
+// encode nor the byte cap applies. The area limit is left as it is: raising it is a separate,
+// measured change.
+//
+// Returns false when the shm write failed, and the caller carries on down the PNG path with the
+// same geometry, so a broken shm costs a frame's worth of speed and never the patch.
+function sendShmPatch(image, damage, geometry, frames, record, patchStarted) {
+  let bitmap;
+  const name = nextShmPatchName(frames);
+  try {
+    bitmap = image.crop(geometry.crop).toBitmap();
+    // `s=`/`v=` are taken from the crop rect, so a bitmap of any other size would be read with the
+    // wrong stride — a sheared patch rather than an error. The PNG path carries its own size.
+    if (bitmap.length !== geometry.crop.width * geometry.crop.height * 4) return false;
+    shmAddon.writeShmFrame(name, bitmap, true);
+  } catch (error) {
+    noteShmFrameResult({ shmError: `patch: ${error.message}` }, frames);
+    return false;
+  }
+  const patchEncoded = frameProbeMark();
+  const id = takeNextPatchId(frames);
+  const { width, height } = geometry.crop;
+  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames,
+    `f=32,s=${width},v=${height},t=s`);
+  writeGfx(`a=d,d=I,i=${id},q=2`, "");
+  writeGfxChunked(header, Buffer.from(name).toString("base64"), prefix, suffix);
+  frameProbeRecord("patch", {
+    patch: frameProbeMs(patchStarted, patchEncoded),
+    transfer: frameProbeMs(patchEncoded, frameProbeMark()),
+    total: frameProbeMs(patchStarted, frameProbeMark()),
+  }, bitmap.length);
+  notePatch(frames, id, damage);
+  inputTrace.mark("frame", { kind: "patch", bytes: bitmap.length, medium: "shm" });
+  record.frames.patches += 1;
+  frames.shmPatches += 1;
+  if (record.frames.patches <= 12) {
+    console.error(`tweb: patch sent #${record.frames.patches} shm `
+      + `cells=${geometry.place.cols}x${geometry.place.rows}`
+      + `@${geometry.place.col},${geometry.place.row} bytes=${bitmap.length}`);
   }
   return true;
 }
@@ -4567,6 +4631,8 @@ function agentDiagnostics() {
       shmReason: shmDecision.reason,
       shmError: lastShmFrameError,
       wholeShm: currentFrames().shmWholeFrames,
+      // Of `patches`, how many went through shared memory rather than as an inline PNG.
+      patchesShm: currentFrames().shmPatches,
       // The base image id, which is also what this pane's shm object names are built from.
       imageId: currentFrames().imageIds.base,
       // How much of the byte budget this pane has earned above the default. 1 means it is on
@@ -8551,8 +8617,8 @@ function cleanupShmFrames() {
     const imageId = frames?.imageIds?.base;
     if (!frames?.shmMarked || seen.has(imageId)) continue;
     seen.add(imageId);
-    for (let slot = 0; slot < SHM_RING; slot += 1) {
-      try { shmAddon.unlinkShm(shmFrameName(process.pid, imageId, slot)); } catch {}
+    for (const name of paneShmNames(process.pid, imageId)) {
+      try { shmAddon.unlinkShm(name); } catch {}
     }
     try { unlinkSync(path.join(app.getPath("userData"), shmMarkerName(process.pid, imageId))); } catch {}
   }

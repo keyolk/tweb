@@ -2,7 +2,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  shmFramesDecision, shmFrameName, shmMarkerName, abandonedShmFrames, SHM_RING,
+  shmFramesDecision, shmFrameName, shmPatchName, paneShmNames, shmMarkerName, abandonedShmFrames,
+  SHM_RING, SHM_PATCH_RING,
 } = require("./shm-frames.cjs");
 
 test("shm frames need the addon before anything else", () => {
@@ -39,6 +40,13 @@ test("a dead engine's marker names every ring slot it may have left", () => {
   const names = [shmMarkerName(10, 3), shmMarkerName(11, 4), shmMarkerName(12, 5), "tweb-frame-10-3.rgba"];
   const swept = abandonedShmFrames(names, 12, (pid) => pid === 11);
   assert.deepEqual(swept.map((entry) => entry.marker), ["tweb-shm-10-3"]);
-  assert.equal(swept[0].objects.length, SHM_RING);
+  assert.equal(swept[0].objects.length, SHM_RING + SHM_PATCH_RING);
   assert.equal(swept[0].objects[0], shmFrameName(10, 3, 0));
+});
+
+test("patch object names also fit the limit, and never collide with whole-frame names", () => {
+  const patch = shmPatchName(4194304, 2147483647, SHM_PATCH_RING - 1);
+  assert.ok(patch.length <= 31, `${patch} is ${patch.length} bytes`);
+  const names = paneShmNames(7, 9);
+  assert.equal(new Set(names).size, names.length);
 });
