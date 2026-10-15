@@ -365,6 +365,10 @@ pub enum Command {
     },
     /// The element the user picked in inspect mode — selector, HTML, text, box.
     InspectElement {
+        /// Also paste it, with a screenshot of the element, into the coding agent pane in the
+        /// browser pane's tmux window — what inspect mode's `a` key does. Never presses Enter.
+        #[arg(long)]
+        send: bool,
         #[command(flatten)]
         agent: AgentOptions,
     },
@@ -841,7 +845,9 @@ fn agent_call(
             let path = path.map(|value| resolve_output_path(&value, working_directory));
             ("capture", json!({ "path": path, "limit": limit }), agent)
         }
-        Command::InspectElement { agent } => ("inspect-element", json!({}), agent),
+        Command::InspectElement { send, agent } => {
+            ("inspect-element", json!({ "send": send }), agent)
+        }
         Command::Float { agent } => ("float", json!({}), agent),
         Command::Pin { agent } => ("pin", json!({}), agent),
         Command::Console {

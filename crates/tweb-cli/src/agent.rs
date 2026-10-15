@@ -489,10 +489,25 @@ pub fn render(method: &str, result: &Value) -> String {
             let tag = text_field(result, "tag");
             let url = text_field(result, "url");
             if selector.is_empty() {
-                "no element picked\n".to_string()
-            } else {
-                format!("{}  {}  {}\n", tag, selector, url)
+                return "no element picked\n".to_string();
             }
+            let mut out = format!("{}  {}  {}\n", tag, selector, url);
+            // `--send`: where the pick went, or why it went nowhere.
+            if let Some(sent) = result.get("sent") {
+                if sent.get("ok").and_then(Value::as_bool) == Some(true) {
+                    out.push_str(&format!(
+                        "sent to {} {}\n",
+                        text_field(sent, "agent"),
+                        text_field(sent, "pane")
+                    ));
+                } else {
+                    out.push_str(&format!("not sent: {}\n", text_field(sent, "reason")));
+                }
+                if let Some(Value::String(path)) = sent.get("screenshot") {
+                    out.push_str(&format!("screenshot: {path}\n"));
+                }
+            }
+            out
         }
         "float" => {
             if result.get("floating").and_then(|v| v.as_bool()) == Some(true) {
@@ -727,6 +742,31 @@ mod tests {
             rendered.contains("POST    -    https://example.com/api"),
             "{rendered}"
         );
+    }
+
+    /// `--send` says where the pick went — or why it went nowhere, which is the line a user
+    /// with no agent pane needs to see rather than a silent success.
+    #[test]
+    fn inspect_send_reports_the_destination_or_the_reason() {
+        let picked = serde_json::json!({ "selector": "h1", "tag": "h1", "url": "https://a.test/" });
+        assert_eq!(
+            super::render("inspect-element", &picked),
+            "h1  h1  https://a.test/\n"
+        );
+        let mut sent = picked.clone();
+        sent["sent"] = serde_json::json!({ "ok": true, "agent": "claude", "pane": "%2",
+                                           "screenshot": "/c/handoff/x-element.png" });
+        let rendered = super::render("inspect-element", &sent);
+        assert!(rendered.contains("sent to claude %2\n"), "{rendered}");
+        assert!(
+            rendered.contains("screenshot: /c/handoff/x-element.png\n"),
+            "{rendered}"
+        );
+        let mut refused = picked;
+        refused["sent"] = serde_json::json!({ "ok": false,
+                                              "reason": "no coding agent pane in this tmux window" });
+        assert!(super::render("inspect-element", &refused)
+            .contains("not sent: no coding agent pane in this tmux window\n"));
     }
 
     /// `undefined` used to come back as `{}` — the engine's `{ value: undefined }` loses its key

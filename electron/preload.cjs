@@ -261,8 +261,12 @@ installPrintShim();
   let visualState = null;
   let inspectState = null;
   // The element context the user picked in inspect mode, kept so an agent that
-  // asks for it later still gets it. Cleared when inspect mode closes.
+  // asks for it later still gets it. Set by the pick, cleared by `Esc` — the keys that act on
+  // the pick close inspect mode, and they used to clear it on the way out, so
+  // `tweb inspect-element` answered "no element picked" for every pick ever made.
   let lastInspectPayload = null;
+  // The live element behind it, so a later request reports where it is NOW.
+  let lastInspectElement = null;
   let tabListState = null;
   let historyState = null;
   let helpHost = null;
@@ -3134,7 +3138,14 @@ installPrintShim();
         // is built in the key handler rather than here because the element is gone by
         // the time this runs — inspect mode may have closed and the reference is to a
         // live DOM node.
-        return lastInspectPayload || null;
+        if (!lastInspectPayload) return null;
+        // Where the element is now: the page may have scrolled since the pick, and
+        // `--send` screenshots this box.
+        const now = lastInspectElement?.isConnected ? visibleRect(lastInspectElement) : null;
+        if (!now) return lastInspectPayload;
+        const origin = topViewportPoint({ x: now.left, y: now.top });
+        return { ...lastInspectPayload, rect: { width: Math.round(now.width), height: Math.round(now.height),
+                                                left: Math.round(origin.x), top: Math.round(origin.y) } };
       }
       default: throw new Error(`unknown agent method ${JSON.stringify(request.method)}`);
     }
@@ -3193,7 +3204,7 @@ installPrintShim();
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
       ["D · o/O · p · d", "image download · open target · paste · inspect"],
-      ["I", "inspect picker", { I: () => startInspect() }],
+      ["I", "inspect picker — then y/h/t copy, a sends it to the agent pane", { I: () => startInspect() }],
     ]],
     ["Browser and modes", [
       ["zi · zo · zz", "zoom in · out · reset", {
@@ -4783,7 +4794,6 @@ installPrintShim();
     inspectState.outline.remove();
     inspectState.panel.remove();
     inspectState = null;
-    lastInspectPayload = null;
     if (restoreMode) normalMode();
   }
 
@@ -5005,7 +5015,7 @@ installPrintShim();
       `${Math.round(item.rect.width)}×${Math.round(item.rect.height)} @ ${Math.round(item.rect.left)},${Math.round(item.rect.top)}`,
       attributes,
       `display=${computed.display} position=${computed.position} color=${computed.color} font=${computed.fontSize}`,
-      "y selector · h HTML · t text · Esc",
+      "y selector · h HTML · t text · a agent · Esc",
     ].filter(Boolean).join("\n");
     panel.textContent = summary;
     panel.style.cssText = [
@@ -5016,7 +5026,23 @@ installPrintShim();
     ].join(";");
     document.documentElement.append(panel);
     inspectState = { ...item, selector, outline, panel };
+    lastInspectPayload = inspectPayload(inspectState);
+    lastInspectElement = element;
     setMode("inspect", element.localName);
+  }
+
+  // Everything an agent gets about a pick. All of it, whichever key acted on it: which part the
+  // agent leans on is its call.
+  function inspectPayload(item, rect = item.rect) {
+    return {
+      selector: item.selector,
+      html: item.element.outerHTML,
+      text: item.element.innerText || item.element.textContent || "",
+      rect: { width: Math.round(rect.width), height: Math.round(rect.height),
+              left: Math.round(rect.left), top: Math.round(rect.top) },
+      url: location.href,
+      tag: item.element.localName,
+    };
   }
 
   function startInspect() {
@@ -5028,22 +5054,28 @@ installPrintShim();
     event.preventDefault();
     event.stopImmediatePropagation();
     const item = inspectState;
-    if (key === "Escape") cancelInspect();
-    else if (key === "y" || key === "h" || key === "t") {
+    if (key === "Escape") {
+      cancelInspect();
+      lastInspectPayload = null;
+      lastInspectElement = null;
+    } else if (key === "a") {
+      // Push the pick to the coding agent in this tmux window (agent-handoff.cjs picks the pane).
+      // The outline and panel go first and the send waits two frames, because the engine
+      // screenshots the element and should not photograph tweb's own overlay over it.
+      const payload = inspectPayload(item, visibleRect(item.element) || item.rect);
+      const origin = topViewportPoint({ x: payload.rect.left, y: payload.rect.top });
+      payload.rect = { ...payload.rect, left: Math.round(origin.x), top: Math.round(origin.y) };
+      lastInspectPayload = payload;
+      cancelInspect(false);
+      flash("agent…");
+      requestAnimationFrame(() => requestAnimationFrame(() => send("inspect-to-agent", payload)));
+    } else if (key === "y" || key === "h" || key === "t") {
       // Clipboard stays — a person at the terminal can still paste. The agent gets the
       // same context as an Orca design-mode attachment: the selector, the HTML, the text,
       // and the element's box, all in one message, so it does not have to re-fetch what the
       // user already picked. Which of the three the agent leans on is its call; it gets all
       // three rather than just the one the key selected.
-      const payload = {
-        selector: item.selector,
-        html: item.element.outerHTML,
-        text: item.element.innerText || item.element.textContent || "",
-        rect: { width: Math.round(item.rect.width), height: Math.round(item.rect.height),
-                left: Math.round(item.rect.left), top: Math.round(item.rect.top) },
-        url: location.href,
-        tag: item.element.localName,
-      };
+      const payload = inspectPayload(item);
       if (key === "y") send("copy-text", item.selector);
       else if (key === "h") send("copy-text", item.element.outerHTML);
       else if (key === "t") send("copy-text", item.element.innerText || item.element.textContent || "");
