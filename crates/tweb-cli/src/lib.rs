@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod mcp;
 pub mod sites;
+pub mod skill;
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -393,6 +394,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// The agent skill that teaches Claude Code or Codex to drive tweb: install, uninstall, print.
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
     /// Settings in config.toml: list, get, set, unset, edit, path.
     Config {
         #[command(subcommand)]
@@ -461,6 +467,52 @@ pub struct AgentOptions {
     /// Print raw JSON instead of the human-readable summary.
     #[arg(long, global = true)]
     pub json: bool,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct SkillAgents {
+    /// Claude Code: `~/.claude/skills/tweb/SKILL.md` (`$CLAUDE_CONFIG_DIR` when set).
+    #[arg(long)]
+    pub claude: bool,
+    /// Codex: `~/.codex/skills/tweb/SKILL.md` (`$CODEX_HOME` when set).
+    #[arg(long)]
+    pub codex: bool,
+}
+
+impl SkillAgents {
+    fn agents(&self) -> Vec<skill::Agent> {
+        let mut agents = Vec::new();
+        if self.claude {
+            agents.push(skill::Agent::Claude);
+        }
+        if self.codex {
+            agents.push(skill::Agent::Codex);
+        }
+        agents
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillAction {
+    /// Write the skill for the agents named, or for each agent installed here when none is.
+    Install {
+        #[command(flatten)]
+        agents: SkillAgents,
+        /// Replace a SKILL.md that tweb did not write.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the skill tweb installed. A SKILL.md it did not write is kept.
+    Uninstall {
+        #[command(flatten)]
+        agents: SkillAgents,
+    },
+    /// Print the skill to stdout, for an agent tweb does not know where to install for.
+    Print {
+        /// Include the Codex section.
+        #[arg(long)]
+        codex: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -681,6 +733,18 @@ pub async fn run() -> Result<()> {
         Command::Doctor { fix } => {
             doctor::run(fix).await?;
         }
+        Command::Skill { action } => match action {
+            SkillAction::Install { agents, force } => skill::install(&agents.agents(), force)?,
+            SkillAction::Uninstall { agents } => skill::uninstall(&agents.agents())?,
+            SkillAction::Print { codex } => print!(
+                "{}",
+                skill::render(if codex {
+                    skill::Agent::Codex
+                } else {
+                    skill::Agent::Claude
+                })
+            ),
+        },
         Command::Config { action } => match action.unwrap_or(ConfigAction::List { json: false }) {
             ConfigAction::List { json } => config::list(json)?,
             ConfigAction::Get { key } => config::get(&key)?,
