@@ -47,6 +47,9 @@ pub struct PaneOptions {
     pub frame_rate: u16,
     pub adaptive_frame_rate: bool,
     pub restore_session: bool,
+    /// `--transparent`: clear page backgrounds for this pane (see electron/transparent-pages.cjs).
+    /// Only the flag; `page.transparent` in config.toml is read by the engine itself.
+    pub transparent: bool,
 }
 
 impl Default for PaneOptions {
@@ -56,6 +59,7 @@ impl Default for PaneOptions {
             frame_rate: 30,
             adaptive_frame_rate: true,
             restore_session: false,
+            transparent: false,
         }
     }
 }
@@ -531,8 +535,11 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 } else {
                     "0"
                 })
-                .arg(url)
                 .current_dir(electron_dir);
+            if options.transparent {
+                command.arg("--tweb-transparent").arg("1");
+            }
+            command.arg(url);
             match options.engine {
                 BrowserEngine::Chrome => {
                     command.env("TWEB_BROWSER", "chrome");
@@ -831,6 +838,11 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
     // A Chrome pane drives a browser that is already shared across panes, and a WebKit pane its
     // own page host; the supervisor hosts Electron pages only, so it is not consulted.
     if options.engine != BrowserEngine::Electron {
+        return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
+    }
+    // The host's ATTACH has no field for it, and a hosted engine reads `page.transparent` from
+    // config.toml for every pane anyway. Only the per-pane flag needs a per-pane engine.
+    if options.transparent {
         return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
     }
     // Decided BEFORE the daemon is started or consulted: a pane that opted out, or one asking for

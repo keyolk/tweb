@@ -127,6 +127,7 @@ const {
   audioOwnerAmong, paneImageIds, collidingImageRange, PATCH_ID_COUNT,
 } = require("./pane-registry.cjs");
 const { paneFrameFileList, runTeardown } = require("./teardown.cjs");
+const { transparentPages, transparentWindowOptions } = require("./transparent-pages.cjs");
 const {
   parseControlLine, resolveTarget, formatOutbound, keyboardRestoreEvent,
 } = require("./pane-control.cjs");
@@ -283,7 +284,7 @@ function commandLineValue(name) {
 }
 
 function commandLineUrl() {
-  const optionsWithValues = new Set(["--tweb-frame-rate", "--tweb-adaptive-frame-rate"]);
+  const optionsWithValues = new Set(["--tweb-frame-rate", "--tweb-adaptive-frame-rate", "--tweb-transparent"]);
   const args = process.argv.slice(2);
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -311,6 +312,16 @@ const adaptiveFrameRate = configuredAdaptiveFrameRate !== undefined
   ? configuredAdaptiveFrameRate !== "0"
   : settings.get("frame_rate.adaptive");
 const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxActiveFrameRate;
+// `tweb open --transparent` passes this; `page.transparent` in config.toml is read per new tab, so
+// it reaches hosted panes too, whose ATTACH carries no such flag. See transparent-pages.cjs.
+const transparentFlag = commandLineValue("--tweb-transparent") === "1";
+function newTabsTransparent() {
+  return transparentPages({ flag: transparentFlag, setting: settings.get("page.transparent"), backend: pageBackend.kind });
+}
+// The tabs created transparent. Per tab rather than read from the setting at paint time: the
+// setting can change under a running engine, and a tab created clear must keep refusing patches
+// (see transparent-pages.cjs) even after the setting is turned off.
+const transparentTabs = new WeakSet();
 // See frame-rate-policy.cjs for why playback is its own tier and how it is detected.
 const frameRates = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
 const playbackWindow = playbackWindowMs(idleFrameRate);
@@ -2033,7 +2044,9 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   // Small damage goes out immediately as a patch instead of waiting for the frame
   // interval — the wait exists to pace whole-frame encodes, and a patch costs a
   // thousandth of one. A caret keeping up with the keyboard is the whole point.
-  if (dirty && !currentFrames().pendingFrameTimer && sendPatch(image, dirty, generation)) {
+  // Not for a transparent tab: a clear pixel in a patch shows the stale base frame beneath it.
+  if (dirty && !transparentTabs.has(tab) && !currentFrames().pendingFrameTimer
+    && sendPatch(image, dirty, generation)) {
     currentFrames().lastFrameSentAt = Date.now();
     return;
   }
@@ -2154,6 +2167,7 @@ function renderedFrameSize(vp) {
 function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize()) {
   const logical = logicalContentSize(vp);
   return {
+    ...transparentWindowOptions(newTabsTransparent()),
     width: logical.width,
     height: logical.height,
     useContentSize: true,
@@ -4420,6 +4434,8 @@ function agentDiagnostics() {
     pane: ownTmuxPane,
     pid: process.pid,
     engineApp: __dirname,
+    // Whether the active tab was created clear, and so sends whole frames only.
+    transparent: tab ? transparentTabs.has(tab) : null,
     pane_geometry: {
       cells: currentFrames().cells,
       pixels: currentFrames().viewport ? { width: currentFrames().viewport.width, height: currentFrames().viewport.height } : null,
@@ -6511,6 +6527,9 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
   const record = currentPane();
   tabPanes.set(tab, record);
   if (currentWindows().tabs.includes(tab)) return tab;
+  // Every tab, popups included, comes through here right after its window was built from
+  // `browserWindowOptions()`, so the setting read now is the one that window was created with.
+  if (newTabsTransparent()) transparentTabs.add(tab);
   configureTab(tab, initialZoomFactor);
   tabSessionUrls.set(tab, url || "about:blank");
   currentWindows().tabs.push(tab);
