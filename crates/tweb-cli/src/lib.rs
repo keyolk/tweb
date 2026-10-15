@@ -48,6 +48,11 @@ pub struct BrowserOptions {
     /// Disable activity-aware frame-rate adaptation.
     #[arg(long, overrides_with = "adaptive_frame_rate")]
     pub no_adaptive_frame_rate: bool,
+
+    /// Let the terminal show through pages that paint no background of their own.
+    /// `page.transparent` in config.toml turns it on for every pane. Electron engine only.
+    #[arg(long)]
+    pub transparent: bool,
 }
 
 impl BrowserOptions {
@@ -74,6 +79,19 @@ impl BrowserOptions {
 
     fn engine(&self) -> BrowserEngineArg {
         self.engine.unwrap_or(BrowserEngineArg::Electron)
+    }
+
+    /// Refuses `--transparent` where it cannot be honoured. Only the flag: `page.transparent`
+    /// from config.toml is ignored by those engines instead, because a setting meant for every
+    /// pane must not stop a Chrome pane from opening.
+    fn check_transparent(&self) -> Result<()> {
+        if self.transparent && !matches!(self.engine(), BrowserEngineArg::Electron) {
+            anyhow::bail!(
+                "--transparent needs the Electron engine: the Chrome engine's frames are JPEG and \
+                 the WebKit host has no transparent path"
+            );
+        }
+        Ok(())
     }
 
     /// A flag on this command line wins; otherwise `frame_rate.adaptive` from config.toml.
@@ -107,6 +125,9 @@ impl BrowserOptions {
         } else {
             " --no-adaptive-frame-rate"
         });
+        if self.transparent {
+            value.push_str(" --transparent");
+        }
         value
     }
 }
@@ -661,6 +682,7 @@ pub async fn run() -> Result<()> {
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // An omitted URL is preserved across tmux split-window too.
             let browser = browser.with_engine_for(url.as_deref());
+            browser.check_transparent()?;
             split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
         }
         Command::PaneInternal { browser, page, url } => {
@@ -882,6 +904,7 @@ fn agent_call(
 /// rather than being spawned as a separate binary. That is what keeps version skew from
 /// appearing between the CLI and the frontend (DESIGN.md 4.1).
 async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
+    browser.check_transparent()?;
     // The frontend locates the engine paths itself. If the CLI guessed and passed them in, the
     // binary and the app directory could end up mismatched (node_modules/electron has a
     // package.json too), and being the same process there is no reason to pass them anyway.
@@ -895,6 +918,7 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
         frame_rate: browser.max_frame_rate(),
         adaptive_frame_rate: browser.adaptive(),
         restore_session: url.is_none(),
+        transparent: browser.transparent,
     };
     tweb_pane::run_with_options(url.unwrap_or("about:blank"), options).await
 }
@@ -999,6 +1023,7 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
         frame_rate: None,
         adaptive_frame_rate: false,
         no_adaptive_frame_rate: false,
+        transparent: false,
     };
     split_and_run_pane(
         Some(url),
@@ -1114,6 +1139,34 @@ mod tests {
                 assert!(!browser.no_adaptive_frame_rate);
             }
             other => panic!("bare tweb parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transparent_reaches_the_split_pane_and_only_on_electron() {
+        let cli = Cli::try_parse_from([
+            "tweb",
+            "split",
+            "--frame-rate",
+            "30",
+            "--adaptive-frame-rate",
+            "--transparent",
+            "--engine",
+            "electron",
+        ])
+        .unwrap();
+        let Command::Split { browser, .. } = cli.command else {
+            panic!("not a split");
+        };
+        assert!(browser.check_transparent().is_ok());
+        assert!(browser.shell_args().ends_with(" --transparent"));
+        for engine in ["chrome", "webkit"] {
+            let cli =
+                Cli::try_parse_from(["tweb", "open", "--engine", engine, "--transparent"]).unwrap();
+            let Command::Open { browser, .. } = cli.command else {
+                panic!("not an open");
+            };
+            assert!(browser.check_transparent().is_err(), "{engine}");
         }
     }
 

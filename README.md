@@ -71,6 +71,9 @@ tweb split --engine webkit https://localhost:5173
 # Run the pages in your own (managed) Google Chrome — Okta device trust, Endpoint Verification
 tweb split --engine chrome https://sendbird.okta.com/
 
+# Let the terminal background show through pages without a background colour
+tweb open --transparent ./notes.html
+
 # Tune the active maximum frame rate
 # adaptive uses the given value while active and drops to at most 4fps when idle
 tweb open --frame-rate 24 --adaptive-frame-rate https://localhost:5173
@@ -141,6 +144,7 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `zoom.default` | `0.8` | next new tab |
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
+| `page.transparent` | `false` | next new tab |
 | `downloads.dir` | system Downloads | next engine start |
 | `ime.slot_cells` | `3` | live |
 | `search.engine` | `google` (or `duckduckgo`, `bing`, `brave`, `kagi`, `ecosia`, `perplexity`, or a URL with `%s`) | live |
@@ -150,6 +154,14 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 that already set one of these (`TWEB_DEFAULT_ZOOM`, `TWEB_FRAME_RATE`, `TWEB_ADAPTIVE_FRAME_RATE`,
 `TWEB_DOWNLOAD_DIR`, `TWEB_IME_SLOT_CELLS`) still wins over the file, and a flag on `tweb open` wins
 over both. The list itself is `electron/settings-schema.json`, shared by the CLI and the engine.
+
+`page.transparent` (or `tweb open --transparent` for one pane) lets the terminal show through pages
+that paint no background of their own: the frame keeps its alpha channel and is placed under the
+text, so the terminal's background colour, opacity and blur show wherever the page is clear. Pages
+with a background of their own are unaffected. A transparent tab sends whole frames only, because a
+damage patch is a second image over the base one and its clear pixels would show the stale frame
+beneath. Electron engine only (Chrome's screencast is JPEG; the WebKit host has no transparent
+path). The floating window (`w`) relays JPEG, so a clear page is black there.
 
 Wheel direction needs no setting to match macOS: the terminal has already applied natural scrolling
 when it reports the wheel, and TWeb follows the report. `scroll.invert` is for wanting it the other way.

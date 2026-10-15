@@ -46,6 +46,14 @@
       "description": "Drop to a low idle rate when nothing moves. `--no-adaptive-frame-rate` overrides it."
     },
     {
+      "key": "page.transparent",
+      "type": "bool",
+      "default": false,
+      "env": "TWEB_TRANSPARENT",
+      "applies": "new-tab",
+      "description": "Let the terminal show through pages that paint no background. Electron engine only. `tweb open --transparent` turns it on for one pane."
+    },
+    {
       "key": "downloads.dir",
       "type": "path",
       "default": "",
