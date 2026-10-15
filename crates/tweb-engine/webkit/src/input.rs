@@ -236,6 +236,17 @@ fn wheel(webview: &WKWebView, input: &Mouse) {
         );
     }
     if let Some(event) = NSEvent::eventWithCGEvent(&event) {
+        // What WebKit will read back, not what was asked for: the phases only count if the CGEvent
+        // fields above survive into the NSEvent.
+        if crate::protocol::profiling() {
+            crate::protocol::profile(format!(
+                "wheel dy={:.2} precise={} phase={} momentum={}",
+                event.scrollingDeltaY(),
+                event.hasPreciseScrollingDeltas(),
+                event.phase().0,
+                event.momentumPhase().0,
+            ));
+        }
         webview.scrollWheel(&event);
     }
 }
