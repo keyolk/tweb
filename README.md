@@ -51,6 +51,47 @@ thereafter. Running inside the workspace prefers `electron/node_modules`, and a 
 takes precedence over the download. Set `TWEB_NO_AUTO_INSTALL=1` to block the automatic install, or
 `TWEB_ELECTRON=<binary>` to point at one yourself. `TWEB_CACHE_DIR` changes the cache location.
 
+### Linux, and machines you reach over SSH (Coder, dev VMs)
+
+TWeb builds and runs on Linux x64 and arm64 with the same `make install`. The terminal stays on
+your laptop; tweb, tmux and the engine run on the remote machine. Run `tweb doctor` there first —
+it reports each of the points below.
+
+- **Electron's shared libraries.** The runtime download is the official Linux zip, which expects the
+  usual desktop libraries. A minimal image (a Coder workspace, a container) has none of them, and
+  `tweb doctor` lists the ones `ldd` cannot resolve. On Ubuntu 24.04:
+
+  ```sh
+  sudo apt-get install --no-install-recommends libnss3 libatk-bridge2.0-0t64 libcups2t64 \
+    libgtk-3-0t64 libgbm1 libxkbcommon0 libasound2t64 libxcomposite1 libxdamage1 libxrandr2 \
+    fonts-dejavu-core fonts-noto-cjk
+  ```
+
+  (Drop the `t64` suffixes on 22.04.) Without fonts the engine starts and draws every glyph as nothing.
+- **No display server is needed.** With neither `DISPLAY` nor `WAYLAND_DISPLAY` set, the engine
+  starts on Chromium's headless Ozone platform with SwiftShader for GL, so WebGL works. Floating
+  mode (`w`) needs a real display and says so instead.
+- **The renderer sandbox.** Chromium sandboxes page renderers with unprivileged user namespaces or
+  a setuid `chrome-sandbox`. Many containers allow neither — a Coder workspace has
+  `user.max_user_namespaces = 0` and no `CAP_SYS_ADMIN`, so even a setuid helper fails there. TWeb
+  then refuses to start and says why. It does not turn the sandbox off by itself: if you accept
+  that a compromised renderer would not be contained, `export TWEB_NO_SANDBOX=1` allows it, and
+  `tweb diag` reports `sandboxed: false` from then on.
+- **Frames travel inline.** When the terminal is on another machine (`SSH_CONNECTION`/`SSH_TTY` in
+  the pane, or on the tmux client attached to it), whole frames go as `t=d` inline PNG rather than
+  as frame files the laptop could never open, and are paced to a link budget of 4MB/s
+  (`TWEB_REMOTE_BUDGET`, bytes per second). `TWEB_FRAME_TRANSPORT=file|direct` overrides the choice;
+  `tweb doctor` and `tweb diag` show the medium in use and why.
+- **Pixel size.** Coder's SSH server forwards rows and columns but not pixels. TWeb then asks your
+  terminal for its cell size through tmux and renders at your laptop's resolution and scale. If your
+  terminal does not answer, set it yourself: `TWEB_CELL_SIZE=18x36` (device pixels per cell).
+- **tmux.** Run `tweb doctor --fix` on the remote machine for its tmux settings (passthrough,
+  extended keys; tmux 3.4 is fine). Ghostty's own settings live on your laptop — run
+  `tweb doctor --fix` there for those. Connect from the terminal straight into the remote tmux: a
+  second tmux on the laptop in between is not supported.
+- **macOS-only parts.** `--engine webkit` (WKWebView) is refused on Linux, and the Chrome engine and
+  `tweb chrome` handoff assume a local desktop Chrome.
+
 ## Commands
 
 The official executable is `tweb`. `twb` is an optional alias.
@@ -886,12 +927,32 @@ Not consolation prizes — these are things Chrome cannot do because it owns its
 - **Modal shortcuts are native.** The Vimium-style layer is TWeb's own preload rather than an
   extension, so it survives the extension gap entirely.
 
+### Linux and remote terminals
+
+Measured on 2026-10-15 on a Coder workspace (Ubuntu 24.04, arm64, no GPU, no display) reached from
+a Mac over `ssh` (relayed, 83ms RTT, ~6.5MB/s bulk), with the Mac side played by a PTY that records
+what a terminal would receive.
+
+| What | Result |
+|---|---|
+| Build, `make check` | Passes on Linux arm64 as on macOS. |
+| Runtime install | The linux-arm64 Electron zip downloads, verifies and runs from `~/.cache/tweb`. |
+| Headless engine | Starts on Ozone headless; GPU process up on SwiftShader, WebGL enabled. |
+| Sandbox | Refused with the reason in a container that cannot sandbox; runs with `TWEB_NO_SANDBOX=1`. |
+| Frames over SSH, in remote tmux | Every whole frame `t=d` PNG, no `o=z`, no raw: 29 of 29 whole frames and 5 patches arrived intact, 2880x1764 at scale 2. |
+| Input over SSH | Keys typed on the laptop side reached the page (`hello` into a field), `j`/PageDown scrolled. |
+| Link load, scrolling Wikipedia | ~740KB a frame; the rate cap settled at 5fps, ~2MB/s on the link with peaks of 2.9-3.2MB/s across two runs. |
+| Link load, full-screen canvas animation | ~290KB a frame, ~6.6fps, 1.9MB/s steady, nothing lost. |
+
+Not yet: the per-pane daemon (`twebd`) does not host remote panes — each gets its own engine — and a
+pane keeps the medium it chose at start if you later attach to it from the other side.
+
 ### What still needs validating
 
 1. The damage-aware Kitty path's frame pacing against the release gate in DESIGN.md §7.7
 2. Chrome extension/profile bootstrap compatibility — nothing is built, so nothing is validated
 3. tmux window-scoped agent resource exchange, beyond the agent socket that ships
-4. Remote Chromium/video transport scalability
+4. Remote video at scale: one link, one pane, measured above; several panes sharing a link are not
 5. The WebKit engine inside a real tmux client: every WebKit number above is from a bare PTY
 6. A live macOS 2-set hangul IME with per-jamo backspace mid-composition
 
