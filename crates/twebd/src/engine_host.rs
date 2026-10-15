@@ -312,17 +312,27 @@ impl EngineHost {
                 return Err(reason);
             }
         }
-        let stdin = {
-            let mut inner = self.inner.lock();
-            inner.sinks.insert(key, sink);
-            inner.stdin.clone()
+        let Some(stdin) = self.register(&key, sink) else {
+            return Err("engine stdin closed".to_string());
         };
-        match stdin {
-            Some(stdin) => stdin
-                .send(line)
-                .map_err(|_| "engine stdin closed".to_string()),
-            None => Err("engine stdin closed".to_string()),
-        }
+        stdin.send(line).map_err(|_| {
+            self.inner.lock().sinks.remove(&key);
+            "engine stdin closed".to_string()
+        })
+    }
+
+    /// Puts a pane in the routing table and returns the engine's stdin — or, with no engine to feed
+    /// it, leaves the table alone and returns `None`.
+    ///
+    /// The engine can die between `spawn_engine` returning and this lock: `watch_exit` is already
+    /// running, and an engine that exits right after `READY` drains the table before this pane is in
+    /// it. A sink registered then would count as a hosted pane that nothing ever closes, while the
+    /// caller is already falling back to its own engine.
+    fn register(&self, key: &PaneKey, sink: PaneSink) -> Option<UnboundedSender<String>> {
+        let mut inner = self.inner.lock();
+        let stdin = inner.stdin.clone()?;
+        inner.sinks.insert(key.clone(), sink);
+        Some(stdin)
     }
 
     /// Forwards one control line to an already-hosted pane. A pane the engine does not have is not
@@ -945,7 +955,10 @@ mod tests {
         let launcher = fake_engine(
             "dies",
             &format!(
-                "#!/bin/sh\necho 'READY {}'\nexit 0\n",
+                // Dies once the pane's attach has reached it, not as soon as it is ready: an engine
+                // that exits straight after `READY` can be gone before `open` registers the pane,
+                // which is a refused open (covered below), not the death this test is about.
+                "#!/bin/sh\necho 'READY {}'\nread -r line\nexit 0\n",
                 crate::protocol::PROTOCOL_VERSION
             ),
         );
@@ -964,5 +977,16 @@ mod tests {
             EngineEvent::Closed { ref pane, .. } if pane.is_empty()
         ));
         assert_eq!(host.hosted_pane_count(), 0, "the routing table is dropped");
+    }
+
+    // An engine gone before the pane is registered refuses it, and the pane is not left in the
+    // routing table: the race between `spawn_engine` and `watch_exit`, made deterministic by
+    // registering against a host whose engine is already gone.
+    #[test]
+    fn a_pane_is_not_routed_to_an_engine_that_is_gone() {
+        let host = EngineHost::new(fake_engine("never-started", "#!/bin/sh\n"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(host.register(&key(), tx).is_none(), "no engine, no stdin");
+        assert_eq!(host.hosted_pane_count(), 0, "and no pane left routed");
     }
 }
