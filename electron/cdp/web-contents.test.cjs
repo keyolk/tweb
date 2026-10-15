@@ -2,7 +2,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { CdpWebContents, isViewportFrame, isBrowserScaleFrame, windowArea } = require("./web-contents.cjs");
+const { CdpWebContents, isViewportFrame, windowArea } = require("./web-contents.cjs");
 
 // Just enough of an engine to construct contents and feed it Page events by hand.
 function contents() {
@@ -491,14 +491,27 @@ test("the input skew is accepted at the ratio between the real and emulated scal
   assert.strictEqual(await created.measureInputScale(), 1, "a probe that missed keeps the last value");
 });
 
-test("a frame at the forced browser scale is the whole viewport, drawn scaled down", () => {
+test("a frame at the forced browser scale is the viewport, not the window", () => {
   const viewport = { width: 900, height: 1125 };
   // Forced to 2 under an emulated 1.6: Chrome sent 1800x2250, which was dropped as the window's.
   assert.ok(isViewportFrame({ width: 1800, height: 2250 }, viewport, 1.6, 2));
-  assert.ok(isBrowserScaleFrame({ width: 1800, height: 2250 }, viewport, 2));
-  assert.ok(!isBrowserScaleFrame({ width: 1440, height: 1800 }, viewport, 2));
-  assert.ok(!isBrowserScaleFrame({ width: 900, height: 1125 }, viewport, 1));
   // A window frame in device pixels sizes the window in DIPs.
   assert.deepEqual(windowArea({ width: 1800, height: 2008 }, 2), { width: 900, height: 1004 });
   assert.deepEqual(windowArea({ width: 900, height: 1004 }, 0), { width: 900, height: 1004 });
+});
+
+// Measured at zoom 0.8 on a 1440x900 pane: the 1800x1126 browser-scale frames held the device
+// picture 1:1 in their top-left; scaled down to the pane, the page shrank to 80% on every scroll.
+test("a frame at the forced browser scale is never drawn; it asks for a capture", async () => {
+  const { created, paints, captures } = cssContents();
+  created.engine.scaleFactor = 2;
+  created.deviceScaleFactor = 1.6;
+  created.viewport = { width: w / 2, height: h / 2 };
+  created.frameSize = { width: Math.round(w / 2 * 1.6), height: Math.round(h / 2 * 1.6) };
+  for (const data of ["QQ==", "Qg=="]) {
+    created.presentScreencastFrame(data);
+    await settle();
+  }
+  assert.deepStrictEqual(paints, []);
+  assert.strictEqual(captures.length, 2);
 });
