@@ -143,6 +143,8 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `frame_rate.adaptive` | `true` | next `tweb open` |
 | `downloads.dir` | system Downloads | next engine start |
 | `ime.slot_cells` | `3` | live |
+| `search.engine` | `google` (or `duckduckgo`, `bing`, `brave`, `kagi`, `ecosia`, `perplexity`, or a URL with `%s`) | live |
+| `search.suggest` | `off` (an engine name or a URL with `%s` turns on omnibox suggestions; every keystroke typed there then goes to that provider) | live |
 
 "Live" means a running pane picks the change up within a second, no restart. An environment variable
 that already set one of these (`TWEB_DEFAULT_ZOOM`, `TWEB_FRAME_RATE`, `TWEB_ADAPTIVE_FRAME_RATE`,
