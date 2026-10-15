@@ -373,6 +373,20 @@ Register it with an MCP client as a stdio server.
 The agent socket is provided by the Electron engine, which also hosts the Chrome and WebKit engines'
 pages — so it serves all three.
 
+To teach a coding agent all of this, install the agent skill (`skill/tweb/SKILL.md`, compiled into
+the binary so it always matches the `tweb` that wrote it):
+
+```sh
+tweb skill install            # for each of Claude Code (~/.claude) and Codex (~/.codex) found here
+tweb skill install --claude   # ~/.claude/skills/tweb/SKILL.md ($CLAUDE_CONFIG_DIR when set)
+tweb skill install --codex    # ~/.codex/skills/tweb/SKILL.md ($CODEX_HOME), plus a sandbox note
+tweb skill print              # to stdout, for any other agent
+tweb skill uninstall
+```
+
+Rerun `install` after upgrading tweb. It replaces only a copy it wrote itself; a SKILL.md you wrote
+is left alone unless you pass `--force`.
+
 ## Browser engines and frame policy
 
 `open` and `split` both accept `--engine electron|chrome|webkit`. The default is `electron`, which
