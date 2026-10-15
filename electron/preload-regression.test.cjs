@@ -1999,18 +1999,26 @@ test("inspect mode sends element context to an agent", () => {
   // The preload keeps the payload so an agent asking later still gets it.
   assert.match(electron, /let lastInspectPayload/);
   // agentDispatch answers the "inspect-element" method from the kept payload.
-  assert.match(electron, /case "inspect-element": \{[\s\S]*return lastInspectPayload \|\| null/);
+  assert.match(electron, /case "inspect-element": \{[^}]*?if \(!lastInspectPayload\) return null;/);
+  // The pick sets it, and closing inspect mode no longer wipes it: every key that acts on a pick
+  // closes inspect mode, so clearing there meant `tweb inspect-element` never saw one.
+  assert.match(electron, /lastInspectPayload = inspectPayload\(inspectState\);/);
+  const cancel = electron.slice(electron.indexOf("function cancelInspect("),
+    electron.indexOf("function cancelCommandPalette("));
+  assert.doesNotMatch(cancel, /lastInspectPayload = null/);
   // The payload carries all three — selector, html, text — not just the one the key picked.
-  const handler = electron.slice(electron.indexOf('const payload = {'),
+  const builder = electron.slice(electron.indexOf("function inspectPayload(item"),
+    electron.indexOf("function startInspect()"));
+  assert.match(builder, /selector: item\.selector/);
+  assert.match(builder, /html: item\.element\.outerHTML/);
+  assert.match(builder, /text: item\.element\.innerText/);
+  assert.match(builder, /rect: \{/);
+  const handler = electron.slice(electron.indexOf("function handleInspectKey("),
     electron.indexOf('window.dispatchEvent(new CustomEvent("tweb-agent-inspect"'));
-  assert.match(handler, /selector: item\.selector/);
-  assert.match(handler, /html: item\.element\.outerHTML/);
-  assert.match(handler, /text: item\.element\.innerText/);
-  assert.match(handler, /rect: \{/);
   // Clipboard still gets the one the key selected.
   assert.match(handler, /if \(key === "y"\) send\("copy-text", item\.selector\)/);
-  // cancelInspect clears the payload, so a stale pick does not leak to the next agent.
-  assert.match(electron, /lastInspectPayload = null;/);
+  // Esc drops the pick, so a cancelled one does not leak to the next agent.
+  assert.match(handler, /if \(key === "Escape"\) \{\s*\n\s*cancelInspect\(\);\s*\n\s*lastInspectPayload = null;/);
   // main.cjs forwards the method as an agent RPC.
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "inspect-element"/);
@@ -3007,4 +3015,89 @@ test("v badges are coloured by kind and the round reads as visual", () => {
   assert.match(electron, /return BADGE_COLORS\[target\.kind\] \|\| BADGE_COLORS\.text;/);
   assert.match(electron, /startPicker\(targets, "hint", pickVisualTarget, space, "visual"\);/);
   assert.match(electron, /setMode\(shown, `\$\{space \? space\.total : targets\.length\}`\);/);
+});
+
+// Inspect mode's `a` pushes the pick to the agent pane. It is a key INSIDE inspect mode, after an
+// element is picked: `a` is a hint label while the picker is open, and the picker sees keys first,
+// so `a` must not be reachable from there — and it must not change what y/h/t/Esc already did.
+test("inspect `a` sends the pick to the agent and leaves the other inspect keys as they were", () => {
+  const from = electron.indexOf("function handleInspectKey(event, key) {");
+  const to = electron.indexOf("function closeBrowserContextMenu", from);
+  assert.ok(from > 0 && to > from, "handleInspectKey is gone");
+  const source = electron.slice(from, to);
+  const run = (key) => {
+    const sent = [];
+    const flashes = [];
+    const element = { outerHTML: "<h1>Hi</h1>", innerText: "Hi", localName: "h1" };
+    const state = { inspectState: { selector: "h1", element, rect: { left: 1, top: 2, width: 30, height: 10 } },
+                    lastInspectPayload: "picked", cancelled: 0 };
+    const event = { prevented: false, preventDefault() { this.prevented = true; }, stopImmediatePropagation() {} };
+    const handle = new Function("state", "sent", "flashes", `
+      let inspectState = state.inspectState;
+      let lastInspectPayload = state.lastInspectPayload;
+      let lastInspectElement = null;
+      const location = { href: "https://a.test/" };
+      const send = (...args) => sent.push(args);
+      const flash = (message) => flashes.push(message);
+      const cancelInspect = () => { state.cancelled += 1; inspectState = null; };
+      const visibleRect = () => null;
+      const topViewportPoint = (point) => point;
+      const requestAnimationFrame = (fn) => fn();
+      const window = { dispatchEvent() {} };
+      class CustomEvent { constructor(type, init) { this.type = type; this.detail = init.detail; } }
+      ${source.replace("function handleInspectKey", "function inspectPayload(item, rect = item.rect) { return { selector: item.selector, rect, url: location.href }; }\nfunction handleInspectKey")}
+      return (event, key) => { const handled = handleInspectKey(event, key); state.lastInspectPayload = lastInspectPayload; return handled; };
+    `)(state, sent, flashes);
+    const handled = handle(event, key);
+    return { handled, sent, flashes, state, event };
+  };
+
+  const agent = run("a");
+  assert.equal(agent.handled, true);
+  assert.deepEqual(agent.sent.map(([action]) => action), ["inspect-to-agent"]);
+  assert.equal(agent.sent[0][1].selector, "h1");
+  assert.equal(agent.state.cancelled, 1);
+  assert.notEqual(agent.state.lastInspectPayload, null, "`a` keeps the pick for a later `tweb inspect-element`");
+
+  assert.deepEqual(run("y").sent, [["copy-text", "h1"]]);
+  assert.deepEqual(run("h").sent, [["copy-text", "<h1>Hi</h1>"]]);
+  assert.deepEqual(run("t").sent, [["copy-text", "Hi"]]);
+  const escape = run("Escape");
+  assert.deepEqual(escape.sent, []);
+  assert.equal(escape.state.lastInspectPayload, null, "Esc drops the pick");
+  // Any other key is still swallowed while the pick is open and does nothing.
+  const other = run("j");
+  assert.equal(other.handled, true);
+  assert.deepEqual(other.sent, []);
+  assert.equal(other.state.cancelled, 0);
+
+  // The picker gets keys before inspect mode does, so `a` while choosing is still a label.
+  assert.ok(electron.indexOf("if (handlePickerKey(event, key)) return;")
+    < electron.indexOf("if (handleInspectKey(event, key)) return;"));
+  // And normal mode does not bind `a`: nothing outside inspect changes meaning.
+  const table = electron.slice(electron.indexOf("const shortcutHelpSections = ["),
+    electron.indexOf("const normalKeyActions = new Map("));
+  assert.doesNotMatch(table, /\ba: \(\) =>/);
+  // The engine side exists and is a shortcut, not something a page could call by name.
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "inspect-to-agent":\n\s+void sendInspectToAgent\(tab, value\);/);
+});
+
+// `gr` starts and stops a recording. It is a new `g` chord, so it must not take a chord or a key
+// that already meant something.
+test("gr toggles recording and leaves the other g chords alone", () => {
+  const from = electron.indexOf("    if (pendingG) {");
+  const chord = electron.slice(from, electron.indexOf("    if (pendingZ) {", from));
+  assert.match(chord, /else if \(key === "r"\) send\("record-toggle"\);/);
+  for (const [key, action] of [["g", /scrollSurfaceTo\(0\)/], ["h", /showHistory\(\)/], ["d", /showDownloads\(\)/],
+    ["p", /send\("print-paper"\)/], ["i", /document\.querySelector/]]) {
+    assert.match(chord, new RegExp(`key === "${key}"\\) ${action.source}`), `g${key} changed`);
+  }
+  assert.equal((chord.match(/key === "r"/g) || []).length, 1);
+  // A bare `r` is still reload; only the chord records.
+  assert.match(electron, /\["r · gi", "reload · focus first input", \{ r: \(\) => send\("reload"\) \}\]/);
+  // The palette row and `:record` reach the same action.
+  assert.match(electron, /\{ name: "record", label: "Record for agent \(start \/ stop\)", action: \(\) => send\("record-toggle"\) \}/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /case "record-toggle":\n\s+toggleRecording\(\);/);
 });

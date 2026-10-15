@@ -86,6 +86,11 @@ const GEOMETRY_FREE_METHODS = new Set([
   // answer it would make the one command that exists to describe engine state the one
   // command that changes it.
   "diag",
+  // A recording observes what the user sees. Holding the surface open to start or stop one would
+  // repaint a pane nobody is looking at, and those paints would be recorded as page changes.
+  "record-start",
+  "record-stop",
+  "record-status",
 ]);
 
 /// Whether `method` should hold the active tab's surface open while it runs.

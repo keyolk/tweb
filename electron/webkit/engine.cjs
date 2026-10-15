@@ -233,7 +233,7 @@ class WebKitEngine extends EventEmitter {
     this.byView = new Map();
     this.nextView = 1;
     this.ipcMain = new WebKitIpcMain();
-    this.webRequestListeners = { beforeRequest: null, completed: null };
+    this.webRequestListeners = { beforeRequest: null, completed: null, errorOccurred: null };
     this.downloadListeners = [];
     this.downloads = new Map();
     this.scaleFactor = 1;
@@ -418,10 +418,14 @@ class WebKitEngine extends EventEmitter {
   session() {
     const engine = this;
     return {
-      // WebKit gives an embedder no view of a page's requests: the network log stays empty.
+      // WebKit gives an embedder no view of a page's requests: the network log stays empty, and
+      // these listeners are kept but never called. `observesRequests` says so to anyone who
+      // would otherwise report "no failed requests" as if it had looked.
       webRequest: {
+        observesRequests: false,
         onBeforeRequest(listener) { engine.webRequestListeners.beforeRequest = listener; },
         onCompleted(listener) { engine.webRequestListeners.completed = listener; },
+        onErrorOccurred(listener) { engine.webRequestListeners.errorOccurred = listener; },
       },
       on(event, listener) {
         if (event === "will-download") engine.downloadListeners.push(listener);

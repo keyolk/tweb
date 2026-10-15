@@ -3,6 +3,8 @@
 
 # JavaScript dependencies
 /electron/node_modules/
+# The native addon tweb-pane copies into a checkout's app dir for development binaries
+/electron/native/
 node_modules/
 
 # Tauri generated bundles and local state

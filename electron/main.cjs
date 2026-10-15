@@ -15,6 +15,7 @@ const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug
 const { BrowserWindow, ipcMain, session } = pageBackend;
 const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
+const { searchUrl, suggestUrl, parseSuggestions } = require("./search-engines.cjs");
 // The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
 // here because the mode resets that clear it run from functions defined well above that case.
 const insertModeOwners = new WeakMap();
@@ -51,6 +52,8 @@ const { buildBrowserContextMenu } = require("./context-menu.cjs");
 const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { waitFor } = require("./agent-wait.cjs");
+const { elementCrop, findAgentPane, pasteToAgent, inspectMessage } = require("./agent-handoff.cjs");
+const { Recording, cleanPageEvent, oneLine, timelineMarkdown } = require("./recorder.cjs");
 const { evaluate } = require("./agent-eval.cjs");
 const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
 const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
@@ -58,8 +61,13 @@ const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
+const {
+  shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
+  SHM_RING, SHM_PATCH_RING,
+} = require("./shm-frames.cjs");
 const { mouseEventParams, pointerTarget, nextCapture } = require("./oopif-input.cjs");
 const { interpolatePoints } = require("./pointer-interpolation.cjs");
+const { NativeInput, createPaneNative, paneGeometry } = require("./native-input.cjs");
 const { shareLabels } = require("./hint-labels.cjs");
 const { cachesToClear, cachePaths, DISPOSABLE: DISPOSABLE_CACHES } = require("./profile-hygiene.cjs");
 const {
@@ -127,6 +135,9 @@ const {
   audioOwnerAmong, paneImageIds, collidingImageRange, PATCH_ID_COUNT,
 } = require("./pane-registry.cjs");
 const { paneFrameFileList, runTeardown } = require("./teardown.cjs");
+const { remoteNetwork, remoteProfileDir, proxyConfig } = require("./remote-network.cjs");
+const { handleFileRequest } = require("./markdown-page.cjs");
+const { transparentPages, transparentWindowOptions } = require("./transparent-pages.cjs");
 const {
   parseControlLine, resolveTarget, formatOutbound, keyboardRestoreEvent,
 } = require("./pane-control.cjs");
@@ -198,6 +209,19 @@ const hostedRuntime = isHostedRuntime(process.env);
 // call sites falls through to its "not in tmux" branch, which already exists and is already
 // correct. A hosted pane's geometry and visibility arrive over its own connection instead.
 const ownTmuxPane = hostedRuntime ? null : (process.env.TMUX_PANE || null);
+// `--ssh`: this pane's network is a remote host's, through the tunnel its frontend opened. Never
+// on a host: the frontend keeps a tunnelled pane off the daemon, because a proxy is per session
+// and a host's panes share one. The profile moves before anything opens it — `ready` is too late,
+// Chromium has the cookie store by then. See remote-network.cjs for why the profile moves at all.
+const remote = hostedRuntime ? null : remoteNetwork(process.env);
+if (remote) {
+  app.setPath("userData", remoteProfileDir(app.getPath("userData"), remote));
+  // WebRTC's UDP does not go through SOCKS; without this a page on the remote network could
+  // still read the local machine's addresses.
+  app.on("web-contents-created", (_event, contents) => {
+    contents.setWebRTCIPHandlingPolicy("disable_non_proxied_udp");
+  });
+}
 // Now that the pane is known, say which one this is. A host serves many panes and names none of
 // them; a per-pane engine names the pane it belongs to, which is what tells two engines apart in
 // `ps` when two panes are open. The `comm` column truncates to about 15 characters, so the
@@ -283,7 +307,7 @@ function commandLineValue(name) {
 }
 
 function commandLineUrl() {
-  const optionsWithValues = new Set(["--tweb-frame-rate", "--tweb-adaptive-frame-rate"]);
+  const optionsWithValues = new Set(["--tweb-frame-rate", "--tweb-adaptive-frame-rate", "--tweb-transparent"]);
   const args = process.argv.slice(2);
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -311,6 +335,16 @@ const adaptiveFrameRate = configuredAdaptiveFrameRate !== undefined
   ? configuredAdaptiveFrameRate !== "0"
   : settings.get("frame_rate.adaptive");
 const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxActiveFrameRate;
+// `tweb open --transparent` passes this; `page.transparent` in config.toml is read per new tab, so
+// it reaches hosted panes too, whose ATTACH carries no such flag. See transparent-pages.cjs.
+const transparentFlag = commandLineValue("--tweb-transparent") === "1";
+function newTabsTransparent() {
+  return transparentPages({ flag: transparentFlag, setting: settings.get("page.transparent"), backend: pageBackend.kind });
+}
+// The tabs created transparent. Per tab rather than read from the setting at paint time: the
+// setting can change under a running engine, and a tab created clear must keep refusing patches
+// (see transparent-pages.cjs) even after the setting is turned off.
+const transparentTabs = new WeakSet();
 // See frame-rate-policy.cjs for why playback is its own tier and how it is detected.
 const frameRates = frameRateTiers(maxActiveFrameRate, adaptiveFrameRate);
 const playbackWindow = playbackWindowMs(idleFrameRate);
@@ -818,15 +852,43 @@ function attachedTerminalName() {
 
 // Decided once, here, rather than in the worker: the worker has no tmux and no terminal of its
 // own, and this is the process that knows which one the frames are going to.
+const clientTermname = attachedTerminalName();
 const deflateFrames = deflateFramesAllowed({
-  clientTermname: attachedTerminalName(),
+  clientTermname,
   term: process.env.TERM,
   termProgram: process.env.TERM_PROGRAM,
   override: process.env.TWEB_DEFLATE_FRAMES,
 });
 
+// The shared-memory frame addon (`crates/tweb-frame-native`), unpacked beside this file by the
+// binary. The main thread loads it too — not to write frames, which the worker does, but to unlink
+// a dead engine's objects at startup, which only native code can do.
+const shmAddonPath = process.env.TWEB_SHM_ADDON || path.join(__dirname, "native", "tweb-frame.node");
+let shmAddon = null;
+let shmAddonError = null;
+if (existsSync(shmAddonPath)) {
+  try {
+    shmAddon = require(shmAddonPath);
+  } catch (error) {
+    shmAddonError = error.message;
+    console.error(`tweb: shm frame addon failed to load: ${error.message}`);
+  }
+}
+const shmDecision = shmFramesDecision({
+  addonLoaded: Boolean(shmAddon),
+  clientTermname,
+  term: process.env.TERM,
+  termProgram: process.env.TERM_PROGRAM,
+  remote: Boolean(process.env.SSH_CONNECTION || process.env.SSH_TTY),
+  override: process.env.TWEB_SHM_FRAMES,
+});
+// Raw only: `t=s` carries `f=32` pixels, and the PNG path has no use for it. Turned off for the
+// rest of the session after repeated write failures — see `noteShmFrameResult`.
+let shmFramesEnabled = rawFramesEnabled && shmDecision.allowed;
+console.error(`tweb: whole-frame medium ${shmFramesEnabled ? "shm" : frameTransport} (${shmDecision.reason})`);
+
 const gfxWorker = new Worker(path.join(__dirname, "gfx-worker.cjs"), {
-  workerData: { deflateFrames },
+  workerData: { deflateFrames, shmAddon: shmFramesEnabled ? shmAddonPath : null },
 });
 gfxWorker.unref();
 
@@ -1409,6 +1471,57 @@ function syncTmuxVisibility() {
 // pane's view of what it has in flight there is its own, which is what `frame-context.cjs`
 // keeps. The pane a completion belongs to travels with the message rather than being inferred,
 // because inferring it is how one pane's frame ends up placed in another pane's rectangle.
+// The next ring slot's object name for this pane, or null when frames are not going through
+// shared memory. The first one also drops the pane's marker file, so a later engine can find and
+// unlink these objects if this one dies before its worker's exit path runs.
+function markShmPane(frames) {
+  if (frames.shmMarked) return;
+  frames.shmMarked = true;
+  try {
+    writeFileSync(path.join(app.getPath("userData"), shmMarkerName(process.pid, frames.imageIds.base)), "");
+  } catch (error) {
+    console.error(`tweb: shm marker write failed: ${error.message}`);
+  }
+}
+
+function nextShmFrameName(frames) {
+  if (!shmFramesEnabled) return null;
+  markShmPane(frames);
+  const slot = frames.shmSlot;
+  frames.shmSlot = (slot + 1) % SHM_RING;
+  return shmFrameName(process.pid, frames.imageIds.base, slot);
+}
+
+function nextShmPatchName(frames) {
+  markShmPane(frames);
+  const slot = frames.shmPatchSlot;
+  frames.shmPatchSlot = (slot + 1) % SHM_PATCH_RING;
+  return shmPatchName(process.pid, frames.imageIds.base, slot);
+}
+
+// A frame whose shm write failed already went out through the file medium inside the worker, so a
+// failure costs speed rather than the frame. Repeated failures mean shm is broken here — a full
+// `/dev/shm`, a sandbox refusing `shm_open` — and paying a failed attempt per frame would be pure
+// waste, so the medium is given up for the session.
+const SHM_FRAME_FAILURE_LIMIT = 3;
+let shmFrameFailures = 0;
+let lastShmFrameError = shmAddonError;
+
+function noteShmFrameResult(message, frames) {
+  if (message?.shm) {
+    shmFrameFailures = 0;
+    frames.shmWholeFrames += 1;
+  }
+  if (!message?.shmError) return;
+  lastShmFrameError = message.shmError;
+  console.error(`tweb: shm frame failed: ${message.shmError}`);
+  shmFrameFailures += 1;
+  if (shmFramesEnabled && shmFrameFailures >= SHM_FRAME_FAILURE_LIMIT) {
+    shmFramesEnabled = false;
+    console.error(`tweb: shm frames off for this session after ${shmFrameFailures} failures`);
+  }
+}
+
 function sendGfxFrameToWorker(frame, frames = currentFrames()) {
   const pixels = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
     ? frame.png
@@ -1426,6 +1539,7 @@ function sendGfxFrameToWorker(frame, frames = currentFrames()) {
       height: frame.height,
       transport: frameTransport,
       filePath: frameFilePathFor(frames, frame.format),
+      shmName: frame.format === "raw" ? nextShmFrameName(frames) : null,
     }, [pixels.buffer]);
   } catch (error) {
     // The hand-off never happened, so the pane must not be left believing the worker is busy —
@@ -1520,6 +1634,7 @@ gfxWorker.on("message", (message) => {
   // Counted after the routing, not before it: the key is what says whose compression this was,
   // and a count taken above would land on whichever pane happened to ask for its diag.
   if (message?.type !== "error" && message?.compressed) frames.compressedWholeFrames += 1;
+  noteShmFrameResult(message, frames);
   // Scoped to the pane the completion belongs to: dispatching the queue reads the frame-rate state
   // and the window, and doing that against another pane's is how one pane's frame lands in
   // another's rectangle.
@@ -1850,8 +1965,10 @@ function deletePatches(frames = currentFrames()) {
 
 // Kitty places an image at the cursor. Patches address their cell against the pane's own
 // origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
-function patchPlacementSequence(id, place, frames = currentFrames()) {
-  const header = `a=T,f=100,i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
+// `format` is the transmission half of the header: `f=100` for a PNG sent inline, or the raw
+// `f=32,s=,v=,t=s` of a shared-memory patch.
+function patchPlacementSequence(id, place, frames = currentFrames(), format = "f=100") {
+  const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
@@ -1884,6 +2001,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   if (!geometry) return false;
 
   const patchStarted = frameProbeMark();
+  if (shmFramesEnabled && sendShmPatch(image, damage, geometry, frames, record, patchStarted)) return true;
   let png;
   try {
     png = image.crop(geometry.crop).toPNG();
@@ -1930,6 +2048,56 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
     console.error(`tweb: patch sent #${patchFramesSent} `
       + `cells=${geometry.place.cols}x${geometry.place.rows}`
       + `@${geometry.place.col},${geometry.place.row} bytes=${png.length}`);
+  }
+  return true;
+}
+
+// A patch through shared memory: the crop's raw pixels go into an object and only its name goes
+// over the tty.
+//
+// What this removes is everything that kept patches small. The PNG path pays a SYNCHRONOUS
+// `toPNG()` on this thread that scales with area (patch-geometry.cjs: p90 24ms at the 0.2 limit,
+// 422ms at 0.85), and then writes the base64 inline — the 360-430KB whiteboard patches that
+// blocked this thread in `write()` (see `IMMEDIATE_PATCH_MAX_BYTES`). Here the cost is the crop's
+// copy plus one more copy into the mapping, and the tty sees a few dozen bytes, so neither the
+// encode nor the byte cap applies. The area limit is left as it is: raising it is a separate,
+// measured change.
+//
+// Returns false when the shm write failed, and the caller carries on down the PNG path with the
+// same geometry, so a broken shm costs a frame's worth of speed and never the patch.
+function sendShmPatch(image, damage, geometry, frames, record, patchStarted) {
+  let bitmap;
+  const name = nextShmPatchName(frames);
+  try {
+    bitmap = image.crop(geometry.crop).toBitmap();
+    // `s=`/`v=` are taken from the crop rect, so a bitmap of any other size would be read with the
+    // wrong stride — a sheared patch rather than an error. The PNG path carries its own size.
+    if (bitmap.length !== geometry.crop.width * geometry.crop.height * 4) return false;
+    shmAddon.writeShmFrame(name, bitmap, true);
+  } catch (error) {
+    noteShmFrameResult({ shmError: `patch: ${error.message}` }, frames);
+    return false;
+  }
+  const patchEncoded = frameProbeMark();
+  const id = takeNextPatchId(frames);
+  const { width, height } = geometry.crop;
+  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames,
+    `f=32,s=${width},v=${height},t=s`);
+  writeGfx(`a=d,d=I,i=${id},q=2`, "");
+  writeGfxChunked(header, Buffer.from(name).toString("base64"), prefix, suffix);
+  frameProbeRecord("patch", {
+    patch: frameProbeMs(patchStarted, patchEncoded),
+    transfer: frameProbeMs(patchEncoded, frameProbeMark()),
+    total: frameProbeMs(patchStarted, frameProbeMark()),
+  }, bitmap.length);
+  notePatch(frames, id, damage);
+  inputTrace.mark("frame", { kind: "patch", bytes: bitmap.length, medium: "shm" });
+  record.frames.patches += 1;
+  frames.shmPatches += 1;
+  if (record.frames.patches <= 12) {
+    console.error(`tweb: patch sent #${record.frames.patches} shm `
+      + `cells=${geometry.place.cols}x${geometry.place.rows}`
+      + `@${geometry.place.col},${geometry.place.row} bytes=${bitmap.length}`);
   }
   return true;
 }
@@ -2033,7 +2201,9 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   // Small damage goes out immediately as a patch instead of waiting for the frame
   // interval — the wait exists to pace whole-frame encodes, and a patch costs a
   // thousandth of one. A caret keeping up with the keyboard is the whole point.
-  if (dirty && !currentFrames().pendingFrameTimer && sendPatch(image, dirty, generation)) {
+  // Not for a transparent tab: a clear pixel in a patch shows the stale base frame beneath it.
+  if (dirty && !transparentTabs.has(tab) && !currentFrames().pendingFrameTimer
+    && sendPatch(image, dirty, generation)) {
     currentFrames().lastFrameSentAt = Date.now();
     return;
   }
@@ -2154,6 +2324,7 @@ function renderedFrameSize(vp) {
 function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize()) {
   const logical = logicalContentSize(vp);
   return {
+    ...transparentWindowOptions(newTabsTransparent()),
     width: logical.width,
     height: logical.height,
     useContentSize: true,
@@ -3302,7 +3473,32 @@ function normalizeOmniboxInput(input) {
   if (!/\s/.test(value) && (/^[^/]+\.[^/]+(?:\/|$)/.test(value) || /^[^/]+:\d+(?:\/|$)/.test(value))) {
     return `https://${value}`;
   }
-  return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
+  return searchUrl(value, settings.get("search.engine"));
+}
+
+// Suggestions for what is typed in the omnibox, from `search.suggest` (off by default — see
+// search-engines.cjs for why). Fetched here rather than in the page: the omnibox lives inside the
+// page's own document, and a request from there would carry that site's origin and be subject to its
+// CSP. A slow or failing provider just yields no rows; the omnibox never waits on it.
+const SUGGEST_TIMEOUT_MS = 1500;
+
+async function omniboxSuggestions(query) {
+  const url = suggestUrl(query, settings.get("search.suggest"));
+  if (!url) return [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SUGGEST_TIMEOUT_MS);
+  try {
+    const response = await electron.net.fetch(url, { signal: controller.signal, credentials: "omit" });
+    if (!response.ok) return [];
+    const engine = settings.get("search.engine");
+    return parseSuggestions(await response.text())
+      .map((text) => ({ kind: "search", title: text, url: searchUrl(text, engine) }));
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: omnibox suggestions failed: ${error.message}`);
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // History is shared by every pane and survives restarts, so the omnibox offers
@@ -3818,6 +4014,15 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "omnibox-model":
       sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
       break;
+    // `seq` travels back so the page can drop a reply to a query it has already moved past.
+    case "omnibox-suggest": {
+      const seq = value?.seq;
+      const query = String(value?.query || "");
+      omniboxSuggestions(query).then((suggestions) => {
+        if (!tab.isDestroyed()) sendToFocusedTabFrame(tab, "tweb-omnibox-suggest", { seq, query, suggestions });
+      });
+      break;
+    }
     // The page re-asks on every keystroke so the filter runs over the whole file rather
     // than over a slice the renderer happens to be holding.
     case "history-model":
@@ -3890,6 +4095,18 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "copy-text":
       clipboard.writeText(String(value || ""));
+      break;
+    // Inspect mode's `a`: the pick goes to the agent pane, not the clipboard.
+    case "inspect-to-agent":
+      void sendInspectToAgent(tab, value);
+      break;
+    // `gr`, the palette's Record row and `:record`.
+    case "record-toggle":
+      toggleRecording();
+      break;
+    // A click or a committed field change, from a frame of a tab being recorded.
+    case "record-event":
+      recordPageEvent(tab, value);
       break;
     // The address the tab actually settled on, which the page cannot always see:
     // a subframe reports its own URL, and a cross-origin one cannot read the top.
@@ -4108,6 +4325,8 @@ ipcMain.on("tweb-preload-ready", bindPane(
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-mode", shortcutModeMessage());
+  // A new document in a recorded tab starts listening for clicks again.
+  if (recordingForTab(tab)) event.reply("tweb-recording", { recording: true });
   if (tab === currentWindows().win && frame === tab.webContents.mainFrame) {
     event.reply("tweb-cell-metrics", cellMetrics());
     event.reply("tweb-tab-state", tabStateModel());
@@ -4317,7 +4536,7 @@ function watchConsole(contents) {
       ? { level: first.level, message: first.message, line: first.lineNumber, source: first.sourceId }
       : { level, message, line, source: sourceId };
     const numericLevels = ["debug", "info", "warning", "error"];
-    recordConsoleMessage({
+    const entry = {
       level: typeof detail.level === "number"
         ? numericLevels[detail.level] || "info"
         : String(detail.level ?? "info"),
@@ -4325,7 +4544,9 @@ function watchConsole(contents) {
       line: detail.line,
       source: detail.source,
       url: contents.getURL(),
-    });
+    };
+    recordConsoleMessage(entry);
+    recordConsoleError(contents, entry);
   });
 }
 
@@ -4346,6 +4567,7 @@ function watchNetwork() {
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
     networkLog.push({
       id: details.id,
+      webContentsId: details.webContentsId ?? null,
       url: details.url,
       method: details.method,
       resourceType: details.resourceType,
@@ -4365,7 +4587,21 @@ function watchNetwork() {
     if (!entry) return;
     entry.statusCode = details.statusCode;
     entry.fromCache = Boolean(details.fromCache);
+    if (details.statusCode >= 400) recordNetworkFailure(details, entry, details.statusCode, null);
   });
+  // A request that never got a response at all — DNS, refused, blocked, aborted. Only a recording
+  // reads these; `tweb network` shows such a request as one with no status. Each page engine's
+  // session shim provides it (cdp/engine.cjs, webkit/engine.cjs); checked anyway, because a shim
+  // without it threw here and took the engine's whole startup down with it — measured on the
+  // Chrome engine: no agent socket, no page.
+  const { webRequest } = session.defaultSession;
+  if (typeof webRequest.onErrorOccurred === "function") {
+    webRequest.onErrorOccurred((details) => {
+      if (details.error === "net::ERR_ABORTED") return;
+      const entry = networkLog.findLast((candidate) => candidate.id === details.id);
+      recordNetworkFailure(details, entry, null, details.error);
+    });
+  }
 }
 
 ipcMain.on("tweb-agent-response", (_event, response) => {
@@ -4436,6 +4672,10 @@ function agentDiagnostics() {
     // False only where the frontend found no way to sandbox the renderers and the user allowed
     // running without (TWEB_NO_SANDBOX=1); see crates/twebd/src/chromium_platform.rs.
     sandboxed: !app.commandLine.hasSwitch("no-sandbox"),
+    // `--ssh`: whose network this pane is on, and which profile it uses for it.
+    remote: remote ? { destination: remote.destination, proxy: remote.proxyRules, profile: app.getPath("userData") } : null,
+    // Whether the active tab was created clear, and so sends whole frames only.
+    transparent: tab ? transparentTabs.has(tab) : null,
     pane_geometry: {
       cells: currentFrames().cells,
       pixels: currentFrames().viewport ? { width: currentFrames().viewport.width, height: currentFrames().viewport.height } : null,
@@ -4503,6 +4743,16 @@ function agentDiagnostics() {
       transportFromDaemonEnv: hostedRuntime,
       // Of `whole`, how many went out deflated (`o=z`). See DETAIL.md 8.6.
       wholeCompressed: currentFrames().compressedWholeFrames,
+      // Whether whole frames go through shared memory (`t=s`), why or why not, and how many of
+      // `whole` did. See shm-frames.cjs.
+      wholeMedium: shmFramesEnabled ? "shm" : frameTransport,
+      shmReason: shmDecision.reason,
+      shmError: lastShmFrameError,
+      wholeShm: currentFrames().shmWholeFrames,
+      // Of `patches`, how many went through shared memory rather than as an inline PNG.
+      patchesShm: currentFrames().shmPatches,
+      // The base image id, which is also what this pane's shm object names are built from.
+      imageId: currentFrames().imageIds.base,
       // How much of the byte budget this pane has earned above the default. 1 means it is on
       // the conservative floor; above that, nothing has been dropped and it is spending more.
       // The budget is a guess about the machine and this is what corrects it.
@@ -4517,6 +4767,9 @@ function agentDiagnostics() {
       unscopedResolutions: unscopedPaneResolutions,
     },
     input: {
+      // The macOS pointer/trackpad helper as this pane sees it. `reports.native` against
+      // `reports.cell` is how many terminal reports were replaced by the real pointer.
+      native: nativeEnabled() ? nativeInput.diag(inputState().native, nativeGeometry()) : { helper: "off" },
       vimiumShortcuts: inputState().vimium,
       cmdBypass: inputState().bypass,
       pageInsertMode: inputState().insertMode,
@@ -4825,6 +5078,346 @@ async function agentCapture(params) {
   return { console: messages, network: requests, screenshot: await agentScreenshot(params) };
 }
 
+// --- handing a pick to the coding agent beside this pane ---
+//
+// The rules (which pane is an agent, which one gets it, what the text may contain) are in
+// agent-handoff.cjs. This half owns the side effects: the element's screenshot on disk, the
+// tmux calls, and telling the user where it went.
+
+// Where handed-off files live: the same cache root the frontend uses (`engine_app::cache_root`),
+// so `TWEB_CACHE_DIR` moves both. The agent reads these by path, so they outlive the pane.
+function twebCacheRoot() {
+  if (process.env.TWEB_CACHE_DIR) return process.env.TWEB_CACHE_DIR;
+  if (process.env.XDG_CACHE_HOME) return path.join(process.env.XDG_CACHE_HOME, "tweb");
+  return path.join(os.homedir(), ".cache", "tweb");
+}
+
+function handoffDirectory() {
+  return path.join(twebCacheRoot(), "handoff");
+}
+
+// Enough for weeks of picks, bounded so a directory nobody looks at does not grow forever.
+const HANDOFF_KEEP_FILES = 200;
+
+function pruneHandoffDirectory(directory) {
+  try {
+    const files = readdirSync(directory)
+      .filter((name) => name.endsWith(".png"))
+      .map((name) => ({ name, at: statSync(path.join(directory, name)).mtimeMs }))
+      .sort((left, right) => right.at - left.at);
+    for (const file of files.slice(HANDOFF_KEEP_FILES)) rmSync(path.join(directory, file.name), { force: true });
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: handoff prune failed: ${error.message}`);
+  }
+}
+
+function handoffStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+// The element's pixels, as the page shows them right now: the whole viewport is captured and the
+// element cut out of it, which is the same arithmetic on every page engine (see `elementCrop`).
+// `rect` is in the top frame's CSS pixels.
+async function saveElementScreenshot(contents, rect) {
+  if (![rect?.left, rect?.top, rect?.width, rect?.height].every(Number.isFinite)) return null;
+  const viewportWidth = Number(await contents.executeJavaScript("innerWidth", true));
+  const whole = await contents.capturePage();
+  if (!whole || whole.isEmpty()) return null;
+  const area = elementCrop(rect, whole.getSize(), viewportWidth);
+  if (!area) return null;
+  const image = whole.crop(area);
+  const directory = handoffDirectory();
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, `${handoffStamp()}-element.png`);
+  writeFileSync(file, image.toPNG(), { mode: 0o600 });
+  pruneHandoffDirectory(directory);
+  return file;
+}
+
+function handoffRun(command, args, input) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)));
+    child.stdin?.end(input ?? "");
+  });
+}
+
+// This pane's tmux id. A hosted pane has no TMUX_PANE of its own; its placement says where it is.
+function handoffSelfPane() {
+  return vis().placement?.paneId || ownTmuxPane;
+}
+
+function findHandoffTarget() {
+  return findAgentPane({ selfPane: handoffSelfPane(), run: handoffRun });
+}
+
+function pasteHandoff(target, text) {
+  return pasteToAgent({ target, text, run: handoffRun });
+}
+
+// The user's answer to "where did it go", shown where they pressed the key.
+function handoffToast(tab, what, result) {
+  const message = result.ok ? `${what} → ${result.agent} ${result.pane}` : `✕ ${result.reason}`;
+  console.error(`tweb: handoff ${what}: ${result.ok ? `pasted into ${result.agent} ${result.pane}` : result.reason}`);
+  if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", message);
+}
+
+/// The picked element, pasted into the agent pane with a screenshot of it.
+async function sendInspectToAgent(tab, payload) {
+  if (!payload || typeof payload !== "object") return { ok: false, reason: "no element picked" };
+  const target = await findHandoffTarget();
+  if (!target.ok) {
+    handoffToast(tab, "element", target);
+    return target;
+  }
+  let screenshot = null;
+  try {
+    screenshot = await saveElementScreenshot(tab.webContents, payload.rect);
+  } catch (error) {
+    // The text is the handoff; a missing picture is worth a line in the log, not a failed send.
+    console.error(`tweb: element screenshot failed: ${error.message}`);
+  }
+  const result = await pasteHandoff(target, inspectMessage(payload, screenshot));
+  handoffToast(tab, "element", result);
+  return { ...result, screenshot };
+}
+
+// --- recording a pane for the agent (`tweb record`, `gr`) ---
+//
+// The rules — what an event may hold, the bounds, the timeline — are in recorder.cjs. This half
+// owns the hooks that feed it and the files. One recording per pane, keyed by the pane record.
+const recordings = new WeakMap();
+// The longest side a keyframe is stored at. A 2880x1800 pane frame is several MB as PNG and an
+// agent reads it no better than a 1440-wide JPEG; sixty of the former would be a quarter gigabyte.
+const KEYFRAME_MAX_WIDTH = 1440;
+const KEYFRAME_TIMER_MS = 1000;
+
+function activeRecording() {
+  return recordings.get(currentPane()) || null;
+}
+
+// The recording a tab's event belongs to: the tab's own pane, not whichever pane is ambient.
+function recordingForTab(tab) {
+  const record = tab && tabPanes.get(tab);
+  return record ? recordings.get(record) || null : null;
+}
+
+function tabForContents(contents) {
+  for (const tab of tabPanes.keys()) {
+    if (!tab.isDestroyed() && tab.webContents === contents) return tab;
+  }
+  return null;
+}
+
+function tabForWebContentsId(id) {
+  for (const tab of tabPanes.keys()) {
+    if (!tab.isDestroyed() && tab.webContents.id === id) return tab;
+  }
+  return null;
+}
+
+function broadcastRecordingState(record = currentPane()) {
+  const state = { recording: recordings.has(record) };
+  for (const tab of windowsFor(record).tabs) sendToTabFrames(tab, "tweb-recording", state);
+}
+
+// One keyframe of the pane's active tab, attached to `entry` (or to a new `change` event).
+//
+// Captures run one at a time, in the order asked: a navigation's keyframe is asked for while the
+// click that caused it is still being captured, and dropping the second lost the navigation's
+// picture. A timer keyframe is the exception — it is skipped while one is pending, since the
+// pending one already shows the page as it is now.
+function captureKeyframe(recording, record, reason, entry = null) {
+  if (reason === "change" && recording.pendingCaptures) return recording.captures;
+  recording.pendingCaptures = (recording.pendingCaptures || 0) + 1;
+  recording.captures = (recording.captures || Promise.resolve())
+    .then(() => captureKeyframeNow(recording, record, reason, entry))
+    .finally(() => { recording.pendingCaptures -= 1; });
+  return recording.captures;
+}
+
+// Right after a navigation commits the compositor is between documents, and `capturePage` fails
+// with `UnknownVizError` — measured on the very capture a navigation keyframe makes. The next
+// frame or two is fine.
+async function captureWithRetry(contents, attempts = 3) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await contents.capturePage();
+    } catch (error) {
+      if (attempt >= attempts || contents.isDestroyed()) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
+async function captureKeyframeNow(recording, record, reason, entry) {
+  // A delayed click or navigation keyframe that comes due after stop would be a file the
+  // timeline, already written, does not mention.
+  if (recording.stopped && reason !== "stop") return;
+  const tab = windowsFor(record).win;
+  if (!tab || tab.isDestroyed() || record.visible === false) return;
+  const name = recording.reserveKeyframe(reason);
+  if (!name) return;
+  try {
+    let image = await captureWithRetry(tab.webContents);
+    const size = image?.getSize?.() || { width: 0, height: 0 };
+    if (!image || image.isEmpty() || size.width < 32 || size.height < 32) {
+      recording.keyframes -= 1;
+      return;
+    }
+    if (size.width > KEYFRAME_MAX_WIDTH && image.resize) image = image.resize({ width: KEYFRAME_MAX_WIDTH });
+    writeFileSync(path.join(recording.directory, name), image.toJPEG(80), { mode: 0o600 });
+    const target = entry || recording.record("change", {});
+    if (target) target.keyframe = name;
+  } catch (error) {
+    recording.keyframes -= 1;
+    console.error(`tweb: record keyframe failed: ${error.message}`);
+  }
+}
+
+// After a click the page answers within a frame or two, and the answer is what is worth seeing.
+const CLICK_KEYFRAME_DELAY_MS = 400;
+// A navigation's keyframe is taken when it stops loading, or after this if it never does.
+const NAVIGATION_KEYFRAME_FALLBACK_MS = 3000;
+
+function recordTabNavigation(tab, url, inPage) {
+  const recording = recordingForTab(tab);
+  if (!recording || tab !== windowsFor(tabPanes.get(tab)).win) return;
+  const entry = recording.record("navigate", { url: oneLine(url, 300), inPage: Boolean(inPage) });
+  if (!entry) return;
+  const record = tabPanes.get(tab);
+  if (inPage) {
+    setTimeout(() => void captureKeyframe(recording, record, "navigate", entry), CLICK_KEYFRAME_DELAY_MS);
+    return;
+  }
+  clearTimeout(recording.navigationTimer);
+  recording.pendingNavigation = entry;
+  recording.navigationTimer = setTimeout(() => settleNavigationKeyframe(tab), NAVIGATION_KEYFRAME_FALLBACK_MS);
+}
+
+function settleNavigationKeyframe(tab) {
+  const recording = recordingForTab(tab);
+  if (!recording?.pendingNavigation) return;
+  const entry = recording.pendingNavigation;
+  recording.pendingNavigation = null;
+  clearTimeout(recording.navigationTimer);
+  void captureKeyframe(recording, tabPanes.get(tab), "navigate", entry);
+}
+
+function recordPageEvent(tab, event) {
+  const recording = recordingForTab(tab);
+  const clean = recording && cleanPageEvent(event);
+  if (!clean) return;
+  const { kind, ...detail } = clean;
+  const entry = recording.record(kind, detail);
+  if (entry && kind === "click") {
+    const record = tabPanes.get(tab);
+    setTimeout(() => void captureKeyframe(recording, record, "click", entry), CLICK_KEYFRAME_DELAY_MS);
+  }
+}
+
+function recordConsoleError(contents, entry) {
+  if (entry.level !== "error") return;
+  const recording = recordingForTab(tabForContents(contents));
+  recording?.record("console-error", {
+    message: oneLine(entry.message, 300), source: oneLine(entry.source, 200), line: entry.line, url: oneLine(entry.url, 300),
+  });
+}
+
+// `entry` is the request's line in the network log. A page engine's completion events do not all
+// carry the URL and method again (Chrome's loadingFailed has neither), and the log has both.
+function recordNetworkFailure(details, entry, status, error) {
+  const recording = recordingForTab(tabForWebContentsId(details.webContentsId ?? entry?.webContentsId));
+  recording?.record("network-failure", {
+    method: details.method || entry?.method || "GET",
+    url: oneLine(details.url || entry?.url || "", 300),
+    status: status ?? null,
+    error: error || null,
+  });
+}
+
+function recordingDirectory() {
+  return path.join(twebCacheRoot(), "recordings", handoffStamp());
+}
+
+function startRecording(params = {}) {
+  const record = currentPane();
+  const existing = recordings.get(record);
+  if (existing) return { ok: true, recording: true, directory: existing.directory, already: true };
+  const directory = recordingDirectory();
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const recording = new Recording({
+    directory,
+    pane: handoffSelfPane() || record.id || null,
+    intervalMs: Number.isFinite(params.interval) ? params.interval * 1000 : undefined,
+    unavailable: recordingLimits(),
+  });
+  recordings.set(record, recording);
+  const tab = windowsFor(record).win;
+  const entry = recording.record("start", { url: oneLine(tab && !tab.isDestroyed() ? tab.webContents.getURL() : "", 300) });
+  void captureKeyframe(recording, record, "start", entry);
+  // Paints set `dirty`; this tick turns a changing page into a keyframe every interval.
+  recording.timer = setInterval(() => {
+    if (recording.periodicDue()) void captureKeyframe(recording, record, "change");
+  }, KEYFRAME_TIMER_MS);
+  broadcastRecordingState(record);
+  console.error(`tweb: recording to ${directory}`);
+  return { ok: true, recording: true, directory, unavailable: recording.unavailable };
+}
+
+// What this pane's page engine cannot record. Asked of the session rather than of the engine's
+// name, so an engine that gains request events stops being listed without an edit here.
+function recordingLimits() {
+  return session.defaultSession.webRequest?.observesRequests === false
+    ? ["failed requests (this engine cannot see a page's requests)"]
+    : [];
+}
+
+async function stopRecording(params = {}) {
+  const record = currentPane();
+  const recording = recordings.get(record);
+  if (!recording) return { ok: false, recording: false, message: "not recording" };
+  clearInterval(recording.timer);
+  clearTimeout(recording.navigationTimer);
+  recording.stopped = true;
+  const tab = windowsFor(record).win;
+  const entry = recording.record("stop", { url: oneLine(tab && !tab.isDestroyed() ? tab.webContents.getURL() : "", 300) });
+  // Queued behind any capture still running, so every keyframe is in the timeline it is linked from.
+  await captureKeyframe(recording, record, "stop", entry);
+  recordings.delete(record);
+  broadcastRecordingState(record);
+  recording.endedAt = Date.now();
+  const timeline = path.join(recording.directory, "timeline.md");
+  writeFileSync(timeline, timelineMarkdown(recording, path.join), { mode: 0o600 });
+  writeFileSync(path.join(recording.directory, "events.json"), `${JSON.stringify({
+    startedAt: new Date(recording.startedAt).toISOString(),
+    endedAt: new Date(recording.endedAt).toISOString(),
+    pane: recording.pane,
+    events: recording.events,
+  }, null, 2)}\n`, { mode: 0o600 });
+  const summary = recording.summary(timeline);
+  console.error(`tweb: recording stopped: ${timeline}`);
+  let sent = null;
+  if (params.send !== false) {
+    const target = await findHandoffTarget();
+    sent = target.ok ? await pasteHandoff(target, summary) : target;
+    if (tab && !tab.isDestroyed()) handoffToast(tab, "recording", sent);
+  } else if (tab && !tab.isDestroyed()) {
+    sendToMainTabFrame(tab, "tweb-flash", "recording saved");
+  }
+  return { ok: true, recording: false, directory: recording.directory, timeline, summary, ...recording.counts(), sent };
+}
+
+function toggleRecording() {
+  if (activeRecording()) void stopRecording();
+  else {
+    const started = startRecording();
+    const tab = currentWindows().win;
+    const note = started.unavailable?.length ? " · no failed requests on this engine" : "";
+    if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", `● recording — gr stops${note}`);
+  }
+}
+
 /**
  * `tweb device` — lay the page out as a phone or tablet does.
  *
@@ -5050,9 +5643,22 @@ async function dispatchAgentCommand(method, params) {
     }
     case "inspect-element": {
       // The user picked an element in inspect mode. Forward the payload the preload
-      // collected to the agent — or answer null if inspect mode is closed.
+      // collected to the agent — or answer null if nothing has been picked.
       const result = await agentPageRequest("inspect-element", {}, 3000);
-      return result || { ok: false, message: "no element picked" };
+      if (!result) return { ok: false, message: "no element picked" };
+      // `--send`: the same push the inspect `a` key does, for a caller in another pane.
+      if (params?.send) return { ...result, sent: await sendInspectToAgent(agentTab(), result) };
+      return result;
+    }
+    case "record-start":
+      return startRecording(params);
+    case "record-stop":
+      return stopRecording(params);
+    case "record-status": {
+      const recording = activeRecording();
+      return recording
+        ? { recording: true, directory: recording.directory, events: recording.events.length, keyframes: recording.keyframes }
+        : { recording: false };
     }
     case "float": {
       inputState().floating = true;
@@ -5491,6 +6097,8 @@ function sendPointerEvent(tab, event) {
   // A type CDP has no equivalent for (`contextMenu`) goes the direct way rather than being
   // turned into something the protocol rejects.
   if (params && ensureDebugger(tab)) {
+    // CDP's wheel has no phase field, so an event that is only a phase is nothing to it.
+    if (event.phaseOnly) return;
     watchOopifSessions(tab);
     // A frame's box moves with a scroll or a resize, so it is re-read as the pointer travels —
     // but on the MOVE, not on the press. `sendPointerEvent` is synchronous (the terminal
@@ -6130,7 +6738,7 @@ function runBrowserContextMenuCommand(tab, action) {
     case "paste-plain": contents.pasteAndMatchStyle(); break;
     case "select-all": contents.selectAll(); break;
     case "search-selection":
-      createTab(`https://www.google.com/search?q=${encodeURIComponent(params.selectionText)}`, true);
+      createTab(searchUrl(params.selectionText, settings.get("search.engine")), true);
       break;
     case "open-link": createTab(params.linkURL, true); break;
     case "open-link-here": void contents.loadURL(params.linkURL); break;
@@ -6284,7 +6892,11 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
   onContents("paint", (_event, dirty, image) => {
     // A page painting on its own is what separates video from a static screen, and the
     // frame-rate policy reads it to decide whether to fall all the way to idle.
-    if (tab === currentWindows().win) notePaintActivity();
+    if (tab === currentWindows().win) {
+      notePaintActivity();
+      const recording = activeRecording();
+      if (recording) recording.dirty = true;
+    }
     const size = image.getSize();
     const expected = currentFrames().viewport && renderedFrameSize(currentFrames().viewport);
     if (loggedFrameGeneration !== currentFrames().generation && !image.isEmpty()
@@ -6436,6 +7048,8 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
   // ordinary end, a stop, and a failure alike — a bar left behind by an error page would be
   // the most annoying form of this feature.
   onContents("did-stop-loading", () => sendLoadingProgress(tab, null));
+  // A recorded navigation's keyframe is the page it loaded, not the blank one it left.
+  onContents("did-stop-loading", () => settleNavigationKeyframe(tab));
 
   let showingLoadError = false;
   const recordNavigation = (url) => {
@@ -6455,9 +7069,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     recordNavigation(url);
     updatePaneTitle();
     noticeChromeSite(tab, url);
+    recordTabNavigation(tab, url, false);
   });
   onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
-    if (isMainFrame) { recordNavigation(url); updatePaneTitle(); }
+    if (isMainFrame) { recordNavigation(url); updatePaneTitle(); recordTabNavigation(tab, url, true); }
   });
 
   let initialZoomApplied = false;
@@ -6527,6 +7142,9 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
   const record = currentPane();
   tabPanes.set(tab, record);
   if (currentWindows().tabs.includes(tab)) return tab;
+  // Every tab, popups included, comes through here right after its window was built from
+  // `browserWindowOptions()`, so the setting read now is the one that window was created with.
+  if (newTabsTransparent()) transparentTabs.add(tab);
   configureTab(tab, initialZoomFactor);
   tabSessionUrls.set(tab, url || "about:blank");
   currentWindows().tabs.push(tab);
@@ -6777,6 +7395,8 @@ function inputState() {
       // The last point a motion report produced, for filling in the gap tmux leaves between
       // two of them. Null outside a drag; see pointer-interpolation.cjs.
       lastDragPoint: null,
+      // This pane's share of the native pointer and trackpad; see native-input.cjs.
+      native: createPaneNative(),
     };
     paneInputStates.set(record.key, state);
   }
@@ -6859,7 +7479,10 @@ function hasZoomModifier(modifiers) {
 function dispatchMouse(cb, rawX, rawY, release) {
   if (!currentWindows().win) return;
   const contents = currentWindows().win.webContents;
-  const { x, y } = logicalMousePoint(rawX, rawY);
+  // Inside tmux the report is a cell. Where the native pointer agrees with it, the point is the
+  // pointer's real one instead — see native-input.cjs. Outside tmux the report is already pixels.
+  const native = nativeReportPoint(rawX, rawY, (cb & 32) !== 0);
+  const { x, y } = native && paneIsInTmux() ? native : logicalMousePoint(rawX, rawY);
   const clicks = inputState().clicks;
   const modifiers = mouseModifiers(cb);
   const buttonCode = cb & 3;
@@ -6872,42 +7495,30 @@ function dispatchMouse(cb, rawX, rawY, release) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
-    // Both deltas in `sendInputEvent`'s sign, a positive delta being the way the CONTENT moves:
-    // wheel up (64) is +deltaY and wheel left (66) is +deltaX. xterm numbers the horizontal
-    // buttons 6 = left, 7 = right. The CDP route converts this to the DOM's sign in one place
-    // (mouseEventParams), so both axes have to be stated the same way here.
-    // `scroll.invert` flips both axes, as macOS's own setting does; `scroll.distance` is one notch.
-    const sign = settings.get("scroll.invert") ? -1 : 1;
-    const distance = settings.get("scroll.distance");
-    const horizontal = (buttonCode === 2 ? 1 : buttonCode === 3 ? -1 : 0) * sign;
-    const vertical = direction * sign;
-    const deltaX = horizontal * distance;
-    const deltaY = vertical * distance;
-    sendPointerEvent(currentWindows().win, {
-      type: "mouseWheel",
-      x,
-      y,
-      deltaX,
-      deltaY,
-      modifiers,
-      // What the direct path needs on top; CDP takes the deltas alone.
-      wheel: {
-        deltaX,
-        deltaY,
-        wheelTicksX: horizontal,
-        wheelTicksY: vertical,
-        accelerationRatioX: 0.5,
-        accelerationRatioY: 0.5,
-        hasPreciseScrollingDeltas: false,
-        canScroll: true,
-      },
-    });
+    // A trackpad gesture over this pane is scrolled from the helper's own deltas, and the notches
+    // the terminal made of the same gesture would scroll it a second time. See `wheelClaim`.
+    const paneNative = inputState().native;
+    const claim = nativeEnabled() ? nativeInput.wheelClaim(paneNative, nativeGeometry()) : "pass";
+    if (claim === "drop") {
+      paneNative.wheel.dropped += 1;
+      return;
+    }
+    if (claim === "hold") {
+      const record = currentPane();
+      nativeInput.hold(paneNative, () => withPaneScope(record, () => dispatchTerminalWheel(buttonCode, direction, x, y, modifiers)));
+      return;
+    }
+    dispatchTerminalWheel(buttonCode, direction, x, y, modifiers);
     return;
   }
-
   const button = buttonCode === 0 ? "left" : buttonCode === 1 ? "middle" : buttonCode === 2 ? "right" : undefined;
   let type = "mouseMove";
   if (!motion && button) type = release ? "mouseUp" : "mouseDown";
+  // What the terminal says is held, which is what a native move between two reports may drag.
+  const paneNative = inputState().native;
+  paneNative.modifiers = modifiers;
+  paneNative.held = type === "mouseUp" || !button ? null : button;
+  paneNative.lastSent = { x, y };
   let clickCount = 0;
   if (type === "mouseDown") {
     clickCount = clicks.press(button, x, y);
@@ -6923,9 +7534,11 @@ function dispatchMouse(cb, rawX, rawY, release) {
   //
   // Only while a button is held: a pointer merely travelling is quantised too, but nothing
   // reads the path of a hover, and a page doing hit-testing per move would get three times the
-  // work for nothing. Only inside tmux, since elsewhere the coordinates are already pixels.
+  // work for nothing. Only inside tmux, since elsewhere the coordinates are already pixels. And
+  // not when the point came from the native pointer: the helper's moves already filled the path
+  // with real points, and a straight line drawn over them would bend it.
   const state = inputState();
-  if (type === "mouseMove" && button && paneIsInTmux()) {
+  if (type === "mouseMove" && button && paneIsInTmux() && !native) {
     const vp = currentFrames().viewport || queryViewportSize();
     const logical = logicalContentSize(vp);
     const cell = { x: logical.width / vp.cols, y: logical.height / vp.rows };
@@ -6970,9 +7583,195 @@ function dispatchMouse(cb, rawX, rawY, release) {
     // losing every entry that depends on the target.
   }
   if (debugLogging && type !== "mouseMove") {
-    console.error(`tweb: ${type} ${button} ${x},${y}`);
+    console.error(`tweb: ${type} ${button} ${x},${y}${native ? " (native)" : ""}`);
   }
 }
+
+/// One terminal wheel notch, as the terminal reported it.
+function dispatchTerminalWheel(buttonCode, direction, x, y, modifiers) {
+  if (!currentWindows().win) return;
+  {
+    // Both deltas in `sendInputEvent`'s sign, a positive delta being the way the CONTENT moves:
+    // wheel up (64) is +deltaY and wheel left (66) is +deltaX. xterm numbers the horizontal
+    // buttons 6 = left, 7 = right. The CDP route converts this to the DOM's sign in one place
+    // (mouseEventParams), so both axes have to be stated the same way here.
+    // `scroll.invert` flips both axes, as macOS's own setting does; `scroll.distance` is one notch.
+    const sign = settings.get("scroll.invert") ? -1 : 1;
+    const distance = settings.get("scroll.distance");
+    const horizontal = (buttonCode === 2 ? 1 : buttonCode === 3 ? -1 : 0) * sign;
+    const vertical = direction * sign;
+    const deltaX = horizontal * distance;
+    const deltaY = vertical * distance;
+    sendPointerEvent(currentWindows().win, {
+      type: "mouseWheel",
+      x,
+      y,
+      deltaX,
+      deltaY,
+      modifiers,
+      // What the direct path needs on top; CDP takes the deltas alone.
+      wheel: {
+        deltaX,
+        deltaY,
+        wheelTicksX: horizontal,
+        wheelTicksY: vertical,
+        accelerationRatioX: 0.5,
+        accelerationRatioY: 0.5,
+        hasPreciseScrollingDeltas: false,
+        canScroll: true,
+      },
+    });
+  }
+}
+
+// --- native pointer and trackpad (macOS) ---
+
+// One helper per engine, shared by every pane it hosts: it reports the one pointer there is, and
+// each pane decides from its own geometry and its own reports whether that pointer is over it.
+const nativeInput = new NativeInput({
+  log: (message) => console.error(`tweb: ${message}`),
+});
+
+function nativeEnabled() {
+  return process.platform === "darwin" && settings.get("input.native") === true;
+}
+
+// This pane's cell grid in screen points, on the display the pointer is on.
+function nativeGeometry() {
+  return paneGeometry({
+    viewport: currentFrames().viewport || queryViewportSize(),
+    origin: currentFrames().origin,
+    inTmux: paneIsInTmux(),
+  }, nativeInput.window?.scale);
+}
+
+// A fraction of the pane as the window point `sendInputEvent` takes. Kept fractional: the CDP route
+// carries sub-pixel positions, and rounding here would put back a grid, only a finer one.
+function nativePanePoint(hit) {
+  const logical = logicalContentSize(currentFrames().viewport || queryViewportSize());
+  return {
+    x: Math.min(logical.width - 1, Math.max(0, hit.fx * logical.width)),
+    y: Math.min(logical.height - 1, Math.max(0, hit.fy * logical.height)),
+  };
+}
+
+// A terminal report, seen by the native side: it locates the pane, arms the helper, and answers
+// where the pointer really is when the two agree. Null leaves the report's own point.
+function nativeReportPoint(rawX, rawY, motion) {
+  if (!nativeEnabled() || !nativeInput.arm()) return null;
+  const hit = nativeInput.report(inputState().native, nativeGeometry(), rawX - 1, rawY - 1, { motion });
+  return hit ? nativePanePoint(hit) : null;
+}
+
+// AppKit modifier bits as Electron's modifier names.
+function nativeModifiers(flags) {
+  const modifiers = [];
+  if (flags & (1 << 17)) modifiers.push("shift");
+  if (flags & (1 << 18)) modifiers.push("control");
+  if (flags & (1 << 19)) modifiers.push("alt");
+  if (flags & (1 << 20)) modifiers.push("meta");
+  return modifiers;
+}
+
+// The pane the native pointer is over, in its own scope: one that has been reported through the
+// window the pointer is over, is shown, and contains the point. `allowOutside` keeps a drag that
+// started in a pane delivered to it after the pointer leaves, as the terminal does.
+function withNativePane(x, y, fn, { allowOutside = false } = {}) {
+  let handled = false;
+  forEachPane(() => {
+    if (handled) return;
+    const paneNative = inputState().native;
+    if (!paneNative.latched || !currentWindows().win || !currentPane().visible) return;
+    const geometry = nativeGeometry();
+    const hit = nativeInput.hit(paneNative, geometry, x, y);
+    if (!hit) {
+      // Over some other window now: the pane is not under the pointer, and coming back to it is
+      // the terminal's to report, as leaving its rect is below.
+      if (nativeInput.window?.id !== paneNative.windowId) paneNative.latched = false;
+      return;
+    }
+    if (!hit.inside && !(allowOutside && paneNative.held)) {
+      // The pointer left. It is this pane's again once the terminal reports it here, not before:
+      // a popup, another client's window or a neighbouring pane may be what it entered.
+      paneNative.latched = false;
+      return;
+    }
+    handled = true;
+    fn(paneNative, hit, geometry);
+  });
+}
+
+// A pointer move the terminal did not report: inside a cell, or between two of its reports.
+// Inside tmux only — outside it the terminal's own reports are already pixels.
+nativeInput.on("move", (event) => {
+  if (!nativeEnabled()) return;
+  withNativePane(event.x, event.y, (paneNative, hit) => {
+    if (!paneIsInTmux()) return;
+    // A button counts as held only while both say so: the terminal, which saw where it went down,
+    // and the hardware, which knows it is still down.
+    const button = event.buttons ? paneNative.held || undefined : undefined;
+    const point = nativePanePoint(hit);
+    if (paneNative.lastSent && paneNative.lastSent.x === point.x && paneNative.lastSent.y === point.y) return;
+    paneNative.lastSent = point;
+    inputState().clicks.move(button, point.x, point.y);
+    if (button) inputState().lastDragPoint = point;
+    sendPointerEvent(currentWindows().win, {
+      type: "mouseMove",
+      x: point.x,
+      y: point.y,
+      button,
+      modifiers: paneNative.modifiers,
+      held: Boolean(button),
+      clickCount: 0,
+    });
+  }, { allowOutside: true });
+});
+
+// A scroll event from the real device. A precise one (trackpad, Magic Mouse) is scrolled here by
+// its own deltas, momentum events included — that is the inertia, generated by macOS and carried
+// as more events. A mouse wheel's is left to the terminal's notches, which `scroll.distance` sizes.
+nativeInput.on("scroll", (event) => {
+  if (!nativeEnabled()) return;
+  withNativePane(event.x, event.y, (paneNative, hit, geometry) => {
+    const precise = NativeInput.scrollsNatively(event);
+    nativeInput.noteNativeScroll(paneNative, precise);
+    if (!precise) return;
+    // Points to the window's DIPs. The pane's page is laid out at its logical size, which is the
+    // pane's points only when the render scale matches the display's.
+    const logical = logicalContentSize(currentFrames().viewport || queryViewportSize());
+    const perPoint = logical.width / (geometry.cols * geometry.cellW);
+    // `scrollingDeltaY` already follows the natural-scrolling setting and is positive when the
+    // content moves down — `sendInputEvent`'s sign, as the terminal's notches are.
+    const sign = settings.get("scroll.invert") ? -1 : 1;
+    const deltaX = event.dx * perPoint * sign;
+    const deltaY = event.dy * perPoint * sign;
+    // A phase change with no movement (fingers down, fingers up) is marked `phaseOnly`: the CDP
+    // route has no phases to give it and skips it, WebKit reads the phases and gets every one.
+    const point = nativePanePoint(hit);
+    sendPointerEvent(currentWindows().win, {
+      type: "mouseWheel",
+      x: point.x,
+      y: point.y,
+      deltaX,
+      deltaY,
+      modifiers: nativeModifiers(event.modifiers),
+      wheel: {
+        deltaX,
+        deltaY,
+        wheelTicksX: 0,
+        wheelTicksY: 0,
+        accelerationRatioX: 1,
+        accelerationRatioY: 1,
+        hasPreciseScrollingDeltas: true,
+        canScroll: true,
+        phase: event.phase,
+        momentumPhase: event.momentum,
+      },
+      phaseOnly: !deltaX && !deltaY,
+    });
+    paneNative.wheel.delivered += 1;
+  });
+});
 
 const KITTY_KEYS = new Map([
   [27, "Escape"], [13, "Enter"], [9, "Tab"], [127, "Backspace"],
@@ -8300,6 +9099,27 @@ function directorySize(directory) {
   return total;
 }
 
+// Local Markdown opens rendered. The engine answers file: itself and renders a Markdown document
+// requested as a page; every other file request goes to Chromium's own loader unchanged. See
+// markdown-page.cjs for why at the scheme (relative links and images keep resolving against the
+// file) and why marked. Before the first tab and on a host alike, since both open local files.
+//
+// Electron only: the Chrome engine's pages load in Chrome and the WebKit host's in WKWebView, and
+// neither consults this session, so there a .md file shows as text as it always has.
+function serveLocalMarkdown() {
+  if (pageBackend.kind !== "electron") return;
+  try {
+    session.defaultSession.protocol.handle("file", (request) => handleFileRequest(request, {
+      passThrough: (passed) => electron.net.fetch(passed, { bypassCustomProtocolHandlers: true }),
+      readFile: (file) => require("node:fs/promises").readFile(file),
+    }));
+  } catch (error) {
+    // A file: handler that failed to register leaves Chromium's own loader in place — Markdown as
+    // text, everything else as before. Logged: it is the only sign the feature is missing.
+    console.error(`tweb: markdown rendering unavailable: ${error.message}`);
+  }
+}
+
 app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock?.hide();
   // Before any window exists, because this deletes directories Chromium opens when one does.
@@ -8325,6 +9145,7 @@ app.whenReady().then(async () => {
   }
   configureDownloads();
   watchNetwork();
+  serveLocalMarkdown();
   // A backstop, not the mechanism: `browser-window-created` above and the per-tab
   // show/focus/move listeners in `configureTab` are what actually keep a window hidden.
   // This caught anything they missed, twenty times a second, forever — a second is plenty
@@ -8386,6 +9207,20 @@ app.whenReady().then(async () => {
     return;
   }
 
+  // Refused rather than ignored: the Chrome engine's browser is shared by every Chrome pane and the
+  // WebKit host has no per-pane proxy, so either would load this pane's pages on the LOCAL network
+  // while the user believes they are on the remote one. The CLI refuses first; this is the floor.
+  if (remote && pageBackend.kind !== "electron") {
+    console.error(`tweb: --ssh needs the Electron engine (this one is ${pageBackend.kind})`);
+    app.quit();
+    return;
+  }
+  // Awaited before the first navigation for the same reason the extension rules below are: a
+  // request that starts before the proxy is set goes out direct, from the local machine.
+  if (remote) {
+    await session.defaultSession.setProxy(proxyConfig(remote));
+    console.error(`tweb: network through ssh ${remote.destination} (${remote.proxyRules})`);
+  }
   terminalSetup();
   // Chrome has to be up before the first tab asks it for a target. A Chrome that cannot start
   // is not something to fall back from silently — the user chose it for a site Electron cannot
@@ -8474,6 +9309,24 @@ function cleanupFrameFiles() {
   removeFrameFiles(paneFrameFilePaths([...paneRegistry.list(), solePane]));
 }
 
+// This engine's own shared-memory objects and markers. The terminal unlinks every object it read,
+// so normally only the markers are left; the objects matter when a pane was hidden with a frame in
+// flight. Done here as well as in the worker because a worker torn down with the process is not
+// guaranteed to run its own exit handler.
+function cleanupShmFrames() {
+  if (!shmAddon) return;
+  const seen = new Set();
+  for (const frames of [...frameContexts.values(), soleFrames]) {
+    const imageId = frames?.imageIds?.base;
+    if (!frames?.shmMarked || seen.has(imageId)) continue;
+    seen.add(imageId);
+    for (const name of paneShmNames(process.pid, imageId)) {
+      try { shmAddon.unlinkShm(name); } catch {}
+    }
+    try { unlinkSync(path.join(app.getPath("userData"), shmMarkerName(process.pid, imageId))); } catch {}
+  }
+}
+
 // The above only removes this engine's own files, and only if it reaches its exit path. An
 // engine that is SIGKILLed — or orphaned, which is the case `orphan-watch.cjs` exists for —
 // leaves its last whole frame behind at up to 20MB, and nothing collects it. Observed: four
@@ -8503,6 +9356,25 @@ function sweepAbandonedFrameFiles() {
     }
   }
   if (removed > 0) console.error(`tweb: swept ${removed} frame files from dead engines`);
+  sweepAbandonedShmFrames(directory, names);
+}
+
+// The shared-memory objects a dead engine's panes may have left, found through their markers.
+// Without the addon they cannot be unlinked, so the markers stay for an engine that can.
+function sweepAbandonedShmFrames(directory, names) {
+  if (!shmAddon) return;
+  let unlinked = 0;
+  for (const { marker, objects } of abandonedShmFrames(names, process.pid, processAlive)) {
+    for (const object of objects) {
+      try {
+        if (shmAddon.unlinkShm(object)) unlinked += 1;
+      } catch (error) {
+        if (debugLogging) console.error(`tweb: shm sweep failed ${object}: ${error.message}`);
+      }
+    }
+    try { unlinkSync(path.join(directory, marker)); } catch {}
+  }
+  if (unlinked > 0) console.error(`tweb: swept ${unlinked} shm frames from dead engines`);
 }
 
 // The claim counterpart to `sweepAbandonedFrameFiles`, and here for the same reason: the slot
@@ -8641,6 +9513,7 @@ app.on("before-quit", () => {
           }
         }],
         [`${label} frame files`, cleanupFrameFiles],
+        [`${label} shm frames`, cleanupShmFrames],
         [`${label} stop painting`, () => {
           for (const tab of currentWindows().tabs) {
             if (!tab.isDestroyed()) tab.webContents.stopPainting();
@@ -8667,6 +9540,7 @@ app.on("before-quit", () => {
 process.on("exit", () => {
   runTeardown([
     ["exit frame files", cleanupFrameFiles],
+    ["exit shm frames", cleanupShmFrames],
     // The delete that takes each pane's image off the terminal. An exit handler cannot await, so
     // this only works because every pane writer has a synchronous sink — see `fdSink`. Give a
     // writer an async sink and these deletes are dropped, stranding the images.

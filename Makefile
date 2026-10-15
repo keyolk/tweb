@@ -51,6 +51,8 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/cdp/sign-in-block.cjs
 	node --check electron/cdp/web-contents.cjs
 	node --check electron/chrome-sites.cjs
+	node --check electron/agent-handoff.cjs
+	node --check electron/recorder.cjs
 	node --check electron/webkit/engine.cjs
 	node --check electron/webkit/helper.cjs
 	node --check electron/webkit/web-contents.cjs
@@ -58,8 +60,11 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/preload.cjs
 	node --check electron/gfx-worker.cjs
 	node --check electron/deflate-policy.cjs
+	node --check electron/search-engines.cjs
+	node --check electron/shm-frames.cjs
 	node --check electron/oopif-input.cjs
 	node --check electron/pointer-interpolation.cjs
+	node --check electron/native-input.cjs
 	node --check electron/settings.cjs
 	node --check electron/hint-labels.cjs
 	node --check electron/profile-hygiene.cjs
@@ -99,6 +104,10 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/extensions.cjs
 	node --check electron/extension-report.cjs
 	node --check electron/teardown.cjs
+	node --check electron/remote-network.cjs
+	node --check electron/markdown-page.cjs
+	node --check electron/vendor/marked.umd.cjs
+	node --check electron/transparent-pages.cjs
 	node --check electron/float-display.cjs
 	node --check electron/command-line.cjs
 	node --check electron/terminal-focus.cjs
@@ -119,6 +128,10 @@ install: release ## Install tweb into PREFIX (default ~/.local)
 	@# binary is a stub that says WKWebView is missing, and `tweb` refuses the engine itself.
 	@test "$$(uname)" != Darwin || test ! -f target/release/tweb-webkit \
 		|| install -m 0755 target/release/tweb-webkit "$(DESTDIR)$(PREFIX)/bin/tweb-webkit"
+	@# The macOS pointer/trackpad helper. The engine finds it beside `tweb`; without it a pane in
+	@# tmux keeps the terminal's cell-snapped mouse and wheel notches.
+	@test ! -f target/release/tweb-native-input \
+		|| install -m 0755 target/release/tweb-native-input "$(DESTDIR)$(PREFIX)/bin/tweb-native-input"
 	@# The supervisor. `tweb __pane` starts it on demand and finds it beside itself, so an install
 	@# without it is an install where every pane silently spawns its own engine.
 	@test ! -f target/release/twebd \
@@ -130,11 +143,14 @@ install: release ## Install tweb into PREFIX (default ~/.local)
 		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-webkit"
 	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/twebd" \
 		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/twebd"
+	@test "$$(uname)" != Darwin || test ! -f "$(DESTDIR)$(PREFIX)/bin/tweb-native-input" \
+		|| codesign -f -s - "$(DESTDIR)$(PREFIX)/bin/tweb-native-input"
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/tweb"
 
 uninstall: ## Remove what install placed (the cache is left alone)
 	rm -f "$(DESTDIR)$(PREFIX)/bin/tweb" "$(DESTDIR)$(PREFIX)/bin/tweb-webkit" \
 		"$(DESTDIR)$(PREFIX)/bin/tweb-tauri" \
+		"$(DESTDIR)$(PREFIX)/bin/tweb-native-input" \
 		"$(DESTDIR)$(PREFIX)/bin/twebd"
 
 clean: ## Remove the Rust build output
