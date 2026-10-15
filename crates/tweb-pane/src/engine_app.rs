@@ -32,6 +32,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/deflate-policy.cjs"),
     ),
     (
+        "shm-frames.cjs",
+        include_str!("../../../electron/shm-frames.cjs"),
+    ),
+    (
         "profile-hygiene.cjs",
         include_str!("../../../electron/profile-hygiene.cjs"),
     ),
@@ -269,12 +273,24 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Binary files that ship beside the app code. Kept apart from `FILES` because those are text and
+/// are read as such — the require-closure and syntax-check tests below walk their lines.
+///
+/// `native/tweb-frame.node` is the shared-memory frame addon `build.rs` compiles from
+/// `crates/tweb-frame-native`. It is empty when that build was skipped or failed, and an empty
+/// entry is simply not written: the engine then finds no addon and keeps the frame-file medium.
+const BINARY_FILES: &[(&str, &[u8])] = &[(
+    "native/tweb-frame.node",
+    include_bytes!(concat!(env!("OUT_DIR"), "/tweb-frame.node")),
+)];
+
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.
 /// What is needed is not collision resistance but only "different contents, different directory".
 fn content_tag() -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (name, body) in FILES {
-        for byte in name.as_bytes().iter().chain(body.as_bytes()) {
+    let text = FILES.iter().map(|(name, body)| (*name, body.as_bytes()));
+    for (name, body) in text.chain(BINARY_FILES.iter().copied()) {
+        for byte in name.as_bytes().iter().chain(body) {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
@@ -297,9 +313,13 @@ pub fn cache_root() -> PathBuf {
 fn write_app(directory: &Path) -> Result<()> {
     std::fs::create_dir_all(directory)
         .with_context(|| format!("cannot create {}", directory.display()))?;
-    for (name, body) in FILES {
+    let text = FILES.iter().map(|(name, body)| (*name, body.as_bytes()));
+    for (name, body) in text.chain(BINARY_FILES.iter().copied()) {
+        if body.is_empty() {
+            continue;
+        }
         let path = directory.join(name);
-        // `cdp/…` and any other subdirectory the app keeps.
+        // `cdp/…`, `native/` and any other subdirectory the app keeps.
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
