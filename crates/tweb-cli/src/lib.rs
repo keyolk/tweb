@@ -50,6 +50,15 @@ pub struct BrowserOptions {
     #[arg(long, overrides_with = "adaptive_frame_rate")]
     pub no_adaptive_frame_rate: bool,
 
+    /// Send the pane's network through an ssh host, so its `localhost` is that host's.
+    /// `host`, `user@host[:port]`, an ssh_config alias (`coder.<workspace>` after
+    /// `coder config-ssh`), `coder:<workspace>`, or ssh flags and a destination in one
+    /// quoted string (`"-J bastion me@box"`). The tunnel closes with the pane.
+    /// Electron engine only; the pane gets its own profile for that host.
+    // Hyphen values allowed: the pass-through form starts with an ssh flag (`-J bastion me@box`).
+    #[arg(long, value_name = "DEST", allow_hyphen_values = true)]
+    pub ssh: Option<String>,
+
     /// Let the terminal show through pages that paint no background of their own.
     /// `page.transparent` in config.toml turns it on for every pane. Electron engine only.
     #[arg(long)]
@@ -61,6 +70,12 @@ impl BrowserOptions {
     /// `engine.chrome_sites`, electron for everything else (and for a restored session).
     fn with_engine_for(&self, url: Option<&str>) -> BrowserOptions {
         let mut resolved = self.clone();
+        // A tunnelled pane is an Electron pane: the Chrome engine's browser is shared by every
+        // Chrome pane, so a proxy there would reroute all of them, and the WebKit host has no
+        // per-pane proxy. `engine.chrome_sites` therefore does not apply to it.
+        if resolved.ssh.is_some() && resolved.engine.is_none() {
+            resolved.engine = Some(BrowserEngineArg::Electron);
+        }
         if resolved.engine.is_none() {
             let site = url.and_then(|url| sites::matching_site(url, &config::chrome_sites()));
             if let Some(site) = &site {
@@ -80,6 +95,21 @@ impl BrowserOptions {
 
     fn engine(&self) -> BrowserEngineArg {
         self.engine.unwrap_or(BrowserEngineArg::Electron)
+    }
+
+    /// `--ssh`, parsed. Checked in the calling process, before any pane is split, so a typo is
+    /// reported where it was typed rather than in a pane that closes as it opens.
+    fn ssh_target(&self) -> Result<Option<tweb_pane::ssh::SshTarget>> {
+        let Some(value) = &self.ssh else {
+            return Ok(None);
+        };
+        if !matches!(self.engine(), BrowserEngineArg::Electron) {
+            anyhow::bail!(
+                "--ssh needs the Electron engine: the Chrome engine shares one browser across \
+                 panes and the WebKit host has no per-pane proxy"
+            );
+        }
+        tweb_pane::ssh::parse_target(value).map(Some)
     }
 
     /// Refuses `--transparent` where it cannot be honoured. Only the flag: `page.transparent`
@@ -126,6 +156,9 @@ impl BrowserOptions {
         } else {
             " --no-adaptive-frame-rate"
         });
+        if let Some(ssh) = &self.ssh {
+            value.push_str(&format!(" --ssh={}", shell_quote(ssh)));
+        }
         if self.transparent {
             value.push_str(" --transparent");
         }
@@ -734,12 +767,28 @@ pub async fn run() -> Result<()> {
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // An omitted URL is preserved across tmux split-window too.
             let browser = browser.with_engine_for(url.as_deref());
+            browser.ssh_target()?;
             browser.check_transparent()?;
             split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
         }
         Command::PaneInternal { browser, page, url } => {
             // Without a URL, restore the tmux window session.
-            run_pane(page.as_deref().or(url.as_deref()), &browser).await?;
+            let result = run_pane(page.as_deref().or(url.as_deref()), &browser).await;
+            // A split pane closes the moment this returns, taking the error with it — and an ssh
+            // that could not connect is the one failure here a person has to read to fix (a host
+            // name, a key, a refused login). So that pane waits for Enter first.
+            if let (Err(error), Some(_)) = (&result, &browser.ssh) {
+                use std::io::{BufRead, IsTerminal};
+                if std::io::stdin().is_terminal() {
+                    eprintln!("tweb: {error:#}\n\npress Enter to close this pane");
+                    let _ = std::io::stdin().lock().read_line(&mut String::new());
+                    // Already reported. Returning the error would print it a second time, after
+                    // the person dismissed the first. The tunnel is gone with `run_pane`'s frame,
+                    // so there is nothing left for a destructor to do.
+                    std::process::exit(1);
+                }
+            }
+            result?;
         }
         Command::EnginePaths { json } => {
             let (electron, app) = tweb_pane::find_electron()?;
@@ -982,6 +1031,7 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
         frame_rate: browser.max_frame_rate(),
         adaptive_frame_rate: browser.adaptive(),
         restore_session: url.is_none(),
+        ssh: browser.ssh_target()?,
         transparent: browser.transparent,
     };
     tweb_pane::run_with_options(url.unwrap_or("about:blank"), options).await
@@ -1087,6 +1137,7 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
         frame_rate: None,
         adaptive_frame_rate: false,
         no_adaptive_frame_rate: false,
+        ssh: None,
         transparent: false,
     };
     split_and_run_pane(
@@ -1204,6 +1255,54 @@ mod tests {
             }
             other => panic!("bare tweb parsed as {other:?}"),
         }
+    }
+
+    /// `tweb split --ssh` re-runs this binary as `__pane` through a shell command line, so the
+    /// value has to survive quoting — including the pass-through form that starts with a flag.
+    #[test]
+    fn ssh_survives_the_split_command_line() {
+        let cli = Cli::try_parse_from([
+            "tweb",
+            "split",
+            "--frame-rate",
+            "30",
+            "--adaptive-frame-rate",
+            "--ssh",
+            "-J bastion me@box",
+            "http://localhost:3000",
+        ])
+        .expect("split --ssh should parse");
+        let Command::Split { browser, .. } = cli.command else {
+            panic!("not a split");
+        };
+        // Electron without consulting `engine.chrome_sites`, which would read config.toml.
+        let browser = browser.with_engine_for(Some("http://localhost:3000"));
+        assert!(matches!(
+            browser.engine,
+            Some(super::BrowserEngineArg::Electron)
+        ));
+        let target = browser.ssh_target().unwrap().unwrap();
+        assert_eq!(target.destination, "me@box");
+        let args = browser.shell_args();
+        assert!(args.ends_with("--ssh='-J bastion me@box'"), "{args}");
+        // And the pane parses what the split wrote.
+        let pane =
+            Cli::try_parse_from(["tweb", "__pane", "--ssh=-J bastion me@box", "about:blank"])
+                .expect("__pane --ssh= should parse");
+        let Command::PaneInternal { browser, .. } = pane.command else {
+            panic!("not a pane");
+        };
+        assert_eq!(browser.ssh.as_deref(), Some("-J bastion me@box"));
+    }
+
+    #[test]
+    fn ssh_refuses_the_engines_that_cannot_proxy_one_pane() {
+        let cli =
+            Cli::try_parse_from(["tweb", "open", "--engine", "chrome", "--ssh", "box"]).unwrap();
+        let Command::Open { browser, .. } = cli.command else {
+            panic!("not an open");
+        };
+        assert!(browser.ssh_target().is_err());
     }
 
     #[test]

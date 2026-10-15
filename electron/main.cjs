@@ -132,6 +132,7 @@ const {
   audioOwnerAmong, paneImageIds, collidingImageRange, PATCH_ID_COUNT,
 } = require("./pane-registry.cjs");
 const { paneFrameFileList, runTeardown } = require("./teardown.cjs");
+const { remoteNetwork, remoteProfileDir, proxyConfig } = require("./remote-network.cjs");
 const { handleFileRequest } = require("./markdown-page.cjs");
 const { transparentPages, transparentWindowOptions } = require("./transparent-pages.cjs");
 const {
@@ -205,6 +206,19 @@ const hostedRuntime = isHostedRuntime(process.env);
 // call sites falls through to its "not in tmux" branch, which already exists and is already
 // correct. A hosted pane's geometry and visibility arrive over its own connection instead.
 const ownTmuxPane = hostedRuntime ? null : (process.env.TMUX_PANE || null);
+// `--ssh`: this pane's network is a remote host's, through the tunnel its frontend opened. Never
+// on a host: the frontend keeps a tunnelled pane off the daemon, because a proxy is per session
+// and a host's panes share one. The profile moves before anything opens it — `ready` is too late,
+// Chromium has the cookie store by then. See remote-network.cjs for why the profile moves at all.
+const remote = hostedRuntime ? null : remoteNetwork(process.env);
+if (remote) {
+  app.setPath("userData", remoteProfileDir(app.getPath("userData"), remote));
+  // WebRTC's UDP does not go through SOCKS; without this a page on the remote network could
+  // still read the local machine's addresses.
+  app.on("web-contents-created", (_event, contents) => {
+    contents.setWebRTCIPHandlingPolicy("disable_non_proxied_udp");
+  });
+}
 // Now that the pane is known, say which one this is. A host serves many panes and names none of
 // them; a per-pane engine names the pane it belongs to, which is what tells two engines apart in
 // `ps` when two panes are open. The `comm` column truncates to about 15 characters, so the
@@ -4608,6 +4622,8 @@ function agentDiagnostics() {
     pane: ownTmuxPane,
     pid: process.pid,
     engineApp: __dirname,
+    // `--ssh`: whose network this pane is on, and which profile it uses for it.
+    remote: remote ? { destination: remote.destination, proxy: remote.proxyRules, profile: app.getPath("userData") } : null,
     // Whether the active tab was created clear, and so sends whole frames only.
     transparent: tab ? transparentTabs.has(tab) : null,
     pane_geometry: {
@@ -8595,6 +8611,20 @@ app.whenReady().then(async () => {
     return;
   }
 
+  // Refused rather than ignored: the Chrome engine's browser is shared by every Chrome pane and the
+  // WebKit host has no per-pane proxy, so either would load this pane's pages on the LOCAL network
+  // while the user believes they are on the remote one. The CLI refuses first; this is the floor.
+  if (remote && pageBackend.kind !== "electron") {
+    console.error(`tweb: --ssh needs the Electron engine (this one is ${pageBackend.kind})`);
+    app.quit();
+    return;
+  }
+  // Awaited before the first navigation for the same reason the extension rules below are: a
+  // request that starts before the proxy is set goes out direct, from the local machine.
+  if (remote) {
+    await session.defaultSession.setProxy(proxyConfig(remote));
+    console.error(`tweb: network through ssh ${remote.destination} (${remote.proxyRules})`);
+  }
   terminalSetup();
   // Chrome has to be up before the first tab asks it for a target. A Chrome that cannot start
   // is not something to fall back from silently — the user chose it for a site Electron cannot
