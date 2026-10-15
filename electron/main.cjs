@@ -15,6 +15,7 @@ const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug
 const { BrowserWindow, ipcMain, session } = pageBackend;
 const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
+const { searchUrl, suggestUrl, parseSuggestions } = require("./search-engines.cjs");
 // The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
 // here because the mode resets that clear it run from functions defined well above that case.
 const insertModeOwners = new WeakMap();
@@ -3302,7 +3303,32 @@ function normalizeOmniboxInput(input) {
   if (!/\s/.test(value) && (/^[^/]+\.[^/]+(?:\/|$)/.test(value) || /^[^/]+:\d+(?:\/|$)/.test(value))) {
     return `https://${value}`;
   }
-  return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
+  return searchUrl(value, settings.get("search.engine"));
+}
+
+// Suggestions for what is typed in the omnibox, from `search.suggest` (off by default — see
+// search-engines.cjs for why). Fetched here rather than in the page: the omnibox lives inside the
+// page's own document, and a request from there would carry that site's origin and be subject to its
+// CSP. A slow or failing provider just yields no rows; the omnibox never waits on it.
+const SUGGEST_TIMEOUT_MS = 1500;
+
+async function omniboxSuggestions(query) {
+  const url = suggestUrl(query, settings.get("search.suggest"));
+  if (!url) return [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SUGGEST_TIMEOUT_MS);
+  try {
+    const response = await electron.net.fetch(url, { signal: controller.signal, credentials: "omit" });
+    if (!response.ok) return [];
+    const engine = settings.get("search.engine");
+    return parseSuggestions(await response.text())
+      .map((text) => ({ kind: "search", title: text, url: searchUrl(text, engine) }));
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: omnibox suggestions failed: ${error.message}`);
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // History is shared by every pane and survives restarts, so the omnibox offers
@@ -3805,6 +3831,15 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "omnibox-model":
       sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
       break;
+    // `seq` travels back so the page can drop a reply to a query it has already moved past.
+    case "omnibox-suggest": {
+      const seq = value?.seq;
+      const query = String(value?.query || "");
+      omniboxSuggestions(query).then((suggestions) => {
+        if (!tab.isDestroyed()) sendToFocusedTabFrame(tab, "tweb-omnibox-suggest", { seq, query, suggestions });
+      });
+      break;
+    }
     // The page re-asks on every keystroke so the filter runs over the whole file rather
     // than over a slice the renderer happens to be holding.
     case "history-model":
@@ -6114,7 +6149,7 @@ function runBrowserContextMenuCommand(tab, action) {
     case "paste-plain": contents.pasteAndMatchStyle(); break;
     case "select-all": contents.selectAll(); break;
     case "search-selection":
-      createTab(`https://www.google.com/search?q=${encodeURIComponent(params.selectionText)}`, true);
+      createTab(searchUrl(params.selectionText, settings.get("search.engine")), true);
       break;
     case "open-link": createTab(params.linkURL, true); break;
     case "open-link-here": void contents.loadURL(params.linkURL); break;

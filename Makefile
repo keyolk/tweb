@@ -58,6 +58,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/preload.cjs
 	node --check electron/gfx-worker.cjs
 	node --check electron/deflate-policy.cjs
+	node --check electron/search-engines.cjs
 	node --check electron/oopif-input.cjs
 	node --check electron/pointer-interpolation.cjs
 	node --check electron/settings.cjs

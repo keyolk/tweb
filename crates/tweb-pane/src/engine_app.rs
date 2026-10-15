@@ -52,6 +52,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/settings.cjs"),
     ),
     (
+        "search-engines.cjs",
+        include_str!("../../../electron/search-engines.cjs"),
+    ),
+    (
         "settings-schema.json",
         include_str!("../../../electron/settings-schema.json"),
     ),

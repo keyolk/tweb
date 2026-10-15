@@ -102,6 +102,7 @@ test("every schema entry is complete and its default has its type", () => {
       int: Number.isInteger(entry.default),
       float: typeof entry.default === "number",
       path: typeof entry.default === "string",
+      string: typeof entry.default === "string",
       list: Array.isArray(entry.default) && entry.default.every((item) => typeof item === "string"),
     }[entry.type];
     assert.ok(typeOk, `${entry.key} default does not match ${entry.type}`);
@@ -120,4 +121,11 @@ test("the engine reads each setting where it is used, so a live change needs no 
   for (const name of ["TWEB_DOWNLOAD_DIR", "TWEB_DEFAULT_ZOOM", "TWEB_IME_SLOT_CELLS", "TWEB_ADAPTIVE_FRAME_RATE"]) {
     assert.ok(!main.includes(`process.env.${name}`), name);
   }
+});
+
+test("a string setting is taken as written, without the home expansion a path gets", () => {
+  const entry = settings.schema.find((candidate) => candidate.type === "string");
+  assert.ok(entry, "the schema has a string setting");
+  const { values } = settings.resolve({ [entry.key]: "  ~/not-a-path  " }, {});
+  assert.equal(values[entry.key], "~/not-a-path");
 });

@@ -64,6 +64,20 @@
       "description": "Width in cells of the box an IME composition is drawn in."
     },
     {
+      "key": "search.engine",
+      "type": "string",
+      "default": "google",
+      "applies": "live",
+      "description": "What a search typed in the omnibox (or a selection's \"Search\") opens: google, duckduckgo, bing, brave, kagi, ecosia, perplexity, or a URL with %s where the query goes."
+    },
+    {
+      "key": "search.suggest",
+      "type": "string",
+      "default": "off",
+      "applies": "live",
+      "description": "Search suggestions in the omnibox: off, an engine name above, or a URL with %s returning OpenSearch JSON. Off by default because every keystroke typed there is sent to that provider."
+    },
+    {
       "key": "engine.chrome_sites",
       "type": "list",
       "default": [],
