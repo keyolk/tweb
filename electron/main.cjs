@@ -132,6 +132,7 @@ const {
   audioOwnerAmong, paneImageIds, collidingImageRange, PATCH_ID_COUNT,
 } = require("./pane-registry.cjs");
 const { paneFrameFileList, runTeardown } = require("./teardown.cjs");
+const { handleFileRequest } = require("./markdown-page.cjs");
 const { transparentPages, transparentWindowOptions } = require("./transparent-pages.cjs");
 const {
   parseControlLine, resolveTarget, formatOutbound, keyboardRestoreEvent,
@@ -8486,6 +8487,27 @@ function directorySize(directory) {
   return total;
 }
 
+// Local Markdown opens rendered. The engine answers file: itself and renders a Markdown document
+// requested as a page; every other file request goes to Chromium's own loader unchanged. See
+// markdown-page.cjs for why at the scheme (relative links and images keep resolving against the
+// file) and why marked. Before the first tab and on a host alike, since both open local files.
+//
+// Electron only: the Chrome engine's pages load in Chrome and the WebKit host's in WKWebView, and
+// neither consults this session, so there a .md file shows as text as it always has.
+function serveLocalMarkdown() {
+  if (pageBackend.kind !== "electron") return;
+  try {
+    session.defaultSession.protocol.handle("file", (request) => handleFileRequest(request, {
+      passThrough: (passed) => electron.net.fetch(passed, { bypassCustomProtocolHandlers: true }),
+      readFile: (file) => require("node:fs/promises").readFile(file),
+    }));
+  } catch (error) {
+    // A file: handler that failed to register leaves Chromium's own loader in place — Markdown as
+    // text, everything else as before. Logged: it is the only sign the feature is missing.
+    console.error(`tweb: markdown rendering unavailable: ${error.message}`);
+  }
+}
+
 app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock?.hide();
   // Before any window exists, because this deletes directories Chromium opens when one does.
@@ -8511,6 +8533,7 @@ app.whenReady().then(async () => {
   }
   configureDownloads();
   watchNetwork();
+  serveLocalMarkdown();
   // A backstop, not the mechanism: `browser-window-created` above and the per-tab
   // show/focus/move listeners in `configureTab` are what actually keep a window hidden.
   // This caught anything they missed, twenty times a second, forever — a second is plenty

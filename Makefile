@@ -101,6 +101,8 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/extensions.cjs
 	node --check electron/extension-report.cjs
 	node --check electron/teardown.cjs
+	node --check electron/markdown-page.cjs
+	node --check electron/vendor/marked.umd.cjs
 	node --check electron/transparent-pages.cjs
 	node --check electron/float-display.cjs
 	node --check electron/command-line.cjs
