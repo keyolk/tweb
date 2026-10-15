@@ -6853,7 +6853,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
   const contents = currentWindows().win.webContents;
   // Inside tmux the report is a cell. Where the native pointer agrees with it, the point is the
   // pointer's real one instead — see native-input.cjs. Outside tmux the report is already pixels.
-  const native = nativeReportPoint(rawX, rawY);
+  const native = nativeReportPoint(rawX, rawY, (cb & 32) !== 0);
   const { x, y } = native && paneIsInTmux() ? native : logicalMousePoint(rawX, rawY);
   const clicks = inputState().clicks;
   const modifiers = mouseModifiers(cb);
@@ -7029,9 +7029,9 @@ function nativePanePoint(hit) {
 
 // A terminal report, seen by the native side: it locates the pane, arms the helper, and answers
 // where the pointer really is when the two agree. Null leaves the report's own point.
-function nativeReportPoint(rawX, rawY) {
+function nativeReportPoint(rawX, rawY, motion) {
   if (!nativeEnabled() || !nativeInput.arm()) return null;
-  const hit = nativeInput.report(inputState().native, nativeGeometry(), rawX - 1, rawY - 1);
+  const hit = nativeInput.report(inputState().native, nativeGeometry(), rawX - 1, rawY - 1, { motion });
   return hit ? nativePanePoint(hit) : null;
 }
 

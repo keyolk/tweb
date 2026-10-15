@@ -59,16 +59,16 @@ function harness({ binary = "/bin/helper" } = {}) {
 }
 
 // Where a screen point is in the pane's own cells, as tmux would report it (zero-based here).
-function cellOf(x, y, window = WINDOW) {
+function cellOf(x, y, window = WINDOW, grid = GRID) {
   return {
-    col: Math.floor((x - window.x - GRID.x) / GEOMETRY.cellW) - ORIGIN.left,
-    row: Math.floor((y - window.y - GRID.y) / GEOMETRY.cellH) - ORIGIN.top,
+    col: Math.floor((x - window.x - grid.x) / GEOMETRY.cellW) - ORIGIN.left,
+    row: Math.floor((y - window.y - grid.y) / GEOMETRY.cellH) - ORIGIN.top,
   };
 }
 
 // The pointer travelling slowly across the pane, the helper seeing every point and the terminal
 // reporting each new cell, as a real one does.
-function travel(h, pane, from, to, steps, window = WINDOW) {
+function travel(h, pane, from, to, steps, window = WINDOW, grid = GRID) {
   let last = null;
   let result = null;
   for (let i = 0; i <= steps; i += 1) {
@@ -76,7 +76,7 @@ function travel(h, pane, from, to, steps, window = WINDOW) {
     const y = from.y + (to.y - from.y) * i / steps;
     h.advance(8);
     h.line({ ev: "m", x, y, b: 0 });
-    const cell = cellOf(x, y, window);
+    const cell = cellOf(x, y, window, grid);
     if (!last || last.col !== cell.col || last.row !== cell.row) {
       h.advance(4);
       result = h.native.report(pane, GEOMETRY, cell.col, cell.row);
@@ -304,4 +304,51 @@ test("no helper, or one that died, leaves everything to the terminal", () => {
 
   const linux = new NativeInput({ platform: "linux", findHelper: () => "/bin/x" });
   assert.strictEqual(linux.arm(), false);
+});
+
+// Measured on a real Ghostty window: the grid was known to 0.1pt after a wander. Then a trackpad
+// flick was posted at a point the pointer had not moved to, and Ghostty reported each wheel event
+// at the last cell it had tracked. Three of those reset the estimate, and the horizontal wander
+// that followed could never narrow Y again — the pointer stayed on cells for the rest of the run.
+test("wheel and press reports at a stale cell do not undo a located grid", () => {
+  const { h, pane } = calibrated();
+  const located = h.native.estimateFor(GEOMETRY).origin();
+  const stale = cellOf(WINDOW.x + 120, WINDOW.y + 140);
+  for (let i = 0; i < 13; i += 1) {
+    h.advance(16);
+    h.line({ ev: "s", x: WINDOW.x + 560, y: WINDOW.y + 331, dx: 0, dy: -12, ph: 4, mo: 0, pr: true, mods: 0 });
+    h.native.report(pane, GEOMETRY, stale.col, stale.row, { motion: false });
+  }
+  const estimate = h.native.estimateFor(GEOMETRY);
+  assert.ok(estimate.usable(GEOMETRY.cellW, GEOMETRY.cellH));
+  assert.deepStrictEqual(estimate.origin(), located, "a report that is not a cell crossing never calibrates");
+});
+
+test("a few disagreeing motion reports do not reset the grid", () => {
+  const { h, pane } = calibrated();
+  const located = h.native.estimateFor(GEOMETRY).origin();
+  // The pointer is far away while the terminal still names an old cell: stale or from another path.
+  for (let i = 0; i < 5; i += 1) {
+    h.advance(16);
+    h.line({ ev: "m", x: WINDOW.x + 560, y: WINDOW.y + 331, b: 0 });
+    h.native.report(pane, GEOMETRY, 3 + (i % 2), 4);
+  }
+  const estimate = h.native.estimateFor(GEOMETRY);
+  assert.ok(estimate.usable(GEOMETRY.cellW, GEOMETRY.cellH));
+  assert.deepStrictEqual(estimate.origin(), located);
+  assert.ok(estimate.conflicts >= 5);
+});
+
+test("a grid that really moved takes over once its own reports locate it", () => {
+  const { h, pane } = calibrated();
+  // Ghostty showing a tab bar: every cell 28pt lower in the same window.
+  const moved = { x: GRID.x, y: GRID.y + 28 };
+  const start = { x: WINDOW.x + 100, y: WINDOW.y + 150 };
+  const end = { x: start.x + 80, y: start.y + 60 };
+  travel(h, pane, start, end, 300, WINDOW, moved);
+  travel(h, pane, end, start, 300, WINDOW, moved);
+  const estimate = h.native.estimateFor(GEOMETRY);
+  assert.ok(estimate.usable(GEOMETRY.cellW, GEOMETRY.cellH));
+  assert.ok(Math.abs(estimate.origin().y - moved.y) < 0.5, `y ${estimate.origin().y}`);
+  assert.ok(Math.abs(estimate.origin().x - moved.x) < 0.5, `x ${estimate.origin().x}`);
 });

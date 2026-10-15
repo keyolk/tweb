@@ -47,7 +47,6 @@ const FRESH_MS = 100;
 // Interval endpoints that miss each other by less than this still agree (sub-point jitter between
 // the two streams). Three disagreements in a row mean the grid really moved.
 const AGREE_PT = 1;
-const CONFLICTS_TO_RESET = 3;
 // The wheel. A terminal report within DROP_MS of a precise native event in the same pane is that
 // gesture; one with nothing native yet waits HOLD_MS for it; FLUSHES_TO_SILENCE waits that found
 // nothing mean the helper is not hearing this wheel, and waiting stops for SILENCE_MS.
@@ -145,37 +144,27 @@ function paneGeometry({ viewport, origin, inTmux }, scale) {
 
 /// Where cell 0 starts on one axis: somewhere in (lo, hi], narrowed by every report.
 class AxisEstimate {
-  constructor() {
-    this.lo = -Infinity;
-    this.hi = Infinity;
-    this.conflicts = 0;
+  constructor(lo = -Infinity, hi = Infinity) {
+    this.lo = lo;
+    this.hi = hi;
   }
 
-  offer(lo, hi) {
+  /// Whether a report's interval can hold together with this one.
+  fits(lo, hi) {
+    return Math.max(this.lo, lo) <= Math.min(this.hi, hi) + AGREE_PT;
+  }
+
+  apply(lo, hi) {
     const nextLo = Math.max(this.lo, lo);
     const nextHi = Math.min(this.hi, hi);
-    if (nextLo <= nextHi + AGREE_PT) {
-      if (nextLo > nextHi) {
-        const middle = (nextLo + nextHi) / 2;
-        this.lo = middle;
-        this.hi = middle;
-      } else {
-        this.lo = nextLo;
-        this.hi = nextHi;
-      }
-      this.conflicts = 0;
-      return true;
+    if (nextLo > nextHi) {
+      const middle = (nextLo + nextHi) / 2;
+      this.lo = middle;
+      this.hi = middle;
+    } else {
+      this.lo = nextLo;
+      this.hi = nextHi;
     }
-    // A report the estimate cannot hold. Once is skew between the streams; three in a row is the
-    // grid having moved (a window resized under a balanced padding, a status line toggled), and the
-    // estimate starts again from the report.
-    this.conflicts += 1;
-    if (this.conflicts >= CONFLICTS_TO_RESET) {
-      this.lo = lo;
-      this.hi = hi;
-      this.conflicts = 0;
-    }
-    return false;
   }
 
   width() { return this.hi - this.lo; }
@@ -183,29 +172,62 @@ class AxisEstimate {
 }
 
 /// The grid origin of one terminal window, relative to the window's top-left, in points.
+///
+/// A report the estimate cannot hold is not trusted to overturn it. It goes to a challenger, a
+/// second estimate built only from disagreeing reports, and the challenger replaces this one only
+/// once it has itself narrowed to usable. A grid that really moved (Ghostty showing a tab bar, a
+/// padding change) produces travelling reports that narrow a challenger as quickly as the first
+/// estimate narrowed. Stale reports do not: measured on a real Ghostty window, three wheel reports
+/// at the last motion cell while the scroll event sat 120pt away reset a grid known to 0.1pt under
+/// the old "three conflicts in a row" rule. A horizontal wander after that could never narrow Y
+/// again, so the pointer stayed on cells for the rest of the session.
 class GridEstimate {
   constructor() {
     this.x = new AxisEstimate();
     this.y = new AxisEstimate();
     this.reports = 0;
+    this.conflicts = 0;
+    this.challenger = null;
   }
 
   /// One report: the pointer was in client-grid cell (col, row) while the helper saw it somewhere
   /// in `xs`/`ys` (window-relative min/max over the samples the report could have been made from).
   offer(col, row, xs, ys, cellW, cellH) {
     this.reports += 1;
-    const okX = this.x.offer(xs.min - (col + 1) * cellW, xs.max - col * cellW);
-    const okY = this.y.offer(ys.min - (row + 1) * cellH, ys.max - row * cellH);
-    return okX && okY;
+    const bx = [xs.min - (col + 1) * cellW, xs.max - col * cellW];
+    const by = [ys.min - (row + 1) * cellH, ys.max - row * cellH];
+    if (this.x.fits(...bx) && this.y.fits(...by)) {
+      this.x.apply(...bx);
+      this.y.apply(...by);
+      this.challenger = null;
+      return true;
+    }
+    this.conflicts += 1;
+    if (!this.challenger || !this.challenger.x.fits(...bx) || !this.challenger.y.fits(...by)) {
+      this.challenger = { x: new AxisEstimate(...bx), y: new AxisEstimate(...by) };
+    } else {
+      this.challenger.x.apply(...bx);
+      this.challenger.y.apply(...by);
+    }
+    if (narrow(this.challenger, cellW, cellH)) {
+      this.x = this.challenger.x;
+      this.y = this.challenger.y;
+      this.challenger = null;
+    }
+    return false;
   }
 
   /// Good enough to place a pointer: known to within half a cell (and never asked to be finer than
   /// a point, which a one-pixel grid outside tmux would otherwise demand).
   usable(cellW, cellH) {
-    return this.x.width() <= Math.max(1, cellW / 2) && this.y.width() <= Math.max(1, cellH / 2);
+    return narrow(this, cellW, cellH);
   }
 
   origin() { return { x: this.x.value(), y: this.y.value() }; }
+}
+
+function narrow(estimate, cellW, cellH) {
+  return estimate.x.width() <= Math.max(1, cellW / 2) && estimate.y.width() <= Math.max(1, cellH / 2);
 }
 
 /// A pane's share of the native state. Kept on the pane's input state, so N panes in one host each
@@ -264,6 +286,18 @@ class NativeInput extends EventEmitter {
     this.window = null;
     this.samples = [];
     this.estimates = new Map();
+    // `TWEB_NATIVE_INPUT_TRACE=<file>`: one JSON line per terminal report, with the native samples
+    // it was matched against and the grid estimate after it. How the grid was found not to settle.
+    this.tracePath = env.TWEB_NATIVE_INPUT_TRACE || null;
+  }
+
+  trace(record) {
+    try {
+      fs.appendFileSync(this.tracePath, `${JSON.stringify(record)}\n`);
+    } catch (error) {
+      this.log(`native input: trace write failed: ${error.message}`);
+      this.tracePath = null;
+    }
   }
 
   /// Ask for the native stream, starting the helper the first time. Cheap enough to call on every
@@ -364,7 +398,7 @@ class NativeInput extends EventEmitter {
   /// A terminal mouse report for a pane, `col`/`row` zero-based in the pane (cells in tmux, device
   /// pixels outside it). Narrows the grid estimate and, when the native pointer agrees with the
   /// report, returns where in the pane it really is as fractions of the pane: `{ fx, fy }`.
-  report(paneNative, geometry, col, row) {
+  report(paneNative, geometry, col, row, { motion = true } = {}) {
     const now = this.now();
     if (!this.live() || !geometry || !this.window) {
       paneNative.reports.cell += 1;
@@ -374,8 +408,13 @@ class NativeInput extends EventEmitter {
     const estimate = this.estimateFor(geometry, window);
     const gridCol = geometry.left + col;
     const gridRow = geometry.top + row;
+    // Only a motion report calibrates. A terminal sends one because the pointer crossed into a
+    // new cell, which is what both bounds below rely on. A press or a wheel report repeats
+    // whatever cell the terminal last tracked, and that can be stale: a wheel event's position
+    // need not be where the terminal last saw the pointer move. Those reports still get a native
+    // point below, when the pointer agrees with them.
     const offer = (samples, atCol, atRow) => {
-      if (!samples.length) return;
+      if (!motion || !samples.length) return;
       const xs = samples.map((sample) => sample.x - window.x);
       const ys = samples.map((sample) => sample.y - window.y);
       estimate.offer(
@@ -398,7 +437,20 @@ class NativeInput extends EventEmitter {
       offer(this.samples.filter((sample) => sample.at >= previous.at && now - sample.at > REPORT_WINDOW_MS),
         previous.col, previous.row);
     }
-    paneNative.lastReport = { at: now, col: gridCol, row: gridRow, windowId: window.id };
+    if (motion) paneNative.lastReport = { at: now, col: gridCol, row: gridRow, windowId: window.id };
+    if (this.tracePath) {
+      this.trace({
+        at: Math.round(now * 10) / 10, motion, col: gridCol, row: gridRow, cell: [geometry.cellW, geometry.cellH],
+        window: [window.x, window.y],
+        samples: this.samples.slice(-12).map((sample) => [Math.round(now - sample.at), sample.x - window.x, sample.y - window.y]),
+        x: [estimate.x.lo, estimate.x.hi],
+        y: [estimate.y.lo, estimate.y.hi],
+        conflicts: estimate.conflicts,
+        challenger: estimate.challenger
+          ? [estimate.challenger.x.width(), estimate.challenger.y.width()]
+          : null,
+      });
+    }
     const latest = this.latestSample();
     if (!latest || now - latest.at > FRESH_MS || !estimate.usable(geometry.cellW, geometry.cellH)) {
       paneNative.reports.cell += 1;
@@ -508,6 +560,8 @@ class NativeInput extends EventEmitter {
         usable: estimate.usable(geometry.cellW, geometry.cellH),
         widthPt: [estimate.x.width(), estimate.y.width()].map((w) => (Number.isFinite(w) ? Math.round(w * 100) / 100 : null)),
         reports: estimate.reports,
+        conflicts: estimate.conflicts,
+        challenger: Boolean(estimate.challenger),
       } : null,
       reports: { ...paneNative.reports },
       wheel: {
