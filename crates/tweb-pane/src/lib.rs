@@ -1153,6 +1153,13 @@ fn electron_app_directory() -> Result<std::path::PathBuf> {
     }
     for candidate in workspace_electron_dirs() {
         if candidate.join("main.cjs").exists() && candidate.join("package.json").exists() {
+            // A checkout's `electron/` has the app's text files but not the native addon, which
+            // only exists as build output. Without this a development binary — the one every
+            // measurement runs — silently loses the shm frame medium. Measured on Linux: a pane
+            // from `<checkout>/target/debug/tweb` sent every patch as an inline PNG.
+            if let Err(err) = engine_app::place_binary_files(&candidate) {
+                tracing::warn!(error = %err, "cannot place the native addon in the workspace app");
+            }
             return Ok(candidate);
         }
     }

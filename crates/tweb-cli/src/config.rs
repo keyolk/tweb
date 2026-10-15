@@ -36,6 +36,8 @@ pub enum Kind {
     Int,
     Float,
     Path,
+    /// Free text, taken as written. Unlike `path`, no `~` expansion.
+    String,
     /// Strings. A TOML array in the file; comma-separated in the environment and on `set`.
     List,
 }
@@ -115,6 +117,7 @@ fn from_env(setting: &Setting, raw: &str) -> Option<serde_json::Value> {
             .filter(|n| n.is_finite())
             .map(|n| clamp(setting, n).into()),
         Kind::Path => Some(expand_home(raw).into()),
+        Kind::String => Some(raw.trim().into()),
         Kind::List => Some(split_list(raw).into()),
     }
 }
@@ -143,6 +146,7 @@ fn from_file(setting: &Setting, item: &Item) -> Option<serde_json::Value> {
             })
         }
         Kind::Path => value.as_str().map(|s| expand_home(s).into()),
+        Kind::String => value.as_str().map(|s| s.trim().into()),
         // Every element a string, or the line is not this setting: half a list is a list the
         // user did not write.
         Kind::List => value
@@ -268,6 +272,7 @@ fn parse_input(setting: &Setting, raw: &str) -> Result<Value> {
             n.into()
         }
         Kind::Path => raw.into(),
+        Kind::String => raw.trim().into(),
         Kind::List => {
             let mut array = toml_edit::Array::new();
             for part in split_list(raw) {
@@ -418,6 +423,7 @@ impl Setting {
             Kind::Int => "int",
             Kind::Float => "float",
             Kind::Path => "path",
+            Kind::String => "string",
             Kind::List => "list",
         }
     }
@@ -544,7 +550,7 @@ mod tests {
                 Kind::Bool => setting.default.is_boolean(),
                 Kind::Int => setting.default.is_i64(),
                 Kind::Float => setting.default.is_number(),
-                Kind::Path => setting.default.is_string(),
+                Kind::Path | Kind::String => setting.default.is_string(),
                 Kind::List => setting.default.is_array(),
             };
             assert!(ok, "{} default does not match its type", setting.key);
