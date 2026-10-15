@@ -71,6 +71,9 @@ tweb split --engine webkit https://localhost:5173
 # Run the pages in your own (managed) Google Chrome — Okta device trust, Endpoint Verification
 tweb split --engine chrome https://sendbird.okta.com/
 
+# A local Markdown file opens rendered (GFM), with its relative links and images working
+tweb split ./README.md
+
 # Tune the active maximum frame rate
 # adaptive uses the given value while active and drops to at most 4fps when idle
 tweb open --frame-rate 24 --adaptive-frame-rate https://localhost:5173
@@ -276,6 +279,17 @@ there.
 the tab then joins this tmux window's Chrome tab group and the handoff stays part of the same
 workspace. Without it the URL still opens, through `open -a "Google Chrome"`. Neither path
 reads or writes the Chrome profile: they hand over a URL and nothing else.
+
+## Local Markdown
+
+A local `.md`/`.markdown` file — a path or a `file://` URL — opens rendered as GitHub-flavoured
+Markdown (tables, task lists, strikethrough, autolinks, heading anchors) instead of as raw text.
+The engine answers `file:` itself and renders a Markdown document requested as a page, so the
+page's URL stays the file's own: `./docs/setup.md` and `images/arch.png` resolve as they do on disk,
+a link to another `.md` opens rendered too, and reload re-reads the file. A script that `fetch()`es
+a `.md` still gets its source. Raw HTML in the document is kept (`<details>`, `<img width>`) but the
+page runs no script and loads no frame. The renderer is [marked](https://github.com/markedjs/marked)
+18.0.14, vendored as its single published file (`electron/vendor/`, MIT). Electron engine only.
 
 ## Agent control (CLI · MCP)
 

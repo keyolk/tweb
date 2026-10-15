@@ -200,6 +200,14 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/teardown.cjs"),
     ),
     (
+        "markdown-page.cjs",
+        include_str!("../../../electron/markdown-page.cjs"),
+    ),
+    (
+        "vendor/marked.umd.cjs",
+        include_str!("../../../electron/vendor/marked.umd.cjs"),
+    ),
+    (
         "float-display.cjs",
         include_str!("../../../electron/float-display.cjs"),
     ),
