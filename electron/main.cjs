@@ -60,6 +60,7 @@ const {
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const { mouseEventParams, pointerTarget, nextCapture } = require("./oopif-input.cjs");
 const { interpolatePoints } = require("./pointer-interpolation.cjs");
+const { NativeInput, createPaneNative, paneGeometry } = require("./native-input.cjs");
 const { shareLabels } = require("./hint-labels.cjs");
 const { cachesToClear, cachePaths, DISPOSABLE: DISPOSABLE_CACHES } = require("./profile-hygiene.cjs");
 const {
@@ -4501,6 +4502,9 @@ function agentDiagnostics() {
       unscopedResolutions: unscopedPaneResolutions,
     },
     input: {
+      // The macOS pointer/trackpad helper as this pane sees it. `reports.native` against
+      // `reports.cell` is how many terminal reports were replaced by the real pointer.
+      native: nativeEnabled() ? nativeInput.diag(inputState().native, nativeGeometry()) : { helper: "off" },
       vimiumShortcuts: inputState().vimium,
       cmdBypass: inputState().bypass,
       pageInsertMode: inputState().insertMode,
@@ -5475,6 +5479,8 @@ function sendPointerEvent(tab, event) {
   // A type CDP has no equivalent for (`contextMenu`) goes the direct way rather than being
   // turned into something the protocol rejects.
   if (params && ensureDebugger(tab)) {
+    // CDP's wheel has no phase field, so an event that is only a phase is nothing to it.
+    if (event.phaseOnly) return;
     watchOopifSessions(tab);
     // A frame's box moves with a scroll or a resize, so it is re-read as the pointer travels —
     // but on the MOVE, not on the press. `sendPointerEvent` is synchronous (the terminal
@@ -6761,6 +6767,8 @@ function inputState() {
       // The last point a motion report produced, for filling in the gap tmux leaves between
       // two of them. Null outside a drag; see pointer-interpolation.cjs.
       lastDragPoint: null,
+      // This pane's share of the native pointer and trackpad; see native-input.cjs.
+      native: createPaneNative(),
     };
     paneInputStates.set(record.key, state);
   }
@@ -6843,7 +6851,10 @@ function hasZoomModifier(modifiers) {
 function dispatchMouse(cb, rawX, rawY, release) {
   if (!currentWindows().win) return;
   const contents = currentWindows().win.webContents;
-  const { x, y } = logicalMousePoint(rawX, rawY);
+  // Inside tmux the report is a cell. Where the native pointer agrees with it, the point is the
+  // pointer's real one instead — see native-input.cjs. Outside tmux the report is already pixels.
+  const native = nativeReportPoint(rawX, rawY);
+  const { x, y } = native && paneIsInTmux() ? native : logicalMousePoint(rawX, rawY);
   const clicks = inputState().clicks;
   const modifiers = mouseModifiers(cb);
   const buttonCode = cb & 3;
@@ -6856,42 +6867,30 @@ function dispatchMouse(cb, rawX, rawY, release) {
       setBrowserZoom(direction > 0 ? "in" : "out");
       return;
     }
-    // Both deltas in `sendInputEvent`'s sign, a positive delta being the way the CONTENT moves:
-    // wheel up (64) is +deltaY and wheel left (66) is +deltaX. xterm numbers the horizontal
-    // buttons 6 = left, 7 = right. The CDP route converts this to the DOM's sign in one place
-    // (mouseEventParams), so both axes have to be stated the same way here.
-    // `scroll.invert` flips both axes, as macOS's own setting does; `scroll.distance` is one notch.
-    const sign = settings.get("scroll.invert") ? -1 : 1;
-    const distance = settings.get("scroll.distance");
-    const horizontal = (buttonCode === 2 ? 1 : buttonCode === 3 ? -1 : 0) * sign;
-    const vertical = direction * sign;
-    const deltaX = horizontal * distance;
-    const deltaY = vertical * distance;
-    sendPointerEvent(currentWindows().win, {
-      type: "mouseWheel",
-      x,
-      y,
-      deltaX,
-      deltaY,
-      modifiers,
-      // What the direct path needs on top; CDP takes the deltas alone.
-      wheel: {
-        deltaX,
-        deltaY,
-        wheelTicksX: horizontal,
-        wheelTicksY: vertical,
-        accelerationRatioX: 0.5,
-        accelerationRatioY: 0.5,
-        hasPreciseScrollingDeltas: false,
-        canScroll: true,
-      },
-    });
+    // A trackpad gesture over this pane is scrolled from the helper's own deltas, and the notches
+    // the terminal made of the same gesture would scroll it a second time. See `wheelClaim`.
+    const paneNative = inputState().native;
+    const claim = nativeEnabled() ? nativeInput.wheelClaim(paneNative, nativeGeometry()) : "pass";
+    if (claim === "drop") {
+      paneNative.wheel.dropped += 1;
+      return;
+    }
+    if (claim === "hold") {
+      const record = currentPane();
+      nativeInput.hold(paneNative, () => withPaneScope(record, () => dispatchTerminalWheel(buttonCode, direction, x, y, modifiers)));
+      return;
+    }
+    dispatchTerminalWheel(buttonCode, direction, x, y, modifiers);
     return;
   }
-
   const button = buttonCode === 0 ? "left" : buttonCode === 1 ? "middle" : buttonCode === 2 ? "right" : undefined;
   let type = "mouseMove";
   if (!motion && button) type = release ? "mouseUp" : "mouseDown";
+  // What the terminal says is held, which is what a native move between two reports may drag.
+  const paneNative = inputState().native;
+  paneNative.modifiers = modifiers;
+  paneNative.held = type === "mouseUp" || !button ? null : button;
+  paneNative.lastSent = { x, y };
   let clickCount = 0;
   if (type === "mouseDown") {
     clickCount = clicks.press(button, x, y);
@@ -6907,9 +6906,11 @@ function dispatchMouse(cb, rawX, rawY, release) {
   //
   // Only while a button is held: a pointer merely travelling is quantised too, but nothing
   // reads the path of a hover, and a page doing hit-testing per move would get three times the
-  // work for nothing. Only inside tmux, since elsewhere the coordinates are already pixels.
+  // work for nothing. Only inside tmux, since elsewhere the coordinates are already pixels. And
+  // not when the point came from the native pointer: the helper's moves already filled the path
+  // with real points, and a straight line drawn over them would bend it.
   const state = inputState();
-  if (type === "mouseMove" && button && paneIsInTmux()) {
+  if (type === "mouseMove" && button && paneIsInTmux() && !native) {
     const vp = currentFrames().viewport || queryViewportSize();
     const logical = logicalContentSize(vp);
     const cell = { x: logical.width / vp.cols, y: logical.height / vp.rows };
@@ -6954,9 +6955,195 @@ function dispatchMouse(cb, rawX, rawY, release) {
     // losing every entry that depends on the target.
   }
   if (debugLogging && type !== "mouseMove") {
-    console.error(`tweb: ${type} ${button} ${x},${y}`);
+    console.error(`tweb: ${type} ${button} ${x},${y}${native ? " (native)" : ""}`);
   }
 }
+
+/// One terminal wheel notch, as the terminal reported it.
+function dispatchTerminalWheel(buttonCode, direction, x, y, modifiers) {
+  if (!currentWindows().win) return;
+  {
+    // Both deltas in `sendInputEvent`'s sign, a positive delta being the way the CONTENT moves:
+    // wheel up (64) is +deltaY and wheel left (66) is +deltaX. xterm numbers the horizontal
+    // buttons 6 = left, 7 = right. The CDP route converts this to the DOM's sign in one place
+    // (mouseEventParams), so both axes have to be stated the same way here.
+    // `scroll.invert` flips both axes, as macOS's own setting does; `scroll.distance` is one notch.
+    const sign = settings.get("scroll.invert") ? -1 : 1;
+    const distance = settings.get("scroll.distance");
+    const horizontal = (buttonCode === 2 ? 1 : buttonCode === 3 ? -1 : 0) * sign;
+    const vertical = direction * sign;
+    const deltaX = horizontal * distance;
+    const deltaY = vertical * distance;
+    sendPointerEvent(currentWindows().win, {
+      type: "mouseWheel",
+      x,
+      y,
+      deltaX,
+      deltaY,
+      modifiers,
+      // What the direct path needs on top; CDP takes the deltas alone.
+      wheel: {
+        deltaX,
+        deltaY,
+        wheelTicksX: horizontal,
+        wheelTicksY: vertical,
+        accelerationRatioX: 0.5,
+        accelerationRatioY: 0.5,
+        hasPreciseScrollingDeltas: false,
+        canScroll: true,
+      },
+    });
+  }
+}
+
+// --- native pointer and trackpad (macOS) ---
+
+// One helper per engine, shared by every pane it hosts: it reports the one pointer there is, and
+// each pane decides from its own geometry and its own reports whether that pointer is over it.
+const nativeInput = new NativeInput({
+  log: (message) => console.error(`tweb: ${message}`),
+});
+
+function nativeEnabled() {
+  return process.platform === "darwin" && settings.get("input.native") === true;
+}
+
+// This pane's cell grid in screen points, on the display the pointer is on.
+function nativeGeometry() {
+  return paneGeometry({
+    viewport: currentFrames().viewport || queryViewportSize(),
+    origin: currentFrames().origin,
+    inTmux: paneIsInTmux(),
+  }, nativeInput.window?.scale);
+}
+
+// A fraction of the pane as the window point `sendInputEvent` takes. Kept fractional: the CDP route
+// carries sub-pixel positions, and rounding here would put back a grid, only a finer one.
+function nativePanePoint(hit) {
+  const logical = logicalContentSize(currentFrames().viewport || queryViewportSize());
+  return {
+    x: Math.min(logical.width - 1, Math.max(0, hit.fx * logical.width)),
+    y: Math.min(logical.height - 1, Math.max(0, hit.fy * logical.height)),
+  };
+}
+
+// A terminal report, seen by the native side: it locates the pane, arms the helper, and answers
+// where the pointer really is when the two agree. Null leaves the report's own point.
+function nativeReportPoint(rawX, rawY) {
+  if (!nativeEnabled() || !nativeInput.arm()) return null;
+  const hit = nativeInput.report(inputState().native, nativeGeometry(), rawX - 1, rawY - 1);
+  return hit ? nativePanePoint(hit) : null;
+}
+
+// AppKit modifier bits as Electron's modifier names.
+function nativeModifiers(flags) {
+  const modifiers = [];
+  if (flags & (1 << 17)) modifiers.push("shift");
+  if (flags & (1 << 18)) modifiers.push("control");
+  if (flags & (1 << 19)) modifiers.push("alt");
+  if (flags & (1 << 20)) modifiers.push("meta");
+  return modifiers;
+}
+
+// The pane the native pointer is over, in its own scope: one that has been reported through the
+// window the pointer is over, is shown, and contains the point. `allowOutside` keeps a drag that
+// started in a pane delivered to it after the pointer leaves, as the terminal does.
+function withNativePane(x, y, fn, { allowOutside = false } = {}) {
+  let handled = false;
+  forEachPane(() => {
+    if (handled) return;
+    const paneNative = inputState().native;
+    if (!paneNative.latched || !currentWindows().win || !currentPane().visible) return;
+    const geometry = nativeGeometry();
+    const hit = nativeInput.hit(paneNative, geometry, x, y);
+    if (!hit) {
+      // Over some other window now: the pane is not under the pointer, and coming back to it is
+      // the terminal's to report, as leaving its rect is below.
+      if (nativeInput.window?.id !== paneNative.windowId) paneNative.latched = false;
+      return;
+    }
+    if (!hit.inside && !(allowOutside && paneNative.held)) {
+      // The pointer left. It is this pane's again once the terminal reports it here, not before:
+      // a popup, another client's window or a neighbouring pane may be what it entered.
+      paneNative.latched = false;
+      return;
+    }
+    handled = true;
+    fn(paneNative, hit, geometry);
+  });
+}
+
+// A pointer move the terminal did not report: inside a cell, or between two of its reports.
+// Inside tmux only — outside it the terminal's own reports are already pixels.
+nativeInput.on("move", (event) => {
+  if (!nativeEnabled()) return;
+  withNativePane(event.x, event.y, (paneNative, hit) => {
+    if (!paneIsInTmux()) return;
+    // A button counts as held only while both say so: the terminal, which saw where it went down,
+    // and the hardware, which knows it is still down.
+    const button = event.buttons ? paneNative.held || undefined : undefined;
+    const point = nativePanePoint(hit);
+    if (paneNative.lastSent && paneNative.lastSent.x === point.x && paneNative.lastSent.y === point.y) return;
+    paneNative.lastSent = point;
+    inputState().clicks.move(button, point.x, point.y);
+    if (button) inputState().lastDragPoint = point;
+    sendPointerEvent(currentWindows().win, {
+      type: "mouseMove",
+      x: point.x,
+      y: point.y,
+      button,
+      modifiers: paneNative.modifiers,
+      held: Boolean(button),
+      clickCount: 0,
+    });
+  }, { allowOutside: true });
+});
+
+// A scroll event from the real device. A precise one (trackpad, Magic Mouse) is scrolled here by
+// its own deltas, momentum events included — that is the inertia, generated by macOS and carried
+// as more events. A mouse wheel's is left to the terminal's notches, which `scroll.distance` sizes.
+nativeInput.on("scroll", (event) => {
+  if (!nativeEnabled()) return;
+  withNativePane(event.x, event.y, (paneNative, hit, geometry) => {
+    const precise = NativeInput.scrollsNatively(event);
+    nativeInput.noteNativeScroll(paneNative, precise);
+    if (!precise) return;
+    // Points to the window's DIPs. The pane's page is laid out at its logical size, which is the
+    // pane's points only when the render scale matches the display's.
+    const logical = logicalContentSize(currentFrames().viewport || queryViewportSize());
+    const perPoint = logical.width / (geometry.cols * geometry.cellW);
+    // `scrollingDeltaY` already follows the natural-scrolling setting and is positive when the
+    // content moves down — `sendInputEvent`'s sign, as the terminal's notches are.
+    const sign = settings.get("scroll.invert") ? -1 : 1;
+    const deltaX = event.dx * perPoint * sign;
+    const deltaY = event.dy * perPoint * sign;
+    // A phase change with no movement (fingers down, fingers up) is marked `phaseOnly`: the CDP
+    // route has no phases to give it and skips it, WebKit reads the phases and gets every one.
+    const point = nativePanePoint(hit);
+    sendPointerEvent(currentWindows().win, {
+      type: "mouseWheel",
+      x: point.x,
+      y: point.y,
+      deltaX,
+      deltaY,
+      modifiers: nativeModifiers(event.modifiers),
+      wheel: {
+        deltaX,
+        deltaY,
+        wheelTicksX: 0,
+        wheelTicksY: 0,
+        accelerationRatioX: 1,
+        accelerationRatioY: 1,
+        hasPreciseScrollingDeltas: true,
+        canScroll: true,
+        phase: event.phase,
+        momentumPhase: event.momentum,
+      },
+      phaseOnly: !deltaX && !deltaY,
+    });
+    paneNative.wheel.delivered += 1;
+  });
+});
 
 const KITTY_KEYS = new Map([
   [27, "Escape"], [13, "Enter"], [9, "Tab"], [127, "Backspace"],

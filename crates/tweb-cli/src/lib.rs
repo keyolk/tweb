@@ -931,7 +931,12 @@ async fn split_and_run_pane(
     // in. Resolving them here instead looked for `electron/` under the cwd, so a split opened from
     // inside a checkout ran that checkout's older app code. Only an explicit override is passed on.
     let mut env_str = String::new();
-    for name in ["TWEB_ELECTRON", "TWEB_ELECTRON_DIR", "TWEB_WEBKIT"] {
+    for name in [
+        "TWEB_ELECTRON",
+        "TWEB_ELECTRON_DIR",
+        "TWEB_WEBKIT",
+        "TWEB_NATIVE_INPUT",
+    ] {
         if let Ok(value) = std::env::var(name) {
             env_str.push_str(&format!("{name}={} ", shell_quote(&value)));
         }

@@ -138,6 +138,7 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 |---|---|---|
 | `scroll.invert` | `false` | live |
 | `scroll.distance` | `100` | live |
+| `input.native` | `true` | live |
 | `zoom.default` | `0.8` | next new tab |
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
@@ -151,6 +152,13 @@ over both. The list itself is `electron/settings-schema.json`, shared by the CLI
 
 Wheel direction needs no setting to match macOS: the terminal has already applied natural scrolling
 when it reports the wheel, and TWeb follows the report. `scroll.invert` is for wanting it the other way.
+
+Inside tmux the terminal can only report the mouse in cells and a trackpad as wheel notches. On macOS
+`tweb-native-input` (installed beside `tweb`) watches the real pointer and the real scroll gesture, so a
+drag is drawn pixel by pixel and a trackpad scrolls by its own deltas, inertia included. It needs no
+permission: mouse and scroll events are readable by any process, and it reads nothing else. It only acts
+while the pointer is over the pane in the window in front, and leaves the terminal's reports alone
+otherwise. `tweb config set input.native false` turns it off.
 
 ## Extensions
 

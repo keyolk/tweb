@@ -1162,6 +1162,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tweb-native-input"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation",
+ "serde_json",
+]
+
+[[package]]
 name = "tweb-pane"
 version = "0.1.0"
 dependencies = [
