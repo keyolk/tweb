@@ -166,6 +166,9 @@ function coerce(entry, value, fromEnv, env) {
     }
     case "path":
       return typeof value === "string" ? expandHome(value, env) : undefined;
+    // Free text as written: no `~` expansion, surrounding space dropped.
+    case "string":
+      return typeof value === "string" ? value.trim() : undefined;
     case "list":
       // Comma-separated in the environment, as `tweb config set` takes it too.
       if (fromEnv) return String(value).split(",").map((part) => part.trim()).filter(Boolean);

@@ -71,6 +71,12 @@ tweb split --engine webkit https://localhost:5173
 # Run the pages in your own (managed) Google Chrome — Okta device trust, Endpoint Verification
 tweb split --engine chrome https://sendbird.okta.com/
 
+# A local Markdown file opens rendered (GFM), with its relative links and images working
+tweb split ./README.md
+
+# Let the terminal background show through pages without a background colour
+tweb open --transparent ./notes.html
+
 # Tune the active maximum frame rate
 # adaptive uses the given value while active and drops to at most 4fps when idle
 tweb open --frame-rate 24 --adaptive-frame-rate https://localhost:5173
@@ -141,13 +147,24 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `zoom.default` | `0.8` | next new tab |
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
+| `page.transparent` | `false` | next new tab |
 | `downloads.dir` | system Downloads | next engine start |
 | `ime.slot_cells` | `3` | live |
+| `search.engine` | `google` (or `duckduckgo`, `bing`, `brave`, `kagi`, `ecosia`, `perplexity`, or a URL with `%s`) | live |
+| `search.suggest` | `off` (an engine name or a URL with `%s` turns on omnibox suggestions; every keystroke typed there then goes to that provider) | live |
 
 "Live" means a running pane picks the change up within a second, no restart. An environment variable
 that already set one of these (`TWEB_DEFAULT_ZOOM`, `TWEB_FRAME_RATE`, `TWEB_ADAPTIVE_FRAME_RATE`,
 `TWEB_DOWNLOAD_DIR`, `TWEB_IME_SLOT_CELLS`) still wins over the file, and a flag on `tweb open` wins
 over both. The list itself is `electron/settings-schema.json`, shared by the CLI and the engine.
+
+`page.transparent` (or `tweb open --transparent` for one pane) lets the terminal show through pages
+that paint no background of their own: the frame keeps its alpha channel and is placed under the
+text, so the terminal's background colour, opacity and blur show wherever the page is clear. Pages
+with a background of their own are unaffected. A transparent tab sends whole frames only, because a
+damage patch is a second image over the base one and its clear pixels would show the stale frame
+beneath. Electron engine only (Chrome's screencast is JPEG; the WebKit host has no transparent
+path). The floating window (`w`) relays JPEG, so a clear page is black there.
 
 Wheel direction needs no setting to match macOS: the terminal has already applied natural scrolling
 when it reports the wheel, and TWeb follows the report. `scroll.invert` is for wanting it the other way.
@@ -277,6 +294,17 @@ the tab then joins this tmux window's Chrome tab group and the handoff stays par
 workspace. Without it the URL still opens, through `open -a "Google Chrome"`. Neither path
 reads or writes the Chrome profile: they hand over a URL and nothing else.
 
+## Local Markdown
+
+A local `.md`/`.markdown` file — a path or a `file://` URL — opens rendered as GitHub-flavoured
+Markdown (tables, task lists, strikethrough, autolinks, heading anchors) instead of as raw text.
+The engine answers `file:` itself and renders a Markdown document requested as a page, so the
+page's URL stays the file's own: `./docs/setup.md` and `images/arch.png` resolve as they do on disk,
+a link to another `.md` opens rendered too, and reload re-reads the file. A script that `fetch()`es
+a `.md` still gets its source. Raw HTML in the document is kept (`<details>`, `<img width>`) but the
+page runs no script and loads no frame. The renderer is [marked](https://github.com/markedjs/marked)
+18.0.14, vendored as its single published file (`electron/vendor/`, MIT). Electron engine only.
+
 ## Agent control (CLI · MCP)
 
 Finishing frontend work in the terminal means agents have to be able to drive the same browser. A
@@ -365,7 +393,7 @@ is left alone unless you pass `--force`.
 provides every existing feature.
 
 - **Electron**: built on Chromium offscreen paint. Provides all current TWeb browser features — Vimium-style modes, tabs/omnibox, visual/inspect, smart copy, detached DevTools. This is the engine every measurement in [Status](#status) was taken on.
-- **Chrome**: the pages run in the installed Google Chrome, headless, on a profile of TWeb's own (`<userData>/chrome-profile`, or `TWEB_CHROME_PROFILE`), driven over CDP. Use it for sites that only work in managed Chrome — see [Sites that need real Chrome](#sites-that-need-real-chrome). The Electron process stays the host and the pane logic is the same code: `electron/cdp/` presents each Chrome tab to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, is injected into each frame's isolated world. One Chrome serves every pane on the profile and exits with the last of them. `TWEB_CHROME` picks the binary, `TWEB_CHROME_HEADED=1` runs it with a (hidden) window, `TWEB_CDP_TRACE=1` logs the protocol.
+- **Chrome**: the pages run in the installed Google Chrome, headless, on a profile of TWeb's own (`<userData>/chrome-profile`, or `TWEB_CHROME_PROFILE`), driven over CDP. Use it for sites that only work in managed Chrome — see [Sites that need real Chrome](#sites-that-need-real-chrome). The Electron process stays the host and the pane logic is the same code: `electron/cdp/` presents each Chrome tab to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, is injected into each frame's isolated world. One Chrome serves every pane on the profile and exits with the last of them. `TWEB_CHROME` picks the binary, `TWEB_CHROME_HEADED=1` runs it with a (hidden) window, `TWEB_CDP_TRACE=1` logs the protocol. Because this Chrome has the installed Chrome's bundle id, macOS can send an outside link (Slack, `open URL`) to it instead of to your own Chrome; such a tab — no opener, nobody attached — is closed and its url handed to your Chrome.
 - **WebKit (macOS)**: the pages are `WKWebView`s in `tweb-webkit`, a small Rust host the Electron engine starts beside itself. As with Chrome, the Electron process stays the host and the pane logic is the same code: `electron/webkit/` presents each view to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, runs in each frame's isolated content world. Input is native `NSEvent`s, so WebKit routes clicks, keys and the wheel into cross-origin frames itself and they arrive trusted. WebKit has no paint event: the host snapshots at the pane's frame rate, drops unchanged pictures, and sends a changed one's dirty box only. `TWEB_WEBKIT` picks the host binary; `TWEB_WEBKIT_PROFILE=1` logs where each frame and eval spent its time.
 
 What the WebKit engine does not have that Electron does — measured where a number is given:
