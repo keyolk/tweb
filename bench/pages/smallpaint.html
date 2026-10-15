@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>smallpaint</title>
+<!--
+  A small box that changes colour every 50ms on an otherwise still page: each paint's damage is a few
+  cells, so it goes down the patch path rather than the whole-frame one. Red and green only, never
+  blue: a consumer that finds pure blue has caught a missing BGRA->RGBA swap, which red/green/blue
+  cycling would hide.
+-->
+<style>html,body{margin:0;background:#fff}#box{position:absolute;left:40px;top:40px;width:48px;height:48px}</style>
+<div id="box"></div>
+<script>
+const colours = ["#ff0000", "#00ff00"];
+let i = 0;
+setInterval(() => { document.getElementById("box").style.background = colours[i++ % colours.length]; }, 50);
+</script>
