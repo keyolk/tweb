@@ -90,19 +90,15 @@ pub fn try_acquire(lock_path: &Path) -> io::Result<Option<DaemonLock>> {
         return Ok(Some(DaemonLock { _file: file }));
     }
     let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        // EWOULDBLOCK/EAGAIN — someone else is the daemon.
-        Some(code) if code == wouldblock_errno() => Ok(None),
-        _ => Err(err),
+    // EWOULDBLOCK/EAGAIN — someone else is the daemon. Matched by kind, which the standard library
+    // maps from the platform's own errno, rather than by number: the number differs (35 on macOS,
+    // 11 on Linux), and the helper that used to spell it took the number from an error built from
+    // a kind, which carries none — so it was always 35, and on Linux every second daemon got an
+    // error instead of a clean yield.
+    if err.kind() == io::ErrorKind::WouldBlock {
+        return Ok(None);
     }
-}
-
-/// EWOULDBLOCK. Same value as EAGAIN on both macOS (35) and Linux (11), but spelled through the
-/// standard library so neither number is hardcoded here.
-fn wouldblock_errno() -> i32 {
-    io::Error::from(io::ErrorKind::WouldBlock)
-        .raw_os_error()
-        .unwrap_or(35)
+    Err(err)
 }
 
 /// Removes a socket file left over from a daemon that is gone.

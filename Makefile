@@ -124,8 +124,9 @@ run-webkit: build ## Run TWeb on the WebKit engine (URL=...)
 install: release ## Install tweb into PREFIX (default ~/.local)
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 0755 target/release/tweb "$(DESTDIR)$(PREFIX)/bin/tweb"
-	@# The WebKit page host. `--engine webkit` finds it beside `tweb`.
-	@test ! -f target/release/tweb-webkit \
+	@# The WebKit page host. `--engine webkit` finds it beside `tweb`. macOS only: elsewhere the
+	@# binary is a stub that says WKWebView is missing, and `tweb` refuses the engine itself.
+	@test "$$(uname)" != Darwin || test ! -f target/release/tweb-webkit \
 		|| install -m 0755 target/release/tweb-webkit "$(DESTDIR)$(PREFIX)/bin/tweb-webkit"
 	@# The macOS pointer/trackpad helper. The engine finds it beside `tweb`; without it a pane in
 	@# tmux keeps the terminal's cell-snapped mouse and wheel notches.

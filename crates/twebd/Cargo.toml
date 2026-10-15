@@ -28,6 +28,10 @@ tracing-subscriber.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `unshare` for the sandbox probe in chromium_platform.rs.
+libc = "0.2"
+
 [dev-dependencies]
 # `test-util` lets the READY-handshake test wait out the real ten-second timeout in virtual time,
 # so the regression it guards is covered without adding ten seconds to every `make check`.

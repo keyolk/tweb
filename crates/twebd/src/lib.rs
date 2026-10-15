@@ -27,6 +27,7 @@
 //! - what happens when the last pane detaches — [`server`] (nothing: the daemon stays up)
 
 pub mod automation;
+pub mod chromium_platform;
 pub mod cli;
 pub mod client;
 pub mod engine_host;

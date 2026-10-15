@@ -458,6 +458,14 @@ pub async fn run(url: &str) -> Result<()> {
 pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     tracing::info!(url, ?options, "tweb __pane starting");
 
+    // The WebKit engine's page host is WKWebView. Elsewhere the host binary exists only to say
+    // so, and an engine that spawned it would sit on a blank pane; refusing here says it first.
+    if options.engine == BrowserEngine::Webkit && !cfg!(target_os = "macos") {
+        anyhow::bail!(
+            "--engine webkit needs macOS (WKWebView); the default Electron engine runs here"
+        );
+    }
+
     // Before anything is installed or entered: a terminal that cannot render Kitty graphics
     // would otherwise get a running engine writing escape sequences at a pane that shows
     // nothing (DESIGN.md 5.2's missing text fallback). The probe reads stdin, so it has to
@@ -551,8 +559,14 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 electron_path.display(),
                 electron_dir.display()
             );
+            // Linux only: the headless display backend on a machine with no display server, and
+            // the sandbox decision. A machine that cannot sandbox the renderers stops here with
+            // the reason, rather than inside Chromium with "No usable sandbox!".
+            let switches = twebd::chromium_platform::engine_switches(&electron_path)
+                .map_err(anyhow::Error::msg)?;
             let mut command = Command::new(&electron_path);
             command
+                .args(&switches)
                 .arg(".")
                 .arg("--tweb-frame-rate")
                 .arg(options.frame_rate.to_string())
@@ -1145,16 +1159,31 @@ pub fn installed_electron_dir() -> Option<std::path::PathBuf> {
 }
 
 /// The Electron executable inside the given directory.
+///
+/// Both platforms' layouts are tried on both, since a candidate that is not there costs one
+/// `stat`: macOS ships an app bundle, Linux a bare `electron` beside its `.so`s and paks.
 pub fn electron_binary_in(directory: &std::path::Path) -> Option<std::path::PathBuf> {
     for relative in [
         "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+        "node_modules/electron/dist/electron",
         "node_modules/.bin/electron",
         // The shape a one-shot install unpacks into: dist only, no node_modules.
         "dist/Electron.app/Contents/MacOS/Electron",
+        "dist/electron",
         "Electron.app/Contents/MacOS/Electron",
     ] {
         let candidate = directory.join(relative);
-        if candidate.exists() {
+        // The `.bin` shim is a node script that execs whatever `path.txt` names, and the
+        // package's postinstall is what writes that file and downloads `dist/`. A package
+        // manager that skips postinstall scripts — bun does on Linux unless told to trust the
+        // package — leaves the shim in place with nothing behind it, and picking it here ends in
+        // "Electron failed to install correctly" instead of falling through to the cache.
+        if relative == "node_modules/.bin/electron"
+            && !directory.join("node_modules/electron/path.txt").exists()
+        {
+            continue;
+        }
+        if candidate.is_file() {
             return Some(candidate);
         }
     }
@@ -1213,11 +1242,10 @@ fn electron_app_directory() -> Result<std::path::PathBuf> {
     engine_app::extracted_app_dir()
 }
 
-/// Finds the Electron executable. The app code is embedded in the binary, so this is the
-/// only piece that has to come from outside.
-fn electron_executable() -> Result<std::path::PathBuf> {
+/// Where an Electron executable already is, and every directory looked in on the way.
+fn locate_electron() -> (Option<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     if let Ok(path) = std::env::var("TWEB_ELECTRON") {
-        return Ok(std::path::PathBuf::from(path));
+        return (Some(std::path::PathBuf::from(path)), Vec::new());
     }
     let mut searched = Vec::new();
     for directory in workspace_electron_dirs()
@@ -1226,11 +1254,24 @@ fn electron_executable() -> Result<std::path::PathBuf> {
         .chain(std::iter::once(engine_app::runtime_dir()))
     {
         if let Some(binary) = electron_binary_in(&directory) {
-            return Ok(binary);
+            return (Some(binary), searched);
         }
         searched.push(directory);
     }
-    if let Ok(binary) = which::which("electron") {
+    (which::which("electron").ok(), searched)
+}
+
+/// The Electron executable a pane would run, without installing one. For `tweb doctor`, which
+/// must report a missing runtime rather than download 295MB to find out.
+pub fn installed_electron() -> Option<std::path::PathBuf> {
+    locate_electron().0
+}
+
+/// Finds the Electron executable. The app code is embedded in the binary, so this is the
+/// only piece that has to come from outside.
+fn electron_executable() -> Result<std::path::PathBuf> {
+    let (found, searched) = locate_electron();
+    if let Some(binary) = found {
         return Ok(binary);
     }
     // Nowhere to be found: install it once. Rather than ship 295MB inside the binary, fetch it on demand.

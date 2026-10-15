@@ -1218,6 +1218,7 @@ dependencies = [
  "tracing-subscriber",
  "tweb-core",
  "tweb-pane",
+ "twebd",
  "url",
  "which",
 ]
@@ -1318,6 +1319,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
