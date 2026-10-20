@@ -58,6 +58,37 @@ pub fn matching_site(input: &str, sites: &[String]) -> Option<String> {
         })
 }
 
+/// The engines a site can be pinned to, in the order a tie between equally specific entries is
+/// broken (see electron/chrome-sites.cjs `PINNABLE_ENGINES`).
+pub const PINNABLE_ENGINES: [&str; 3] = ["chrome", "webkit", "electron"];
+
+/// The engine `input` is pinned to and the entry that pins it. `lists` gives each engine of
+/// [`PINNABLE_ENGINES`] its site list. The most specific entry wins, so `login.okta.com` on
+/// Electron carves an exception out of `okta.com` on Chrome; a tie goes to the earlier engine.
+pub fn pinned_engine(input: &str, lists: &[(&str, Vec<String>)]) -> Option<(&'static str, String)> {
+    let host = url_host(input)?;
+    let mut best: Option<(&'static str, String)> = None;
+    for engine in PINNABLE_ENGINES {
+        let Some((_, sites)) = lists.iter().find(|(name, _)| *name == engine) else {
+            continue;
+        };
+        for site in sites.iter().filter_map(|entry| site_host(entry)) {
+            let covers = host == site
+                || host
+                    .strip_suffix(site.as_str())
+                    .is_some_and(|prefix| prefix.ends_with('.'));
+            if covers
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, held)| site.len() > held.len())
+            {
+                best = Some((engine, site));
+            }
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +129,63 @@ mod tests {
                 matching_site(input, &sites).as_deref(),
                 *expected,
                 "{input} against {sites:?}"
+            );
+        }
+    }
+
+    /// The same table electron/chrome-sites.test.cjs checks for `pinnedEngine`.
+    #[allow(clippy::type_complexity)]
+    const PIN_CASES: &[(&str, &[(&str, &[&str])], Option<(&str, &str)>)] = &[
+        (
+            "https://sendbird.okta.com/",
+            &[("chrome", &["okta.com"])],
+            Some(("chrome", "okta.com")),
+        ),
+        ("https://github.com/", &[("chrome", &["okta.com"])], None),
+        (
+            "https://login.okta.com/",
+            &[("chrome", &["okta.com"]), ("electron", &["login.okta.com"])],
+            Some(("electron", "login.okta.com")),
+        ),
+        (
+            "https://app.example.com/",
+            &[
+                ("webkit", &["example.com"]),
+                ("electron", &["app.example.com"]),
+            ],
+            Some(("electron", "app.example.com")),
+        ),
+        (
+            "https://example.com/",
+            &[("chrome", &["example.com"]), ("webkit", &["example.com"])],
+            Some(("chrome", "example.com")),
+        ),
+        (
+            "https://example.com/",
+            &[("webkit", &["example.com"]), ("electron", &["example.com"])],
+            Some(("webkit", "example.com")),
+        ),
+        (
+            "http://localhost:5173/",
+            &[("webkit", &["localhost"])],
+            Some(("webkit", "localhost")),
+        ),
+        ("file:///tmp/a.html", &[("electron", &["a.html"])], None),
+        ("https://example.com/", &[], None),
+    ];
+
+    #[test]
+    fn the_most_specific_pinned_entry_wins() {
+        for (input, lists, expected) in PIN_CASES {
+            let lists: Vec<(&str, Vec<String>)> = lists
+                .iter()
+                .map(|(engine, sites)| (*engine, sites.iter().map(|s| s.to_string()).collect()))
+                .collect();
+            let got = pinned_engine(input, &lists);
+            assert_eq!(
+                got.as_ref().map(|(e, s)| (*e, s.as_str())),
+                *expected,
+                "{input} against {lists:?}"
             );
         }
     }

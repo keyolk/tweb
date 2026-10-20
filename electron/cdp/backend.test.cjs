@@ -100,3 +100,170 @@ test("Chrome is launched at the pane's device scale factor when one is given", (
   assert.ok(chromeArgs("/p", {}, 0, 2).includes("--force-device-scale-factor=2"));
   assert.ok(!chromeArgs("/p", {}, 0, 0).some((arg) => arg.startsWith("--force-device-scale-factor")));
 });
+
+// --- one pane, several engines ---------------------------------------------------------------
+
+const { EventEmitter } = require("node:events");
+const { createBackend, engineAvailability, engineKind } = require("./backend.cjs");
+
+function fakeElectron() {
+  class FakeElectronWindow {
+    constructor(options) { this.options = options; FakeElectronWindow.all.push(this); }
+    static fromWebContents(contents) { return FakeElectronWindow.all.find((w) => w.webContents === contents) || null; }
+    static getAllWindows() { return [...FakeElectronWindow.all]; }
+    static getFocusedWindow() { return null; }
+  }
+  FakeElectronWindow.all = [];
+  const realSession = {
+    listeners: {}, downloads: [], cleared: 0,
+    webRequest: {
+      onBeforeRequest(l) { realSession.listeners.before = l; },
+      onCompleted(l) { realSession.listeners.completed = l; },
+      onErrorOccurred(l) { realSession.listeners.error = l; },
+    },
+    on(event, l) { if (event === "will-download") realSession.downloads.push(l); return this; },
+    clearCache() { this.cleared += 1; },
+  };
+  return {
+    BrowserWindow: FakeElectronWindow,
+    ipcMain: new EventEmitter(),
+    session: { defaultSession: realSession, fromPartition: () => null },
+    app: new EventEmitter(),
+    nativeImage: {},
+    clipboard: {},
+    realSession,
+  };
+}
+
+function fakeEngine(kind, { fail = false } = {}) {
+  const engine = {
+    kind, started: 0, stopped: 0, windows: [], ipcMain: new EventEmitter(),
+    listeners: {}, downloads: [],
+    async start(options) { engine.started += 1; engine.startOptions = options; if (fail) throw new Error("no chrome"); },
+    async stop() { engine.stopped += 1; },
+    createWindow(options) { const w = { kind, options, webContents: { id: 1000 + engine.windows.length } }; engine.windows.push(w); return w; },
+    fromWebContents(contents) { return engine.windows.find((w) => w.webContents === contents) || null; },
+    getAllWindows() { return engine.windows; },
+    session() {
+      return {
+        webRequest: {
+          observesRequests: kind !== "webkit",
+          onBeforeRequest(l) { engine.listeners.before = l; },
+          onCompleted(l) { engine.listeners.completed = l; },
+          onErrorOccurred(l) { engine.listeners.error = l; },
+        },
+        on(event, l) { if (event === "will-download") engine.downloads.push(l); return this; },
+      };
+    },
+  };
+  return engine;
+}
+
+const tab = (engine) => ({ webPreferences: { offscreen: true }, ...(engine ? { twebEngine: engine } : {}) });
+
+test("engine names: tauri is WebKit, anything unknown is nothing", () => {
+  assert.strictEqual(engineKind(" Chrome "), "chrome");
+  assert.strictEqual(engineKind("tauri"), "webkit");
+  assert.strictEqual(engineKind("safari"), null);
+});
+
+test("an Electron pane starts no page engine until a tab asks for one", async () => {
+  const electron = fakeElectron();
+  const made = [];
+  const backend = createBackend(electron, { env: {}, makeEngine: (kind) => { const e = fakeEngine(kind); made.push(e); return e; } });
+  await backend.start({ scaleFactor: 2 });
+  const first = new backend.BrowserWindow(tab());
+  assert.strictEqual(backend.kindOf(first), "electron");
+  assert.strictEqual(made.length, 0);
+  assert.throws(() => new backend.BrowserWindow(tab("chrome")), /not started/);
+
+  const chrome = await backend.ensureEngine("chrome");
+  assert.strictEqual(chrome.startOptions.scaleFactor, 2, "a late engine starts with the pane's options");
+  await backend.ensureEngine("chrome");
+  assert.strictEqual(chrome.started, 1, "started once");
+  const second = new backend.BrowserWindow(tab("chrome"));
+  assert.strictEqual(backend.kindOf(second), "chrome");
+  assert.strictEqual(backend.BrowserWindow.fromWebContents(second.webContents), second);
+  assert.deepStrictEqual(backend.startedKinds(), ["electron", "chrome"]);
+  // A popup Chrome made for an opener is Chrome's, though it never came through the facade.
+  const popup = chrome.createWindow({});
+  assert.strictEqual(backend.kindOf(popup), "chrome");
+  // The float viewer and any non-tab window stays Electron's.
+  assert.ok(new backend.BrowserWindow({ webPreferences: {} }) instanceof electron.BrowserWindow);
+});
+
+test("listeners registered before an engine starts reach it when it does", async () => {
+  const electron = fakeElectron();
+  const webkit = fakeEngine("webkit");
+  const backend = createBackend(electron, { env: {}, makeEngine: () => webkit });
+  const seen = [];
+  backend.ipcMain.on("tweb-shortcut", (_e, v) => seen.push(v));
+  const before = () => {};
+  backend.session.defaultSession.webRequest.onBeforeRequest(before);
+  const download = () => {};
+  backend.session.defaultSession.on("will-download", download);
+
+  assert.strictEqual(electron.realSession.listeners.before, before, "Electron gets it at once");
+  await backend.ensureEngine("webkit");
+  webkit.ipcMain.emit("tweb-shortcut", {}, "from-webkit");
+  electron.ipcMain.emit("tweb-shortcut", {}, "from-electron");
+  assert.deepStrictEqual(seen, ["from-webkit", "from-electron"]);
+  assert.strictEqual(webkit.listeners.before, before);
+  assert.deepStrictEqual(webkit.downloads, [download]);
+  const page = new backend.BrowserWindow(tab("webkit"));
+  assert.strictEqual(backend.observesRequests(page), false, "WebKit cannot see requests");
+  // Everything else on the session is Electron's own.
+  backend.session.defaultSession.clearCache();
+  assert.strictEqual(electron.realSession.cleared, 1);
+});
+
+test("an engine that fails to start is tried again next time, and stopAll stops what started", async () => {
+  const electron = fakeElectron();
+  let attempts = 0;
+  const backend = createBackend(electron, {
+    env: {}, makeEngine: (kind) => fakeEngine(kind, { fail: ++attempts === 1 }),
+  });
+  await assert.rejects(backend.ensureEngine("chrome"), /no chrome/);
+  const chrome = await backend.ensureEngine("chrome");
+  assert.strictEqual(attempts, 2);
+  await backend.stopAll();
+  assert.strictEqual(chrome.stopped, 1);
+  assert.deepStrictEqual(backend.startedKinds(), ["electron"]);
+});
+
+test("a Chrome pane's tabs default to Chrome, and its engine starts with the pane", async () => {
+  const electron = fakeElectron();
+  const chrome = fakeEngine("chrome");
+  const backend = createBackend(electron, { env: { TWEB_BROWSER: "chrome" }, makeEngine: () => chrome });
+  await backend.start({ scaleFactor: 1 });
+  assert.strictEqual(chrome.started, 1);
+  assert.strictEqual(backend.engine, chrome);
+  assert.strictEqual(backend.kindOf(new backend.BrowserWindow(tab())), "chrome");
+  assert.strictEqual(backend.kindOf(new backend.BrowserWindow(tab("electron"))), "electron");
+});
+
+test("an engine that cannot run here says why", () => {
+  assert.deepStrictEqual(engineAvailability("electron"), { ok: true });
+  assert.strictEqual(engineAvailability("webkit", { platform: "linux" }).reason, "macOS only");
+  assert.deepStrictEqual(engineAvailability("webkit", { platform: "darwin", helper: null }),
+    { ok: false, reason: "tweb-webkit not installed" });
+  assert.strictEqual(engineAvailability("webkit", { platform: "darwin", helper: "/bin/tweb-webkit" }).ok, true);
+  assert.strictEqual(engineAvailability("chrome", { env: {}, exists: () => false }).ok, false);
+  assert.strictEqual(engineAvailability("chrome", { env: { TWEB_CHROME: "/c" } }).ok, true);
+});
+
+test("an engine whose start finishes during quit is stopped and never registered", async () => {
+  const electron = fakeElectron();
+  let release;
+  const engine = fakeEngine("chrome");
+  engine.start = () => new Promise((resolve) => { release = resolve; });
+  const backend = createBackend(electron, { env: {}, makeEngine: () => engine });
+  const start = backend.ensureEngine("chrome");
+  const stop = backend.stopAll();
+  release();
+  await assert.rejects(start, /stopped while the engine was starting/);
+  await stop;
+  assert.strictEqual(engine.stopped, 1);
+  assert.deepStrictEqual(backend.startedKinds(), ["electron"]);
+  await assert.rejects(backend.ensureEngine("webkit"), /backend is stopping/);
+});

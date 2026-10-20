@@ -218,7 +218,19 @@ pub fn frame_rate_max() -> u16 {
 
 /// `engine.chrome_sites`, resolved. A broken file is no list rather than an error, as everywhere.
 pub fn chrome_sites() -> Vec<String> {
-    resolve("engine.chrome_sites")
+    engine_sites("chrome")
+}
+
+/// `engine.<engine>_sites`, resolved, for each pinnable engine (see `sites::PINNABLE_ENGINES`).
+pub fn pinned_site_lists() -> Vec<(&'static str, Vec<String>)> {
+    crate::sites::PINNABLE_ENGINES
+        .iter()
+        .map(|engine| (*engine, engine_sites(engine)))
+        .collect()
+}
+
+fn engine_sites(engine: &str) -> Vec<String> {
+    resolve(&format!("engine.{engine}_sites"))
         .ok()
         .and_then(|r| r.value.as_array().cloned())
         .unwrap_or_default()

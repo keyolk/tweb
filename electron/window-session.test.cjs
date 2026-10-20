@@ -386,3 +386,17 @@ test("startup calls the claim sweeper beside the frame sweeper", () => {
   assert.match(main, /function sweepAbandonedClaimFiles\(\)/);
   assert.match(main, /abandonedClaimFiles\(names, parse, processAlive, process\.pid\)/);
 });
+
+test("a tab's engine is kept across a save and a restore; an unknown one is dropped", () => {
+  const saved = windowSessionForSave([
+    { url: "https://a.okta.com/", zoom: 0.8, engine: "chrome" },
+    { url: "https://github.com/", zoom: 0.8, engine: "safari" },
+    { url: "https://example.com/", zoom: 0.8 },
+  ], 0, 0.8);
+  assert.deepStrictEqual(saved.tabs, [
+    { url: "https://a.okta.com/", zoom: 0.8, engine: "chrome" },
+    { url: "https://github.com/", zoom: 0.8 },
+    { url: "https://example.com/", zoom: 0.8 },
+  ]);
+  assert.deepStrictEqual(normalizeWindowSession(saved, 0.8).tabs, saved.tabs);
+});

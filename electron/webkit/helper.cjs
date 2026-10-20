@@ -83,6 +83,9 @@ class RecordReader {
 function findHelper(env = process.env, appDir = path.join(__dirname, "..")) {
   const candidates = [
     env.TWEB_WEBKIT,
+    // Beside the `tweb` that started this engine. TWEB_WEBKIT is only set for a pane opened on
+    // WebKit; a pane that switches a tab to it later finds the host this way.
+    env.TWEB_BIN && path.join(path.dirname(env.TWEB_BIN), "tweb-webkit"),
     path.join(appDir, "..", "target", "release", "tweb-webkit"),
     path.join(appDir, "..", "target", "debug", "tweb-webkit"),
     // `make install`: <prefix>/libexec/tweb/electron is the app, <prefix>/bin the binaries.

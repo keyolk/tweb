@@ -45,7 +45,8 @@ const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
 const os = require("node:os");
 const settings = require("./settings.cjs");
-const { matchingSite } = require("./chrome-sites.cjs");
+const { ENGINE_LABELS, engineBadgeModel, pinLists, pinTable, routeNavigation } = require("./engine-routing.cjs");
+const { engineKind } = require("./cdp/backend.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
 const { startAgentServer, runtimeDir } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
@@ -342,8 +343,8 @@ const idleFrameRate = adaptiveFrameRate ? Math.min(maxActiveFrameRate, 4) : maxA
 // `tweb open --transparent` passes this; `page.transparent` in config.toml is read per new tab, so
 // it reaches hosted panes too, whose ATTACH carries no such flag. See transparent-pages.cjs.
 const transparentFlag = commandLineValue("--tweb-transparent") === "1";
-function newTabsTransparent() {
-  return transparentPages({ flag: transparentFlag, setting: settings.get("page.transparent"), backend: pageBackend.kind });
+function newTabsTransparent(engine = pageBackend.kind) {
+  return transparentPages({ flag: transparentFlag, setting: settings.get("page.transparent"), backend: engine });
 }
 // The tabs created transparent. Per tab rather than read from the setting at paint time: the
 // setting can change under a running engine, and a tab created clear must keep refusing patches
@@ -425,6 +426,11 @@ const debugLogging = true;
 settings.watch((changed, resolved) => {
   console.error(`tweb: settings changed: ${changed.join(", ")}`);
   for (const warning of resolved.warnings) console.error(`tweb: config.toml: ${warning}`);
+  // Pin lists are live. Refresh every pane's engine badge and its link-routing table within the
+  // same settings tick; no navigation should be needed to see the new pin.
+  if (changed.some((key) => /^engine\.(?:chrome|webkit|electron)_sites$/.test(key))) {
+    forEachPane(() => sendTabState());
+  }
 });
 for (const warning of settings.snapshot().warnings) console.error(`tweb: config.toml: ${warning}`);
 
@@ -2363,10 +2369,12 @@ function renderedFrameSize(vp) {
   };
 }
 
-function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize()) {
+// `engine` is the page engine the tab runs on (cdp/backend.cjs); the pane's own when not given.
+function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize(), engine = pageBackend.kind) {
   const logical = logicalContentSize(vp);
   return {
-    ...transparentWindowOptions(newTabsTransparent()),
+    ...transparentWindowOptions(newTabsTransparent(engine)),
+    twebEngine: engine,
     width: logical.width,
     height: logical.height,
     useContentSize: true,
@@ -2525,6 +2533,7 @@ function writeWindowSession() {
     return [{
       url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
       zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor(),
+      engine: tabEngine(tab),
     }];
   }), currentWindows().activeTabIndex, defaultZoomFactor());
   // A bare startup used to replace the last useful session with about:blank
@@ -3175,17 +3184,151 @@ function handOffToChrome(url) {
   });
 }
 
-// `engine.chrome_sites` (chrome-sites.cjs): a URL the user typed for a listed site goes to a
-// Chrome-engine pane beside this one, where the managed Chrome and its policy extensions can answer
-// what the site checks. Only what the user TYPED moves; a link or a redirect stays in this pane,
-// because an SSO chain split across two browsers breaks at the cookie boundary (README, "Hand over
-// the site, not the identity provider"). Returns whether the URL was taken.
-function sendToChromeEngine(tab, url) {
-  if (pageBackend.kind === "chrome") return false;
-  const site = matchingSite(url, settings.get("engine.chrome_sites"));
-  if (!site) return false;
-  openInChromePane(tab, url, site);
-  return true;
+// Page engines per tab (engine-routing.cjs, cdp/backend.cjs). A site pinned with
+// engine.<engine>_sites renders on that engine: a typed URL, a followed link or a new tab for it
+// replaces the tab with one on the pinned engine at the same place. A redirect does not move the
+// tab — an SSO chain moved mid-way fails — and the engine badge shows the mismatch instead.
+
+function tabEngine(tab) {
+  return pageBackend.kindOf(tab);
+}
+
+// Whether an engine can run here is a file lookup (the Chrome binary, the tweb-webkit host), and
+// tab state is sent on every navigation; a few seconds of memory is enough.
+const engineAvailabilityCache = new Map();
+function engineAvailability(engine) {
+  const cached = engineAvailabilityCache.get(engine);
+  if (cached && Date.now() - cached.at < 5000) return cached.value;
+  const value = pageBackend.availability(engine);
+  engineAvailabilityCache.set(engine, { at: Date.now(), value });
+  return value;
+}
+
+function navigationRoute(tab, url, cause, fromEngine = tabEngine(tab)) {
+  return routeNavigation({
+    url, tabEngine: fromEngine, lists: pinLists(settings), cause, availability: engineAvailability, remote: Boolean(remote),
+  });
+}
+
+// A typed URL or a followed link: moves the tab when the URL is pinned elsewhere. Returns whether
+// the navigation was taken, so the caller loads it in place otherwise.
+function followPin(tab, url, cause) {
+  const route = navigationRoute(tab, url, cause);
+  if (route.action === "switch") {
+    void switchTabEngine(tab, route.engine, url, route.site);
+    return true;
+  }
+  if (route.action === "notice") noticePin(tab, route);
+  return false;
+}
+
+// A new tab for `url`, on the engine it is pinned to, or else on the engine of the tab it came
+// from. An opener's popup is not this: it must share its opener's engine to keep `window.opener`.
+function openTabRouted(fromTab, url, activate = true) {
+  const fromEngine = fromTab && !fromTab.isDestroyed() ? tabEngine(fromTab) : pageBackend.kind;
+  const route = navigationRoute(fromTab, url, "new-tab", fromEngine);
+  if (route.action !== "switch") {
+    if (route.action === "notice" && fromTab) noticePin(fromTab, route);
+    return createTab(url, activate, undefined, undefined, { engine: fromEngine });
+  }
+  const record = currentPane();
+  pageBackend.ensureEngine(route.engine).then(
+    bindPane(() => record, () => createTab(url, activate, undefined, undefined, { engine: route.engine })),
+    bindPane(() => record, (error) => {
+      console.error(`tweb: ${route.engine} engine failed to start (${error.message}); opening ${url} on ${fromEngine}`);
+      createTab(url, activate, undefined, undefined, { engine: fromEngine });
+    }),
+  );
+  return null;
+}
+
+// The tab replaced by one on `engine`, at the same place, showing `url` (the tab's own when not
+// given). History does not come along: it belongs to the old engine's page. Neither do cookies.
+// Resolves to the tab now showing the page (the same one when it was already on `engine`), or
+// null when it could not move.
+async function switchTabEngine(tab, engine, url = null, site = null) {
+  if (!tab || tab.isDestroyed()) return null;
+  const record = tabPanes.get(tab);
+  const flash = bindPane(() => record, (text) => sendToMainTabFrame(tab, "tweb-flash", text));
+  const from = tabEngine(tab);
+  const target = url || tab.webContents.getURL() || tabSessionUrls.get(tab) || "about:blank";
+  if (from === engine) {
+    if (url) void tab.loadURL(url).catch(() => {});
+    return tab;
+  }
+  const available = remote && engine !== "electron"
+    ? { ok: false, reason: "--ssh panes stay on Electron" }
+    : engineAvailability(engine);
+  if (!available.ok) {
+    flash(`${ENGINE_LABELS[engine]} unavailable: ${available.reason}`);
+    return null;
+  }
+  try {
+    await pageBackend.ensureEngine(engine);
+  } catch (error) {
+    console.error(`tweb: ${engine} engine failed to start: ${error.message}`);
+    flash(`${ENGINE_LABELS[engine]} failed to start: ${error.message}`);
+    return null;
+  }
+  return bindPane(() => record, () => {
+    if (tab.isDestroyed()) return null;
+    const windows = currentWindows();
+    const index = windows.tabs.indexOf(tab);
+    if (index < 0) return null;
+    const wasActive = tab === windows.win;
+    const zoom = tabZoomFactors.get(tab) ?? defaultZoomFactor();
+    const next = createTab(target, wasActive, zoom, false, { engine, insertAt: index });
+    // Closed after the new tab is in the list and active, so the close is an ordinary one of a
+    // tab that is not the last: the pane never sees zero tabs.
+    tab.close();
+    console.error(`tweb: tab ${index + 1} ${from} -> ${engine}${site ? ` (pinned for ${site})` : ""}`);
+    next.webContents.once("did-finish-load", () => {
+      sendToMainTabFrame(next, "tweb-flash", `${ENGINE_LABELS[engine]}${site ? ` · pinned for ${site}` : ""}`);
+    });
+    scheduleWindowSessionSave();
+    return next;
+  })();
+}
+
+// Until `tab`'s page has loaded or failed, at most `timeout` ms: an agent asking for a switch
+// wants the list it gets back to show the page, not the blank document it starts from. Called
+// right after `switchTabEngine` made the tab, whose load has therefore not finished yet.
+function settledLoad(tab, timeout = 15_000) {
+  return new Promise((resolve) => {
+    if (!tab || tab.isDestroyed()) return resolve();
+    const contents = tab.webContents;
+    let timer = null;
+    const done = () => {
+      clearTimeout(timer);
+      contents.removeListener("did-finish-load", done);
+      contents.removeListener("did-fail-load", done);
+      resolve();
+    };
+    timer = setTimeout(done, timeout);
+    contents.once("did-finish-load", done);
+    contents.once("did-fail-load", done);
+  });
+}
+
+// A navigation the tab did not move for — a redirect onto a pinned site, or one whose engine
+// cannot run here — is told once per tab and site; the badge keeps showing it.
+const pinNotices = new WeakMap();
+function noticePin(tab, route) {
+  if (!tab || tab.isDestroyed()) return;
+  const seen = pinNotices.get(tab) || new Set();
+  pinNotices.set(tab, seen);
+  const key = `${route.site}:${route.engine}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  const label = ENGINE_LABELS[route.engine];
+  sendToMainTabFrame(tab, "tweb-flash", route.reason
+    ? `${route.site} is pinned to ${label} (${route.reason})`
+    : `${route.site} is pinned to ${label}: engine badge → switch`);
+}
+
+function noticePinnedNavigation(tab, url) {
+  const route = navigationRoute(tab, url, "redirect");
+  if (route.action === "notice") noticePin(tab, route);
 }
 
 // `tweb split --engine chrome URL` beside this pane: the CLI that started this engine, told which
@@ -3208,20 +3351,6 @@ function openInChromePane(tab, url, site) {
   });
   if (debugLogging) console.error(`tweb: ${label} → chrome pane beside ${paneId}`);
   if (tab) sendToMainTabFrame(tab, "tweb-flash", `${label} → Chrome pane`);
-}
-
-// A listed site reached by a link or a redirect is not moved (see sendToChromeEngine), but the user
-// is told once per tab and site, with the way to move it.
-const chromeSiteNotices = new WeakMap();
-function noticeChromeSite(tab, url) {
-  if (pageBackend.kind === "chrome") return;
-  const site = matchingSite(url, settings.get("engine.chrome_sites"));
-  if (!site) return;
-  const seen = chromeSiteNotices.get(tab) || new Set();
-  chromeSiteNotices.set(tab, seen);
-  if (seen.has(site)) return;
-  seen.add(site);
-  sendToMainTabFrame(tab, "tweb-flash", `${site} needs Chrome: c → Reopen in Chrome pane`);
 }
 
 function sendToMainTabFrame(tab, channel, ...args) {
@@ -3487,7 +3616,7 @@ function closeTab(index = currentWindows().activeTabIndex) {
   if (!tab || tab.isDestroyed()) return;
   const url = tab.webContents.getURL();
   if (isRestorableUrl(url)) {
-    currentWindows().closedTabs.push(url);
+    currentWindows().closedTabs.push({ url, engine: tabEngine(tab) });
     if (currentWindows().closedTabs.length > 25) currentWindows().closedTabs.shift();
   }
   if (currentWindows().tabs.length === 1) {
@@ -3503,8 +3632,19 @@ function closeTab(index = currentWindows().activeTabIndex) {
 }
 
 function restoreClosedTab() {
-  const url = currentWindows().closedTabs.pop();
-  if (url) createTab(url, true);
+  const closed = currentWindows().closedTabs.pop();
+  if (!closed) return;
+  // String entries are from a pane process started before per-tab engines existed.
+  const { url, engine } = typeof closed === "string" ? { url: closed, engine: null } : closed;
+  if (!engine || engine === pageBackend.kind) {
+    openTabRouted(currentWindows().win, url, true);
+    return;
+  }
+  const record = currentPane();
+  pageBackend.ensureEngine(engine).then(
+    bindPane(() => record, () => createTab(url, true, undefined, undefined, { engine })),
+    bindPane(() => record, () => openTabRouted(currentWindows().win, url, true)),
+  );
 }
 
 function normalizeOmniboxInput(input) {
@@ -3762,13 +3902,26 @@ function tabListModel() {
 }
 
 function tabStateModel() {
+  const active = currentWindows().win;
+  const lists = pinLists(settings);
   return {
     activeIndex: currentWindows().activeTabIndex,
     count: currentWindows().tabs.length,
     tabs: currentWindows().tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
       index,
       title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "New tab",
+      engine: tabEngine(candidate),
     }]),
+    // The engine badge (preload `renderEngineBadge`) and the pin table its link check uses.
+    engine: active && !active.isDestroyed() ? engineBadgeModel({
+      url: active.webContents.getURL(),
+      tabEngine: tabEngine(active),
+      paneEngine: pageBackend.kind,
+      lists,
+      availability: engineAvailability,
+      remote: Boolean(remote),
+    }) : null,
+    pins: pinTable(lists),
   };
 }
 
@@ -4038,6 +4191,13 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     }
     return;
   }
+  // A link the user clicked to a site pinned to another engine (the preload held it back). Not a
+  // shortcut: it works with vimium off, and the page has already been told nothing.
+  if (action === "pinned-link") {
+    const url = typeof value === "string" ? value : "";
+    if (/^https?:/i.test(url) && !tab.isDestroyed() && !followPin(tab, url, "link")) void tab.webContents.loadURL(url);
+    return;
+  }
   if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
@@ -4206,7 +4366,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       // from a frame with focus (the preload checks `document.hasFocus()`), and a frame giving
       // up focus clears the cursor only if it still owns it. The WebKit engine has no focused
       // frame to ask either, so it takes the same rule.
-      if (pageBackend.kind !== "electron") {
+      if (tabEngine(tab) !== "electron") {
         const key = sourceFrame ? frameKey(sourceFrame) : null;
         if (!value && key && caretOwners.get(tab) && caretOwners.get(tab) !== key) break;
         caretOwners.set(tab, value ? key : null);
@@ -4338,12 +4498,17 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "navigate": {
       const url = normalizeOmniboxInput(value);
-      if (url && !sendToChromeEngine(tab, url)) void contents.loadURL(url);
+      if (url && !followPin(tab, url, "typed")) void contents.loadURL(url);
       break;
     }
     case "new-tab": {
       const url = normalizeOmniboxInput(value);
-      if (url && !sendToChromeEngine(tab, url)) createTab(url, true);
+      if (url) openTabRouted(tab, url, true);
+      break;
+    }
+    case "switch-engine": {
+      const engine = engineKind(value);
+      if (engine) void switchTabEngine(tab, engine);
       break;
     }
   }
@@ -4685,10 +4850,11 @@ function runtimeInfoModel() {
   return runtimeInfoRows({
     version: electron.app.getVersion(),
     appDir: __dirname,
-    backend: pageBackend.kind,
+    backend: currentWindows().win && !currentWindows().win.isDestroyed()
+      ? tabEngine(currentWindows().win) : pageBackend.kind,
     electronVersion: process.versions.electron,
     chromiumVersion: process.versions.chrome,
-    chromeInfo: pageBackend.engine?.version,
+    chromeInfo: pageBackend.engineFor("chrome")?.version,
     pane: ownTmuxPane,
     pid: process.pid,
     hosted: hostedRuntime,
@@ -4951,6 +5117,7 @@ function agentTabList() {
       title: tab.isDestroyed() ? "" : tab.webContents.getTitle(),
       url: tab.isDestroyed() ? "" : tab.webContents.getURL(),
       active: index === currentWindows().activeTabIndex,
+      engine: tabEngine(tab),
     })),
   };
 }
@@ -5418,10 +5585,11 @@ function startRecording(params = {}) {
   return { ok: true, recording: true, directory, unavailable: recording.unavailable };
 }
 
-// What this pane's page engine cannot record. Asked of the session rather than of the engine's
-// name, so an engine that gains request events stops being listed without an edit here.
+// What the active tab's page engine cannot record. Asked of that engine's session rather than of
+// its name, so an engine that gains request events stops being listed without an edit here.
 function recordingLimits() {
-  return session.defaultSession.webRequest?.observesRequests === false
+  const active = currentWindows().win;
+  return active && !active.isDestroyed() && !pageBackend.observesRequests(active)
     ? ["failed requests (this engine cannot see a page's requests)"]
     : [];
 }
@@ -5649,7 +5817,7 @@ async function dispatchAgentCommand(method, params) {
       // only as "Script failed to execute", and the exception is the answer (see agent-eval.cjs).
       const tab = agentTab();
       const contents = tab.webContents;
-      const debuggerSend = pageBackend.kind !== "chrome" && ensureDebugger(tab)
+      const debuggerSend = tabEngine(tab) !== "chrome" && ensureDebugger(tab)
         ? (method, commandParams) => contents.debugger.sendCommand(method, commandParams)
         : null;
       return evaluate(params.script, {
@@ -5673,8 +5841,26 @@ async function dispatchAgentCommand(method, params) {
       activateTab(Number(params.index));
       return agentTabList();
     case "tab-new":
-      createTab(normalizeUrl(String(params.url || "about:blank")), true);
+      openTabRouted(currentWindows().win, normalizeUrl(String(params.url || "about:blank")), true);
       return agentTabList();
+    // A tab moved to another page engine in place, as the engine badge does. Answers once the new
+    // tab is in the list, so the list returned shows it; `ok: false` says why it did not move.
+    case "tab-engine": {
+      const index = params.index == null ? currentWindows().activeTabIndex : Number(params.index);
+      const tab = currentWindows().tabs[index];
+      if (!tab) throw new Error(`no tab ${index}`);
+      if (params.engine == null) return agentTabList();
+      const engine = engineKind(params.engine);
+      if (!engine) throw new Error(`unknown engine ${params.engine} (electron, chrome or webkit)`);
+      const available = remote && engine !== "electron"
+        ? { ok: false, reason: "--ssh panes stay on Electron" }
+        : engineAvailability(engine);
+      if (!available.ok) throw new Error(`${engine} is unavailable here: ${available.reason}`);
+      const moved = await switchTabEngine(tab, engine);
+      if (!moved) throw new Error(`the tab did not move to ${engine}; see the engine log`);
+      await settledLoad(moved);
+      return agentTabList();
+    }
     case "tab-close":
       // `null` as well as absent: the CLI sends `{"index": null}` for a bare `tweb tab close`, and
       // `Number(null)` is 0 — so "close this tab" closed the FIRST tab instead.
@@ -5689,10 +5875,12 @@ async function dispatchAgentCommand(method, params) {
     case "devtools": {
       // Chrome's own DevTools for this pane's page, opened by the CLI in a pane of its own.
       // Only the Chrome engine serves that page; Electron's offscreen tabs keep `devTools: false`.
-      if (!pageBackend.engine?.devtoolsFor) {
-        return { ok: false, message: "DevTools needs a Chrome-engine pane (--engine chrome)" };
+      const active = currentWindows().win;
+      const engine = active && !active.isDestroyed() ? pageBackend.engineFor(tabEngine(active)) : null;
+      if (!engine?.devtoolsFor) {
+        return { ok: false, message: "DevTools needs a tab on the Chrome engine (--engine chrome, or the engine badge)" };
       }
-      return pageBackend.engine.devtoolsFor(currentWindows().win?.webContents);
+      return engine.devtoolsFor(active.webContents);
     }
     case "inspect-element": {
       // The user picked an element in inspect mode. Forward the payload the preload
@@ -5732,6 +5920,8 @@ async function dispatchAgentCommand(method, params) {
         // Which page engine serves this pane: `tweb chrome login` must not close a Chrome a pane
         // is still driving, and this is the only place that can say so.
         browser: pageBackend.kind,
+        // Every engine with tabs in this pane: a Chrome tab in an Electron pane drives Chrome too.
+        engines: pageBackend.startedKinds(),
         tabs: agentTabList(),
       };
     // A peer says the claim changed. Nothing is returned and nothing is trusted — the
@@ -6402,9 +6592,8 @@ let extensionsDirectory = null;
 // the interface — see `extension-policy.cjs` for which manifests are accepted and why an
 // unsupported one is refused with a reason rather than loaded and left inert.
 async function setUpExtensions() {
-  // Chrome brings its own extensions — the managed, policy-installed ones it is used for — and
-  // WebKit runs none.
-  if (pageBackend.kind !== "electron") return;
+  // Always prepare Electron's session: even a pane that started on Chrome or WebKit can move a
+  // tab to Electron later. Chrome keeps its own managed extensions; WebKit runs none.
   const dir = extensionsDir(process.env, app.getPath("userData"));
   extensionsDirectory = dir;
   watchServiceWorkers(session.defaultSession, {
@@ -6791,14 +6980,14 @@ function runBrowserContextMenuCommand(tab, action) {
     case "paste-plain": contents.pasteAndMatchStyle(); break;
     case "select-all": contents.selectAll(); break;
     case "search-selection":
-      createTab(searchUrl(params.selectionText, settings.get("search.engine")), true);
+      openTabRouted(tab, searchUrl(params.selectionText, settings.get("search.engine")), true);
       break;
-    case "open-link": createTab(params.linkURL, true); break;
-    case "open-link-here": void contents.loadURL(params.linkURL); break;
+    case "open-link": openTabRouted(tab, params.linkURL, true); break;
+    case "open-link-here": if (!followPin(tab, params.linkURL, "link")) void contents.loadURL(params.linkURL); break;
     case "save-link": downloadUrl(contents, params.linkURL); break;
     case "copy-link": clipboard.writeText(params.linkURL); break;
     case "open-image":
-    case "open-media": createTab(params.srcURL, true); break;
+    case "open-media": openTabRouted(tab, params.srcURL, true); break;
     case "save-image":
     case "save-media": downloadUrl(contents, params.srcURL); break;
     case "copy-image":
@@ -7021,9 +7210,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     }
     if (details.disposition === "new-window") {
       pendingWindowOpen = { url: target, activate };
-      return { action: "allow", overrideBrowserWindowOptions: browserWindowOptions() };
+      // An opener's popup shares the opener's engine: `window.opener` cannot cross engines.
+      return { action: "allow", overrideBrowserWindowOptions: browserWindowOptions(undefined, tabEngine(tab)) };
     }
-    setImmediate(() => createTab(target, activate));
+    setImmediate(() => openTabRouted(tab, target, activate));
     return { action: "deny" };
   });
 
@@ -7114,14 +7304,16 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
   onContents("did-navigate", (_event, url) => {
     // The Chrome engine cannot sign in to Google (see cdp/sign-in-block.cjs); replace the refusal,
     // whose only button fails the same way, with what to do instead.
-    if (pageBackend.kind === "chrome" && isGoogleSignInRejection(url)) {
+    if (tabEngine(tab) === "chrome" && isGoogleSignInRejection(url)) {
       console.error("tweb: google sign-in refused in the chrome engine; pointing at `tweb chrome login`");
       void contents.loadURL(signInNoticePage(url));
       return;
     }
     recordNavigation(url);
     updatePaneTitle();
-    noticeChromeSite(tab, url);
+    noticePinnedNavigation(tab, url);
+    // The engine badge reads the page's pin, which a navigation changes.
+    if (tab === currentWindows().win) sendTabState(tab);
     recordTabNavigation(tab, url, false);
   });
   onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
@@ -7188,7 +7380,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
   });
 }
 
-function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor()) {
+// `insertAt` places the tab at that index instead of at the end: an engine switch puts the new
+// tab where the one it replaces was (see switchTabEngine).
+function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor(), insertAt = null) {
   // The pane whose scope we were called in — `attachPane` establishes it, and a tab opened from an
   // existing tab inherits it through that tab's bound handlers. Recorded before `configureTab` so
   // the handlers it registers can resolve this tab the first time they fire.
@@ -7197,11 +7391,18 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
   if (currentWindows().tabs.includes(tab)) return tab;
   // Every tab, popups included, comes through here right after its window was built from
   // `browserWindowOptions()`, so the setting read now is the one that window was created with.
-  if (newTabsTransparent()) transparentTabs.add(tab);
+  if (newTabsTransparent(pageBackend.kindOf(tab))) transparentTabs.add(tab);
   configureTab(tab, initialZoomFactor);
   tabSessionUrls.set(tab, url || "about:blank");
-  currentWindows().tabs.push(tab);
-  const index = currentWindows().tabs.length - 1;
+  const { tabs } = currentWindows();
+  let index = tabs.length;
+  if (Number.isInteger(insertAt) && insertAt >= 0 && insertAt < tabs.length) {
+    index = insertAt;
+    tabs.splice(index, 0, tab);
+    if (!activate && index <= currentWindows().activeTabIndex) currentWindows().activeTabIndex += 1;
+  } else {
+    tabs.push(tab);
+  }
 
   tab.on("closed", bindPane(() => tabPanes.get(tab), () => {
     tabPanes.delete(tab);
@@ -7255,17 +7456,21 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
   return tab;
 }
 
+// `engine` must already be started (`pageBackend.ensureEngine`) unless it is Electron or the
+// pane's own; `createTabOn` is the form that starts it.
 function createTab(
   url = "about:blank",
   activate = true,
   initialZoomFactor = defaultZoomFactor(),
-  showInitialPlaceholder = currentWindows().tabs.length === 0
+  showInitialPlaceholder = currentWindows().tabs.length === 0,
+  { engine = pageBackend.kind, insertAt = null } = {}
 ) {
   const tab = adoptTab(
-    new BrowserWindow(browserWindowOptions()),
+    new BrowserWindow(browserWindowOptions(undefined, engine)),
     url,
     activate,
-    initialZoomFactor
+    initialZoomFactor,
+    insertAt
   );
   const load = () => {
     // did-fail-load owns user-visible failures. loadURL also rejects for a normal
@@ -7391,10 +7596,15 @@ function createWindow(url, frames = currentFrames()) {
     return createTab(initialUrl, true);
   }
 
+  const moves = [];
   for (const [index, tab] of session.tabs.entries()) {
-    createTab(tab.url, false, tab.zoom, index === session.activeIndex);
+    const restored = createTab(tab.url, false, tab.zoom, index === session.activeIndex);
+    if (tab.engine && tab.engine !== pageBackend.kind) moves.push([restored, tab.engine]);
   }
   activateTab(session.activeIndex);
+  // A tab that was on another engine comes back on the pane's own and is moved once that engine
+  // has started — the move is the same one the engine badge makes, at the same place.
+  for (const [restored, engine] of moves) void switchTabEngine(restored, engine);
   if (debugLogging) {
     console.error(`tweb: restored ${session.tabs.length} tabs for tmux window`);
   }
@@ -8239,7 +8449,7 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
 function dispatchEditKey(tab, key, text, modifiers, eventKind) {
   if (!tab || tab.isDestroyed()) return;
   const contents = tab.webContents;
-  if (pageBackend.kind === "chrome" || !ensureDebugger(tab)) {
+  if (tabEngine(tab) === "chrome" || !ensureDebugger(tab)) {
     dispatchNativeKey(contents, key, text, modifiers, eventKind);
     return;
   }
@@ -9157,10 +9367,9 @@ function directorySize(directory) {
 // markdown-page.cjs for why at the scheme (relative links and images keep resolving against the
 // file) and why marked. Before the first tab and on a host alike, since both open local files.
 //
-// Electron only: the Chrome engine's pages load in Chrome and the WebKit host's in WKWebView, and
-// neither consults this session, so there a .md file shows as text as it always has.
+// Electron tabs only: Chrome pages load in Chrome and WebKit pages in WKWebView, and neither
+// consults this protocol. Registered in every pane because a tab can move to Electron later.
 function serveLocalMarkdown() {
-  if (pageBackend.kind !== "electron") return;
   try {
     session.defaultSession.protocol.handle("file", (request) => handleFileRequest(request, {
       passThrough: (passed) => electron.net.fetch(passed, { bypassCustomProtocolHandlers: true }),
@@ -9473,16 +9682,16 @@ function sweepAbandonedClaimFiles() {
 // The Chrome engine's tabs live in another process, which an exit does not take with it. Quitting is
 // held once — long enough to close this engine's tabs, and Chrome too when no other pane uses it —
 // then let go. Bounded, because a wedged Chrome must not keep a dead pane's engine alive.
-let pageBackendStopped = pageBackend.kind === "electron";
+// Every engine a tab started is stopped, not only the pane's own: an Electron pane with one Chrome
+// tab has a Chrome to let go of too.
+let pageBackendStopped = false;
 app.on("will-quit", (event) => {
-  if (pageBackendStopped) return;
+  if (pageBackendStopped || pageBackend.startedKinds().length === 1) return;
   pageBackendStopped = true;
   event.preventDefault();
   const done = () => app.quit();
   const timer = setTimeout(done, 3000);
-  pageBackend.engine.stop().catch((error) => {
-    console.error(`tweb: ${pageBackend.kind} engine stop failed: ${error.message}`);
-  }).finally(() => {
+  pageBackend.stopAll().finally(() => {
     clearTimeout(timer);
     done();
   });

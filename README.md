@@ -277,22 +277,31 @@ otherwise, and DESIGN.md names both shortcuts in its non-goals:
 What TWeb offers instead is the real thing. `--engine chrome` runs the pane's pages in the user's
 own Google Chrome, driven over the DevTools protocol, so Chrome answers the check itself.
 
-Rather than remembering the flag, list those sites once:
+Rather than remembering the flag, pin each site to its page engine once:
 
 ```bash
 tweb config set engine.chrome_sites okta.com,accounts.google.com,argo.example.com
+tweb config set engine.webkit_sites localhost
+tweb config set engine.electron_sites login.okta.com  # a narrower exception to okta.com
 ```
 
 An entry covers its host and every subdomain (`okta.com` matches `sendbird.okta.com`, not
-`notokta.com`). Then:
+`notokta.com`). The most specific entry across the three lists wins; an equal tie prefers Chrome,
+then WebKit, then Electron. Then:
 
-- `tweb open`/`tweb split URL` without `--engine` opens a listed site on the Chrome engine and says so
-  on stderr; `--engine electron` still overrides it.
-- A URL typed into a pane's omnibox (`o`, `t`) for a listed site opens in a Chrome-engine pane beside
-  it. Outside tmux it goes to your own Chrome window instead.
-- A listed site reached by a **link or a redirect** stays where it is, with a one-line notice. An SSO
-  chain split across two browsers breaks at the cookie boundary (see below), so only what you type
-  is moved. `c` → **Reopen in Chrome pane** moves the current page on request.
+- `tweb open`/`tweb split URL` without `--engine` opens a listed site on its pinned engine and says so
+  on stderr; an explicit `--engine` still overrides it.
+- One pane can hold tabs on all three engines. A URL typed in its omnibox, a followed top-page link,
+  or a new tab for a pinned site opens on that engine **in the same tab place**. The page reloads
+  there; cookies and history do not move between engines.
+- A server **redirect** does not move the tab. Moving an SSO chain mid-way loses the state/PKCE
+  cookies it started with, so the engine badge turns amber (`electron → chrome?`) instead. Click it
+  to see the current engine, the pin, unavailable engines and the switch actions.
+- The badge is grey on the pane's ordinary engine, blue after a manual switch, green on the engine a
+  site is pinned to, and amber on a mismatch. The command palette offers all three switches, and
+  `:engine chrome` / `tweb tab engine chrome` do the same. `c` still opens a separate Chrome pane.
+- `--ssh` panes stay on Electron: the proxy is Electron's session, while Chrome is shared and WebKit
+  has no per-pane proxy. Their badge explains that the other engines are unavailable.
 
 This is the support path for company-required extensions too. Endpoint Verification reads
 `chrome.enterprise.deviceAttributes` and `platformKeys` and talks to its native host; Cyberhaven talks
@@ -481,8 +490,9 @@ is left alone unless you pass `--force`.
 
 ## Browser engines and frame policy
 
-`open` and `split` both accept `--engine electron|chrome|webkit`. The default is `electron`, which
-provides every existing feature.
+`open` and `split` both accept `--engine electron|chrome|webkit`. The default is Electron, or the
+engine the first URL is pinned to. Tabs opened later choose independently, so one pane can mix all
+three; the engine badge reports and changes the active tab's engine.
 
 - **Electron**: built on Chromium offscreen paint. Provides all current TWeb browser features — Vimium-style modes, tabs/omnibox, visual/inspect, smart copy, detached DevTools. This is the engine every measurement in [Status](#status) was taken on.
 - **Chrome**: the pages run in the installed Google Chrome, headless, on a profile of TWeb's own (`<userData>/chrome-profile`, or `TWEB_CHROME_PROFILE`), driven over CDP. Use it for sites that only work in managed Chrome — see [Sites that need real Chrome](#sites-that-need-real-chrome). The Electron process stays the host and the pane logic is the same code: `electron/cdp/` presents each Chrome tab to `main.cjs` as an Electron `BrowserWindow`/`webContents`, and the same `preload.cjs`, byte for byte, is injected into each frame's isolated world. One Chrome serves every pane on the profile and exits with the last of them. `TWEB_CHROME` picks the binary, `TWEB_CHROME_HEADED=1` runs it with a (hidden) window, `TWEB_CDP_TRACE=1` logs the protocol. Because this Chrome has the installed Chrome's bundle id, macOS can send an outside link (Slack, `open URL`) to it instead of to your own Chrome; such a tab — no opener, nobody attached — is closed and its url handed to your Chrome.

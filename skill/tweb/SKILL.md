@@ -76,6 +76,8 @@ tweb tabs                             # indexes start at 0
 tweb tab new http://localhost:3000
 tweb tab switch 0
 tweb tab close                        # the active tab; or give an index
+tweb tab engine chrome                # this tab on another page engine (electron/chrome/webkit);
+                                      # the page reloads there, signed out of the old engine's cookies
 tweb device "iPhone 12"               # iPad, Pixel 5; `tweb device --reset` to undo
 tweb pdf page.pdf
 ```

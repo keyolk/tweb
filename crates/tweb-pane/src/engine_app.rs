@@ -288,6 +288,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/chrome-sites.cjs"),
     ),
     (
+        "engine-routing.cjs",
+        include_str!("../../../electron/engine-routing.cjs"),
+    ),
+    (
         "agent-handoff.cjs",
         include_str!("../../../electron/agent-handoff.cjs"),
     ),

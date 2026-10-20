@@ -2949,8 +2949,9 @@ test("a contenteditable caret on an empty line or at the end is measured, not gu
 test("on the Chrome and WebKit engines the caret owner is the frame that last reported one", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const branch = main.slice(main.indexOf('case "caret": {'), main.indexOf('case "insert-mode":'));
-  // Neither has a synchronous focused frame; only Electron's own webContents does.
-  assert.match(branch, /if \(pageBackend\.kind !== "electron"\) \{/);
+  // Neither has a synchronous focused frame; only Electron's own webContents does. Asked of the
+  // tab, since one pane can hold tabs on several engines.
+  assert.match(branch, /if \(tabEngine\(tab\) !== "electron"\) \{/);
   // A null from a frame that no longer owns the cursor must not hide the owner's cursor.
   assert.match(branch, /if \(!value && key && caretOwners\.get\(tab\) && caretOwners\.get\(tab\) !== key\) break;/);
   assert.match(branch, /caretOwners\.set\(tab, value \? key : null\);/);

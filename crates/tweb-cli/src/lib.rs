@@ -34,7 +34,8 @@ pub enum BrowserEngineArg {
 #[derive(Args, Clone, Debug)]
 pub struct BrowserOptions {
     /// Browser rendering engine.
-    /// Default: electron, or chrome for a URL listed in `engine.chrome_sites`.
+    /// Default: electron, or the engine a URL is pinned to (`engine.chrome_sites`,
+    /// `engine.webkit_sites`, `engine.electron_sites`).
     #[arg(long, value_enum)]
     pub engine: Option<BrowserEngineArg>,
 
@@ -66,8 +67,9 @@ pub struct BrowserOptions {
 }
 
 impl BrowserOptions {
-    /// The engine for `url`: the flag when given; otherwise chrome for a site listed in
-    /// `engine.chrome_sites`, electron for everything else (and for a restored session).
+    /// The engine for `url`: the flag when given; otherwise the engine its site is pinned to
+    /// (`engine.*_sites`), electron for everything else (and for a restored session). Tabs the
+    /// pane opens later follow the pins on their own (electron/engine-routing.cjs).
     fn with_engine_for(&self, url: Option<&str>) -> BrowserOptions {
         let mut resolved = self.clone();
         // A tunnelled pane is an Electron pane: the Chrome engine's browser is shared by every
@@ -77,18 +79,27 @@ impl BrowserOptions {
             resolved.engine = Some(BrowserEngineArg::Electron);
         }
         if resolved.engine.is_none() {
-            let site = url.and_then(|url| sites::matching_site(url, &config::chrome_sites()));
-            if let Some(site) = &site {
-                eprintln!(
-                    "tweb: {site} is in engine.chrome_sites; opening on the Chrome engine \
-                     (--engine electron to override)"
-                );
+            let pin = url.and_then(|url| sites::pinned_engine(url, &config::pinned_site_lists()));
+            let engine = match pin.as_ref().map(|(engine, _)| *engine) {
+                Some("chrome") => BrowserEngineArg::Chrome,
+                // WebKit is macOS only; a site pinned to it opens on Electron elsewhere.
+                Some("webkit") if cfg!(target_os = "macos") => BrowserEngineArg::Webkit,
+                _ => BrowserEngineArg::Electron,
+            };
+            if let Some((pinned, site)) = &pin {
+                if *pinned != "electron" {
+                    let shown = match engine {
+                        BrowserEngineArg::Chrome => "Chrome",
+                        BrowserEngineArg::Webkit => "WebKit",
+                        BrowserEngineArg::Electron => "Electron (WebKit is macOS only)",
+                    };
+                    eprintln!(
+                        "tweb: {site} is in engine.{pinned}_sites; opening on {shown} \
+                         (--engine electron to override)"
+                    );
+                }
             }
-            resolved.engine = Some(if site.is_some() {
-                BrowserEngineArg::Chrome
-            } else {
-                BrowserEngineArg::Electron
-            });
+            resolved.engine = Some(engine);
         }
         resolved
     }
@@ -599,6 +610,17 @@ pub enum TabAction {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Show the tabs with their page engines, or move a tab to another engine in place:
+    /// `tweb tab engine chrome`. The page is reloaded there; cookies do not move with it.
+    Engine {
+        /// electron, chrome or webkit. Without it, only lists the tabs.
+        engine: Option<String>,
+        /// The tab to move (default: the active one).
+        #[arg(long)]
+        index: Option<usize>,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -928,6 +950,15 @@ pub async fn run() -> Result<()> {
                 TabAction::Close { index, agent } => {
                     ("tab-close", json!({ "index": index }), agent)
                 }
+                TabAction::Engine {
+                    engine,
+                    index,
+                    agent,
+                } => (
+                    "tab-engine",
+                    json!({ "engine": engine, "index": index }),
+                    agent,
+                ),
             };
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
         }
