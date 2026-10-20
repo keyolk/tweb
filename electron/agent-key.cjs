@@ -51,6 +51,38 @@ function insertedText(key, modifiers = []) {
   return modifiers.includes("shift") ? key.toUpperCase() : key;
 }
 
+// Modifier spellings accepted inside a chord, mapped to the names `--mod` takes.
+const CHORD_MODIFIERS = new Map([
+  ["meta", "meta"], ["cmd", "meta"], ["command", "meta"],
+  ["control", "control"], ["ctrl", "control"],
+  ["alt", "alt"], ["option", "alt"], ["opt", "alt"],
+  ["shift", "shift"],
+]);
+
+/// Split a chord like "Meta+k" into its key and modifiers.
+///
+/// `tweb press Meta+k` is the spelling an agent reaches for first (it is Playwright's), and it
+/// used to go out as one key literally named "Meta+k": the page saw a keydown for nothing,
+/// `press` answered ok, and Upwind's Cmd-K palette never opened while `press k --mod meta`
+/// opened it. A chord is split only when every part before the last is a known modifier, so a
+/// lone "+" and a key name that merely contains "+" pass through unchanged. "Shift++" is
+/// Shift and "+". Explicit `--mod` values are kept, and a modifier given both ways counts once.
+function parseChord(key, modifiers = []) {
+  const name = String(key ?? "");
+  const mods = [...modifiers];
+  if (name.length < 2 || !name.includes("+")) return { key: name, modifiers: mods };
+  const plusKey = name.endsWith("++");
+  const parts = (plusKey ? name.slice(0, -2) : name).split("+");
+  const last = plusKey ? "+" : parts.pop();
+  if (!last) return { key: name, modifiers: mods };
+  const chordMods = parts.map((part) => CHORD_MODIFIERS.get(part.toLowerCase()));
+  if (chordMods.length === 0 || chordMods.some((modifier) => !modifier)) {
+    return { key: name, modifiers: mods };
+  }
+  for (const modifier of chordMods) if (!mods.includes(modifier)) mods.push(modifier);
+  return { key: last, modifiers: mods };
+}
+
 /// The `sendInputEvent` payloads for one agent `press`, in order.
 ///
 /// Returned as data rather than sent directly so the rules above are testable without a
@@ -69,4 +101,4 @@ function pressEvents(key, modifiers = []) {
   return events;
 }
 
-module.exports = { pressEvents, insertedText, ACCELERATOR_KEYS };
+module.exports = { pressEvents, insertedText, parseChord, ACCELERATOR_KEYS };

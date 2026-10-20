@@ -136,7 +136,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "tweb_press",
         method: "press",
-        description: "Send a key to the page (Enter, Tab, Escape, ArrowDown, a single character).",
+        description: "Send a key to the page (Enter, Tab, Escape, ArrowDown, a single character, or a chord such as Meta+k).",
         fields: &[
             ("key", "string", "Key name", true),
             ("modifiers", "array", "shift/control/alt/meta", false),

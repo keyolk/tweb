@@ -275,7 +275,7 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// key press (e.g. Enter, Tab, Escape).
+    /// key press (e.g. Enter, Tab, Escape, or a chord such as Meta+k).
     Press {
         key: String,
         /// modifier (shift, control, alt, meta). Repeatable.

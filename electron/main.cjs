@@ -97,7 +97,7 @@ const { isOrphaned, watchedPid, abandonedFrameFiles } = require("./orphan-watch.
 const {
   surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry, restoredLayoutScript,
 } = require("./surface-policy.cjs");
-const { pressEvents } = require("./agent-key.cjs");
+const { pressEvents, parseChord } = require("./agent-key.cjs");
 const { pdfKeyAction, pdfViewportScript, findPdfFrame } = require("./pdf-frame.cjs");
 const { recoveryDecision } = require("./renderer-recovery.cjs");
 const { IDLE: FIND_IDLE, findStep, endStep } = require("./find-session.cjs");
@@ -5091,7 +5091,8 @@ function agentNativeClick(point) {
 // the real key path. This path had drifted from `dispatchNativeKey`: a shifted letter and
 // Space typed nothing, and an arrow key reached the page as key="" because Chromium wants
 // the Accelerator name.
-function agentPressKey(key, modifiers = []) {
+function agentPressKey(rawKey, rawModifiers = []) {
+  const { key, modifiers } = parseChord(rawKey, rawModifiers);
   const contents = agentContents();
   // Same reason as the real key path: sendInputEvent does not reach a PDF's extension
   // frame, so `tweb press PageDown` would answer ok while the viewer stayed on page 1.
