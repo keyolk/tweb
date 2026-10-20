@@ -53,4 +53,42 @@ function matchingSite(input, sites) {
   return null;
 }
 
-module.exports = { matchingSite, siteHost, urlHost };
+// The engines a site can be pinned to, in the order a tie between equally specific entries is
+// broken: Chrome first, because a site listed for Chrome is there for an attestation nothing else
+// can make; WebKit next, because it is the narrower choice of the other two.
+const PINNABLE_ENGINES = ["chrome", "webkit", "electron"];
+
+/** The settings key that lists the sites pinned to `engine`. */
+function sitesKey(engine) {
+  return `engine.${engine}_sites`;
+}
+
+/**
+ * The engine `input` is pinned to, and the entry that pins it, or null. `lists` maps an engine to
+ * its site list. The most specific entry wins — `okta.com` on Chrome and `login.okta.com` on
+ * Electron put `login.okta.com` on Electron — so one list can carve an exception out of another.
+ */
+function pinnedEngine(input, lists) {
+  const host = urlHost(input);
+  if (!host) return null;
+  let best = null;
+  for (const engine of PINNABLE_ENGINES) {
+    for (const entry of Array.isArray(lists?.[engine]) ? lists[engine] : []) {
+      const site = siteHost(entry);
+      if (!site || (host !== site && !host.endsWith(`.${site}`))) continue;
+      if (!best || site.length > best.site.length) best = { engine, site };
+    }
+  }
+  return best;
+}
+
+/** `pinnedEngine` over the three settings lists. */
+function pinnedEngineFromSettings(input, settings) {
+  const lists = {};
+  for (const engine of PINNABLE_ENGINES) lists[engine] = settings.get(sitesKey(engine));
+  return pinnedEngine(input, lists);
+}
+
+module.exports = {
+  PINNABLE_ENGINES, matchingSite, pinnedEngine, pinnedEngineFromSettings, siteHost, sitesKey, urlHost,
+};

@@ -130,6 +130,11 @@ installPrintShim();
     // The same page in a Chrome-engine pane beside this one: for a site listed in
     // `engine.chrome_sites` reached by a link, which is told to the user but not moved for them.
     { name: "chrome-pane", label: "Reopen in Chrome pane", action: () => send("chrome-pane") },
+    // This tab on another page engine, in place (the engine badge's menu does the same). The
+    // page is reloaded there and signed out of whatever only the old engine's cookies held.
+    { name: "engine-electron", label: "Switch tab engine: Electron", action: () => send("switch-engine", "electron") },
+    { name: "engine-chrome", label: "Switch tab engine: Chrome", action: () => send("switch-engine", "chrome") },
+    { name: "engine-webkit", label: "Switch tab engine: WebKit", action: () => send("switch-engine", "webkit") },
     { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
     // Starts a recording, or stops one and pastes its timeline into the agent pane (`gr`).
     { name: "record", label: "Record for agent (start / stop)", action: () => send("record-toggle") },
@@ -158,6 +163,7 @@ installPrintShim();
     // `:open` with nothing to open is a mistake worth naming rather than a silent no-op.
     { name: "open", argument: "url", action: (value) => send("navigate", value) },
     { name: "tab", argument: "url", action: (value) => send("new-tab", value) },
+    { name: "engine", argument: "electron, chrome or webkit", action: (value) => send("switch-engine", value) },
   ];
   // Both tables, by name. Palette rows win a collision, since a row the user can see is the one
   // they will expect `:` to reach.
@@ -292,6 +298,12 @@ installPrintShim();
   let fileChooserState = null;
   let tabBadge = null;
   let tabPopover = null;
+  // The page engine of this tab and the switch menu behind it (engine-routing.cjs builds the
+  // model). `pinRows` is the pin table the link check below reads: most specific site first.
+  let engineBadge = null;
+  let enginePopover = null;
+  let engineState = null;
+  let pinRows = [];
   let tabPopoverPinned = false;
   let tabPopoverTimer = null;
   let indicatorMode = "normal";
@@ -601,6 +613,7 @@ installPrintShim();
   function showTabPopover(pinned = false) {
     if (!topFrame) return;
     ensureIndicator();
+    if (enginePopover) enginePopover.style.display = "none";
     clearTimeout(tabPopoverTimer);
     tabPopoverTimer = null;
     tabPopoverPinned = pinned;
@@ -622,6 +635,10 @@ installPrintShim();
       title.textContent = tab.title || "New tab";
       title.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis";
       title.style.flex = "1 1 auto";
+      const engine = document.createElement("span");
+      engine.textContent = tab.engine || "";
+      engine.title = tab.engine ? `Page engine: ${tab.engine}` : "";
+      engine.style.cssText = "flex:0 0 auto;color:#9aa0a6;font-size:10px";
       // A close control per row. A span rather than a nested <button>: a button inside a button
       // is invalid markup and Chromium hoists it out, which would put the control outside the
       // row it belongs to. Hidden until the row is hovered, like a browser tab's close button,
@@ -645,7 +662,7 @@ installPrintShim();
         tabPopoverPinned = true;
         send("close-tab-from-badge", tab.index);
       };
-      button.append(number, title, close);
+      button.append(number, title, engine, close);
       button.onmouseenter = () => { button.style.background = "#ffffff18"; close.style.visibility = "visible"; };
       button.onmouseleave = () => {
         button.style.background = tab.index === tabState.activeIndex ? "#8ab4f82b" : "transparent";
@@ -745,7 +762,29 @@ installPrintShim();
     ].join(";");
     record.textContent = "● REC";
     record.title = "Recording for the agent — gr stops and sends the timeline";
-    shadow.append(label, input, audio, record, transfer, badge, popover);
+    // The page engine. Quiet grey on the pane's own engine with nothing pinned; coloured when the
+    // tab is on another engine, green on the engine its site is pinned to, amber when the site is
+    // pinned to an engine the tab is not on. A click opens the switch menu.
+    const engine = document.createElement("button");
+    engine.type = "button";
+    engine.setAttribute("aria-haspopup", "menu");
+    engine.setAttribute("aria-expanded", "false");
+    engine.style.cssText = [
+      "box-sizing:border-box", "display:none", "height:18px", "padding:1px 6px",
+      "border:1px solid #9aa0a666", "border-radius:4px", "background:#111d", "color:#9aa0a6",
+      "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "cursor:pointer", "white-space:nowrap", "pointer-events:auto", "backdrop-filter:blur(3px)",
+    ].join(";");
+    engine.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (enginePopover.style.display !== "none") hideEnginePopover();
+      else showEnginePopover();
+    };
+    const engineMenu = document.createElement("div");
+    engineMenu.setAttribute("role", "menu");
+    engineMenu.style.cssText = popover.style.cssText;
+    shadow.append(label, input, audio, record, transfer, engine, badge, popover, engineMenu);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
@@ -755,6 +794,126 @@ installPrintShim();
     transferBadge = transfer;
     tabBadge = badge;
     tabPopover = popover;
+    engineBadge = engine;
+    enginePopover = engineMenu;
+  }
+
+  const ENGINE_TONES = {
+    plain: "#9aa0a6", other: "#8ab4f8", pinned: "#81c995", mismatch: "#fdd663",
+  };
+
+  function renderEngineBadge() {
+    if (!engineBadge) return;
+    if (!engineState) {
+      engineBadge.style.display = "none";
+      return;
+    }
+    const { engine, emphasis, pin } = engineState;
+    const tone = ENGINE_TONES[emphasis] || ENGINE_TONES.plain;
+    engineBadge.style.display = "";
+    engineBadge.style.color = tone;
+    engineBadge.style.borderColor = `${tone}66`;
+    engineBadge.textContent = emphasis === "mismatch" ? `${engine} → ${pin.engine}?` : engine;
+    engineBadge.title = emphasis === "mismatch"
+      ? `${pin.site} is pinned to ${pin.label}, but this tab is on ${engineState.label} · click to switch`
+      : emphasis === "pinned"
+        ? `On ${engineState.label}, as pinned for ${pin.site} · click to switch`
+        : `Page engine: ${engineState.label} · click to switch`;
+  }
+
+  function hideEnginePopover() {
+    if (enginePopover) enginePopover.style.display = "none";
+    if (engineBadge) engineBadge.setAttribute("aria-expanded", "false");
+    paintNow();
+  }
+
+  // One row per engine: the current one marked, the pinned one named, the ones that cannot run
+  // here greyed out with the reason. Choosing one reloads this tab's page on it, in place.
+  function showEnginePopover() {
+    if (!topFrame || !engineState) return;
+    ensureIndicator();
+    hideTabPopover();
+    enginePopover.replaceChildren();
+    const note = document.createElement("div");
+    note.textContent = "Switching reloads the page there; cookies do not move.";
+    note.style.cssText = "padding:3px 7px 6px;color:#9aa0a6;font:11px/1.35 system-ui,-apple-system,sans-serif";
+    enginePopover.append(note);
+    for (const choice of engineState.choices || []) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.disabled = !choice.ok || choice.current;
+      row.style.cssText = [
+        "display:flex", "width:100%", "gap:7px", "align-items:center", "padding:5px 7px",
+        "border:0", "border-radius:4px", "background:transparent", "color:#e8eaed",
+        "font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace", "text-align:left",
+        "white-space:nowrap", choice.ok && !choice.current ? "cursor:pointer" : "cursor:default",
+      ].join(";");
+      if (choice.current) row.style.background = "#8ab4f82b";
+      if (!choice.ok) row.style.color = "#5f6368";
+      const name = document.createElement("span");
+      name.textContent = `${choice.current ? "●" : " "} ${choice.label}`;
+      name.style.cssText = "flex:1 1 auto";
+      const detail = document.createElement("span");
+      detail.textContent = !choice.ok ? choice.reason || "unavailable"
+        : choice.pinned ? `pinned · ${engineState.pin.site}` : choice.current ? "current" : "";
+      detail.style.cssText = `flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;color:${choice.pinned && choice.ok ? "#81c995" : "#9aa0a6"}`;
+      row.append(name, detail);
+      if (choice.ok && !choice.current) {
+        row.onmouseenter = () => { row.style.background = "#ffffff18"; };
+        row.onmouseleave = () => { row.style.background = "transparent"; };
+        row.onclick = (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          hideEnginePopover();
+          send("switch-engine", choice.engine);
+        };
+      }
+      enginePopover.append(row);
+    }
+    enginePopover.style.display = "block";
+    engineBadge.setAttribute("aria-expanded", "true");
+    paintNow();
+  }
+
+  // The engine a URL is pinned to, from the table the engine sent (first covering row wins; the
+  // table is ordered so that is the most specific one). null for unpinned and non-web URLs.
+  function pinnedEngineFor(url) {
+    let host = "";
+    try {
+      const parsed = new URL(url, location.href);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+      host = parsed.hostname.replace(/\.$/, "").toLowerCase();
+    } catch (_) {
+      return null;
+    }
+    const row = pinRows.find(({ site }) => host === site || host.endsWith(`.${site}`));
+    return row ? row.engine : null;
+  }
+
+  // A link the user follows to a site pinned to another engine is held back and handed to the
+  // engine, which reopens the tab there (main.cjs `followPin`). Top frame only, and only a link
+  // that replaces the page (no target, or _self/_top/_parent): tab state, and with it the pins,
+  // goes to the main frame alone. A link in a frame aimed at _top is not caught; it navigates as
+  // before and the badge shows the mismatch. A modified click opens a new tab, which the engine
+  // routes on its own, and a click the page already handled (an SPA router) is the page's.
+  // Registered on the window in the bubble phase, so the page's own handlers have run by then.
+  function holdPinnedLink(event) {
+    if (!topFrame || event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const anchor = event.composedPath().find((node) => (node?.tagName === "A" || node?.tagName === "AREA") && node.href);
+    if (!anchor || anchor.hasAttribute("download")) return;
+    const target = String(anchor.getAttribute("target") || "").toLowerCase();
+    if (!["", "_self", "_top", "_parent"].includes(target)) return;
+    const href = anchor.href;
+    const here = new URL(location.href);
+    const there = new URL(href, location.href);
+    // A fragment on this page is not a navigation.
+    if (there.origin === here.origin && there.pathname === here.pathname && there.search === here.search) return;
+    const pinned = pinnedEngineFor(href);
+    const current = engineState?.engine;
+    if (!pinned || !current || pinned === current) return;
+    event.preventDefault();
+    send("pinned-link", there.href);
   }
 
   // A two-pixel bar across the top of the pane while a page loads.
@@ -881,13 +1040,19 @@ installPrintShim();
     tabBadge.textContent = `${active}/${tabState.count}`;
     tabBadge.title = `Tab ${active}/${tabState.count} in this pane · hover/click for the list`;
     if (tabPopover.style.display !== "none") showTabPopover(tabPopoverPinned);
+    renderEngineBadge();
+    if (enginePopover.style.display !== "none") showEnginePopover();
   }
 
   function updateTabState(model) {
     const tabs = Array.isArray(model?.tabs) ? model.tabs.flatMap((tab, index) => {
       if (!tab || !Number.isInteger(tab.index)) return [];
-      return [{ index: tab.index, title: String(tab.title || `Tab ${index + 1}`) }];
+      return [{ index: tab.index, title: String(tab.title || `Tab ${index + 1}`), engine: typeof tab.engine === "string" ? tab.engine : null }];
     }) : [];
+    engineState = model?.engine && typeof model.engine.engine === "string" ? model.engine : null;
+    pinRows = Array.isArray(model?.pins)
+      ? model.pins.filter((row) => typeof row?.site === "string" && typeof row?.engine === "string")
+      : [];
     const count = tabs.length || (Number.isInteger(model?.count) && model.count > 0 ? model.count : 1);
     const activeIndex = Number.isInteger(model?.activeIndex) ? model.activeIndex : 0;
     tabState = {
@@ -5647,6 +5812,8 @@ installPrintShim();
     }
     send("record-event", { kind: "field", selector: cssSelector(element), field, url: location.href });
   }
+
+  if (topFrame) window.addEventListener("click", holdPinnedLink, false);
 
   ipcRenderer.on("tweb-recording", (_event, state) => {
     const on = Boolean(state?.recording);

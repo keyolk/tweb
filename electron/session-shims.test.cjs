@@ -59,6 +59,7 @@ test("Chrome request events name their tab, and a failure reaches onErrorOccurre
 test("the WebKit session says it sees no requests, rather than reporting none", () => {
   assert.equal(engines.webkit().session().webRequest.observesRequests, false);
   assert.notEqual(engines.chrome().session().webRequest.observesRequests, false);
-  // The recorder lists that limit from this flag (main.cjs `recordingLimits`).
-  assert.match(main, /webRequest\?\.observesRequests === false/);
+  // The recorder lists that limit from this flag, asked for the active tab's engine (main.cjs
+  // `recordingLimits`, cdp/backend.cjs `observesRequests`).
+  assert.match(main, /!pageBackend\.observesRequests\(active\)/);
 });

@@ -98,7 +98,23 @@
       "default": [],
       "env": "TWEB_CHROME_SITES",
       "applies": "live",
-      "description": "Sites that need the managed Chrome (Okta Device Trust, Endpoint Verification, Cyberhaven). Each entry covers that host and its subdomains. `tweb open`/`split` without --engine, and a URL typed in a pane, go to a Chrome-engine pane; links and redirects stay where they are."
+      "description": "Sites pinned to the Chrome engine (Okta Device Trust, Endpoint Verification, Cyberhaven). Each entry covers that host and its subdomains; the most specific entry across the three engine lists wins. A typed URL or a followed link to a pinned site opens it on that engine in the same tab; a redirect stays where it is and the engine badge offers the switch."
+    },
+    {
+      "key": "engine.webkit_sites",
+      "type": "list",
+      "default": [],
+      "env": "TWEB_WEBKIT_SITES",
+      "applies": "live",
+      "description": "Sites pinned to the WebKit engine (macOS). Same rules as engine.chrome_sites."
+    },
+    {
+      "key": "engine.electron_sites",
+      "type": "list",
+      "default": [],
+      "env": "TWEB_ELECTRON_SITES",
+      "applies": "live",
+      "description": "Sites pinned to the Electron engine: an exception carved out of a broader chrome or webkit entry, or a site kept on Electron in a pane opened on another engine. Same rules as engine.chrome_sites."
     }
   ]
 }

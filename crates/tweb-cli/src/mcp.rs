@@ -214,8 +214,19 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "tweb_tabs",
         method: "tabs",
-        description: "List open tabs.",
+        description: "List open tabs, each with the page engine it runs on.",
         fields: &[],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_tab_engine",
+        method: "tab-engine",
+        description: "Move a tab to another page engine (electron, chrome, webkit) in place. \
+                      The page reloads there and its cookies do not come along.",
+        fields: &[
+            ("engine", "string", "electron, chrome or webkit", true),
+            ("index", "number", "Tab index (default: the active tab)", false),
+        ],
         fixed: &[],
     },
     Tool {

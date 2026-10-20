@@ -247,6 +247,13 @@ function clampedZoom(zoom, fallback) {
   return Number.isFinite(zoom) ? Math.min(2, Math.max(0.5, zoom)) : fallback;
 }
 
+// The engine a tab was on (cdp/backend.cjs), kept only when it is one: a session written before
+// tabs had engines has none, and restores on the pane's own.
+const SESSION_ENGINES = new Set(["electron", "chrome", "webkit"]);
+function sessionEngine(engine) {
+  return SESSION_ENGINES.has(engine) ? { engine } : {};
+}
+
 function activeRestoredIndex(entries, activeIndex) {
   if (entries.length === 0) return 0;
   const requested = Number.isInteger(activeIndex) ? Math.max(0, activeIndex) : 0;
@@ -258,11 +265,11 @@ function normalizeWindowSession(parsed, defaultZoomFactor) {
   if (parsed?.version !== 1 || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
   const entries = parsed.tabs.slice(0, 50).flatMap((entry, sourceIndex) => {
     if (!entry || !isRestorableUrl(entry.url)) return [];
-    return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex }];
+    return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex, ...sessionEngine(entry.engine) }];
   });
   if (entries.length === 0) return null;
   return {
-    tabs: entries.map(({ url, zoom }) => ({ url, zoom })),
+    tabs: entries.map(({ url, zoom, engine }) => ({ url, zoom, ...sessionEngine(engine) })),
     activeIndex: activeRestoredIndex(entries, parsed.activeIndex),
   };
 }
@@ -271,13 +278,13 @@ function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
   if (!Array.isArray(tabs) || tabs.length === 0) return null;
   const entries = tabs.slice(0, 50).flatMap((entry, sourceIndex) => {
     if (!entry || !isRestorableUrl(entry.url)) return [];
-    return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex }];
+    return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex, ...sessionEngine(entry.engine) }];
   });
   if (entries.length === 0) return null;
   return {
     version: 1,
     activeIndex: activeRestoredIndex(entries, activeIndex),
-    tabs: entries.map(({ url, zoom }) => ({ url, zoom })),
+    tabs: entries.map(({ url, zoom, engine }) => ({ url, zoom, ...sessionEngine(engine) })),
   };
 }
 

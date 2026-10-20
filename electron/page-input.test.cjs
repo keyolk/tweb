@@ -241,9 +241,10 @@ test("a script-opened popup is allowed, and gets this pane's window options", ()
   // The overrides are the point. An Electron popup with none is not an offscreen window, so it
   // has no display to paint into — that is the `innerWidth: 0, screen: 0x0` tab that froze the
   // pane when allowing was tried before. With them: `inner=1800x1125 screen=1440x900`.
-  assert.match(handler, /action: "allow", overrideBrowserWindowOptions: browserWindowOptions\(\)/);
-  // Everything else still opens as a fresh tab.
-  assert.match(handler, /setImmediate\(\(\) => createTab\(target, activate\)\)/);
+  // On the opener's engine: `window.opener` cannot cross engines.
+  assert.match(handler, /action: "allow", overrideBrowserWindowOptions: browserWindowOptions\(undefined, tabEngine\(tab\)\)/);
+  // Everything else still opens as a fresh tab, on the engine its site is pinned to if any.
+  assert.match(handler, /setImmediate\(\(\) => openTabRouted\(tab, target, activate\)\)/);
   assert.match(handler, /action: "deny"/);
 });
 

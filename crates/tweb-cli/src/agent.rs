@@ -561,7 +561,7 @@ pub fn render(method: &str, result: &Value) -> String {
                 "still floating\n".to_string()
             }
         }
-        "tabs" | "tab" | "tab-new" | "tab-close" => {
+        "tabs" | "tab" | "tab-new" | "tab-close" | "tab-engine" => {
             let tabs = result
                 .get("tabs")
                 .and_then(Value::as_array)
@@ -569,14 +569,21 @@ pub fn render(method: &str, result: &Value) -> String {
                 .unwrap_or_default();
             tabs.iter()
                 .map(|tab| {
+                    // The page engine in brackets, when the engine says (an older one does not).
+                    let engine = tab
+                        .get("engine")
+                        .and_then(Value::as_str)
+                        .map(|engine| format!(" [{engine}]"))
+                        .unwrap_or_default();
                     format!(
-                        "{}{} {} {}",
+                        "{}{}{} {} {}",
                         if tab.get("active").and_then(Value::as_bool).unwrap_or(false) {
                             "*"
                         } else {
                             " "
                         },
                         tab.get("index").and_then(Value::as_i64).unwrap_or(-1),
+                        engine,
                         text_field(tab, "title"),
                         text_field(tab, "url")
                     )

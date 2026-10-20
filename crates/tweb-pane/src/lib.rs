@@ -607,13 +607,17 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 }
                 BrowserEngine::Webkit => {
                     command.env("TWEB_BROWSER", "webkit");
-                    // The page host is found beside this binary, so the engine and its host are
-                    // one build; electron/webkit/helper.cjs falls back to a checkout or PATH.
-                    if let Some(host) = find_webkit() {
-                        command.env("TWEB_WEBKIT", host);
-                    }
                 }
                 BrowserEngine::Electron => {}
+            }
+            // The page host is found beside this binary, so the engine and its host are one
+            // build; electron/webkit/helper.cjs falls back to a checkout or PATH. Given to every
+            // engine, not only a WebKit pane's: any tab can be moved to WebKit later (the engine
+            // badge, engine.webkit_sites).
+            if cfg!(target_os = "macos") {
+                if let Some(host) = find_webkit() {
+                    command.env("TWEB_WEBKIT", host);
+                }
             }
             // Every engine kind reads the pointer and trackpad the same way, through the helper
             // beside this binary (electron/native-input.cjs falls back to a checkout or PATH).

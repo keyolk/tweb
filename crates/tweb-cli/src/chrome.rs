@@ -318,12 +318,19 @@ fn reclaim_profile(profile: &std::path::Path, pid: u32) -> Result<()> {
 fn chrome_panes(statuses: &[(String, serde_json::Value)]) -> Vec<String> {
     statuses
         .iter()
-        .filter(
-            |(_, status)| match status.get("browser").and_then(serde_json::Value::as_str) {
-                Some(kind) => kind == "chrome",
-                None => true,
-            },
-        )
+        .filter(|(_, status)| {
+            // A pane lists every engine its tabs started: an Electron pane with a tab moved to
+            // Chrome drives Chrome as much as a Chrome pane does.
+            let engines_have_chrome = status
+                .get("engines")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|engines| engines.iter().any(|kind| kind == "chrome"));
+            engines_have_chrome
+                || match status.get("browser").and_then(serde_json::Value::as_str) {
+                    Some(kind) => kind == "chrome",
+                    None => true,
+                }
+        })
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -425,6 +432,14 @@ mod login_tests {
         ];
         assert_eq!(chrome_panes(&statuses), vec!["%2", "%3"]);
         assert!(chrome_panes(&[("%1".to_string(), json!({ "browser": "electron" }))]).is_empty());
+        // An Electron pane with a tab on Chrome is driving Chrome.
+        assert_eq!(
+            chrome_panes(&[(
+                "%4".to_string(),
+                json!({ "browser": "electron", "engines": ["electron", "chrome"] })
+            )]),
+            vec!["%4"]
+        );
         assert!(chrome_panes(&[]).is_empty());
     }
 
