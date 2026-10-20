@@ -2,7 +2,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { pressEvents, insertedText } = require("./agent-key.cjs");
+const { pressEvents, insertedText, parseChord } = require("./agent-key.cjs");
 
 const types = (events) => events.map((event) => event.type);
 const charOf = (events) => events.find((event) => event.type === "char")?.keyCode ?? null;
@@ -95,4 +95,37 @@ test("the caller's modifier array is never mutated", () => {
   const modifiers = ["shift"];
   pressEvents("a", modifiers);
   assert.deepStrictEqual(modifiers, ["shift"]);
+});
+
+// Measured on Upwind's console: `press Meta+k` returned ok and the page saw a keydown for a
+// key named "Meta+k", so the Cmd-K palette never opened; `press k --mod meta` opened it.
+test("a chord is split into its key and modifiers", () => {
+  assert.deepStrictEqual(parseChord("Meta+k"), { key: "k", modifiers: ["meta"] });
+  assert.deepStrictEqual(parseChord("Cmd+Shift+P"), { key: "P", modifiers: ["meta", "shift"] });
+  assert.deepStrictEqual(parseChord("ctrl+ArrowLeft"), { key: "ArrowLeft", modifiers: ["control"] });
+  assert.deepStrictEqual(parseChord("Option+a"), { key: "a", modifiers: ["alt"] });
+});
+
+test("a chord merges with --mod without duplicating", () => {
+  assert.deepStrictEqual(parseChord("Meta+k", ["meta"]), { key: "k", modifiers: ["meta"] });
+  assert.deepStrictEqual(parseChord("Shift+a", ["control"]), { key: "a", modifiers: ["control", "shift"] });
+});
+
+test("plus as a key survives", () => {
+  assert.deepStrictEqual(parseChord("+"), { key: "+", modifiers: [] });
+  assert.deepStrictEqual(parseChord("Shift++"), { key: "+", modifiers: ["shift"] });
+});
+
+test("a name with + whose prefix is not a modifier is left alone", () => {
+  assert.deepStrictEqual(parseChord("a+b"), { key: "a+b", modifiers: [] });
+  assert.deepStrictEqual(parseChord("Meta+"), { key: "Meta+", modifiers: [] });
+  assert.deepStrictEqual(parseChord("Enter", ["shift"]), { key: "Enter", modifiers: ["shift"] });
+});
+
+test("the chord's key and modifiers produce the shortcut events", () => {
+  const { key, modifiers } = parseChord("Meta+k");
+  const events = pressEvents(key, modifiers);
+  assert.deepStrictEqual(types(events), ["keyDown", "keyUp"]);
+  assert.strictEqual(events[0].keyCode, "k");
+  assert.deepStrictEqual(events[0].modifiers, ["meta"]);
 });
