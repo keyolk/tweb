@@ -140,6 +140,8 @@ installPrintShim();
     { name: "record", label: "Record for agent (start / stop)", action: () => send("record-toggle") },
     // The same, recorded to be learned: the stop asks the agent to write the site's playbook (`gR`).
     { name: "learn", label: "Learn a flow (record; stop asks for the playbook)", action: () => send("learn-toggle") },
+    // An agent asked to be shown something (`tweb learn`) and the user will not: it is told so.
+    { name: "decline", label: "Decline the agent's request to be shown", action: () => send("learn-decline") },
     // Moving focus between the floating window and its pane, without closing either. Losing
     // one of them on a busy desktop is the case these exist for.
     { name: "terminal", label: "Focus terminal", action: () => send("focus-terminal") },
@@ -296,6 +298,9 @@ installPrintShim();
   // Whether this pane is being recorded (`gr`, `tweb record`). The engine says so on every new
   // document; while it is on, clicks and committed field changes are reported (see recordClick).
   let recordingOn = false;
+  // What the recording is for: learned (`gR`), and what an agent asked to be shown (`tweb learn`).
+  let recordingLearn = false;
+  let recordingGoal = null;
   let transferState = null;
   // Who else is at this pane (agent-presence.cjs), from the tab state.
   let presenceState = null;
@@ -760,10 +765,10 @@ installPrintShim();
     // Shown for the whole recording, so nobody types into a page without knowing it is logged.
     const record = document.createElement("span");
     record.style.cssText = [
-      "box-sizing:border-box", "display:none", "height:18px", "padding:1px 6px",
+      "box-sizing:border-box", "display:none", "max-width:min(48ch,60vw)", "height:18px", "padding:1px 6px",
       "border:1px solid #f28b8266", "border-radius:4px", "background:#111d", "color:#f28b82",
       "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
-      "white-space:nowrap", "backdrop-filter:blur(3px)",
+      "overflow:hidden", "text-overflow:ellipsis", "white-space:nowrap", "backdrop-filter:blur(3px)",
     ].join(";");
     // An agent at the page. Linked and idle it is a quiet aside; while an agent drives it turns
     // solid, so a person about to type sees that someone else has the page. Static on purpose:
@@ -1041,6 +1046,14 @@ installPrintShim();
       ? `Audio muted — ${audioState.owner || "another pane"} owns it · press m to take it back`
       : "";
     audioBadge.style.display = audioState.muted ? "" : "none";
+    // An agent's request stays on screen for the whole recording: the user may come back to the
+    // pane long after the flash, and has to know what is being asked and how to answer it.
+    recordBadge.textContent = recordingGoal ? `● SHOW ME: ${recordingGoal}` : recordingLearn ? "● LEARN" : "● REC";
+    recordBadge.title = recordingGoal
+      ? `The agent asked you to show it: ${recordingGoal}. Do it in this page, then gR to hand it over (:decline to refuse).`
+      : recordingLearn
+        ? "Recording a flow for the agent to learn — gR stops and asks for the playbook"
+        : "Recording for the agent — gr stops and sends the timeline";
     recordBadge.style.display = recordingOn ? "" : "none";
     renderAgentBadge();
     // The absolute path is what a terminal has instead of "Show in folder", and it is
@@ -5854,7 +5867,15 @@ installPrintShim();
 
   ipcRenderer.on("tweb-recording", (_event, state) => {
     const on = Boolean(state?.recording);
-    if (on === recordingOn) return;
+    const learn = on && Boolean(state?.learn);
+    const goal = on && typeof state?.goal === "string" && state.goal ? state.goal : null;
+    if (on === recordingOn && learn === recordingLearn && goal === recordingGoal) return;
+    recordingLearn = learn;
+    recordingGoal = goal;
+    if (on === recordingOn) {
+      if (topFrame) renderIndicator();
+      return;
+    }
     recordingOn = on;
     // Capture phase, so a page that stops propagation still has its click recorded; the listener
     // only reads, it never cancels.

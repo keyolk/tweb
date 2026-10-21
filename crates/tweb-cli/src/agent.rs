@@ -157,6 +157,8 @@ pub(crate) fn read_timeout(method: &str, params: &Value) -> Duration {
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .max(params.get("ms").and_then(Value::as_u64).unwrap_or(0)),
+        // `tweb learn` and `record wait` wait on a person doing a flow by hand.
+        "record-wait" => params.get("timeout").and_then(Value::as_u64).unwrap_or(0),
         _ => 0,
     };
     READ_TIMEOUT.max(Duration::from_millis(asked) + Duration::from_secs(15))

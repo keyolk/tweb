@@ -4316,6 +4316,11 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "learn-toggle":
       toggleRecording({ learn: true });
       break;
+    // `:decline`, and the palette row shown while an agent asks for a demonstration.
+    case "learn-decline":
+      if (activeRecording()?.goal) void declineRecording();
+      else sendToMainTabFrame(tab, "tweb-flash", "no demonstration was asked for");
+      break;
     // A click or a committed field change, from a frame of a tab being recorded.
     case "record-event":
       recordPageEvent(tab, value);
@@ -5418,6 +5423,14 @@ async function sendInspectToAgent(tab, payload) {
 // The rules — what an event may hold, the bounds, the timeline — are in recorder.cjs. This half
 // owns the hooks that feed it and the files. One recording per pane, keyed by the pane record.
 const recordings = new WeakMap();
+// Agents waiting for a pane's recording to stop (`record-wait`, `tweb learn`), and the result of
+// the pane's last stop. The result is kept because a wait can time out and be asked again after
+// the user finished: the second wait names the recording and gets its result instead of "not
+// recording".
+const recordingWaiters = new WeakMap();
+const lastRecordingResults = new WeakMap();
+const RECORD_WAIT_DEFAULT_MS = 600_000;
+const RECORD_WAIT_MAX_MS = 3_600_000;
 // The longest side a keyframe is stored at. A 2880x1800 pane frame is several MB as PNG and an
 // agent reads it no better than a 1440-wide JPEG; sixty of the former would be a quarter gigabyte.
 const KEYFRAME_MAX_WIDTH = 1440;
@@ -5448,7 +5461,8 @@ function tabForWebContentsId(id) {
 }
 
 function broadcastRecordingState(record = currentPane()) {
-  const state = { recording: recordings.has(record) };
+  const recording = recordings.get(record);
+  const state = { recording: Boolean(recording), learn: Boolean(recording?.learn), goal: recording?.goal || null };
   for (const tab of windowsFor(record).tabs) sendToTabFrames(tab, "tweb-recording", state);
 }
 
@@ -5574,7 +5588,7 @@ function recordingDirectory() {
 function startRecording(params = {}) {
   const record = currentPane();
   const existing = recordings.get(record);
-  if (existing) return { ok: true, recording: true, directory: existing.directory, already: true };
+  if (existing) return { ok: true, recording: true, directory: existing.directory, already: true, goal: existing.goal };
   const directory = recordingDirectory();
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const recording = new Recording({
@@ -5583,6 +5597,7 @@ function startRecording(params = {}) {
     intervalMs: Number.isFinite(params.interval) ? params.interval * 1000 : undefined,
     unavailable: recordingLimits(),
     learn: params.learn === true,
+    goal: typeof params.goal === "string" ? params.goal : null,
   });
   recordings.set(record, recording);
   const tab = windowsFor(record).win;
@@ -5593,8 +5608,11 @@ function startRecording(params = {}) {
     if (recording.periodicDue()) void captureKeyframe(recording, record, "change");
   }, KEYFRAME_TIMER_MS);
   broadcastRecordingState(record);
-  console.error(`tweb: recording to ${directory}`);
-  return { ok: true, recording: true, directory, unavailable: recording.unavailable, learn: recording.learn };
+  console.error(`tweb: recording to ${directory}${recording.goal ? ` (asked: ${recording.goal})` : ""}`);
+  if (recording.goal && tab && !tab.isDestroyed()) {
+    sendToMainTabFrame(tab, "tweb-flash", `agent asks: show me ${recording.goal} · gR when done · :decline to refuse`);
+  }
+  return { ok: true, recording: true, directory, unavailable: recording.unavailable, learn: recording.learn, goal: recording.goal };
 }
 
 // What the active tab's page engine cannot record. Asked of that engine's session rather than of
@@ -5631,14 +5649,65 @@ async function stopRecording(params = {}) {
   const summary = recording.summary(timeline);
   console.error(`tweb: recording stopped: ${timeline}`);
   let sent = null;
-  if (params.send !== false) {
+  // An agent asked for this one and is waiting on it (`tweb learn`): the result goes back to
+  // that call, and a paste into the agent pane would type the same thing a second time.
+  if (recording.goal) {
+    if (tab && !tab.isDestroyed()) {
+      sendToMainTabFrame(tab, "tweb-flash", recording.declined ? "declined — the agent was told" : "shown — the agent has it");
+    }
+  } else if (params.send !== false) {
     const target = await findHandoffTarget();
     sent = target.ok ? await pasteHandoff(target, summary) : target;
     if (tab && !tab.isDestroyed()) handoffToast(tab, "recording", sent);
   } else if (tab && !tab.isDestroyed()) {
     sendToMainTabFrame(tab, "tweb-flash", "recording saved");
   }
-  return { ok: true, recording: false, directory: recording.directory, timeline, summary, ...recording.counts(), sent };
+  const result = {
+    ok: true, recording: false, directory: recording.directory, timeline, summary, ...recording.counts(), sent,
+    goal: recording.goal, declined: recording.declined,
+  };
+  lastRecordingResults.set(record, result);
+  for (const done of [...(recordingWaiters.get(record) || [])]) done(result);
+  return result;
+}
+
+// `:decline`: the user will not show what the agent asked for. The recording stops like any
+// other and the waiting agent is told it was declined, so it does not read the timeline as a
+// demonstration.
+async function declineRecording() {
+  const recording = activeRecording();
+  if (!recording?.goal) return { ok: false, message: "no demonstration was asked for" };
+  recording.declined = true;
+  return stopRecording({ send: false });
+}
+
+// `record-wait`: until the pane's recording stops, or `timeout` ms. `directory` names the
+// recording waited for, so a second wait after a timeout still gets its result once it stopped.
+function waitForRecording(params = {}) {
+  const record = currentPane();
+  const recording = recordings.get(record);
+  const wanted = typeof params.directory === "string" && params.directory ? params.directory : null;
+  if (!recording || (wanted && recording.directory !== wanted)) {
+    const last = lastRecordingResults.get(record);
+    if (last && (!wanted || last.directory === wanted)) return Promise.resolve(last);
+    return Promise.resolve({ ok: false, recording: false, message: "not recording" });
+  }
+  const asked = Number(params.timeout);
+  const timeout = Number.isFinite(asked) && asked > 0 ? Math.min(asked, RECORD_WAIT_MAX_MS) : RECORD_WAIT_DEFAULT_MS;
+  return new Promise((resolve) => {
+    const waiters = recordingWaiters.get(record) || new Set();
+    recordingWaiters.set(record, waiters);
+    const done = (result) => {
+      clearTimeout(timer);
+      waiters.delete(done);
+      resolve(result);
+    };
+    const timer = setTimeout(() => done({
+      ok: false, recording: true, waiting: true, directory: recording.directory, goal: recording.goal,
+      message: "still recording",
+    }), timeout);
+    waiters.add(done);
+  });
 }
 
 // `gr` records for the agent; `gR` records a flow for it to learn. Either key stops whichever
@@ -5940,10 +6009,15 @@ async function dispatchAgentCommand(method, params) {
       return startRecording(params);
     case "record-stop":
       return stopRecording(params);
+    case "record-wait":
+      return waitForRecording(params);
     case "record-status": {
       const recording = activeRecording();
       return recording
-        ? { recording: true, directory: recording.directory, events: recording.events.length, keyframes: recording.keyframes }
+        ? {
+          recording: true, directory: recording.directory, events: recording.events.length, keyframes: recording.keyframes,
+          learn: recording.learn, goal: recording.goal,
+        }
         : { recording: false };
     }
     case "float": {

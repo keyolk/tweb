@@ -19,6 +19,7 @@ const MIN_INTERVAL_MS = 1000;
 const TEXT_LIMIT = 80;
 const VALUE_LIMIT = 80;
 const URL_LIMIT = 300;
+const GOAL_LIMIT = 200;
 
 // A field whose value is never recorded. The preload applies the same rule before anything leaves
 // the page (it cannot require this file — see the sandbox note in preload.cjs); this copy is the
@@ -68,11 +69,15 @@ function cleanPageEvent(event) {
 
 class Recording {
   constructor({ directory, pane = null, startedAt = Date.now(), intervalMs = DEFAULT_INTERVAL_MS,
-    maxEvents = MAX_EVENTS, maxKeyframes = MAX_KEYFRAMES, unavailable = [], learn = false } = {}) {
+    maxEvents = MAX_EVENTS, maxKeyframes = MAX_KEYFRAMES, unavailable = [], learn = false, goal = null } = {}) {
     this.directory = directory;
     // A flow shown so the agent learns it (`gR`, `record start --learn`), not a bug report: the
     // stop also asks the agent to write the site's playbook from the timeline.
-    this.learn = Boolean(learn);
+    // What the agent asked to be shown (`tweb learn "<goal>"`). An agent asked, so an agent is
+    // waiting on this recording: the stop answers it rather than pasting into a pane.
+    this.goal = goal ? oneLine(goal, GOAL_LIMIT) || null : null;
+    this.learn = Boolean(learn) || Boolean(this.goal);
+    this.declined = false;
     // What this page engine cannot observe at all. Said in the timeline and the summary, so "0
     // failed requests" from an engine that never sees requests is not read as "none failed".
     this.unavailable = [...unavailable];
@@ -139,7 +144,11 @@ class Recording {
     const c = this.counts();
     const seconds = ((this.endedAt ?? Date.now()) - this.startedAt) / 1000;
     const first = this.events.find((event) => event.url)?.url || "";
+    if (this.declined) {
+      return `tweb learning: declined — the user chose not to show "${this.goal || "the flow"}" (${timelinePath})\n`;
+    }
     return `tweb ${this.learn ? "learning" : "recording"}: ${timelinePath}\n`
+      + (this.goal ? `Asked to be shown: ${this.goal}\n` : "")
       + `${seconds.toFixed(1)}s from ${first}: ${c.navigations} navigations, ${c.clicks} clicks, `
       + `${c.fields} field changes, ${c.consoleErrors} console errors, ${c.failedRequests} failed requests, `
       + `${c.keyframes} keyframes.`
@@ -190,6 +199,8 @@ function timelineMarkdown(recording, joinPath) {
     "# tweb recording",
     "",
     ...(recording.learn ? ["- Recorded to be learned: write the site's playbook from it (`tweb playbook path <url>`)."] : []),
+    ...(recording.goal ? [`- The agent asked to be shown: ${recording.goal}`] : []),
+    ...(recording.declined ? ["- The user declined: this is not a demonstration of the goal."] : []),
     `- Started ${start}, ${((ended - recording.startedAt) / 1000).toFixed(1)}s${recording.pane ? `, pane ${recording.pane}` : ""}`,
     `- ${recording.events.length} events (${c.navigations} navigations, ${c.clicks} clicks, ${c.fields} field changes, `
       + `${c.consoleErrors} console errors, ${c.failedRequests} failed requests), ${c.keyframes} keyframes`,
@@ -214,6 +225,7 @@ function timelineMarkdown(recording, joinPath) {
 
 module.exports = {
   DEFAULT_INTERVAL_MS,
+  GOAL_LIMIT,
   MAX_EVENTS,
   MAX_KEYFRAMES,
   Recording,
