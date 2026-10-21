@@ -116,3 +116,19 @@ test("a recording made to be learned asks for the site's playbook; an ordinary o
   assert.doesNotMatch(plain.summary("/t"), /playbook/);
   assert.doesNotMatch(timelineMarkdown(plain, path.join), /Recorded to be learned/);
 });
+
+test("a demonstration an agent asked for names the goal; a declined one asks for nothing", () => {
+  const asked = new Recording({ directory: "/r", startedAt: 0, goal: "  buy it\nwith 쿠페이 " });
+  assert.equal(asked.learn, true, "asking to be shown is learning");
+  assert.equal(asked.goal, "buy it with 쿠페이");
+  asked.record("start", { url: "https://www.coupang.com/" }, 0);
+  asked.endedAt = 1000;
+  assert.match(asked.summary("/r/timeline.md"), /^tweb learning: \/r\/timeline\.md\nAsked to be shown: buy it with 쿠페이\n/);
+  assert.match(asked.summary("/r/timeline.md"), /Learn this flow/);
+  assert.match(timelineMarkdown(asked, path.join), /\n- The agent asked to be shown: buy it with 쿠페이\n/);
+
+  asked.declined = true;
+  assert.equal(asked.summary("/r/timeline.md"), 'tweb learning: declined — the user chose not to show "buy it with 쿠페이" (/r/timeline.md)\n');
+  assert.match(timelineMarkdown(asked, path.join), /The user declined/);
+  assert.equal(new Recording({ directory: "/r", goal: " " }).goal, null);
+});

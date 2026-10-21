@@ -91,17 +91,42 @@ write it.
 ```sh
 tweb playbook show                    # the playbook for the page in the pane, or where to write one
 tweb playbook path                    # the file to read or write (a URL or host also works)
+tweb playbook write [--append] < f.md # write it from stdin (same file as path)
 tweb playbook list                    # every site with one
+tweb learn "<goal>"                   # ask the user to show you a flow, and wait for it
+tweb record wait                      # keep waiting after learn said "still waiting"
 ```
+
+MCP has the same: `tweb_learn`, `tweb_record_wait`, `tweb_playbook_show`, `tweb_playbook_write`,
+`tweb_playbook_list`.
+
+### The learning loop
+
+When you do not know how to do something on a site, do not guess through it. Learn it once:
+
+1. Run `tweb snapshot`. If it names a playbook, read it and follow it. Stop here.
+2. If there is no playbook, try the flow yourself when it is safe and obvious.
+3. If you are stuck, or the flow pays, sends, signs in or otherwise needs the user, ask to be shown.
+   Run `tweb learn "<goal>"`, with the goal in the user's terms ("buy the item with 쿠페이").
+   Tell the user in your reply that the pane is waiting for them.
+4. The pane shows `● SHOW ME: <goal>`. The user does the flow and presses `gR`.
+   `tweb learn` then prints the timeline path. If the user runs `:decline` instead, it says so.
+   Do not learn from a declined timeline. Ask the user how to go on.
+5. If it prints "still waiting", run `tweb record wait`. Do not start a second `tweb learn`.
+6. Read `timeline.md` and the keyframes it names. Write the playbook with `tweb playbook write`,
+   or write the file at `tweb playbook path`. Follow the rules below.
+7. Next time, step 1 finds the playbook. When it was wrong, fix it with `--append` or a rewrite.
+
+Ask for one flow at a time, and keep the goal short. It is shown on the pane, and the user must
+understand it at a glance.
 
 - `tweb snapshot` prints `playbook <path>` under the title when the page's site has one. Read that
   file before you act on the page.
 - `checkout.coupang.com` uses `coupang.com.md`. A host falls back to its parent domains, and `www.`
   is ignored.
-- To learn a flow from the user, ask them to press `gR` in the pane and do it once, then `gR` again.
-  You can also run `tweb record start --learn` and `tweb record stop`. The stop pastes the
-  timeline path and a request to write the playbook into your pane. Read `timeline.md` and look at
-  the keyframes it names.
+- The user can also start a lesson: `gR` in the pane, the flow, then `gR` again. That stop pastes
+  the timeline path and a request to write the playbook into your pane. `tweb record start
+  --learn` and `tweb record stop` do the same from the CLI.
 - After you finish a flow that had no playbook, or one where the playbook was wrong, update it. Do
   this without being asked when the flow took real effort to work out.
 

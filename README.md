@@ -162,6 +162,9 @@ tweb record stop --pane %3        # --no-send to only write it
 # Show a flow once so agents can repeat it: the stop also asks for the site's playbook
 tweb record start --learn --pane %3
 tweb playbook show                # what agents learned about the page's site
+# The agent asks to be shown, and waits: the pane shows "● SHOW ME: <goal>" until gR or :decline
+tweb learn "buy the item with 쿠페이" --pane %3
+tweb playbook write < coupang.md  # the lesson, into the site's file
 
 # Supervisor status, stop and restart
 tweb daemon status
@@ -873,7 +876,17 @@ lives and points at it.
 - A host is looked up as itself and then each parent domain, with `www.` dropped:
   `checkout.coupang.com` reads `coupang.com.md`. `tweb playbook path` names the file that already
   applies, so a lesson learned on a subdomain joins the site's file.
-- `tweb playbook show | path | list` read them; any editor writes them.
+- `tweb playbook show | path | list` read them. `tweb playbook write [--append]` writes one from
+  stdin into the file `path` names; any editor works too.
+- **The agent can ask first.** `tweb learn "<goal>"` starts a learning recording that names the
+  goal on the pane (`● SHOW ME: <goal>`, and a flash when it starts). Then it waits, 10 minutes by
+  default. The user does the flow and presses `gR`, and the timeline comes back to that call
+  instead of being pasted into a pane. `:decline` (or the palette's *Decline* row) refuses, and the
+  call says it was declined. A call that runs out says "still waiting"; `tweb record wait` keeps
+  waiting for the same recording, and still gets the result if the user finished in between.
+- MCP has the same loop: `tweb_learn`, `tweb_record_wait`, `tweb_playbook_show`,
+  `tweb_playbook_write` and `tweb_playbook_list`. MCP waits 5 minutes by default, since a client
+  may give up on a long call.
 
 The skill tells agents what goes in one — steps named by visible text, shortcut URLs, how to tell a
 step worked, and every step that pays, sends or needs a password marked as the user's — and what

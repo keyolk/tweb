@@ -8,7 +8,9 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
-use crate::agent;
+use crate::{agent, learn, playbook};
+
+const MCP_WAIT_SECS: f64 = 300.0;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -333,6 +335,96 @@ const TOOLS: &[Tool] = &[
         fixed: &[],
     },
     Tool {
+        name: "tweb_learn",
+        method: "learn",
+        description: "Ask the user to show you a flow in the browser pane, and wait until \
+                      they have. Use it when you do not know how to do something on a site \
+                      and its snapshot names no playbook. The pane shows `● SHOW ME: <goal>`; \
+                      the user does it and presses gR (or declines with :decline). Returns \
+                      the timeline; then write the site's playbook from it \
+                      (tweb_playbook_write). If it returns \"still waiting\", call \
+                      tweb_record_wait.",
+        fields: &[
+            (
+                "goal",
+                "string",
+                "What the user should do, in the user's terms (\"buy the item with 쿠페이\")",
+                true,
+            ),
+            (
+                "timeout",
+                "number",
+                "Seconds to wait before returning \"still waiting\" (default 300)",
+                false,
+            ),
+        ],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_record_wait",
+        method: "record-wait",
+        description: "Wait until the pane's recording stops and return its timeline: after \
+                      tweb_learn returned \"still waiting\", or for a recording the user \
+                      started with gr/gR.",
+        fields: &[(
+            "timeout",
+            "number",
+            "Seconds to wait before returning \"still waiting\" (default 300)",
+            false,
+        )],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_playbook_show",
+        method: "playbook-show",
+        description: "The playbook for a site: what an agent learned about driving it. Read \
+                      it before acting on a site whose snapshot names one.",
+        fields: &[(
+            "url",
+            "string",
+            "A URL or host (default: the page in the pane)",
+            false,
+        )],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_playbook_write",
+        method: "playbook-write",
+        description: "Write the playbook for a site, as Markdown: steps named by visible text \
+                      or role (never snapshot refs), shortcut URLs, how to tell a step worked, \
+                      traps. Mark every step that pays, sends, deletes or submits \
+                      \"ask the user first\", and every password, PIN or code \"the user types \
+                      it\". Never write credentials or personal data from the timeline.",
+        fields: &[
+            (
+                "content",
+                "string",
+                "The playbook's Markdown (replaces the file unless append is set)",
+                true,
+            ),
+            (
+                "url",
+                "string",
+                "A URL or host (default: the page in the pane)",
+                false,
+            ),
+            (
+                "append",
+                "boolean",
+                "Add after what the file already holds",
+                false,
+            ),
+        ],
+        fixed: &[],
+    },
+    Tool {
+        name: "tweb_playbook_list",
+        method: "playbook-list",
+        description: "Every site that has a playbook, and its file.",
+        fields: &[],
+        fixed: &[],
+    },
+    Tool {
         name: "tweb_float",
         method: "float",
         description: "Show the current pane's page as an OS desktop window,                       detached from the tmux pane. The page state and                       profile stay with the pane; only the display moves.",
@@ -388,6 +480,40 @@ fn call_tool(pane: Option<&str>, name: &str, arguments: &Value) -> Result<String
             let resolved = crate::resolve_output_path(path, &std::env::current_dir()?);
             params.insert("path".to_string(), Value::String(resolved));
         }
+    }
+    // Learning and playbooks are partly or wholly the CLI's: a playbook is a file in the
+    // config dir, never the engine's, and a learn is a start and a wait.
+    let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+    // An MCP client may give up on a call long before a person finishes a flow, so the wait is
+    // shorter than the CLI's and says how to keep waiting.
+    let wait = || {
+        std::time::Duration::from_secs_f64(
+            params
+                .get("timeout")
+                .and_then(Value::as_f64)
+                .filter(|seconds| *seconds > 0.0)
+                .unwrap_or(MCP_WAIT_SECS),
+        )
+    };
+    match tool.method {
+        "learn" => {
+            let goal = text("goal").unwrap_or_default();
+            return Ok(learn::render(&learn::ask(pane, &goal, 5.0, wait())?));
+        }
+        "record-wait" => return Ok(learn::render(&learn::wait(pane, None, wait())?)),
+        "playbook-show" => return playbook::show_text(&crate::playbook_target(text("url"), pane)?),
+        "playbook-write" => {
+            let content = text("content").unwrap_or_default();
+            let append = params.get("append").and_then(Value::as_bool) == Some(true);
+            let path = playbook::write(
+                &crate::playbook_target(text("url"), pane)?,
+                &content,
+                append,
+            )?;
+            return Ok(format!("wrote {}\n", path.display()));
+        }
+        "playbook-list" => return playbook::list_text(),
+        _ => {}
     }
     let result = agent::request(pane, tool.method, Value::Object(params))?;
     Ok(agent::render_for_agent(tool.method, &result))

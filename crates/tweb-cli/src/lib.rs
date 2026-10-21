@@ -8,6 +8,7 @@ pub mod chrome;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
+pub mod learn;
 pub mod mcp;
 pub mod playbook;
 pub mod sites;
@@ -387,6 +388,21 @@ pub enum Command {
         #[command(subcommand)]
         action: RecordAction,
     },
+    /// Ask the user to show you a flow in the pane, and wait until they have: a learning
+    /// recording that names GOAL on the pane (`● SHOW ME`). The user does it and presses `gR`,
+    /// or `:decline`; the timeline comes back here. Write the site's playbook from it.
+    Learn {
+        /// What the user should do, in the user's terms ("buy the item with 쿠페이").
+        goal: String,
+        /// Seconds to wait before returning "still waiting" (`tweb record wait` waits again).
+        #[arg(long, default_value_t = learn::DEFAULT_WAIT.as_secs())]
+        timeout: u64,
+        /// Seconds between keyframes while the page keeps changing (at least 1).
+        #[arg(long, default_value_t = 5.0)]
+        interval: f64,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// What agents learned about driving a site, one Markdown file per site, read again by the
     /// next session. `snapshot` names the file when the page's site has one.
     Playbook {
@@ -675,6 +691,15 @@ pub enum RecordAction {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Wait until the pane's recording stops (the user pressed `gr`/`gR` or `:decline`), and
+    /// print its timeline: what `tweb learn` does after it starts one.
+    Wait {
+        /// Seconds to wait before returning "still waiting".
+        #[arg(long, default_value_t = learn::DEFAULT_WAIT.as_secs())]
+        timeout: u64,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -690,6 +715,16 @@ pub enum PlaybookAction {
     Path {
         /// A URL or host.
         target: Option<String>,
+        #[arg(long)]
+        pane: Option<String>,
+    },
+    /// Write the playbook for a site (default: the page in the pane) from stdin, replacing it,
+    /// or after what is there with --append. The file is the one `path` names.
+    Write {
+        /// A URL or host.
+        target: Option<String>,
+        #[arg(long)]
+        append: bool,
         #[arg(long)]
         pane: Option<String>,
     },
@@ -990,8 +1025,31 @@ pub async fn run() -> Result<()> {
                     ("record-stop", json!({ "send": !no_send }), agent)
                 }
                 RecordAction::Status { agent } => ("record-status", json!({}), agent),
+                RecordAction::Wait { timeout, agent } => {
+                    let result = learn::wait(
+                        agent.pane.as_deref(),
+                        None,
+                        std::time::Duration::from_secs(timeout),
+                    )?;
+                    print_learn(&result, agent.json);
+                    return Ok(());
+                }
             };
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
+        }
+        Command::Learn {
+            goal,
+            timeout,
+            interval,
+            agent,
+        } => {
+            let result = learn::ask(
+                agent.pane.as_deref(),
+                &goal,
+                interval,
+                std::time::Duration::from_secs(timeout),
+            )?;
+            print_learn(&result, agent.json);
         }
         Command::Playbook { action } => match action {
             PlaybookAction::Show { target, pane } => {
@@ -999,6 +1057,18 @@ pub async fn run() -> Result<()> {
             }
             PlaybookAction::Path { target, pane } => {
                 playbook::print_path(&playbook_target(target, pane.as_deref())?)?
+            }
+            PlaybookAction::Write {
+                target,
+                append,
+                pane,
+            } => {
+                let mut content = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut content)
+                    .context("cannot read the playbook from stdin")?;
+                let path =
+                    playbook::write(&playbook_target(target, pane.as_deref())?, &content, append)?;
+                println!("wrote {}", path.display());
             }
             PlaybookAction::List => playbook::list()?,
         },
@@ -1034,7 +1104,15 @@ pub async fn run() -> Result<()> {
 }
 
 /// The site a `tweb playbook` command is about: the one named, or the page in the pane.
-fn playbook_target(target: Option<String>, pane: Option<&str>) -> Result<String> {
+fn print_learn(result: &serde_json::Value, as_json: bool) {
+    if as_json {
+        println!("{result}");
+    } else {
+        print!("{}", learn::render(result));
+    }
+}
+
+pub(crate) fn playbook_target(target: Option<String>, pane: Option<&str>) -> Result<String> {
     if let Some(target) = target {
         return Ok(target);
     }

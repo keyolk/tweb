@@ -94,25 +94,29 @@ pub fn annotate_snapshot(rendered: String, url: &str, playbook: Option<&Path>) -
 
 /// `tweb playbook show`: the playbook for `target`, or where to write one.
 pub fn show(target: &str) -> Result<()> {
+    print!("{}", show_text(target)?);
+    Ok(())
+}
+
+/// What `show` prints, for the MCP tool as well as the CLI.
+pub fn show_text(target: &str) -> Result<String> {
     let Some(key) = site_key(target) else {
         anyhow::bail!("{target} has no web host, so it has no playbook");
     };
-    match find(target) {
+    Ok(match find(target) {
         Some(path) => {
-            let text = std::fs::read_to_string(&path)
+            let mut text = std::fs::read_to_string(&path)
                 .with_context(|| format!("cannot read {}", path.display()))?;
-            println!("playbook {}\n", path.display());
-            print!("{text}");
             if !text.ends_with('\n') {
-                println!();
+                text.push('\n');
             }
+            format!("playbook {}\n\n{text}", path.display())
         }
-        None => println!(
-            "no playbook for {key}; write one at {}",
+        None => format!(
+            "no playbook for {key}; write one at {}\n",
             dir().join(format!("{key}.md")).display()
         ),
-    }
-    Ok(())
+    })
 }
 
 /// `tweb playbook path`: the file to read or write for `target`. The directory is created so
@@ -126,14 +130,61 @@ pub fn print_path(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// `tweb playbook write`: `content` as the playbook for `target`, replacing it or appended to
+/// it. For an agent with no file tools of its own (an MCP client), and so a script does not have
+/// to know the path. The file is the one `path` names, so a subdomain still joins its site's.
+pub fn write_in(dir: &Path, target: &str, content: &str, append: bool) -> Result<PathBuf> {
+    let path = path_for_in(dir, target)
+        .with_context(|| format!("{target} has no web host, so it has no playbook"))?;
+    if content.trim().is_empty() {
+        anyhow::bail!("refusing to write an empty playbook to {}", path.display());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let mut text = if append {
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if !existing.is_empty() => {
+                let separator = if existing.ends_with("\n\n") {
+                    ""
+                } else if existing.ends_with('\n') {
+                    "\n"
+                } else {
+                    "\n\n"
+                };
+                format!("{existing}{separator}{content}")
+            }
+            Ok(_) => content.to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => content.to_string(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read {}", path.display()))
+            }
+        }
+    } else {
+        content.to_string()
+    };
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn write(target: &str, content: &str, append: bool) -> Result<PathBuf> {
+    write_in(&dir(), target, content, append)
+}
+
 /// `tweb playbook list`: every site with a playbook, and its file.
 pub fn list() -> Result<()> {
+    print!("{}", list_text()?);
+    Ok(())
+}
+
+/// What `list` prints.
+pub fn list_text() -> Result<String> {
     let dir = dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("no playbooks yet ({})", dir.display());
-            return Ok(());
+            return Ok(format!("no playbooks yet ({})\n", dir.display()));
         }
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", dir.display())),
     };
@@ -145,12 +196,12 @@ pub fn list() -> Result<()> {
         .collect();
     rows.sort();
     if rows.is_empty() {
-        println!("no playbooks yet ({})", dir.display());
+        return Ok(format!("no playbooks yet ({})\n", dir.display()));
     }
-    for (site, path) in rows {
-        println!("{site:<32} {}", path.display());
-    }
-    Ok(())
+    Ok(rows
+        .into_iter()
+        .map(|(site, path)| format!("{site:<32} {}\n", path.display()))
+        .collect())
 }
 
 #[cfg(test)]
@@ -211,6 +262,33 @@ mod tests {
         let site = dir.path().join("coupang.com.md");
         assert_eq!(find_in(dir.path(), checkout), Some(site.clone()));
         assert_eq!(path_for_in(dir.path(), checkout), Some(site));
+    }
+
+    #[test]
+    fn write_replaces_or_appends_and_joins_the_sites_file() {
+        let dir = std::env::temp_dir().join(format!("tweb-playbooks-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Dir(dir);
+        let first = write_in(dir.path(), "https://www.coupang.com/", "# coupang", false).unwrap();
+        assert_eq!(first, dir.path().join("coupang.com.md"));
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "# coupang\n");
+        // A lesson from a subdomain lands in the site's file, after what is there.
+        let second = write_in(
+            dir.path(),
+            "https://checkout.coupang.com/x",
+            "## checkout",
+            true,
+        )
+        .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "# coupang\n\n## checkout\n"
+        );
+        write_in(dir.path(), "coupang.com", "# new", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "# new\n");
+        assert!(write_in(dir.path(), "coupang.com", "  \n", false).is_err());
+        assert!(write_in(dir.path(), "about:blank", "# x", false).is_err());
     }
 
     #[test]
