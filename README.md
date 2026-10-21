@@ -159,6 +159,9 @@ tweb inspect-element --send --pane %3
 # Record while the user reproduces a bug; stop writes timeline.md and pastes its path to the agent
 tweb record start --pane %3
 tweb record stop --pane %3        # --no-send to only write it
+# Show a flow once so agents can repeat it: the stop also asks for the site's playbook
+tweb record start --learn --pane %3
+tweb playbook show                # what agents learned about the page's site
 
 # Supervisor status, stop and restart
 tweb daemon status
@@ -762,6 +765,7 @@ composition area and the terminal cursor are removed with it.
 | `y` | Copy the current page URL |
 | `r` | Reload |
 | `gr` | Record for the agent; `gr` again stops and pastes the timeline into the agent pane |
+| `gR` | Record a flow for the agent to learn; `gR` again stops, pastes the timeline and asks for the site's playbook |
 | `zi` / `zo` / `zz` | Zoom in / out / reset |
 | `i` | insert mode: use the page's own shortcuts (`Esc` returns) |
 | `m` | Take audio back for this pane (only one TWeb pane is audible at a time) |
@@ -851,6 +855,29 @@ carries errors from the managed Chrome profile's extensions' content scripts, wh
 on that page. The WebKit engine cannot see a page's requests at all, so a recording there has no
 failed requests and says so — in the start toast, `tweb record start`, the timeline header and
 the pasted summary — rather than reporting zero.
+
+### Playbooks: learning a site (`gR`)
+
+A recording is one demonstration, read once. A playbook is what an agent drew from it, kept so the
+next session does not work the site out again: one Markdown file per site in
+`~/.config/tweb/playbooks/<host>.md` (under `TWEB_CONFIG_DIR` or `XDG_CONFIG_HOME` when set).
+tweb never writes one. Deciding what a flow means is the agent's job; tweb fixes where the file
+lives and points at it.
+
+- `gR` (or the palette's *Learn a flow*, `tweb record start --learn`) records exactly as `gr` does.
+  The stop pastes the timeline and one more line asking the agent to write the site's playbook,
+  naming `tweb playbook path <url>` for the file.
+- `tweb snapshot` prints `playbook <path>` under the title when the page's site has one, so an
+  agent that never heard of the file still finds it before it acts. The MCP `tweb_snapshot` does
+  the same.
+- A host is looked up as itself and then each parent domain, with `www.` dropped:
+  `checkout.coupang.com` reads `coupang.com.md`. `tweb playbook path` names the file that already
+  applies, so a lesson learned on a subdomain joins the site's file.
+- `tweb playbook show | path | list` read them; any editor writes them.
+
+The skill tells agents what goes in one — steps named by visible text, shortcut URLs, how to tell a
+step worked, and every step that pays, sends or needs a password marked as the user's — and what
+never does: credentials and the personal data a timeline shows.
 
 The omnibox's visit history is appended to a per-profile file, so it is shared across panes and
 restarts. `o` prefills the current URL, so it opens filtered to that URL; use `t`/`O` to start from an

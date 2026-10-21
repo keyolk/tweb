@@ -68,8 +68,11 @@ function cleanPageEvent(event) {
 
 class Recording {
   constructor({ directory, pane = null, startedAt = Date.now(), intervalMs = DEFAULT_INTERVAL_MS,
-    maxEvents = MAX_EVENTS, maxKeyframes = MAX_KEYFRAMES, unavailable = [] } = {}) {
+    maxEvents = MAX_EVENTS, maxKeyframes = MAX_KEYFRAMES, unavailable = [], learn = false } = {}) {
     this.directory = directory;
+    // A flow shown so the agent learns it (`gR`, `record start --learn`), not a bug report: the
+    // stop also asks the agent to write the site's playbook from the timeline.
+    this.learn = Boolean(learn);
     // What this page engine cannot observe at all. Said in the timeline and the summary, so "0
     // failed requests" from an engine that never sees requests is not read as "none failed".
     this.unavailable = [...unavailable];
@@ -130,17 +133,28 @@ class Recording {
     };
   }
 
-  /// The two lines pasted into the agent pane.
+  /// The lines pasted into the agent pane: two, and a third asking for the playbook when the
+  /// recording was made to be learned.
   summary(timelinePath) {
     const c = this.counts();
     const seconds = ((this.endedAt ?? Date.now()) - this.startedAt) / 1000;
     const first = this.events.find((event) => event.url)?.url || "";
-    return `tweb recording: ${timelinePath}\n`
+    return `tweb ${this.learn ? "learning" : "recording"}: ${timelinePath}\n`
       + `${seconds.toFixed(1)}s from ${first}: ${c.navigations} navigations, ${c.clicks} clicks, `
       + `${c.fields} field changes, ${c.consoleErrors} console errors, ${c.failedRequests} failed requests, `
       + `${c.keyframes} keyframes.`
-      + `${this.unavailable.length ? ` Not recorded on this engine: ${this.unavailable.join("; ")}.` : ""}\n`;
+      + `${this.unavailable.length ? ` Not recorded on this engine: ${this.unavailable.join("; ")}.` : ""}\n`
+      + (this.learn ? `${learnRequest(first)}\n` : "");
   }
+}
+
+/// What a learning recording asks of the agent. The playbook's path is not spelled out here:
+/// the CLI owns where playbooks live (config dir, parent-domain lookup), and naming the command
+/// keeps this from drifting from it.
+function learnRequest(url) {
+  const site = oneLine(url, URL_LIMIT);
+  return "Learn this flow: write or update the site's playbook from the timeline"
+    + ` (file: \`tweb playbook path${site ? ` ${site}` : ""}\`; see the tweb skill's Playbooks section).`;
 }
 
 function cell(text) {
@@ -175,6 +189,7 @@ function timelineMarkdown(recording, joinPath) {
   const lines = [
     "# tweb recording",
     "",
+    ...(recording.learn ? ["- Recorded to be learned: write the site's playbook from it (`tweb playbook path <url>`)."] : []),
     `- Started ${start}, ${((ended - recording.startedAt) / 1000).toFixed(1)}s${recording.pane ? `, pane ${recording.pane}` : ""}`,
     `- ${recording.events.length} events (${c.navigations} navigations, ${c.clicks} clicks, ${c.fields} field changes, `
       + `${c.consoleErrors} console errors, ${c.failedRequests} failed requests), ${c.keyframes} keyframes`,
@@ -203,6 +218,7 @@ module.exports = {
   MAX_KEYFRAMES,
   Recording,
   cleanPageEvent,
+  learnRequest,
   oneLine,
   sensitiveField,
   timelineMarkdown,

@@ -82,6 +82,46 @@ tweb device "iPhone 12"               # iPad, Pixel 5; `tweb device --reset` to 
 tweb pdf page.pdf
 ```
 
+## Playbooks: learn a site once
+
+A playbook is what an agent learned about driving one site: a Markdown file per site that the next
+session reads instead of working the site out again. tweb only decides where the file lives. You
+write it.
+
+```sh
+tweb playbook show                    # the playbook for the page in the pane, or where to write one
+tweb playbook path                    # the file to read or write (a URL or host also works)
+tweb playbook list                    # every site with one
+```
+
+- `tweb snapshot` prints `playbook <path>` under the title when the page's site has one. Read that
+  file before you act on the page.
+- `checkout.coupang.com` uses `coupang.com.md`. A host falls back to its parent domains, and `www.`
+  is ignored.
+- To learn a flow from the user, ask them to press `gR` in the pane and do it once, then `gR` again.
+  You can also run `tweb record start --learn` and `tweb record stop`. The stop pastes the
+  timeline path and a request to write the playbook into your pane. Read `timeline.md` and look at
+  the keyframes it names.
+- After you finish a flow that had no playbook, or one where the playbook was wrong, update it. Do
+  this without being asked when the flow took real effort to work out.
+
+What to write:
+
+- The steps in order, each as the thing to look for and what to do with it. Name elements by
+  their visible text or role, for example "the 바로구매 button". Do not use snapshot refs, which
+  change on every snapshot. Use generated CSS classes only when nothing else identifies the
+  element.
+- The URLs that skip steps, such as a search URL with its filter parameters.
+- How to tell that each step worked, and the traps you met: a dialog, a lazy list, a slow
+  redirect.
+- The steps that need the user. Mark every step that pays, sends, deletes or submits as
+  **ask the user first**, and every password, PIN or one-time code as **the user types it**. A
+  playbook is not permission to skip either.
+
+What never goes in a playbook: passwords, PINs, codes, card numbers, tokens, addresses, phone
+numbers, order numbers, or any other personal data the timeline shows. Write "the default
+address", not the address.
+
 ## Which pane
 
 Every command takes `--pane %N`. When you leave it out, tweb chooses the pane as follows:

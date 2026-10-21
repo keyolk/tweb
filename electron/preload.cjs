@@ -138,6 +138,8 @@ installPrintShim();
     { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
     // Starts a recording, or stops one and pastes its timeline into the agent pane (`gr`).
     { name: "record", label: "Record for agent (start / stop)", action: () => send("record-toggle") },
+    // The same, recorded to be learned: the stop asks the agent to write the site's playbook (`gR`).
+    { name: "learn", label: "Learn a flow (record; stop asks for the playbook)", action: () => send("learn-toggle") },
     // Moving focus between the floating window and its pane, without closing either. Losing
     // one of them on a busy desktop is the case these exist for.
     { name: "terminal", label: "Focus terminal", action: () => send("focus-terminal") },
@@ -3402,7 +3404,7 @@ installPrintShim();
       }],
       ["b", "list open tabs", { b: () => showTabList() }],
       ["gh · gd", "history page · downloads — search, copy the path, open"],
-      ["gr", "record for the agent · again to stop and send the timeline"],
+      ["gr · gR", "record for the agent · record a flow for it to learn (again to stop and send)"],
       ["J · K", "previous · next tab", { J: () => send("previous-tab"), K: () => send("next-tab") }],
       ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
       ["r · gi", "reload · focus first input", { r: () => send("reload") }],
@@ -5650,6 +5652,8 @@ installPrintShim();
       else if (key === "p") send("print-paper");
       // Record for the agent: start, and again to stop and send the timeline.
       else if (key === "r") send("record-toggle");
+      // Record a flow for the agent to learn; the stop asks it to write the site's playbook.
+      else if (key === "R") send("learn-toggle");
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
       else return;
       event.preventDefault();

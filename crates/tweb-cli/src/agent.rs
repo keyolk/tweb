@@ -623,9 +623,21 @@ pub fn run(pane: Option<&str>, method: &str, params: Value, as_json: bool) -> Re
     if as_json {
         println!("{}", render_json(method, &result));
     } else {
-        print!("{}", render(method, &result));
+        print!("{}", render_for_agent(method, &result));
     }
     Ok(())
+}
+
+/// [`render`], plus what the pane cannot know: for a snapshot, the site's playbook if one has
+/// been written. Kept out of `render` so that stays a pure function of the result.
+pub fn render_for_agent(method: &str, result: &Value) -> String {
+    let rendered = render(method, result);
+    if method != "snapshot" {
+        return rendered;
+    }
+    let url = text_field(result, "url");
+    let playbook = crate::playbook::find(&url);
+    crate::playbook::annotate_snapshot(rendered, &url, playbook.as_deref())
 }
 
 /// A browser pane `tweb devtools` can inspect.
