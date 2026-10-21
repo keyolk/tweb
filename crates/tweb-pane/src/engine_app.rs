@@ -296,6 +296,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/agent-handoff.cjs"),
     ),
     (
+        "agent-presence.cjs",
+        include_str!("../../../electron/agent-presence.cjs"),
+    ),
+    (
         "recorder.cjs",
         include_str!("../../../electron/recorder.cjs"),
     ),

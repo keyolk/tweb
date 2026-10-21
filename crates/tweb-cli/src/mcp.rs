@@ -232,7 +232,9 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "tweb_status",
         method: "status",
-        description: "Report the pane, its pid and its tabs.",
+        description: "Report the pane, its pid, its tabs, and who else is at it: \
+                      `presence.driving` while an agent's page-changing call is \
+                      recent, `presence.link` while a controller is linked.",
         fields: &[],
         fixed: &[],
     },

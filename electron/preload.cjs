@@ -290,10 +290,13 @@ installPrintShim();
   let audioState = { muted: false, owner: null };
   let transferBadge = null;
   let recordBadge = null;
+  let agentBadge = null;
   // Whether this pane is being recorded (`gr`, `tweb record`). The engine says so on every new
   // document; while it is on, clicks and committed field changes are reported (see recordClick).
   let recordingOn = false;
   let transferState = null;
+  // Who else is at this pane (agent-presence.cjs), from the tab state.
+  let presenceState = null;
   let downloadsState = null;
   let fileChooserState = null;
   let tabBadge = null;
@@ -760,6 +763,17 @@ installPrintShim();
       "box-shadow:0 1px 4px #0007", "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
       "white-space:nowrap", "backdrop-filter:blur(3px)",
     ].join(";");
+    // An agent at the page. Linked and idle it is a quiet aside; while an agent drives it turns
+    // solid, so a person about to type sees that someone else has the page. Static on purpose:
+    // every pixel that changes is a frame sent to the terminal (see the loading bar).
+    const agent = document.createElement("span");
+    agent.style.cssText = [
+      "box-sizing:border-box", "display:none", "max-width:min(30ch,40vw)", "height:18px",
+      "padding:1px 6px", "border:1px solid #d9775766", "border-radius:4px", "background:#111d",
+      "color:#d97757", "box-shadow:0 1px 4px #0007", "overflow:hidden", "text-overflow:ellipsis",
+      "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "white-space:nowrap", "backdrop-filter:blur(3px)",
+    ].join(";");
     record.textContent = "● REC";
     record.title = "Recording for the agent — gr stops and sends the timeline";
     // The page engine. Quiet grey on the pane's own engine with nothing pinned; coloured when the
@@ -784,13 +798,14 @@ installPrintShim();
     const engineMenu = document.createElement("div");
     engineMenu.setAttribute("role", "menu");
     engineMenu.style.cssText = popover.style.cssText;
-    shadow.append(label, input, audio, record, transfer, engine, badge, popover, engineMenu);
+    shadow.append(agent, label, input, audio, record, transfer, engine, badge, popover, engineMenu);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
     inputBadge = input;
     audioBadge = audio;
     recordBadge = record;
+    agentBadge = agent;
     transferBadge = transfer;
     tabBadge = badge;
     tabPopover = popover;
@@ -1021,6 +1036,7 @@ installPrintShim();
       : "";
     audioBadge.style.display = audioState.muted ? "" : "none";
     recordBadge.style.display = recordingOn ? "" : "none";
+    renderAgentBadge();
     // The absolute path is what a terminal has instead of "Show in folder", and it is
     // strictly more useful: a path can be fed to the user's own tools, a Finder window
     // cannot. It goes in the tooltip rather than the badge because a full path would push
@@ -1044,12 +1060,25 @@ installPrintShim();
     if (enginePopover.style.display !== "none") showEnginePopover();
   }
 
+  function renderAgentBadge() {
+    const driving = presenceState?.driving;
+    const link = presenceState?.link;
+    agentBadge.textContent = driving ? `◐ AGENT ${driving.method}` : link ? `⇄ ${link.owner}` : "";
+    agentBadge.title = driving
+      ? `An agent is driving this page (${driving.method})${link ? ` · linked: ${link.owner}` : ""} — input now races it`
+      : link ? `Linked to ${link.owner}: it can see and drive this pane` : "";
+    agentBadge.style.background = driving ? "#d97757" : "";
+    agentBadge.style.color = driving ? "#202124" : "";
+    agentBadge.style.display = driving || link ? "" : "none";
+  }
+
   function updateTabState(model) {
     const tabs = Array.isArray(model?.tabs) ? model.tabs.flatMap((tab, index) => {
       if (!tab || !Number.isInteger(tab.index)) return [];
       return [{ index: tab.index, title: String(tab.title || `Tab ${index + 1}`), engine: typeof tab.engine === "string" ? tab.engine : null }];
     }) : [];
     engineState = model?.engine && typeof model.engine.engine === "string" ? model.engine : null;
+    presenceState = model?.presence && typeof model.presence === "object" ? model.presence : null;
     pinRows = Array.isArray(model?.pins)
       ? model.pins.filter((row) => typeof row?.site === "string" && typeof row?.engine === "string")
       : [];

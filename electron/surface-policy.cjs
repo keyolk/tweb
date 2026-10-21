@@ -82,6 +82,8 @@ const GEOMETRY_FREE_METHODS = new Set([
   "console",
   "errors",
   "audio-sync",
+  // A controller's heartbeat (agent-presence.cjs): it says who is linked, it does not look.
+  "link",
   // `diag` reports the collapsed size as a fact about the pane. Restoring the surface to
   // answer it would make the one command that exists to describe engine state the one
   // command that changes it.

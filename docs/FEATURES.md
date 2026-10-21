@@ -89,6 +89,15 @@ cross-talk. Every method that touches the page (`snapshot`, `click`, `screenshot
 `eval`, `console`) goes through the same socket; methods that are pure bookkeeping
 (`panes`, `tabs`, `status`) do not.
 
+The person sees who else is at the page. While an agent's page-changing call
+(`click`, `fill`, `type`, `navigate`, …) is under 8 s old the pane's indicator shows
+a solid `◐ AGENT <verb>`; reads (`snapshot`, `console`, …) do not raise it. A key,
+click or paste from the person in that window flashes once that their input races
+the agent. A controller beside the pane (the cc-mods cockpit, say) renews
+`tweb link --owner "cc-mods %42" --ttl 30 --pane %3` and the pane shows
+`⇄ cc-mods %42` until the link lapses. Both are in `status.presence` (and so in
+`tweb panes --json`), and `tweb panes` marks them as `◐agent:<verb>` and `⇄<owner>`.
+
 ## Remote network
 
 `tweb split --ssh <dest> http://localhost:3000` opens a pane whose network is the remote

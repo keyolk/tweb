@@ -554,6 +554,13 @@ pub fn render(method: &str, result: &Value) -> String {
                 "not floating\n".to_string()
             }
         }
+        "link" => {
+            if result.get("linked").and_then(Value::as_bool) == Some(true) {
+                format!("linked {}\n", text_field(result, "owner"))
+            } else {
+                "unlinked\n".to_string()
+            }
+        }
         "pin" => {
             if result.get("floating").and_then(|v| v.as_bool()) == Some(false) {
                 "pinned\n".to_string()
@@ -677,6 +684,24 @@ fn inspect_target(pane: String, status: &Value, nearby: &[String]) -> Option<Ins
 }
 
 /// `tweb panes` — every browser pane an agent could drive.
+/// ` ◐agent:<verb>` while an agent drives the pane, ` ⇄<owner>` while a controller is linked.
+fn presence_marker(entry: &Value) -> String {
+    let mut out = String::new();
+    if let Some(verb) = entry
+        .pointer("/status/presence/driving/method")
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!(" ◐agent:{verb}"));
+    }
+    if let Some(owner) = entry
+        .pointer("/status/presence/link/owner")
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!(" ⇄{owner}"));
+    }
+    out
+}
+
 pub fn list_panes(as_json: bool) -> Result<()> {
     let sockets = discover_sockets();
     let mut entries = Vec::new();
@@ -709,8 +734,9 @@ pub fn list_panes(as_json: bool) -> Result<()> {
             .cloned()
             .unwrap_or(Value::Null);
         println!(
-            "{} {} {}",
+            "{}{} {} {}",
             text_field(entry, "pane"),
+            presence_marker(entry),
             text_field(&active, "title"),
             text_field(&active, "url")
         );

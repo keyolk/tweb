@@ -54,6 +54,7 @@ const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibilit
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { waitFor } = require("./agent-wait.cjs");
 const { elementCrop, findAgentPane, pasteToAgent, inspectMessage } = require("./agent-handoff.cjs");
+const presenceLib = require("./agent-presence.cjs");
 const { Recording, cleanPageEvent, oneLine, timelineMarkdown } = require("./recorder.cjs");
 const { evaluate } = require("./agent-eval.cjs");
 const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
@@ -3922,6 +3923,8 @@ function tabStateModel() {
       remote: Boolean(remote),
     }) : null,
     pins: pinTable(lists),
+    // The agent badge: driving, or the controller linked to the pane.
+    presence: presenceLib.presenceModel(panePresence(), Date.now()),
   };
 }
 
@@ -5732,7 +5735,37 @@ function agentDevice(params) {
 // answers with the page rather than with a one-pixel slice of it. The dispatch itself is
 // unchanged; `withAgentSurface` is a pass-through for a visible pane.
 function handleAgentCommand(method, params) {
+  // Recorded before the call runs: a click that takes seconds is driving the whole time.
+  if (presenceLib.noteAgentCall(panePresence(), method, params, Date.now())) sendPresence();
   return withAgentSurface(method, () => dispatchAgentCommand(method, params));
+}
+
+// The pane's agent presence (agent-presence.cjs): an agent driving it, a controller linked to it.
+// Kept on the pane record, created the first time anything asks.
+function panePresence(pane = currentPane()) {
+  if (!pane.presence) pane.presence = presenceLib.createPresence();
+  return pane.presence;
+}
+
+// Re-sends the indicator's presence, and again when it next changes by time alone (the driving
+// window runs out, a link expires). One timer per pane, replaced on every send.
+function sendPresence(pane = currentPane()) {
+  sendTabState();
+  clearTimeout(pane.presenceTimer);
+  const at = presenceLib.nextChange(panePresence(pane), Date.now());
+  if (at === null) return;
+  pane.presenceTimer = setTimeout(() => withPaneScope(pane, () => sendPresence(pane)), Math.max(50, at - Date.now() + 20));
+  pane.presenceTimer.unref?.();
+}
+
+// A key, a click, a paste from the person in this pane. While an agent drives, say once that the
+// two of them are racing on one page.
+function noteUserInput() {
+  if (!presenceLib.noteUserInput(panePresence(), Date.now())) return;
+  const tab = currentWindows().win;
+  const driving = presenceLib.presenceModel(panePresence(), Date.now()).driving;
+  if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", `⚠ an agent is driving this page (${driving?.method ?? "agent"}) — your input races it`);
+  console.error("tweb: user input while an agent is driving");
 }
 
 async function dispatchAgentCommand(method, params) {
@@ -5914,10 +5947,17 @@ async function dispatchAgentCommand(method, params) {
     }
     case "capture":
       return agentCapture(params);
+    case "link": {
+      const result = presenceLib.applyLink(panePresence(), params, Date.now());
+      sendPresence();
+      return result;
+    }
     case "status":
       return {
         pid: process.pid,
         pane: ownTmuxPane,
+        // Who else is at this pane: an agent driving it, a controller linked to it.
+        presence: presenceLib.presenceModel(panePresence(), Date.now()),
         // Which page engine serves this pane: `tweb chrome login` must not close a Chrome a pane
         // is still driving, and this is the only place that can say so.
         browser: pageBackend.kind,
@@ -7752,6 +7792,8 @@ function dispatchMouse(cb, rawX, rawY, release) {
   const buttonCode = cb & 3;
   const motion = (cb & 32) !== 0;
   const wheel = (cb & 64) !== 0;
+  // A bare pointer move is not the person acting on the page; a press, a drag or a wheel is.
+  if (!release && !(motion && buttonCode === 3)) noteUserInput();
 
   if (wheel) {
     const direction = buttonCode === 0 ? 1 : buttonCode === 1 ? -1 : 0;
@@ -8501,6 +8543,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   if (!currentWindows().win || !key) return;
   const modifiers = electronModifiers(modifierMask);
   const pressed = eventKind !== 3;
+  if (pressed) noteUserInput();
   const control = modifiers.includes("control");
   const shift = modifiers.includes("shift");
   if (debugLogging && modifiers.length) {
@@ -8663,6 +8706,7 @@ function dispatchControlByte(byte, extraModifierBits = 0) {
 // turn \n into \r on paste, so both sides are normalized before comparing.
 function dispatchPaste(text) {
   if (!currentWindows().win || !text) return;
+  noteUserInput();
   const contents = currentWindows().win.webContents;
   const normalize = (value) => value.replace(/\r\n?/g, "\n");
   const body = normalize(text);
@@ -8679,6 +8723,7 @@ function dispatchPaste(text) {
 }
 
 function dispatchText(buffer) {
+  if (buffer.length) noteUserInput();
   let offset = 0;
   while (offset < buffer.length) {
     const byte = buffer[offset];

@@ -101,6 +101,10 @@ Add `--json` to any command for machine-readable output.
   undone: sending a message, buying, deleting, submitting a form, or changing account settings.
   Ask the user before you do one of these.
 - Do not close a pane or tab that you did not open.
+- While your page-changing commands run, the pane shows `◐ AGENT <verb>`, so the user knows not to
+  type. If the user types or clicks during that time, the pane warns them. `tweb status` reports it
+  under `presence`; a `presence.conflictAt` newer than your last command means the user acted
+  meanwhile, so take a new snapshot before you continue.
 - Some sites need the user's managed Google Chrome, for example Okta device trust. tweb opens those
   sites on its Chrome engine (`--engine chrome`). The same commands work there.
 
