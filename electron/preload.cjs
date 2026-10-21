@@ -905,8 +905,9 @@ installPrintShim();
     return row ? row.engine : null;
   }
 
-  // A link the user follows to a site pinned to another engine is held back and handed to the
-  // engine, which reopens the tab there (main.cjs `followPin`). Top frame only, and only a link
+  // A link the user follows to a site pinned to another engine, or off a pinned site to an
+  // unpinned one from a tab the pin moved, is held back and handed to the engine, which reopens
+  // the tab there (main.cjs `followPin`). Top frame only, and only a link
   // that replaces the page (no target, or _self/_top/_parent): tab state, and with it the pins,
   // goes to the main frame alone. A link in a frame aimed at _top is not caught; it navigates as
   // before and the badge shows the mismatch. A modified click opens a new tab, which the engine
@@ -926,7 +927,10 @@ installPrintShim();
     if (there.origin === here.origin && there.pathname === here.pathname && there.search === here.search) return;
     const pinned = pinnedEngineFor(href);
     const current = engineState?.engine;
-    if (!pinned || !current || pinned === current) return;
+    if (!current || pinned === current) return;
+    // An unpinned page from a tab a pin carried off the pane's engine goes back there
+    // (engine-routing.cjs `routeNavigation`); one moved by hand ("other") follows links in place.
+    if (!pinned && !(engineState.emphasis === "pinned" && engineState.paneEngine !== current)) return;
     event.preventDefault();
     send("pinned-link", there.href);
   }

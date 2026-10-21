@@ -34,6 +34,36 @@ test("unpinned pages and pages already on their engine stay", () => {
   assert.deepStrictEqual(route("https://login.okta.com/", "chrome"), { action: "switch", engine: "electron", site: "login.okta.com" });
 });
 
+test("a tab a pin moved goes back to the pane's engine when the user leaves for an unpinned page", () => {
+  const leave = (cause, fromUrl = "https://sendbird.okta.com/app") => routeNavigation({
+    url: "https://github.com/", tabEngine: "chrome", lists, cause, availability: everywhere, fromUrl, paneEngine: "electron",
+  });
+  for (const cause of ["typed", "link", "new-tab"]) {
+    assert.deepStrictEqual(leave(cause), { action: "switch", engine: "electron", site: null }, cause);
+  }
+  // A redirect off the pinned site is mid-chain, as onto one: it stays.
+  assert.deepStrictEqual(leave("redirect"), { action: "stay" });
+  // Moved by hand (its page has no pin), the tab keeps the engine it was put on.
+  assert.deepStrictEqual(leave("link", "https://gitlab.com/"), { action: "stay" });
+  // On the pane's own engine already, or with nothing known about where it came from.
+  assert.deepStrictEqual(routeNavigation({
+    url: "https://github.com/", tabEngine: "electron", lists, cause: "link", availability: everywhere,
+    fromUrl: "https://login.okta.com/", paneEngine: "electron",
+  }), { action: "stay" });
+  assert.deepStrictEqual(routeNavigation({ url: "https://github.com/", tabEngine: "chrome", lists, cause: "link", availability: everywhere }),
+    { action: "stay" });
+  // A pane opened on Chrome keeps an unpinned page on Chrome.
+  assert.deepStrictEqual(routeNavigation({
+    url: "https://github.com/", tabEngine: "chrome", lists, cause: "link", availability: everywhere,
+    fromUrl: "https://a.okta.com/", paneEngine: "chrome",
+  }), { action: "stay" });
+  // Within the pinned site nothing moves.
+  assert.deepStrictEqual(routeNavigation({
+    url: "https://b.okta.com/", tabEngine: "chrome", lists, cause: "link", availability: everywhere,
+    fromUrl: "https://a.okta.com/", paneEngine: "electron",
+  }), { action: "stay" });
+});
+
 test("an engine that cannot run here, or an --ssh pane, keeps the tab and says why", () => {
   const noWebKit = (engine) => (engine === "webkit" ? { ok: false, reason: "macOS only" } : { ok: true });
   assert.deepStrictEqual(

@@ -12,6 +12,11 @@
 // redirect does not. An SSO chain is redirects, and moving mid-chain loses the state and PKCE
 // cookies the chain was started with, so the sign-in fails rather than merely asking again. A
 // redirect onto a pinned site is shown on the engine badge instead, which offers the move.
+//
+// A tab a pin carried off the pane's own engine goes back when the user leaves for a page with
+// no pin: the pin was for that site, not for whatever the tab shows next. A tab moved by hand
+// stays where it was put — the user chose that engine for the page, and following its links on
+// the same engine is the point of choosing it.
 
 const { PINNABLE_ENGINES, pinnedEngine, siteHost, sitesKey } = require("./chrome-sites.cjs");
 
@@ -49,20 +54,37 @@ function pinTable(lists) {
  * `remote` is a pane whose network goes through --ssh: its proxy is Electron's session, so its
  * pages stay on Electron whatever the pins say.
  *
- * Returns `{ action: "stay" }`, `{ action: "switch", engine, site }`, or
- * `{ action: "notice", engine, site, reason }`.
+ * `fromUrl` is the page the tab shows now and `paneEngine` the engine the pane was opened on;
+ * together they say whether a pin put the tab where it is (see above). Without them a tab on
+ * another engine is taken to have been moved by hand, and stays.
+ *
+ * Returns `{ action: "stay" }`, `{ action: "switch", engine, site }` (`site` null for a tab
+ * going back to the pane's engine), or `{ action: "notice", engine, site, reason }`.
  */
-function routeNavigation({ url, tabEngine, lists, cause, availability, remote = false }) {
+function routeNavigation({ url, tabEngine, lists, cause, availability, remote = false, fromUrl = null, paneEngine = null }) {
+  const userMade = cause === "typed" || cause === "link" || cause === "new-tab";
   const pin = pinnedEngine(url, lists);
-  if (!pin || pin.engine === tabEngine) return { action: "stay" };
+  if (!pin) {
+    if (userMade && returnsHome({ fromUrl, tabEngine, paneEngine, lists }) && availability(paneEngine).ok) {
+      return { action: "switch", engine: paneEngine, site: null };
+    }
+    return { action: "stay" };
+  }
+  if (pin.engine === tabEngine) return { action: "stay" };
   const { engine, site } = pin;
   if (remote && engine !== "electron") {
     return { action: "notice", engine, site, reason: "--ssh panes stay on Electron" };
   }
   const available = availability(engine);
   if (!available.ok) return { action: "notice", engine, site, reason: available.reason };
-  if (cause === "typed" || cause === "link" || cause === "new-tab") return { action: "switch", engine, site };
+  if (userMade) return { action: "switch", engine, site };
   return { action: "notice", engine, site, reason: null };
+}
+
+/** Whether the tab is off the pane's engine because the page it shows is pinned there. */
+function returnsHome({ fromUrl, tabEngine, paneEngine, lists }) {
+  if (!fromUrl || !paneEngine || tabEngine === paneEngine) return false;
+  return pinnedEngine(fromUrl, lists)?.engine === tabEngine;
 }
 
 /**
