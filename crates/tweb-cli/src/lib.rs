@@ -454,6 +454,22 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
+    /// Say that a controller (a plugin in the next tmux pane, say) is linked to the pane, for
+    /// `--ttl` seconds. The pane shows `⇄ <owner>` until the link lapses; call again to renew.
+    /// Agent calls themselves show as `◐ AGENT <verb>` without a link.
+    Link {
+        /// Who is linking, shown in the pane (default: "pane <$TMUX_PANE>").
+        #[arg(long)]
+        owner: Option<String>,
+        /// Seconds the link lives without a renewal.
+        #[arg(long, default_value_t = 30)]
+        ttl: u64,
+        /// Drop the link now instead of waiting for it to lapse.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// MCP server for agents (stdio).
     Mcp {
         #[command(flatten)]
@@ -1061,6 +1077,24 @@ fn agent_call(
         }
         Command::Float { agent } => ("float", json!({}), agent),
         Command::Pin { agent } => ("pin", json!({}), agent),
+        Command::Link {
+            owner,
+            ttl,
+            clear,
+            agent,
+        } => {
+            let owner = owner.or_else(|| {
+                std::env::var("TMUX_PANE")
+                    .ok()
+                    .filter(|pane| !pane.is_empty())
+                    .map(|pane| format!("pane {pane}"))
+            });
+            (
+                "link",
+                json!({ "owner": owner, "ttl": ttl, "clear": clear }),
+                agent,
+            )
+        }
         Command::Console {
             limit,
             clear,
@@ -1465,6 +1499,35 @@ mod tests {
         assert_eq!(called, "navigate");
         assert_eq!(params["url"], "back.example.com");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// `tweb link` is the controller's heartbeat: owner and ttl go through as given, and
+    /// `--clear` drops the link.
+    #[test]
+    fn link_carries_owner_ttl_and_clear() {
+        let directory = std::env::temp_dir();
+        let cli = Cli::try_parse_from([
+            "tweb",
+            "link",
+            "--owner",
+            "cc-mods %42",
+            "--ttl",
+            "20",
+            "--pane",
+            "%43",
+        ])
+        .expect("parse");
+        let (called, params, agent) = super::agent_call(cli.command, &directory).expect("call");
+        assert_eq!(called, "link");
+        assert_eq!(
+            params,
+            serde_json::json!({ "owner": "cc-mods %42", "ttl": 20, "clear": false })
+        );
+        assert_eq!(agent.pane.as_deref(), Some("%43"));
+        let cli = Cli::try_parse_from(["tweb", "link", "--owner", "x", "--clear"]).expect("parse");
+        let (_, params, _) = super::agent_call(cli.command, &directory).expect("call");
+        assert_eq!(params["clear"], true);
+        assert_eq!(params["ttl"], 30);
     }
 
     #[test]
