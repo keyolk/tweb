@@ -9,6 +9,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod mcp;
+pub mod playbook;
 pub mod sites;
 pub mod skill;
 
@@ -386,6 +387,12 @@ pub enum Command {
         #[command(subcommand)]
         action: RecordAction,
     },
+    /// What agents learned about driving a site, one Markdown file per site, read again by the
+    /// next session. `snapshot` names the file when the page's site has one.
+    Playbook {
+        #[command(subcommand)]
+        action: PlaybookAction,
+    },
     /// screenshot.
     Screenshot {
         /// Where to save it. Without a path, a base64 PNG is printed.
@@ -648,6 +655,10 @@ pub enum RecordAction {
         /// Seconds between keyframes while the page keeps changing (at least 1).
         #[arg(long, default_value_t = 5.0)]
         interval: f64,
+        /// Record a flow for the agent to learn: the stop also asks it to write the site's
+        /// playbook. `gR` in the pane does the same.
+        #[arg(long)]
+        learn: bool,
         #[command(flatten)]
         agent: AgentOptions,
     },
@@ -664,6 +675,26 @@ pub enum RecordAction {
         #[command(flatten)]
         agent: AgentOptions,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlaybookAction {
+    /// Print the playbook for a site (default: the page in the pane), or where to write one.
+    Show {
+        /// A URL or host.
+        target: Option<String>,
+        #[arg(long)]
+        pane: Option<String>,
+    },
+    /// The file to read or write for a site (default: the page in the pane).
+    Path {
+        /// A URL or host.
+        target: Option<String>,
+        #[arg(long)]
+        pane: Option<String>,
+    },
+    /// Every site with a playbook.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -946,9 +977,15 @@ pub async fn run() -> Result<()> {
         Command::Mcp { agent } => mcp::serve(agent.pane.as_deref())?,
         Command::Record { action } => {
             let (method, params, agent) = match action {
-                RecordAction::Start { interval, agent } => {
-                    ("record-start", json!({ "interval": interval }), agent)
-                }
+                RecordAction::Start {
+                    interval,
+                    learn,
+                    agent,
+                } => (
+                    "record-start",
+                    json!({ "interval": interval, "learn": learn }),
+                    agent,
+                ),
                 RecordAction::Stop { no_send, agent } => {
                     ("record-stop", json!({ "send": !no_send }), agent)
                 }
@@ -956,6 +993,15 @@ pub async fn run() -> Result<()> {
             };
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
         }
+        Command::Playbook { action } => match action {
+            PlaybookAction::Show { target, pane } => {
+                playbook::show(&playbook_target(target, pane.as_deref())?)?
+            }
+            PlaybookAction::Path { target, pane } => {
+                playbook::print_path(&playbook_target(target, pane.as_deref())?)?
+            }
+            PlaybookAction::List => playbook::list()?,
+        },
         Command::Tab { action } => {
             let (method, params, agent) = match action {
                 TabAction::Switch { index, agent } => ("tab", json!({ "index": index }), agent),
@@ -985,6 +1031,33 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The site a `tweb playbook` command is about: the one named, or the page in the pane.
+fn playbook_target(target: Option<String>, pane: Option<&str>) -> Result<String> {
+    if let Some(target) = target {
+        return Ok(target);
+    }
+    let status = agent::request(pane, "status", json!({}))
+        .context("no site given and no browser pane to read one from")?;
+    Ok(active_tab_url(&status).unwrap_or_default())
+}
+
+/// The URL of the active tab in a `status` result. Status has no top-level `url`; each tab
+/// carries its own.
+fn active_tab_url(status: &serde_json::Value) -> Option<String> {
+    let tabs = status.get("tabs")?;
+    let active = tabs.get("active").and_then(serde_json::Value::as_u64);
+    tabs.get("tabs")?
+        .as_array()?
+        .iter()
+        .find(|tab| {
+            tab.get("active").and_then(serde_json::Value::as_bool) == Some(true)
+                || tab.get("index").and_then(serde_json::Value::as_u64) == active
+        })?
+        .get("url")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Map a page-driving subcommand onto its JSON-RPC method and params.

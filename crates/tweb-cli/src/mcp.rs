@@ -302,12 +302,21 @@ const TOOLS: &[Tool] = &[
                       keyframes on navigation, after clicks and while the page changes, \
                       plus navigations, clicks, field changes (password values are never \
                       recorded), console errors and failed requests.",
-        fields: &[(
-            "interval",
-            "number",
-            "Seconds between keyframes while the page changes (default 5)",
-            false,
-        )],
+        fields: &[
+            (
+                "interval",
+                "number",
+                "Seconds between keyframes while the page changes (default 5)",
+                false,
+            ),
+            (
+                "learn",
+                "boolean",
+                "Record a flow to learn: the stop also asks for the site's playbook \
+                 (tweb playbook path) to be written from the timeline",
+                false,
+            ),
+        ],
         fixed: &[],
     },
     Tool {
@@ -381,7 +390,7 @@ fn call_tool(pane: Option<&str>, name: &str, arguments: &Value) -> Result<String
         }
     }
     let result = agent::request(pane, tool.method, Value::Object(params))?;
-    Ok(agent::render(tool.method, &result))
+    Ok(agent::render_for_agent(tool.method, &result))
 }
 
 fn respond(id: Option<Value>, payload: Result<Value>) -> Option<Value> {

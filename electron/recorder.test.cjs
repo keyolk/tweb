@@ -100,3 +100,19 @@ test("what the engine cannot record is said in the timeline and the summary", ()
   assert.match(recording.summary("/r/timeline.md"), / Not recorded on this engine: failed requests \(x\)\.\n$/);
   assert.doesNotMatch(new Recording({ directory: "/r" }).summary("/t"), /Not recorded/);
 });
+
+test("a recording made to be learned asks for the site's playbook; an ordinary one does not", () => {
+  const learning = new Recording({ directory: "/r", startedAt: 0, learn: true });
+  learning.record("start", { url: "https://www.coupang.com/np/search?q=x" }, 0);
+  learning.endedAt = 1000;
+  const summary = learning.summary("/r/timeline.md");
+  assert.match(summary, /^tweb learning: \/r\/timeline\.md\n/);
+  assert.match(summary, /\nLearn this flow: .*`tweb playbook path https:\/\/www\.coupang\.com\/np\/search\?q=x`.*\n$/);
+  assert.match(timelineMarkdown(learning, path.join), /Recorded to be learned/);
+
+  const plain = new Recording({ directory: "/r", startedAt: 0 });
+  plain.record("start", { url: "https://example.com/" }, 0);
+  assert.match(plain.summary("/t"), /^tweb recording: /);
+  assert.doesNotMatch(plain.summary("/t"), /playbook/);
+  assert.doesNotMatch(timelineMarkdown(plain, path.join), /Recorded to be learned/);
+});

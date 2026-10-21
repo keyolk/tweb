@@ -4312,6 +4312,10 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "record-toggle":
       toggleRecording();
       break;
+    // `gR` and the palette's Learn row.
+    case "learn-toggle":
+      toggleRecording({ learn: true });
+      break;
     // A click or a committed field change, from a frame of a tab being recorded.
     case "record-event":
       recordPageEvent(tab, value);
@@ -5578,6 +5582,7 @@ function startRecording(params = {}) {
     pane: handoffSelfPane() || record.id || null,
     intervalMs: Number.isFinite(params.interval) ? params.interval * 1000 : undefined,
     unavailable: recordingLimits(),
+    learn: params.learn === true,
   });
   recordings.set(record, recording);
   const tab = windowsFor(record).win;
@@ -5589,7 +5594,7 @@ function startRecording(params = {}) {
   }, KEYFRAME_TIMER_MS);
   broadcastRecordingState(record);
   console.error(`tweb: recording to ${directory}`);
-  return { ok: true, recording: true, directory, unavailable: recording.unavailable };
+  return { ok: true, recording: true, directory, unavailable: recording.unavailable, learn: recording.learn };
 }
 
 // What the active tab's page engine cannot record. Asked of that engine's session rather than of
@@ -5636,13 +5641,16 @@ async function stopRecording(params = {}) {
   return { ok: true, recording: false, directory: recording.directory, timeline, summary, ...recording.counts(), sent };
 }
 
-function toggleRecording() {
+// `gr` records for the agent; `gR` records a flow for it to learn. Either key stops whichever
+// recording is running, so a stop never depends on remembering which one was started.
+function toggleRecording({ learn = false } = {}) {
   if (activeRecording()) void stopRecording();
   else {
-    const started = startRecording();
+    const started = startRecording({ learn });
     const tab = currentWindows().win;
     const note = started.unavailable?.length ? " · no failed requests on this engine" : "";
-    if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", `● recording — gr stops${note}`);
+    const label = learn ? "● learning — gR stops and asks for the playbook" : "● recording — gr stops";
+    if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-flash", `${label}${note}`);
   }
 }
 
