@@ -3188,7 +3188,8 @@ function handOffToChrome(url) {
 // Page engines per tab (engine-routing.cjs, cdp/backend.cjs). A site pinned with
 // engine.<engine>_sites renders on that engine: a typed URL, a followed link or a new tab for it
 // replaces the tab with one on the pinned engine at the same place. A redirect does not move the
-// tab — an SSO chain moved mid-way fails — and the engine badge shows the mismatch instead.
+// tab — an SSO chain moved mid-way fails — and the engine badge shows the mismatch instead. A tab
+// a pin moved goes back to the pane's engine when the user leaves for an unpinned page.
 
 function tabEngine(tab) {
   return pageBackend.kindOf(tab);
@@ -3206,8 +3207,10 @@ function engineAvailability(engine) {
 }
 
 function navigationRoute(tab, url, cause, fromEngine = tabEngine(tab)) {
+  const fromUrl = tab && !tab.isDestroyed() ? tab.webContents.getURL() || tabSessionUrls.get(tab) || null : null;
   return routeNavigation({
     url, tabEngine: fromEngine, lists: pinLists(settings), cause, availability: engineAvailability, remote: Boolean(remote),
+    fromUrl, paneEngine: pageBackend.kind,
   });
 }
 
