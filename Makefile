@@ -115,6 +115,8 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/command-line.cjs
 	node --check electron/terminal-focus.cjs
 	node --check electron/float-preload.cjs
+	node --check electron/hangul-keys.cjs
+	node --check electron/input-source.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
 	./target/debug/tweb open --engine electron "$(URL)"

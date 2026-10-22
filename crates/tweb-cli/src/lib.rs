@@ -8,6 +8,7 @@ pub mod chrome;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
+pub mod ime;
 pub mod learn;
 pub mod mcp;
 pub mod playbook;
@@ -559,6 +560,10 @@ pub enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// internal: select the input source a pane's keys need (`normal` or `restore`), run by tmux's
+    /// pane-focus hooks and the engine. See ime.rs.
+    #[command(name = "__ime", hide = true)]
+    ImeInternal { action: String },
     /// internal: the pane frontend (launched by tmux; not a documented automation API).
     #[command(name = "__pane", hide = true)]
     PaneInternal {
@@ -911,6 +916,11 @@ pub async fn run() -> Result<()> {
             browser.ssh_target()?;
             browser.check_transparent()?;
             split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
+        }
+        Command::ImeInternal { action } => {
+            if let Some(action) = ime::Action::parse(&action) {
+                ime::run(action);
+            }
         }
         Command::PaneInternal { browser, page, url } => {
             // Without a URL, restore the tmux window session.

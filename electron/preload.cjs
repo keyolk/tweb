@@ -1139,6 +1139,7 @@ installPrintShim();
     send("insert-mode", enabled);
   }
 
+  let reportedTextMode = null;
   function setMode(mode, detail = "") {
     const root = document.documentElement;
     if (!root) return;
@@ -1151,6 +1152,12 @@ installPrintShim();
     // so ArrowDown in a suggestion box did nothing. Mirror the editable state to
     // the engine so those keys arrive natively, with their real key codes.
     setEngineNativeKeys(mode === "insert");
+    // Whether typed Hangul is text or commands, and which input source the pane wants (main.cjs
+    // `syncInputSource`). Only the top frame's overlays count; a subframe's field is insert-mode.
+    if (topFrame && mode !== reportedTextMode) {
+      reportedTextMode = mode;
+      send("text-mode", mode);
+    }
     if (!topFrame) {
       if (document.hasFocus()) send("frame-mode", { mode, detail });
       return;
