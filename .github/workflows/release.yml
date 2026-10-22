@@ -1,0 +1,126 @@
+name: release
+
+# Prebuilt macOS binaries for `tweb` and its helpers, published on a `v*` tag.
+#
+# Asset contract (cc-mods installs from it; keep the names stable):
+#   tweb_<version>_darwin_<arm64|amd64>.tar.gz  binaries at the archive root
+#   checksums.txt                                sha256sum format over every archive
+#
+# workflow_dispatch and pull_request build the same archives and keep them as run artifacts;
+# give workflow_dispatch a tag to (re)upload them to that tag's release instead.
+
+on:
+  push:
+    tags: ["v*"]
+  # Build only (publish needs a tag), so a change to this file proves itself before it ships.
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to upload to (empty: build only, artifacts on the run)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          # Cross-built on the arm64 runner: the Intel macOS runners are being retired, and
+          # every crate here builds for either Apple target from the same SDK.
+          - target: x86_64-apple-darwin
+            arch: amd64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          crate=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          tag="${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}"
+          if [ -n "$tag" ]; then
+            version="${tag#v}"
+            # A tag that disagrees with Cargo.toml would ship a binary whose --version lies.
+            if [ "$version" != "$crate" ]; then
+              echo "::error::tag $tag does not match workspace version $crate"
+              exit 1
+            fi
+          else
+            version="$crate-dev.${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Rust toolchain
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name="tweb_${{ steps.version.outputs.version }}_darwin_${{ matrix.arch }}"
+          src="target/${{ matrix.target }}/release"
+          mkdir -p "dist/$name"
+          for bin in tweb twebd tweb-webkit tweb-native-input; do
+            install -m 0755 "$src/$bin" "dist/$name/$bin"
+            # Ad-hoc signature: an unsigned arm64 Mach-O is killed at exec.
+            codesign -f -s - "dist/$name/$bin"
+          done
+          tar -C "dist/$name" -czf "dist/$name.tar.gz" tweb twebd tweb-webkit tweb-native-input
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        if: matrix.arch == 'arm64'
+        run: dist/tweb_*_darwin_arm64/tweb --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > checksums.txt && cat checksums.txt
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*.tar.gz dist/checksums.txt
