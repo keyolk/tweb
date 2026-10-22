@@ -6,12 +6,15 @@ name: release
 #   tweb_<version>_darwin_<arm64|amd64>.tar.gz  binaries at the archive root
 #   checksums.txt                                sha256sum format over every archive
 #
-# workflow_dispatch builds the same archives and keeps them as run artifacts; give it a
-# tag to (re)upload them to that tag's release instead.
+# workflow_dispatch and pull_request build the same archives and keep them as run artifacts;
+# give workflow_dispatch a tag to (re)upload them to that tag's release instead.
 
 on:
   push:
     tags: ["v*"]
+  # Build only (publish needs a tag), so a change to this file proves itself before it ships.
+  pull_request:
+    paths: [".github/workflows/release.yml"]
   workflow_dispatch:
     inputs:
       tag:
