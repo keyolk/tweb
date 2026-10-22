@@ -31,6 +31,9 @@ test("focus hooks switch to ABC entering a commands pane and restore leaving any
   assert.match(focusOut[3], /__ime restore/);
   // Edit mode's hooks are index 71; these must not replace them.
   assert.ok(![focusIn, focusOut].some((args) => args[2].includes("[71]")));
+  // A path with a space and a quote survives the three quoting layers (if-shell, run-shell, sh).
+  const [awkward] = focusHookCommands("/tmp/my dir/it's/tweb");
+  assert.ok(awkward[3].endsWith(String.raw`"run-shell -b \"'/tmp/my dir/it'\\\\''s/tweb' __ime normal >/dev/null 2>&1\""`), awkward[3]);
   assert.deepStrictEqual(focusHookCommands("/t", false),
     [["set-hook", "-gu", "pane-focus-in[72]"], ["set-hook", "-gu", "pane-focus-out[72]"]]);
 });

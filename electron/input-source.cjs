@@ -21,6 +21,10 @@ function keysAreText(state) {
 // The preload modes that take typed text: a focused field, and tweb's own input overlays.
 const TEXT_MODES = new Set(["insert", "omnibox", "search", "command-line", "command"]);
 
+function tmuxEscape(value) {
+  return String(value).replace(/["\\$]/g, "\\$&");
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
@@ -33,12 +37,15 @@ function focusHookCommands(tweb, enabled = true) {
   if (!enabled) {
     return [["set-hook", "-gu", "pane-focus-in[72]"], ["set-hook", "-gu", "pane-focus-out[72]"]];
   }
-  const run = (action) => `run-shell -b "${shellQuote(tweb)} __ime ${action} >/dev/null 2>&1"`;
+  // Three layers of quoting: the shell command run-shell runs, inside the run-shell command, inside
+  // the if-shell command the hook stores. Each tmux layer is a double-quoted string, so `"`, `\` and
+  // `$` are escaped once per layer; the binary path is single-quoted for the shell.
+  const run = (action) => `run-shell -b "${tmuxEscape(`${shellQuote(tweb)} __ime ${action} >/dev/null 2>&1`)}"`;
   return [
     ["set-hook", "-g", "pane-focus-in[72]",
-      `if-shell -F "#{&&:#{==:#{@tweb_browser},1},#{!=:#{@tweb_text},1}}" '${run("normal")}'`],
+      `if-shell -F "#{&&:#{==:#{@tweb_browser},1},#{!=:#{@tweb_text},1}}" "${tmuxEscape(run("normal"))}"`],
     ["set-hook", "-g", "pane-focus-out[72]",
-      `if-shell -F "#{==:#{@tweb_browser},1}" '${run("restore")}'`],
+      `if-shell -F "#{==:#{@tweb_browser},1}" "${tmuxEscape(run("restore"))}"`],
   ];
 }
 
