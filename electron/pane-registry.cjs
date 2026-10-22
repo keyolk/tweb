@@ -179,6 +179,7 @@ function createPaneRecord({
       restore: false,
       path: null,
       legacyPath: null,
+      stablePath: null,
       claimPath: null,
     },
     // Where this pane lives right now, who is looking at it, and how we know.
