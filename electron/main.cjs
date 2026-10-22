@@ -38,6 +38,8 @@ const { execFile, execFileSync } = require("node:child_process");
 const { Worker } = require("node:worker_threads");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const net = require("node:net");
+const { hangulKeys } = require("./hangul-keys.cjs");
+const { TEXT_MODES, focusHookCommands, keysAreText } = require("./input-source.cjs");
 const path = require("node:path");
 const { createInputTrace } = require("./input-trace.cjs");
 const { runtimeInfoRows } = require("./runtime-info.cjs");
@@ -1278,6 +1280,41 @@ function setPaneEditOption(paneId, on) {
   } catch (error) {
     if (debugLogging) console.error(`tweb: @tweb_edit failed: ${error.message}`);
   }
+}
+
+// The input source follows the pane's keys: ABC while they are commands, the person's own while
+// they are text (input-source.cjs, crates/tweb-cli/src/ime.rs). `TWEB_IME_SWITCH=0` leaves the
+// input source alone; typed Hangul is then still read as the keys under it (hangul-keys.cjs).
+const imeSwitching = process.env.TWEB_IME_SWITCH !== "0" && process.platform === "darwin";
+const twebBinary = () => process.env.TWEB_BIN || path.join(os.homedir(), ".local", "bin", "tweb");
+let imeHooksInstalled = false;
+
+function ensureImeHooks() {
+  if (imeHooksInstalled) return;
+  imeHooksInstalled = true;
+  for (const args of focusHookCommands(twebBinary(), imeSwitching)) {
+    execFile("tmux", args, { timeout: 1000 }, (error) => {
+      if (error && debugLogging) console.error(`tweb: ime hook failed: ${error.message}`);
+    });
+  }
+}
+
+// Called wherever the pane's keys may have changed between commands and text. Writes `@tweb_text`
+// for the focus hooks, and when this pane has focus right now, switches the source itself.
+function syncInputSource(record = currentPane()) {
+  const paneId = record?.paneId;
+  if (!paneId || String(paneId).startsWith("pid-")) return;
+  ensureImeHooks();
+  const text = withPaneScope(record, () => keysAreText(inputState()));
+  if (record.keysAreText === text) return;
+  record.keysAreText = text;
+  execFile("tmux", ["set-option", "-p", "-t", paneId, "@tweb_text", text ? "1" : "0"], { timeout: 1000 }, () => {});
+  if (!imeSwitching) return;
+  execFile("tmux", ["display-message", "-p", "-t", paneId,
+    "#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}"], { timeout: 1000 }, (error, stdout) => {
+    if (error || String(stdout).trim() !== "1") return;
+    execFile(twebBinary(), ["__ime", text ? "restore" : "normal"], { timeout: 3000 }, () => {});
+  });
 }
 
 function restoreTmuxPassthroughClients() {
@@ -3593,6 +3630,7 @@ function applyShortcutMode() {
   // A Ghostty config reload or a pane restart can reset one side only, so reconcile
   // always runs even when the value already matches.
   reconcileTmuxPassthrough();
+  syncInputSource();
   updatePaneTitle();
   // The mode belongs to this pane, so it is reported by this pane's in-page indicator.
   // It used to also flash `tmux display-message`, which writes to the status line the
@@ -3649,6 +3687,9 @@ function activateTab(index) {
   // delivery is armed and its keys go back through the renderer, where they
   // arrive with keyCode 0.
   sendToTabFrames(currentWindows().win, "tweb-shortcuts-mode", shortcutModeMessage());
+  // The new tab's overlay state is its own; its preload reports it again on its next mode change.
+  inputState().textMode = false;
+  syncInputSource();
   // The other tab's caret says nothing about this one, and its preload only
   // reports on focus — which switching soleWindows.tabs does not fire.
   moveTerminalCaret(null);
@@ -4468,8 +4509,14 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
         insertModeOwners.delete(tab);
         inputState().insertMode = false;
       }
+      syncInputSource();
       break;
     }
+    case "text-mode":
+      if (tab !== currentWindows().win) break;
+      inputState().textMode = TEXT_MODES.has(value);
+      syncInputSource();
+      break;
     // Take the speakers back from whichever pane holds them. Only ever a deliberate
     // keypress: a page starting playback in a muted pane does not get to do this.
     case "reclaim-audio":
@@ -4602,6 +4649,8 @@ ipcMain.on("tweb-preload-ready", bindPane(
   if (frame === tab.webContents.mainFrame) {
     inputState().insertMode = false;
     insertModeOwners.delete(tab);
+    inputState().textMode = false;
+    syncInputSource();
   }
   const key = frameKey(frame);
   if (info?.shortcutFrame) shortcutFrameKeys(tab).add(key);
@@ -7780,7 +7829,10 @@ function createWindow(url, frames = currentFrames()) {
     const initialUrl = sess().restore && !isRestorableUrl(url)
       ? noWindowSessionPage()
       : url;
-    return createTab(initialUrl, true);
+    const tab = createTab(initialUrl, true);
+    // A new pane takes focus as it opens, before any focus hook could have seen it as tweb's.
+    syncInputSource();
+    return tab;
   }
 
   const moves = [];
@@ -7795,6 +7847,7 @@ function createWindow(url, frames = currentFrames()) {
   if (debugLogging) {
     console.error(`tweb: restored ${session.tabs.length} tabs for tmux window`);
   }
+  syncInputSource();
   return currentWindows().win;
 }
 
@@ -7840,6 +7893,9 @@ function inputState() {
       vimium: process.env.TWEB_START_VIMIUM !== "0",
       bypass: false,
       insertMode: false,
+      // The top frame's preload has one of tweb's own text overlays open (the omnibox, `/` search,
+      // `:`); typed Hangul there is text, not commands. See input-source.cjs.
+      textMode: false,
       // Whether this pane's page is shown as an OS desktop window (floating mode).
       floating: false,
       // The last point a motion report produced, for filling in the gap tmux leaves between
@@ -8884,7 +8940,15 @@ function dispatchText(buffer) {
       continue;
     }
     const text = inputState().decoder.write(buffer.subarray(offset));
+    const commands = !keysAreText(inputState());
     for (const char of text) {
+      // Hangul in normal mode is a command typed under a Korean input source, often merged by the
+      // IME (`f` `j` -> `러`): it is replayed as the keys that typed it. See hangul-keys.cjs.
+      const keys = commands ? hangulKeys(char) : null;
+      if (keys) {
+        for (const key of keys) dispatchKey(key.codePointAt(0), /[A-Z]/.test(key) ? 2 : 1);
+        continue;
+      }
       const codepoint = char.codePointAt(0);
       const modifierMask = codepoint >= 65 && codepoint <= 90 ? 2 : 1;
       dispatchKey(codepoint, modifierMask);
