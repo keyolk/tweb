@@ -2496,6 +2496,9 @@ function resolveWindowSessionPaths() {
   });
   if (!claim) return;
   sess().path = path.join(directory, `${claim.keys.primary}.json`);
+  sess().stablePath = claim.keys.stable
+    ? path.join(directory, `${claim.keys.stable}.json`)
+    : null;
   sess().legacyPath = claim.keys.legacy
     ? path.join(directory, `${claim.keys.legacy}.json`)
     : null;
@@ -2527,22 +2530,29 @@ function releaseWindowSessionClaim() {
   }
 }
 
+// Saved under both keys (see `windowSessionKeys`): the window id for this tmux server's lifetime,
+// the window index for after a server restart.
 function writeWindowSessionState(state) {
   if (!sess().path || !state) return;
-  const temporaryPath = `${sess().path}.${process.pid}.tmp`;
-  try {
-    mkdirSync(path.dirname(sess().path), { recursive: true });
-    writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, sess().path);
-  } catch (error) {
-    try { unlinkSync(temporaryPath); } catch {}
-    if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
+  for (const target of [sess().stablePath, sess().path]) {
+    if (!target) continue;
+    const temporaryPath = `${target}.${process.pid}.tmp`;
+    try {
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+      renameSync(temporaryPath, target);
+    } catch (error) {
+      try { unlinkSync(temporaryPath); } catch {}
+      if (debugLogging) console.error(`tweb: window session save failed: ${error.message}`);
+    }
   }
 }
 
 function readWindowSession() {
   if (!sess().restore || !sess().path) return null;
-  for (const candidate of [sess().path, sess().legacyPath]) {
+  // The window id first: within one tmux server it cannot belong to another window, while the
+  // index may have been another window's before a renumber.
+  for (const candidate of [sess().stablePath, sess().path, sess().legacyPath]) {
     if (!candidate) continue;
     try {
       const session = normalizeWindowSession(
@@ -2550,9 +2560,10 @@ function readWindowSession() {
         defaultZoomFactor()
       );
       if (!session) continue;
-      if (candidate !== sess().path) {
+      if (candidate !== sess().stablePath) {
+        // Found only under an older key: written under the current ones now.
         writeWindowSessionState({ version: 1, ...session });
-        if (debugLogging) console.error("tweb: migrated legacy window session");
+        if (debugLogging) console.error(`tweb: window session restored from ${path.basename(candidate)}`);
       }
       return session;
     } catch (error) {

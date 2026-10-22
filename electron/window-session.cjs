@@ -61,7 +61,16 @@ function windowSessionKeys(identity, slot = 0) {
   const legacy = slotNumber === 0 && identity.serverStartedAt && identity.windowId
     ? sessionKey([identity.socketPath, identity.serverStartedAt, identity.windowId])
     : null;
-  return { primary, legacy: legacy === primary ? null : legacy };
+  // The window's id, which tmux keeps for the server's lifetime. The index is not: with
+  // `renumber-windows on`, closing any window before this one shifts its index, and a session saved
+  // under the old index is then found by nobody — or, worse, by whichever window now has that
+  // index. Measured: a pane saved four tabs at index 5, was respawned at index 2, and restored
+  // "No previous page". The index key is still written, because ids do not survive a tmux server
+  // restart (tmux-resurrect brings windows back by index, under new ids).
+  const stable = identity.serverStartedAt && identity.windowId
+    ? sessionKey(["v3-id", identity.socketPath, identity.serverStartedAt, identity.windowId, `slot${slotNumber}`])
+    : null;
+  return { primary, legacy: legacy === primary ? null : legacy, stable };
 }
 
 /** Where a slot's claim file lives, beside the session file it guards. */

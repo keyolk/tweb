@@ -23,6 +23,23 @@ const tmuxIdentity = {
   windowIndex: "3",
 };
 
+// `renumber-windows on`: closing an earlier window moves this one from index 5 to 2. Measured: the
+// index key then pointed at an empty slot and the pane restored nothing. The window id key holds.
+test("the window id key survives a renumber; the index key does not", () => {
+  const before = windowSessionKeys({ ...tmuxIdentity, windowIndex: "5" });
+  const after = windowSessionKeys({ ...tmuxIdentity, windowIndex: "2" });
+  assert.notEqual(before.primary, after.primary);
+  assert.equal(before.stable, after.stable);
+  assert.match(before.stable, /^[0-9a-f]{24}$/);
+  // Per slot, and never equal to an index key.
+  assert.notEqual(windowSessionKeys(tmuxIdentity, 1).stable, before.stable);
+  assert.notEqual(before.stable, before.primary);
+  // Another window, or the same id after a server restart, is a different key.
+  assert.notEqual(windowSessionKeys({ ...tmuxIdentity, windowId: "@8" }).stable, before.stable);
+  assert.notEqual(windowSessionKeys({ ...tmuxIdentity, serverStartedAt: "200" }).stable, before.stable);
+  assert.equal(windowSessionKeys({ ...tmuxIdentity, windowId: undefined }).stable, null);
+});
+
 test("the primary session key survives a tmux server restart", () => {
   const before = windowSessionKeys(tmuxIdentity);
   const after = windowSessionKeys({

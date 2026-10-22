@@ -511,8 +511,10 @@ test("bare open never restores or saves an internal blank page", () => {
     `if \\(!sess\\(\\)\\.path \\|\\| (?:soleWindows|currentWindows\\(\\))\\.tabs\\.length === 0\\) return;`));
   assert.match(main, /function writeWindowSessionState\(state\)/);
   assert.match(main, /if \(!sess\(\)\.path \|\| !state\) return;/);
+  // Saved under the window id as well as the index (window-session.cjs `windowSessionKeys`).
+  assert.match(main, /for \(const target of \[sess\(\)\.stablePath, sess\(\)\.path\]\)/);
   assert.match(main, /claimWindowSessionSlot\(\{/);
-  assert.match(main, /for \(const candidate of \[sess\(\)\.path, sess\(\)\.legacyPath\]\)/);
+  assert.match(main, /for \(const candidate of \[sess\(\)\.stablePath, sess\(\)\.path, sess\(\)\.legacyPath\]\)/);
   // Per-pane now: `tweb open` with no url means "restore this window's tabs" and with a url means
   // "open that", and one host serves both at once.
   assert.match(main, /sess\(\)\.restore && !isRestorableUrl\(url\)/);
@@ -3104,3 +3106,4 @@ test("gr toggles recording and leaves the other g chords alone", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "record-toggle":\n\s+toggleRecording\(\);/);
 });
+
