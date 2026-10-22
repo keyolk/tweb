@@ -92,3 +92,32 @@ test("targetCreated and targetInfoChanged route a foreign tab to the hand-off, a
   assert.deepStrictEqual(handed, ["https://example.com/a", "https://example.com/b"]);
   assert.deepStrictEqual(sent, [["Target.closeTarget", "A"], ["Target.closeTarget", "B"]]);
 });
+
+// A frozen Chrome kept a half-made tab in the pane's list until it woke: the close waited for
+// Chrome before letting the tab go. The tab now goes first, and a target that arrives after its
+// tab was closed is closed on arrival.
+test("closing a tab whose Chrome does not answer lets the tab go at once", async () => {
+  const { EventEmitter } = require("node:events");
+  const sent = [];
+  let answerCreate;
+  const connection = Object.assign(new EventEmitter(), {
+    closed: false,
+    send(method, params) {
+      sent.push({ method, params });
+      if (method === "Target.createTarget") return new Promise((resolve) => { answerCreate = resolve; });
+      return new Promise(() => {});
+    },
+  });
+  const engine = new CdpEngine({ userDataDir: "/tmp/none", nativeImage: {}, clipboard: {} });
+  engine.connection = connection;
+  const window = engine.createWindow({ width: 100, height: 100 });
+  let closed = 0;
+  window.on("closed", () => { closed += 1; });
+  window.close();
+  assert.strictEqual(closed, 1, "closed before Chrome answered anything");
+  assert.ok(!sent.some((call) => call.method === "Target.closeTarget"), "no target to close yet");
+  answerCreate({ targetId: "LATE" });
+  await assert.rejects(engine.whenReady(window), /closed before Chrome made it/);
+  assert.deepStrictEqual(sent.filter((call) => call.method === "Target.closeTarget").map((call) => call.params),
+    [{ targetId: "LATE" }]);
+});

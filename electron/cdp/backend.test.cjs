@@ -136,12 +136,13 @@ function fakeElectron() {
 }
 
 function fakeEngine(kind, { fail = false } = {}) {
-  const engine = {
+  const engine = Object.assign(new EventEmitter(), {
     kind, started: 0, stopped: 0, windows: [], ipcMain: new EventEmitter(),
     listeners: {}, downloads: [],
     async start(options) { engine.started += 1; engine.startOptions = options; if (fail) throw new Error("no chrome"); },
     async stop() { engine.stopped += 1; },
-    createWindow(options) { const w = { kind, options, webContents: { id: 1000 + engine.windows.length } }; engine.windows.push(w); return w; },
+    createWindow(options) { const w = { kind, options, engine, webContents: { id: 1000 + engine.windows.length } }; engine.windows.push(w); return w; },
+    whenReady(window) { return engine.ready?.get(window) || Promise.resolve(); },
     fromWebContents(contents) { return engine.windows.find((w) => w.webContents === contents) || null; },
     getAllWindows() { return engine.windows; },
     session() {
@@ -155,7 +156,7 @@ function fakeEngine(kind, { fail = false } = {}) {
         on(event, l) { if (event === "will-download") engine.downloads.push(l); return this; },
       };
     },
-  };
+  });
   return engine;
 }
 
@@ -266,4 +267,52 @@ test("an engine whose start finishes during quit is stopped and never registered
   assert.strictEqual(engine.stopped, 1);
   assert.deepStrictEqual(backend.startedKinds(), ["electron"]);
   await assert.rejects(backend.ensureEngine("webkit"), /backend is stopping/);
+});
+
+// Measured: Chrome alive, its CDP socket closed, and every later tab failed with "CDP connection
+// closed" because the dead engine stayed registered. A lost engine is forgotten and restarted.
+test("an engine whose link dies is forgotten, reported, and started fresh on next use", async () => {
+  const electron = fakeElectron();
+  const made = [];
+  const backend = createBackend(electron, { env: {}, makeEngine: (kind) => { const e = fakeEngine(kind); made.push(e); return e; } });
+  const lost = [];
+  backend.onEngineLost((kind) => lost.push(kind));
+  const first = await backend.ensureEngine("chrome");
+  const page = new backend.BrowserWindow(tab("chrome"));
+  first.emit("disconnected");
+  assert.deepStrictEqual(lost, ["chrome"]);
+  assert.deepStrictEqual(backend.startedKinds(), ["electron"]);
+  assert.strictEqual(backend.kindOf(page), "chrome", "the dead tab still names its engine, so main.cjs can rebuild it");
+  const second = await backend.ensureEngine("chrome");
+  assert.notStrictEqual(second, first);
+  assert.strictEqual(made.length, 2);
+  // A late event from the old engine does not drop the new one.
+  first.emit("disconnected");
+  assert.deepStrictEqual(backend.startedKinds(), ["electron", "chrome"]);
+  assert.deepStrictEqual(lost, ["chrome"]);
+});
+
+test("an engine stopped at quit is not reported lost", async () => {
+  const electron = fakeElectron();
+  const chrome = fakeEngine("chrome");
+  chrome.stop = async () => { chrome.emit("disconnected"); };
+  const backend = createBackend(electron, { env: {}, makeEngine: () => chrome });
+  const lost = [];
+  backend.onEngineLost((kind) => lost.push(kind));
+  await backend.ensureEngine("chrome");
+  await backend.stopAll();
+  assert.deepStrictEqual(lost, []);
+});
+
+// The engine move waits on this before closing the old tab.
+test("whenReady follows the tab's own engine, and Electron's tab is ready at once", async () => {
+  const electron = fakeElectron();
+  const chrome = fakeEngine("chrome");
+  chrome.ready = new WeakMap();
+  const backend = createBackend(electron, { env: {}, makeEngine: () => chrome });
+  await backend.whenReady(new backend.BrowserWindow(tab()));
+  await backend.ensureEngine("chrome");
+  const page = new backend.BrowserWindow(tab("chrome"));
+  chrome.ready.set(page, Promise.reject(new Error("Target.createTarget: CDP connection closed")));
+  await assert.rejects(backend.whenReady(page), /CDP connection closed/);
 });

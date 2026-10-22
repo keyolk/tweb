@@ -86,9 +86,14 @@ test("typed URLs, links and new tabs follow pins in place; redirects are only to
   assert.doesNotMatch(notice, /switchTabEngine|loadURL|execFile/);
   assert.match(notice, /navigationRoute\(tab, url, "redirect"\)/);
   assert.match(main, /noticePinnedNavigation\(tab, url\);/);
-  // The switch replaces the tab at its own index and closes the old one only after.
-  const sw = main.slice(main.indexOf("async function switchTabEngine("), main.indexOf("const pinNotices"));
-  assert.match(sw, /createTab\(target, wasActive, zoom, false, \{ engine, insertAt: index \}\);\s+\/\/[^\n]*\n[^\n]*\n\s+tab\.close\(\);/);
+  // The switch makes the new tab in the background at the old one's index, waits until its engine
+  // has the page, and only then closes the old one; a failed new tab is closed instead.
+  const sw = main.slice(main.indexOf("async function switchTabEngine("), main.indexOf("const ENGINE_TAB_READY_MS"));
+  const made = sw.indexOf("createTab(target, false, zoom, false, { engine, insertAt: index })");
+  const ready = sw.indexOf("await withTimeout(pageBackend.whenReady(next)");
+  const closed = sw.indexOf("tab.close();");
+  assert.ok(made > 0 && ready > made && closed > ready, "old tab closed only after the new one is ready");
+  assert.match(sw.slice(ready, closed), /catch \(error\) \{[\s\S]*?next\.close\(\);[\s\S]*?return null;/);
   // A separate Chrome pane is still on offer.
   const open = main.slice(main.indexOf("function openInChromePane("), main.indexOf("function sendToMainTabFrame("));
   assert.match(open, /\["split", "--engine", "chrome", url\]/);

@@ -127,6 +127,7 @@ function createBackend(electron, { env = process.env, debug = false, makeEngine 
         }
         engines.set(kind, engine);
         wireEngine(engine);
+        engine.once("disconnected", () => forgetEngine(kind, engine));
         return engine;
       }).catch((error) => {
         // Not cached: the next tab that asks tries again (Chrome closed mid-launch, say).
@@ -136,6 +137,23 @@ function createBackend(electron, { env = process.env, debug = false, makeEngine 
       starting.set(kind, started);
     }
     return starting.get(kind);
+  }
+
+  // An engine whose link died — the CDP socket closed, tweb-webkit exited — is forgotten, so the
+  // next `ensureEngine` starts a fresh one instead of every call failing on the dead link. Measured
+  // on a real pane: Chrome was alive and answered /json/version, but the socket had closed, and
+  // every capture, click and new tab failed with "CDP connection closed" until the pane went black.
+  // A fresh CdpEngine reuses the live Chrome (`ensureChrome`) or launches one when it is gone.
+  // Its tabs are not rebuilt here: main.cjs owns them, and is told through `onEngineLost`.
+  const lostListeners = [];
+  function forgetEngine(kind, engine) {
+    if (stopping || engines.get(kind) !== engine) return;
+    engines.delete(kind);
+    starting.delete(kind);
+    console.error(`tweb: ${kind} engine disconnected`);
+    for (const listener of lostListeners) {
+      try { listener(kind); } catch (error) { console.error(`tweb: engine-lost listener failed: ${error.message}`); }
+    }
   }
 
   // A function, not a class: `new BrowserWindow(...)` returns whichever object the constructor
@@ -264,6 +282,15 @@ function createBackend(electron, { env = process.env, debug = false, makeEngine 
     kindOf,
     observesRequests,
     ensureEngine,
+    onEngineLost: (listener) => { lostListeners.push(listener); },
+    // Resolves once `window`'s page exists, rejects when it never will. An engine tab is made
+    // asynchronously behind a synchronous constructor (`CdpBrowserWindow.attach`); Electron's is
+    // there at once.
+    whenReady(window) {
+      // The window's own engine, not the started one of its kind: after a disconnect they differ.
+      const engine = windowKinds.get(window) === "electron" ? null : window?.engine;
+      return typeof engine?.whenReady === "function" ? engine.whenReady(window) : Promise.resolve();
+    },
     availability: (kind) => engineAvailability(kind, { env }),
     // The pane's engine before its first tab; the others start on demand with the same options.
     start: (options = {}) => {
