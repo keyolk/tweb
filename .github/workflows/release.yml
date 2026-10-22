@@ -1,6 +1,11 @@
 name: release
 
-# Prebuilt macOS binaries for `tweb` and its helpers, published on a `v*` tag.
+# Prebuilt macOS binaries for `tweb` and its helpers.
+#
+# Every merge to main publishes the next patch release (latest v* tag + 1), so
+# what `cc-mods-tools update` installs is never older than main. Push a v* tag
+# yourself for a minor/major bump; later merges count up from it. Docs-only
+# merges do not release.
 #
 # Asset contract (cc-mods installs from it; keep the names stable):
 #   tweb_<version>_darwin_<arm64|amd64>.tar.gz  binaries at the archive root
@@ -11,7 +16,9 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+    paths-ignore: ["**.md", "docs/**", "media/**"]
   # Build only (publish needs a tag), so a change to this file proves itself before it ships.
   pull_request:
     paths: [".github/workflows/release.yml"]
@@ -25,8 +32,57 @@ on:
 permissions:
   contents: write
 
+# One release run at a time, never cancelled mid-upload, so two quick merges
+# cannot both pick the same next patch number. GitHub keeps only the newest
+# pending run; a merge whose run is dropped ships in the next one.
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          crate=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          tag="${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}"
+          if [ -z "$tag" ] && [ "${{ github.event_name }}" = push ]; then
+            if [ -n "$(git tag --points-at HEAD 'v*')" ]; then
+              echo "HEAD is already released as $(git tag --points-at HEAD 'v*')"
+              exit 0
+            fi
+            last=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+            last=${last#v}; last=${last:-0.0.0}
+            IFS=. read -r ma mi pa <<<"${last%%-*}"
+            next="$ma.$mi.$((pa + 1))"
+            # Cargo.toml bumped past the tags (a manual minor bump) wins.
+            if [ "$(printf '%s\n%s\n' "$next" "$crate" | sort -V | tail -1)" = "$crate" ] && [ "$crate" != "$last" ]; then
+              next=$crate
+            fi
+            tag="v$next"
+          fi
+          if [ -n "$tag" ]; then
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$crate-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "resolved ${tag:-build only}"
+
   build:
+    needs: version
+    if: needs.version.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
@@ -41,25 +97,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.sha }}
 
-      - name: Resolve version
-        id: version
+      - name: Stamp version
         shell: bash
+        # The release version comes from the tag, not from Cargo.toml (merges
+        # release without a bump), so write it in before building; otherwise
+        # `tweb --version` would report the stale workspace version.
         run: |
-          crate=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
-          tag="${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}"
-          if [ -n "$tag" ]; then
-            version="${tag#v}"
-            # A tag that disagrees with Cargo.toml would ship a binary whose --version lies.
-            if [ "$version" != "$crate" ]; then
-              echo "::error::tag $tag does not match workspace version $crate"
-              exit 1
-            fi
-          else
-            version="$crate-dev.${GITHUB_SHA::7}"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          sed -i '' '/^\[workspace.package\]/,/^\[/s/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+          cargo update --workspace --offline 2>/dev/null || cargo update --workspace
+          grep -A1 '^\[workspace.package\]' Cargo.toml
 
       - name: Rust toolchain
         run: rustup target add ${{ matrix.target }}
@@ -80,7 +128,7 @@ jobs:
         id: package
         shell: bash
         run: |
-          name="tweb_${{ steps.version.outputs.version }}_darwin_${{ matrix.arch }}"
+          name="tweb_${{ needs.version.outputs.version }}_darwin_${{ matrix.arch }}"
           src="target/${{ matrix.target }}/release"
           mkdir -p "dist/$name"
           for bin in tweb twebd tweb-webkit tweb-native-input; do
@@ -102,8 +150,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
-    if: github.ref_type == 'tag' || inputs.tag != ''
+    needs: [version, build]
+    if: needs.version.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -118,9 +166,12 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+            # --target creates the tag on the built commit for a merge release.
+            # A tag made with this token starts no workflow, so it does not
+            # trigger a second run of this one.
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --target "$GITHUB_SHA"
           fi
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*.tar.gz dist/checksums.txt
