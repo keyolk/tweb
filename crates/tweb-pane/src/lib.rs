@@ -561,10 +561,12 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     } else {
         None
     };
+    let mut options = options;
     match hosted {
         Some(HostedOutcome::Finished) => return Ok(()),
         Some(HostedOutcome::Spawn(reason)) if !matches!(reason, attach::SpawnReason::FlagOff) => {
             tracing::info!(reason = %reason, "spawning this pane's own engine");
+            options.restore_session |= restores_after(&reason);
         }
         Some(HostedOutcome::Spawn(_)) | None => {}
     }
@@ -926,6 +928,17 @@ enum HostedOutcome {
     Finished,
     /// Spawn an engine for this pane — today's path, with the reason for the log.
     Spawn(attach::SpawnReason),
+}
+
+/// Whether the engine this pane falls back to restores the window's tabs instead of opening `url`.
+///
+/// A pane opened with a URL starts without restoring (`tweb open youtube.com` means that page). But
+/// once hosting has run, the URL is history: the person has since opened tabs, and the hosted engine
+/// saved them to the window session as it went. A daemon restart (`tweb daemon restart`, an
+/// upgrade) ends every hosted session, and reopening the URL dropped all of them — measured: two
+/// panes with four tabs between them came back with one each, the first URL each was opened with.
+fn restores_after(reason: &attach::SpawnReason) -> bool {
+    matches!(reason, attach::SpawnReason::HostedSessionLost(_))
 }
 
 /// Runs this pane against the daemon, or says why it cannot be.
@@ -1397,9 +1410,28 @@ pub fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
 mod tests {
     use super::{
         changed_geometry_message, host_geometry, matching_client_ttys, raw_kitty_delete,
-        resolve_electron_paths, tmux_passthrough, workspace_electron_dir_for, PasteTracker,
-        PATCH_ID_COUNT,
+        resolve_electron_paths, restores_after, tmux_passthrough, workspace_electron_dir_for,
+        PasteTracker, PATCH_ID_COUNT,
     };
+
+    // A daemon restart ends hosting; the pane's own engine then restores the tabs the hosted one
+    // saved. Never hosted (no daemon, flag off, inline frames): the URL it was opened with.
+    #[test]
+    fn only_a_lost_hosted_session_restores_the_window_tabs() {
+        use crate::attach::SpawnReason;
+        assert!(restores_after(&SpawnReason::HostedSessionLost(
+            "twebd closed the connection".into()
+        )));
+        for reason in [
+            SpawnReason::FlagOff,
+            SpawnReason::NoSocket,
+            SpawnReason::ConnectFailed("refused".into()),
+            SpawnReason::DaemonStartFailed("x".into()),
+            SpawnReason::InlineFrames("ssh".into()),
+        ] {
+            assert!(!restores_after(&reason), "{reason}");
+        }
+    }
 
     #[test]
     fn only_a_binary_built_in_a_workspace_uses_its_electron_dir() {
