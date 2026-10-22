@@ -295,6 +295,10 @@ class CdpEngine extends EventEmitter {
     const { targetId } = await this.connection.send("Target.createTarget", {
       url: "about:blank", newWindow: true, background: true,
     });
+    if (window.isDestroyed()) {
+      void this.connection.send("Target.closeTarget", { targetId }).catch(() => {});
+      throw new Error("the tab was closed before Chrome made it");
+    }
     await this.adoptTarget(window, contents, targetId);
   }
 
@@ -321,11 +325,16 @@ class CdpEngine extends EventEmitter {
     return [...this.windows];
   }
 
+  // The tab is gone for main.cjs at once; Chrome's target follows. Waiting for Chrome first kept a
+  // tab whose engine had stopped answering in the pane's list — measured: a frozen Chrome held a
+  // half-made tab there until it woke. A target not created yet is closed when it arrives
+  // (`openTarget`).
   async closeTarget(window) {
     const contents = window.webContents;
     if (contents && !contents.isDestroyed()) {
-      await this.connection.send("Target.closeTarget", { targetId: contents.targetId }).catch(() => {});
+      const { targetId } = contents;
       contents.destroy();
+      if (targetId) await this.connection.send("Target.closeTarget", { targetId }).catch(() => {});
     } else {
       window.onContentsDestroyed();
     }

@@ -3249,14 +3249,17 @@ function openTabRouted(fromTab, url, activate = true) {
 // The tab replaced by one on `engine`, at the same place, showing `url` (the tab's own when not
 // given). History does not come along: it belongs to the old engine's page. Neither do cookies.
 // Resolves to the tab now showing the page (the same one when it was already on `engine`), or
-// null when it could not move.
-async function switchTabEngine(tab, engine, url = null, site = null) {
+// null when it could not move — and then the old tab is still there, on screen, and says why.
+//
+// `rebuild` replaces the tab even when it is already on `engine`: its engine was lost and
+// restarted, so the page under the tab is gone (see `rebuildLostTabs`).
+async function switchTabEngine(tab, engine, url = null, site = null, { rebuild = false } = {}) {
   if (!tab || tab.isDestroyed()) return null;
   const record = tabPanes.get(tab);
   const flash = bindPane(() => record, (text) => sendToMainTabFrame(tab, "tweb-flash", text));
   const from = tabEngine(tab);
   const target = url || tab.webContents.getURL() || tabSessionUrls.get(tab) || "about:blank";
-  if (from === engine) {
+  if (from === engine && !rebuild) {
     if (url) void tab.loadURL(url).catch(() => {});
     return tab;
   }
@@ -3274,18 +3277,38 @@ async function switchTabEngine(tab, engine, url = null, site = null) {
     flash(`${ENGINE_LABELS[engine]} failed to start: ${error.message}`);
     return null;
   }
+  // Made in the background beside the tab it replaces, and the old tab closed only once the new
+  // engine has the page. Closing first left a pane with no tab at all when the new one then
+  // failed — measured: a badge switch to Chrome over a dead CDP link closed the Electron tab,
+  // `Target.createTarget` failed, and the pane went black with `tabs: []`.
+  let next = null;
+  try {
+    next = bindPane(() => record, () => {
+      if (tab.isDestroyed()) return null;
+      const index = currentWindows().tabs.indexOf(tab);
+      if (index < 0) return null;
+      const zoom = tabZoomFactors.get(tab) ?? defaultZoomFactor();
+      return createTab(target, false, zoom, false, { engine, insertAt: index });
+    })();
+    if (!next) return null;
+    await withTimeout(pageBackend.whenReady(next), ENGINE_TAB_READY_MS, `no ${engine} tab after ${ENGINE_TAB_READY_MS}ms`);
+  } catch (error) {
+    console.error(`tweb: tab move ${from} -> ${engine} failed: ${error.message}`);
+    if (next && !next.isDestroyed()) next.close();
+    flash(`${ENGINE_LABELS[engine]} failed: ${error.message} · still on ${ENGINE_LABELS[from]}`);
+    return null;
+  }
   return bindPane(() => record, () => {
-    if (tab.isDestroyed()) return null;
+    if (next.isDestroyed()) return null;
     const windows = currentWindows();
-    const index = windows.tabs.indexOf(tab);
-    if (index < 0) return null;
-    const wasActive = tab === windows.win;
-    const zoom = tabZoomFactors.get(tab) ?? defaultZoomFactor();
-    const next = createTab(target, wasActive, zoom, false, { engine, insertAt: index });
-    // Closed after the new tab is in the list and active, so the close is an ordinary one of a
-    // tab that is not the last: the pane never sees zero tabs.
-    tab.close();
-    console.error(`tweb: tab ${index + 1} ${from} -> ${engine}${site ? ` (pinned for ${site})` : ""}`);
+    // The user may have closed the old tab while the new one was being made; the page they asked
+    // for is still wanted, so it stays.
+    const index = windows.tabs.indexOf(next);
+    if (!tab.isDestroyed()) {
+      if (tab === windows.win) activateTab(index);
+      tab.close();
+    }
+    console.error(`tweb: tab ${windows.tabs.indexOf(next) + 1} ${from} -> ${engine}${site ? ` (pinned for ${site})` : ""}${rebuild ? " (rebuilt)" : ""}`);
     next.webContents.once("did-finish-load", () => {
       sendToMainTabFrame(next, "tweb-flash", `${ENGINE_LABELS[engine]}${site ? ` · pinned for ${site}` : ""}`);
     });
@@ -3293,6 +3316,44 @@ async function switchTabEngine(tab, engine, url = null, site = null) {
     return next;
   })();
 }
+
+// Long enough for a cold Chrome target (about a second when measured), short enough that a link
+// that hangs instead of failing does not keep a half-made tab around.
+const ENGINE_TAB_READY_MS = 15_000;
+
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// Every tab on an engine whose link died is rebuilt on a fresh one at the same place and url, and
+// moved to Electron when the engine cannot come back. Left alone, such a tab is a frozen frame
+// whose every capture and click fails (`CDP connection closed`), and nothing ever repairs it.
+//
+// An engine that is lost again within a minute of the last loss is not restarted for these tabs: a
+// link that keeps dying would otherwise rebuild every tab in a loop. They go to Electron at once.
+const ENGINE_LOSS_WINDOW_MS = 60_000;
+const lastEngineLoss = new Map();
+function rebuildLostTabs(kind) {
+  const now = Date.now();
+  const flapping = now - (lastEngineLoss.get(kind) ?? -Infinity) < ENGINE_LOSS_WINDOW_MS;
+  lastEngineLoss.set(kind, now);
+  forEachPane(() => {
+    for (const tab of [...currentWindows().tabs]) {
+      if (tab.isDestroyed() || tabEngine(tab) !== kind) continue;
+      const rebuilt = flapping ? Promise.resolve(null) : switchTabEngine(tab, kind, null, null, { rebuild: true });
+      void rebuilt.then((next) => {
+        if (next || tab.isDestroyed()) return;
+        console.error(`tweb: ${kind} engine ${flapping ? "lost twice within a minute" : "did not come back"}; moving the tab to electron`);
+        return switchTabEngine(tab, "electron");
+      });
+    }
+  });
+}
+pageBackend.onEngineLost(rebuildLostTabs);
 
 // Until `tab`'s page has loaded or failed, at most `timeout` ms: an agent asking for a switch
 // wants the list it gets back to show the page, not the blank document it starts from. Called
