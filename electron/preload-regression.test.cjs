@@ -1431,13 +1431,37 @@ test("the terminal cursor is hidden until a caret is parked on it", () => {
 // collapsing to a selection start — so the bar was drawn at the viewport's top-left
 // corner. Two bars appeared: one on the caret, one in the corner.
 test("the page's caret bar is measured the same way as the terminal cursor", () => {
-  const update = electron.slice(electron.indexOf("function updateVisualSelection()"),
-    electron.indexOf("// The caret starts where the selection starts"));
+  const update = electron.slice(electron.indexOf("function drawVisualSelection()"),
+    electron.indexOf("function updateVisualSelection()"));
   assert.match(update, /const range = selection\.getRangeAt\(0\);/);
   assert.match(update, /rect\.width \|\| rect\.height \? rect : firstCharacterRect\(range\)/);
   // The same helper the terminal cursor uses, so the two can never disagree about where
   // the caret is.
   assert.match(electron, /function firstCharacterRect\(range\)/);
+});
+
+// The outline and caret bar were placed only when a key was handled. The page keeps moving
+// after that — Chromium reveals the moved caret, `scroll-behavior: smooth` animates it, an
+// inner scroller moves its text without the window scrolling — so the box was left where the
+// text had been while the selection showed up elsewhere. Scrolls and resizes redraw it, and
+// the caret's block outline is a range rather than a rect so it has something to follow.
+test("the visual outline follows the page when it scrolls after a key", () => {
+  assert.match(electron, /document\.addEventListener\("scroll", drawVisualSelection, true\);/);
+  assert.match(electron, /addEventListener\("resize", drawVisualSelection\);/);
+  const update = electron.slice(electron.indexOf("function updateVisualSelection()"),
+    electron.indexOf("// The caret starts where the selection starts"));
+  assert.match(update, /drawVisualSelection\(\);/);
+  assert.match(electron, /visualState\.blockRange = range\.cloneRange\(\);/);
+  assert.doesNotMatch(electron, /blockRect/);
+});
+
+// The `v` badge colours were explained only in the `?` panel, which is closed while the
+// badges are up, so a `v` round draws its own key from the same colour table.
+test("a visual round shows what its badge colours mean", () => {
+  assert.match(electron, /if \(shown === "visual" && topFrame\) shadow\.append\(badgeLegend\(\)\);/);
+  const legend = electron.slice(electron.indexOf("const BADGE_LEGEND"), electron.indexOf("function startPicker("));
+  for (const kind of ["text", "link", "image", "editable", "scroll"]) assert.match(legend, new RegExp(`\\["${kind}", `));
+  assert.match(legend, /BADGE_COLORS\[kind\]\.fill/);
 });
 
 // Backspace navigating back is the one Chrome reflex that can destroy work: pressed inside
