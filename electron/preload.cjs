@@ -2309,6 +2309,28 @@ installPrintShim();
     return BADGE_COLORS[target.kind] || BADGE_COLORS.text;
   }
 
+  // The colours meant nothing to anyone who had not read the `?` panel, and that panel is
+  // closed while the badges are up. So a `v` round carries its own key, in the corner across
+  // from the mode label, for as long as the badges are on screen.
+  const BADGE_LEGEND = [["text", "text"], ["link", "link"], ["image", "image"],
+    ["editable", "edit"], ["scroll", "scroll area"]];
+  function badgeLegend() {
+    const legend = document.createElement("div");
+    legend.style.cssText = [
+      "position:fixed", "left:5px", "bottom:5px", "display:flex", "gap:6px", "padding:2px 6px",
+      "border:1px solid #fdd66366", "border-radius:4px", "background:#111d", "color:#e8eaed",
+      "box-shadow:0 1px 4px #0007", "font:11px/16px ui-monospace,SFMono-Regular,Menlo,monospace",
+    ].join(";");
+    for (const [kind, name] of BADGE_LEGEND) {
+      const entry = document.createElement("span");
+      const swatch = document.createElement("span");
+      swatch.style.cssText = `display:inline-block;width:9px;height:9px;margin-right:3px;border-radius:2px;background:${BADGE_COLORS[kind].fill}`;
+      entry.append(swatch, name);
+      legend.append(entry);
+    }
+    return legend;
+  }
+
   // `shown` is the mode the indicator names; a shared `v` round runs as a "hint" picker (that is
   // what routes typed labels to every frame) but should read V, not H.
   function startPicker(targets, mode, onPick, space = null, shown = mode) {
@@ -2350,6 +2372,8 @@ installPrintShim();
       shadow.append(badge);
       return { ...target, label: labels[index], badge };
     });
+    // Only the top frame draws it: in a shared round every frame has a picker of its own.
+    if (shown === "visual" && topFrame) shadow.append(badgeLegend());
     document.documentElement.append(host);
     paintNow();
     pickerState = { host, items, typed: "", mode, onPick, shared: Boolean(space), round: space?.round };
@@ -3440,7 +3464,7 @@ installPrintShim();
         n: () => { if (!lastSearch) return false; stepSearch(true); },
         N: () => { if (!lastSearch) return false; stepSearch(false); },
       }],
-      ["v · V", "visual picker — label colour is the kind: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
+      ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
@@ -4749,8 +4773,28 @@ installPrintShim();
     if (visualState) visualState.caretBar = null;
   }
 
-  function updateVisualSelection() {
-    if (!visualState?.selectionMade) return;
+  // Where a link or image pick is now. The picker measured it once, and the page can
+  // scroll under it afterwards, so carry that rect along by however far its element moved.
+  function pickedRect() {
+    const then = visualState.elementRectAtPick;
+    const now = then && visualState.element?.getBoundingClientRect?.();
+    if (!now) return visualState.rect;
+    const { left, top, width, height } = visualState.rect;
+    return { left: left + now.left - then.left, top: top + now.top - then.top, width, height };
+  }
+
+  // Places the outline and the caret bar, and nothing else. It is apart from
+  // updateVisualSelection because the page keeps moving after a key is handled: Chromium
+  // scrolls the moved caret into view, a page with `scroll-behavior: smooth` animates that
+  // over the next frames, and an inner scroller moves its text without the window
+  // scrolling at all. Drawn only on keys, the box stayed where the text used to be and
+  // the selection showed up somewhere else — so scroll and resize redraw it too.
+  function drawVisualSelection() {
+    if (!visualState) return;
+    if (!visualState.selectionMade) {
+      updateOutline(visualState.outline, pickedRect());
+      return;
+    }
     const selection = visualSelection();
     if (!selection?.rangeCount) return;
     const range = selection.getRangeAt(0);
@@ -4761,17 +4805,29 @@ installPrintShim();
       // was drawn at the viewport's top-left corner instead of on the caret. Measure the
       // character the caret sits in front of, the same way the terminal cursor does.
       updateCaretBar(rect.width || rect.height ? rect : firstCharacterRect(range) || rect);
-      setMode("visual", "caret v·h·j·k·l·w·b·e·{·}");
-    } else {
-      removeCaretBar();
-      if (visualState.pageSelection) {
-        updateOutline(visualState.outline, { left: 1, top: 1, width: innerWidth - 2, height: innerHeight - 2 });
-      } else if (rect.width || rect.height) {
-        updateOutline(visualState.outline, rect);
-      }
-      setMode("visual", `text ${selection.toString().length} y·c·o·h·j·k·l·w·b·e`);
+      if (visualState.pageSelection) return;
+      // The block keeps its outline as context for the caret. It is held as a range, not a
+      // rect, so it moves with the text it outlines.
+      const block = visualState.blockRange?.getBoundingClientRect() || pickedRect();
+      if (block.width || block.height) updateOutline(visualState.outline, block);
+      return;
     }
+    removeCaretBar();
+    if (visualState.pageSelection) {
+      updateOutline(visualState.outline, { left: 1, top: 1, width: innerWidth - 2, height: innerHeight - 2 });
+    } else if (rect.width || rect.height) {
+      updateOutline(visualState.outline, rect);
+    }
+  }
+
+  function updateVisualSelection() {
+    if (!visualState?.selectionMade) return;
+    const selection = visualSelection();
+    if (!selection?.rangeCount) return;
+    if (visualState.caret) setMode("visual", "caret v·h·j·k·l·w·b·e·{·}");
+    else setMode("visual", `text ${selection.toString().length} y·c·o·h·j·k·l·w·b·e`);
     scrollSelectionIntoView(selection);
+    drawVisualSelection();
     // Parks the terminal cursor on the caret so IME composition stays visible.
     reportCaret();
   }
@@ -4846,7 +4902,6 @@ installPrintShim();
       selection.removeAllRanges();
       selection.addRange(range);
       visualState.selectionMade = true;
-      visualState.blockRect = visualState.rect;
       visualState.caret = true;
       updateVisualSelection();
       return;
@@ -4854,11 +4909,10 @@ installPrintShim();
     if (!selection.rangeCount) return;
     const range = selection.getRangeAt(0);
     // Keep the block the hint picked outlined so the caret has visible context.
-    visualState.blockRect = range.getBoundingClientRect();
+    visualState.blockRange = range.cloneRange();
     const start = visibleSelectionStart(range);
     selection.collapse(start.node, start.offset);
     visualState.caret = true;
-    if (!visualState.pageSelection) updateOutline(visualState.outline, visualState.blockRect);
     updateVisualSelection();
   }
 
@@ -4952,7 +5006,8 @@ installPrintShim();
       selection.addRange(range);
       selectionMade = true;
     }
-    visualState = { ...item, outline, selectionMade };
+    const elementRectAtPick = item.element?.getBoundingClientRect?.() || null;
+    visualState = { ...item, outline, selectionMade, elementRectAtPick };
     if (selectionMade) updateVisualSelection();
     else if (item.kind === "image") setMode("visual", "image y·Y·u·D·o");
     else setMode("visual", `${item.kind} y·Y·u·o·p`);
@@ -6098,6 +6153,8 @@ installPrintShim();
   }
   document.addEventListener("scroll", reportCaret, true);
   addEventListener("resize", reportCaret);
+  document.addEventListener("scroll", drawVisualSelection, true);
+  addEventListener("resize", drawVisualSelection);
   // A scroll or a resize here moves every child frame's box, and a child has no way to
   // notice that from the inside — its own viewport did not change.
   document.addEventListener("scroll", broadcastFrameOffsets, true);
