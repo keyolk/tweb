@@ -1041,7 +1041,8 @@ test("composition gets a cell-aligned surface past the caret", () => {
   assert.match(electron, /lastCaretReport = "";\n\s+reportCaret\(\);/);
   // Hidden offscreen windows may stop servicing rAF after blur. Cleanup must not
   // depend on another painted frame or the surface and terminal cursor stick around.
-  assert.match(electron, /addEventListener\("focusout", \(\) => queueMicrotask\(\(\) => \{/);
+  assert.match(electron, /function handleFocusOut\(\) \{\n\s+queueMicrotask\(\(\) => \{/);
+  assert.match(electron, /addEventListener\("focusout", handleFocusOut, true\);/);
   // Same-origin frames share one terminal cursor; a late report from the frame
   // that just lost focus must not overwrite the new focused frame's report.
   assert.match(main, /handleNativeShortcut\(tab, message\.action, message\.value, event\.senderFrame\)/);
@@ -1464,6 +1465,27 @@ test("a visual round shows what its badge colours mean", () => {
   assert.match(legend, /BADGE_COLORS\[kind\]\.fill/);
 });
 
+// Electron does not start the preload in a same-origin iframe that shares its parent's
+// process, so that frame's keys reach the main frame. The main frame saw the IFRAME element
+// as active and ran `b` and `f` as commands while the user typed in the frame's input. It now
+// follows focus into a frame it can read, unless that frame's own preload marked it.
+test("focus inside a same-origin frame with no preload of its own counts as editing", () => {
+  const active = electron.slice(electron.indexOf("function activeElement()"),
+    electron.indexOf("// Whether THIS frame is the one holding the caret"));
+  assert.match(active, /preloadlessChildDocument\(active\)\?\.activeElement/);
+  const child = electron.slice(electron.indexOf("function preloadlessChildDocument("),
+    electron.indexOf("function activeElement()"));
+  assert.match(child, /doc\.documentElement\?\.dataset\.twebPreload/);
+  for (const type of ["focusin", "focusout", "keydown"]) {
+    assert.match(child, new RegExp(`doc\\.addEventListener\\("${type}", `));
+  }
+  assert.match(electron, /document\.documentElement\.dataset\.twebPreload = "1";/);
+  // Typing into that frame's field has to edit that frame's document.
+  const keyDefault = electron.slice(electron.indexOf("function performKeyDefault("),
+    electron.indexOf("function hideTabPopover()"));
+  assert.doesNotMatch(keyDefault, /\bdocument\.execCommand/);
+});
+
 // Backspace navigating back is the one Chrome reflex that can destroy work: pressed inside
 // a form field it would leave the page and take what was typed with it. The editable check
 // is what makes it safe, so the binding and its guard are pinned together — an edit that
@@ -1832,7 +1854,7 @@ test("the page keys move the caret in a field before they scroll", () => {
   const page = perform.slice(perform.indexOf('if (key === "PageUp" || key === "PageDown")'));
   // Same two calls, in the same order, as the arrow branch above it.
   assert.match(page, /if \(moveTextControlCaret\(active, key, Boolean\(payload\.shiftKey\)\)\) return;/);
-  assert.match(page, /if \(active\?\.isContentEditable && moveContentEditableCaret\(key, Boolean\(payload\.shiftKey\)\)\) return;/);
+  assert.match(page, /if \(active\?\.isContentEditable && moveContentEditableCaret\(key, Boolean\(payload\.shiftKey\), doc\)\) return;/);
   // And only then the surface, which is what it always did.
   assert.match(page, /scrollSurfacePage\(key === "PageUp" \? -0\.9 : 0\.9\)/);
 
@@ -2527,9 +2549,10 @@ test("the editing commands do not gate on OS focus, which offscreen never has", 
     electron.indexOf("function eventIsEditable"),
   );
   assert.notEqual(guard.length, 0);
-  // The main frame still yields to a focused iframe: without this both frames would act on
-  // one keystroke and the page would select twice.
-  assert.match(guard, /topFrame && isTag\(document\.activeElement, "iframe", "frame"\)/);
+  // The main frame still yields to a focused iframe that runs its own preload: without this
+  // both frames would act on one keystroke and the page would select twice. `activeElement`
+  // only stops at an IFRAME when that frame has a preload, or cannot be read.
+  assert.match(guard, /topFrame && isTag\(activeElement\(\), "iframe", "frame"\)/);
   // A subframe qualifies by holding an editable, not by owning OS focus.
   assert.match(guard, /isEditable\(activeElement\(\)\) \|\| Boolean\(topFrame\)/);
   assert.doesNotMatch(guard, /document\.hasFocus/);

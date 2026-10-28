@@ -357,10 +357,45 @@ installPrintShim();
     return false;
   }
 
+  // A same-origin iframe usually shares its parent's renderer process, and in that case
+  // Electron never starts this preload in it: the frame logs `Cannot destructure property
+  // 'preloadScripts' of 'binding.startupData' as it is null` and runs bare. It never
+  // registers, so the engine hands its keys to the main frame — which saw only the IFRAME
+  // element as active, decided nothing editable had focus, and ran `b` and `f` as commands
+  // while the user was typing in the frame's input. The main frame can read such a frame,
+  // so it follows focus into it. A frame whose own preload did start marks its document,
+  // and is left to handle its own keys.
+  const watchedChildDocuments = new WeakSet();
+  function preloadlessChildDocument(element) {
+    if (!isTag(element, "iframe", "frame")) return null;
+    let doc = null;
+    try {
+      doc = element.contentDocument;
+    } catch (_) {
+      return null;
+    }
+    if (!doc || doc.documentElement?.dataset.twebPreload) return null;
+    // Focus moving between fields inside the frame fires nothing in this document, so the
+    // mode indicator listens in the frame's document too. So does the key handler: the real
+    // Escape `dismissPageOverlay` asks for lands in the frame, and without it Escape left
+    // the caret in the field.
+    if (!watchedChildDocuments.has(doc)) {
+      watchedChildDocuments.add(doc);
+      doc.addEventListener("focusin", handleFocusIn, true);
+      doc.addEventListener("focusout", handleFocusOut, true);
+      doc.addEventListener("keydown", handleNormalKey, true);
+    }
+    return doc;
+  }
+
   function activeElement() {
     let active = document.activeElement;
-    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
-    return active;
+    for (;;) {
+      while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+      const inner = preloadlessChildDocument(active)?.activeElement;
+      if (!inner || inner === inner.ownerDocument.body) return active;
+      active = inner;
+    }
   }
 
   // Whether THIS frame is the one holding the caret, for the editing commands the engine
@@ -377,7 +412,9 @@ installPrintShim();
   // The document's own `activeElement` is the right question and needs no OS focus. A frame
   // that is not the one being typed in has `body` (or null) there, not an editable.
   function frameOwnsCaret() {
-    if (topFrame && isTag(document.activeElement, "iframe", "frame")) return false;
+    // `activeElement` already went into a frame that has no preload of its own, so an
+    // IFRAME here is one whose own preload holds the caret.
+    if (topFrame && isTag(activeElement(), "iframe", "frame")) return false;
     return isEditable(activeElement()) || Boolean(topFrame);
   }
 
@@ -524,8 +561,8 @@ installPrintShim();
     return true;
   }
 
-  function moveContentEditableCaret(key, extend) {
-    const selection = getSelection();
+  function moveContentEditableCaret(key, extend, doc = document) {
+    const selection = (doc.defaultView || window).getSelection();
     if (!selection || typeof selection.modify !== "function") return false;
     const motion = {
       ArrowLeft: ["backward", "character"], ArrowRight: ["forward", "character"],
@@ -548,15 +585,18 @@ installPrintShim();
   }
 
   function performKeyDefault(active, payload, editable) {
+    // The field can be in a same-origin frame this document types into for it, and
+    // `execCommand` acts on its own document's focus.
+    const doc = active?.ownerDocument || document;
     const key = { Up: "ArrowUp", Down: "ArrowDown", Left: "ArrowLeft", Right: "ArrowRight" }[payload.key] || payload.key;
     if (key === "Enter") {
       if (isTag(active, "textarea")) {
         if (!payload.shiftKey && singleLineTextarea(active) && requestImplicitSubmit(active)) return;
-        document.execCommand("insertText", false, "\n");
+        doc.execCommand("insertText", false, "\n");
         return;
       }
       if (active?.isContentEditable) {
-        document.execCommand("insertLineBreak", false, null);
+        doc.execCommand("insertLineBreak", false, null);
         return;
       }
       if (isTag(active, "button")
@@ -569,7 +609,7 @@ installPrintShim();
     }
     if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(key)) {
       if (moveTextControlCaret(active, key, Boolean(payload.shiftKey))) return;
-      if (active?.isContentEditable && moveContentEditableCaret(key, Boolean(payload.shiftKey))) return;
+      if (active?.isContentEditable && moveContentEditableCaret(key, Boolean(payload.shiftKey), doc)) return;
       // Through the picked surface, the way `gg`/`G` and `j`/`k` already go. These four
       // called the window directly, so picking an inner pane with `s` moved the page
       // behind it instead — the one thing picking a surface exists to prevent.
@@ -589,7 +629,7 @@ installPrintShim();
       // any other editor does with them. A single-line input has no page of its own, so
       // `textControlDestination` answers with the ends there.
       if (moveTextControlCaret(active, key, Boolean(payload.shiftKey))) return;
-      if (active?.isContentEditable && moveContentEditableCaret(key, Boolean(payload.shiftKey))) return;
+      if (active?.isContentEditable && moveContentEditableCaret(key, Boolean(payload.shiftKey), doc)) return;
       // A page, not a line. 90px is the line step `j`/`k` use, which made these two keys
       // do the same thing as the ones right next to them. Measured against the scroll
       // surface like `d`/`u`, so an inner pane pages by its own height rather than the
@@ -599,9 +639,9 @@ installPrintShim();
       return;
     }
     if (editable && typeof payload.text === "string" && payload.text) {
-      document.execCommand("insertText", false, payload.text);
+      doc.execCommand("insertText", false, payload.text);
     } else if (editable && key === "Backspace") {
-      document.execCommand("delete", false, null);
+      doc.execCommand("delete", false, null);
     }
   }
 
@@ -6135,19 +6175,26 @@ installPrintShim();
   });
 
   addEventListener("keydown", handleNormalKey, true);
-  addEventListener("focusin", (event) => {
-    if (vimiumEnabled && isEditable(event.target) && !searchState && !promptHost) setMode("insert");
+  function handleFocusIn(event) {
+    // Focus entering a preloadless frame arrives here as the IFRAME element; the field is
+    // what `activeElement` finds inside it.
+    const editable = isEditable(event.target) || isEditable(activeElement());
+    if (vimiumEnabled && editable && !searchState && !promptHost) setMode("insert");
     reportCaret();
-  }, true);
-  addEventListener("focusout", () => queueMicrotask(() => {
-    // BrowserWindow stays hidden for offscreen painting. Once its focused input
-    // blurs, Chromium may stop servicing requestAnimationFrame altogether, which
-    // used to leave both the IME surface and terminal cursor behind indefinitely.
-    // A microtask still runs after the complete focus transition (including the
-    // matching focusin), without depending on a visible frame clock.
-    if (!hasTransientMode()) normalMode();
-    reportCaret();
-  }), true);
+  }
+  // BrowserWindow stays hidden for offscreen painting. Once its focused input
+  // blurs, Chromium may stop servicing requestAnimationFrame altogether, which
+  // used to leave both the IME surface and terminal cursor behind indefinitely.
+  // A microtask still runs after the complete focus transition (including the
+  // matching focusin), without depending on a visible frame clock.
+  function handleFocusOut() {
+    queueMicrotask(() => {
+      if (!hasTransientMode()) normalMode();
+      reportCaret();
+    });
+  }
+  addEventListener("focusin", handleFocusIn, true);
+  addEventListener("focusout", handleFocusOut, true);
   for (const event of ["input", "keyup", "click", "selectionchange"]) {
     document.addEventListener(event, reportCaret, true);
   }
@@ -6206,4 +6253,6 @@ installPrintShim();
   // cannot, and main needs to know so it does not hand keys to a frame that
   // will silently drop them.
   ipcRenderer.send("tweb-preload-ready", { shortcutFrame });
+  // Tells a parent's `preloadlessChildDocument` that this frame handles its own keys.
+  if (!topFrame && document.documentElement) document.documentElement.dataset.twebPreload = "1";
 }
