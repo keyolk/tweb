@@ -3154,3 +3154,28 @@ test("gr toggles recording and leaves the other g chords alone", () => {
   assert.match(main, /case "record-toggle":\n\s+toggleRecording\(\);/);
 });
 
+
+// The page keeps moving while the user reads a label. Measured with real keys on a page that
+// shifts 130px after the badges appear: every pick clicked the card one row below the one the
+// user read, because the badge stayed put and the click went to where its target had moved.
+// And a target whose centre is covered after the round began was clicked through the cover.
+test("badges follow their targets and a pick clicks a point that reaches its target", () => {
+  const source = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const picker = source.slice(source.indexOf("function startPicker(targets, mode, onPick"),
+    source.indexOf("function updatePicker()"));
+  assert.match(picker, /pickerState\.trackFrame = requestAnimationFrame\(trackBadges\);/);
+  const track = source.slice(source.indexOf("function trackBadges()"), source.indexOf("function updatePicker()"));
+  assert.match(track, /badge\.style\.left = `\$\{Math\.max\(0, track\.badgeLeft \+ dx\)\}px`;/);
+  assert.match(track, /if \(dx === track\.dx && dy === track\.dy\) continue;/,
+    "a style write every frame keeps the page repainting and the terminal receiving frames");
+  const cancel = source.slice(source.indexOf("function cancelPicker("), source.indexOf("function showHintFeedback("));
+  assert.match(cancel, /cancelAnimationFrame\(pickerState\.trackFrame\)/);
+
+  const click = source.slice(source.indexOf("function hintClickPoint(item)"),
+    source.indexOf("// --- caret reporting ---"));
+  assert.match(click, /return topViewportPoint\(reachablePoint\(item\.element, rect\)\);/);
+  assert.match(click, /composedSelfOrAncestor\(hit, element\) \|\| element\.contains\(hit\)/,
+    "the same reachability rule the hint pass uses");
+  assert.match(click, /elementFromPoint\(x - offset\.x, y - offset\.y\)/,
+    "a same-origin frame's element is probed in its own coordinates");
+});
