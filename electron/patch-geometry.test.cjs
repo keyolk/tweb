@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
+const { patchGeometry, patchCursorMove, patchRelativeKeys, unionDamage } = require("./patch-geometry.cjs");
 
 // Everything below is in frame pixels: a `paint` dirty rect and `NativeImage.crop` share
 // the frame's own pixel space, which is device pixels once a scale factor is applied.
@@ -130,6 +130,20 @@ test("cursor motion at the pane origin still addresses the origin", () => {
   const move = patchCursorMove({ col: 0, row: 0 }, { left: 4, top: 10 }, REAL_CELLS);
   assert.equal(move.prefix, "\x1b[11;5H");
   assert.equal(move.suffix, "\x1b[11;5H");
+});
+
+// The relative path addresses the same cell the cursor walk does, without needing the origin:
+// the terminal measures from the base placement, which already sits at the pane origin.
+test("a relative patch is offset from the base placement by its own cell", () => {
+  assert.equal(patchRelativeKeys({ col: 13, row: 21 }, REAL_CELLS, 7, 1), "P=7,Q=1,H=13,V=21");
+  assert.equal(patchRelativeKeys({ col: 0, row: 0 }, REAL_CELLS, 7, 1), "P=7,Q=1,H=0,V=0");
+});
+
+test("a relative patch is clamped into the pane like the cursor walk", () => {
+  assert.equal(
+    patchRelativeKeys({ col: 999, row: -4 }, REAL_CELLS, 7, 1),
+    `P=7,Q=1,H=${REAL_CELLS.cols - 1},V=0`,
+  );
 });
 
 test("damage accumulates until the next whole frame", () => {

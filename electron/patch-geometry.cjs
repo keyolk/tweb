@@ -172,4 +172,29 @@ function patchCursorMove(place, origin, cells, esc = "\x1b") {
   };
 }
 
-module.exports = { patchGeometry, patchCursorMove, unionDamage, PATCH_AREA_LIMIT, MIN_PATCH_CELLS };
+/**
+ * The placement keys that put a patch at its cell RELATIVE to the base frame's placement — the
+ * terminal-side replacement for `patchCursorMove` (see relative-placement.cjs for which terminals
+ * get it). `H=`/`V=` are cells from the parent's top-left, which is the pane origin, so they are
+ * the patch's own `col`/`row`, clamped into the pane exactly as the cursor walk is.
+ *
+ * No cursor motion goes with it: the protocol requires that a relative placement never moves the
+ * cursor, whatever `C=` says.
+ *
+ * @param {{col: number, row: number}} place patch position, in cells from the pane origin
+ * @param {{cols: number, rows: number}} cells the pane's cell grid, for clamping
+ * @param {number} parentImage the base frame's image id
+ * @param {number} parentPlacement the base frame's placement id
+ * @returns {string} `P=,Q=,H=,V=` for the patch's header
+ */
+function patchRelativeKeys(place, cells, parentImage, parentPlacement) {
+  const maxCol = Math.max(0, (cells?.cols ?? 1) - 1);
+  const maxRow = Math.max(0, (cells?.rows ?? 1) - 1);
+  const col = Math.min(maxCol, Math.max(0, Math.trunc(place?.col ?? 0)));
+  const row = Math.min(maxRow, Math.max(0, Math.trunc(place?.row ?? 0)));
+  return `P=${parentImage},Q=${parentPlacement},H=${col},V=${row}`;
+}
+
+module.exports = {
+  patchGeometry, patchCursorMove, patchRelativeKeys, unionDamage, PATCH_AREA_LIMIT, MIN_PATCH_CELLS,
+};
