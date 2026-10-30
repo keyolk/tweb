@@ -60,11 +60,12 @@ const presenceLib = require("./agent-presence.cjs");
 const { Recording, cleanPageEvent, oneLine, timelineMarkdown } = require("./recorder.cjs");
 const { evaluate } = require("./agent-eval.cjs");
 const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
-const { patchGeometry, patchCursorMove, unionDamage } = require("./patch-geometry.cjs");
+const { patchGeometry, patchCursorMove, patchRelativeKeys, unionDamage } = require("./patch-geometry.cjs");
 const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
+const { relativePatchesDecision } = require("./relative-placement.cjs");
 const { passthroughRuns } = require("./tmux-passthrough.cjs");
 const {
   shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
@@ -873,6 +874,36 @@ function attachedTerminalName() {
 // Decided once, here, rather than in the worker: the worker has no tmux and no terminal of its
 // own, and this is the process that knows which one the frames are going to.
 const clientTermname = attachedTerminalName();
+
+// The attached client's version, which the name above does not carry: tmux keeps the terminal's
+// own XTVERSION answer ("ghostty 1.4.0") as `#{client_termtype}`. Empty outside tmux, where
+// `TERM_PROGRAM_VERSION` is the terminal's own and is read instead.
+//
+// Only asked when this process is in tmux. Outside it, `tmux display-message` still answers — for
+// whatever client of the DEFAULT server was active last, which is some other terminal entirely:
+// measured, a pane on a bare Ghostty 1.3.1 read "ghostty 1.4.0" from the user's own tmux client,
+// and was sent relative patches it silently dropped.
+function attachedTerminalType() {
+  if (!process.env.TMUX) return "";
+  try {
+    return execFileSync("tmux", ["display-message", "-p", "#{client_termtype}"], {
+      encoding: "utf8", timeout: 1000,
+    }).trim();
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: client termtype lookup failed: ${error.message}`);
+    return "";
+  }
+}
+
+// Decided once with the other terminal facts. A terminal that cannot place a relative patch drops
+// it silently under `q=2`, so this only turns on for one known to — see relative-placement.cjs.
+const relativePatches = relativePatchesDecision({
+  clientTermtype: attachedTerminalType(),
+  termProgram: process.env.TERM_PROGRAM,
+  termProgramVersion: process.env.TERM_PROGRAM_VERSION,
+  override: process.env.TWEB_RELATIVE_PATCHES,
+});
+console.error(`tweb: patch placement ${relativePatches.allowed ? "relative" : "absolute"} (${relativePatches.reason})`);
 const deflateFrames = deflateFramesAllowed({
   clientTermname,
   term: process.env.TERM,
@@ -2047,13 +2078,28 @@ function deletePatches(frames = currentFrames()) {
   for (const id of takeLivePatchIds(frames)) writeGfx(`a=d,d=I,i=${id},q=2`, "");
 }
 
-// Kitty places an image at the cursor. Patches address their cell against the pane's own
-// origin on screen — see `patchCursorMove` for why that is absolute rather than relative.
+// Two ways to put a patch on its cell.
+//
+// Relative, where the terminal supports it (relative-placement.cjs): the patch is a child of the
+// base frame's placement, offset by its own cell, and the terminal does the addressing. Nothing
+// moves the cursor and the pane's origin is not needed.
+//
+// Absolute, everywhere else — older Ghostty included: Kitty places an image at the cursor, so the
+// cursor is walked to the patch's cell against the pane's own origin on screen and back — see
+// `patchCursorMove` for why that is absolute rather than relative cursor motion.
+//
 // `format` is the transmission half of the header: `f=100` for a PNG sent inline, or the raw
 // `f=32,s=,v=,t=s` of a shared-memory patch.
 function patchPlacementSequence(id, place, frames = currentFrames(), format = "f=100") {
-  const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}`
-    + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2";
+  const z = imageZ === 0 ? "" : `,z=${imageZ}`;
+  if (relativePatches.allowed) {
+    // Same z as the base: within one z the later placement draws on top, measured on Ghostty 1.4.
+    const parent = patchRelativeKeys(place, frames.cells, frames.imageIds.base, PLACEMENT_ID);
+    const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},${parent},c=${place.cols},r=${place.rows}`
+      + `${z},q=2`;
+    return { header, prefix: "", suffix: "" };
+  }
+  const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}${z},q=2`;
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
 
@@ -2069,7 +2115,8 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   // Addressing a patch's cell needs to know where the pane sits on screen. Without tmux
   // there is no pane offset to resolve — the whole terminal is the pane — but the cursor is
   // then wherever the page last parked it, so the origin has to be known either way.
-  if (paneIsInTmux(record) && !frames.origin) return false;
+  // A relative patch is addressed by the terminal against the base placement, so it needs neither.
+  if (!relativePatches.allowed && paneIsInTmux(record) && !frames.origin) return false;
   // A patch only makes sense over an already-correct base frame. With nothing on screen
   // yet, or a base from an older generation, the whole frame is what is needed.
   if (!frames.imageTransferred || frames.pendingImageDelete) return false;
@@ -5077,6 +5124,9 @@ function agentDiagnostics() {
       // Whether whole frames go out as raw pixels or PNG. Raw skips an encode that cost the
       // main thread 28–101ms; PNG is the fallback when frames are not going through files.
       wholeFormat: rawFramesEnabled ? "raw" : "png",
+      // How patches find their cell: `relative` to the base placement (Ghostty 1.4+), or
+      // `absolute` by walking the cursor from the pane origin — and why.
+      patchPlacement: `${relativePatches.allowed ? "relative" : "absolute"} (${relativePatches.reason})`,
       // How whole frames reach the terminal, and where the setting came from.
       //
       // Reported because setting it is silently a no-op on the hosted path, which is the
