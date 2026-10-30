@@ -2229,6 +2229,7 @@ installPrintShim();
     if (reportLoss && pickerState?.mode === "hint" && pickerState.shared) {
       send("hint-lost", { round: pickerState.round });
     }
+    if (pickerState) cancelAnimationFrame(pickerState.trackFrame);
     pickerState?.host.remove();
     pickerState = null;
     stopMediaHover();
@@ -2410,14 +2411,55 @@ installPrintShim();
         "color:#161616", "box-shadow:0 1px 4px #0008", "font:700 12px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace",
       ].join(";");
       shadow.append(badge);
-      return { ...target, label: labels[index], badge };
+      const anchor = target.element.getBoundingClientRect();
+      return {
+        ...target, label: labels[index], badge,
+        track: { left: anchor.left, top: anchor.top, badgeLeft, badgeTop, dx: 0, dy: 0, hidden: false },
+      };
     });
     // Only the top frame draws it: in a shared round every frame has a picker of its own.
     if (shown === "visual" && topFrame) shadow.append(badgeLegend());
     document.documentElement.append(host);
     paintNow();
     pickerState = { host, items, typed: "", mode, onPick, shared: Boolean(space), round: space?.round };
+    pickerState.trackFrame = requestAnimationFrame(trackBadges);
     setMode(shown, `${space ? space.total : targets.length}`);
+  }
+
+  // Badges follow their targets while the round is open.
+  //
+  // A badge is drawn where its target was when the round began, but a pick clicks where the target
+  // is NOW — `hintClickPoint` measures it again. A page that moves in between left the two apart:
+  // the user read a label off one card and the click landed on whichever element had been there
+  // first. Measured on YouTube: after Back the grid settles 56px up 0.7-0.9s later, exactly when a
+  // user presses `f` on the page they came back to. Moving the badge with its element keeps what
+  // the user reads and what the pick clicks the same thing.
+  //
+  // One getBoundingClientRect per target per frame, and only while a round is open.
+  function trackBadges() {
+    const state = pickerState;
+    if (!state) return;
+    for (const item of state.items) {
+      const { track, badge } = item;
+      const now = item.element.isConnected ? item.element.getBoundingClientRect() : null;
+      // Gone, or collapsed to nothing: there is no longer anything under the label to pick.
+      const visible = Boolean(now && (now.width || now.height));
+      // Written only on a change: a style write every frame would keep the page repainting, and
+      // every repaint is a frame sent to the terminal.
+      if (visible === track.hidden) {
+        track.hidden = !visible;
+        badge.style.visibility = visible ? "" : "hidden";
+      }
+      if (!visible) continue;
+      const dx = Math.round(now.left - track.left);
+      const dy = Math.round(now.top - track.top);
+      if (dx === track.dx && dy === track.dy) continue;
+      track.dx = dx;
+      track.dy = dy;
+      badge.style.left = `${Math.max(0, track.badgeLeft + dx)}px`;
+      badge.style.top = `${Math.max(0, track.badgeTop + dy)}px`;
+    }
+    state.trackFrame = requestAnimationFrame(trackBadges);
   }
 
   function updatePicker() {
@@ -2523,10 +2565,31 @@ installPrintShim();
   function hintClickPoint(item) {
     if (item.mediaControl && item.nativePoint) return topViewportPoint(item.nativePoint);
     const rect = visibleRect(item.element) || item.rect;
-    return topViewportPoint({
-      x: rect.left + rect.width / 2,
-      y: rect.top + rect.height / 2,
-    });
+    return topViewportPoint(reachablePoint(item.element, rect));
+  }
+
+  // A point inside `rect` where a click reaches `element`: its centre, unless something else now
+  // sits on top of the centre.
+  //
+  // `reachableAt` drops a covered target when the round is collected, but the page keeps going
+  // while the user types the label. A hover preview that grows over its neighbours, a toast or a
+  // sticky bar sliding in covers the centre after the badge was drawn, and the native click went
+  // to whatever was on top. A target that is still reachable somewhere inside its box is clicked
+  // there instead; one that is covered everywhere keeps the centre, which is what it did before.
+  const REACH_RATIOS = [[.5, .5], [.25, .5], [.75, .5], [.5, .25], [.5, .75],
+    [.15, .15], [.85, .15], [.15, .85], [.85, .85]];
+  function reachablePoint(element, rect) {
+    const centre = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    const document_ = element.ownerDocument;
+    if (typeof document_?.elementFromPoint !== "function") return centre;
+    const offset = frameOffset(element);
+    for (const [rx, ry] of REACH_RATIOS) {
+      const x = Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width * rx));
+      const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height * ry));
+      const hit = document_.elementFromPoint(x - offset.x, y - offset.y);
+      if (hit && (composedSelfOrAncestor(hit, element) || element.contains(hit))) return { x, y };
+    }
+    return centre;
   }
 
   // --- caret reporting ---
