@@ -114,6 +114,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/float-display.cjs
 	node --check electron/command-line.cjs
 	node --check electron/terminal-focus.cjs
+	node --check electron/relative-placement.cjs
 	node --check electron/float-preload.cjs
 	node --check electron/hangul-keys.cjs
 	node --check electron/input-source.cjs
