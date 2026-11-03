@@ -2310,8 +2310,16 @@ function flushPendingFrame() {
 function queueFrame(tab, image, immediate = false, dirty = null) {
   const generation = currentFrames().generation;
   const viewport = currentFrames().viewport;
-  const size = image?.getSize();
+  let size = image?.getSize();
   const expected = viewport && renderedFrameSize(viewport);
+  // A popup cannot be made the pane's size (see `popupTabs`), so its frame is scaled to it. Not
+  // as a patch: the damage rect is in the popup's pixels.
+  if (expected && size && popupTabs.has(tab) && !image.isEmpty()
+    && (size.width !== expected.width || size.height !== expected.height)) {
+    image = image.resize({ width: expected.width, height: expected.height, quality: "good" });
+    size = image.getSize();
+    dirty = null;
+  }
   if (!expected || !size || size.width !== expected.width || size.height !== expected.height) {
     if (debugLogging) {
       console.error(`tweb: frame dropped got=${size?.width}x${size?.height}`
@@ -2452,6 +2460,52 @@ function renderedFrameSize(vp) {
     width: Math.max(1, Math.round(logical.width * scaleFactor)),
     height: Math.max(1, Math.round(logical.height * scaleFactor)),
   };
+}
+
+// Tabs Electron made for an opener (`did-create-window`), and the size each one really has.
+//
+// WHY. Under Electron 43 an offscreen popup never changes size after it is created — measured
+// in plain Electron: `setContentSize`, `setSize`, `setBounds`, `setContentBounds`, a page-side
+// `resizeTo` and `createWindow` all leave the renderer at its first size, while the same calls
+// resize an ordinary offscreen window. And a popup opened BY a popup paints at deviceScaleFactor
+// 1 whatever it was created with: popups take their opener's construction-time factor, and a
+// popup has none recorded. Measured with the root at 3: depth 1 painted at 3, depth 2 and 3 at 1.
+// So a popup's frames stop matching the pane after any pane resize, and a second-level popup's
+// never match at all — `queueFrame` dropped every one and the tab was blank. Multicampus opens
+// its course player that way (home -> "Learning Home" -> "Learning Page").
+//
+// Since the popup cannot be resized, its frames are scaled to the pane instead, and input is
+// mapped onto the size the popup really has.
+const popupTabs = new WeakSet();
+const popupWindowSizes = new WeakMap();
+
+/// The window size, in DIPs, that input points and per-cell distances are measured against for
+/// `tab`: the pane's logical size, or for a popup the size it was stuck at.
+function tabLogicalSize(tab, vp) {
+  return (tab && popupWindowSizes.get(tab)) || logicalContentSize(vp);
+}
+
+/// Records the size a popup's renderer really has. `outerWidth` is the frameless window's size in
+/// DIPs, which is what `sendInputEvent` takes; `getContentSize()` reports what was last asked for.
+async function measurePopupSize(tab) {
+  if (!tab || tab.isDestroyed() || !popupTabs.has(tab)) return;
+  let size;
+  try {
+    size = await tab.webContents.executeJavaScript("[outerWidth, outerHeight]", true);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: popup size probe failed: ${error.message}`);
+    return;
+  }
+  const [width, height] = (size || []).map(Number);
+  if (tab.isDestroyed() || !(width > 0) || !(height > 0)) return;
+  const known = popupWindowSizes.get(tab);
+  if (known && known.width === width && known.height === height) return;
+  popupWindowSizes.set(tab, { width, height });
+  if (debugLogging) console.error(`tweb: popup window is ${width}x${height}`);
+  if (tab === currentWindows().win) withPaneScope(tabPanes.get(tab), () => {
+    broadcastCellMetrics(tab);
+    reparkTerminalCaret();
+  });
 }
 
 // `engine` is the page engine the tab runs on (cdp/backend.cjs); the pane's own when not given.
@@ -5078,6 +5132,8 @@ function agentDiagnostics() {
       contentSize: size ? { width: size[0], height: size[1] } : null,
       zoomFactor: tab ? tab.webContents.getZoomFactor() : null,
       defaultZoomFactor: defaultZoomFactor(),
+      // A popup's real size, which no resize changes; null for an ordinary tab.
+      popupSize: tab ? popupWindowSizes.get(tab) || null : null,
       visible: tab ? tab.isVisible() : null,
     },
     // What config.toml resolved to and where each value came from (env / file / default).
@@ -6268,7 +6324,7 @@ function unparkTerminalCaret() {
 
 function cellMetrics() {
   if (!currentFrames().viewport || !currentWindows().win || currentWindows().win.isDestroyed()) return null;
-  const logical = logicalContentSize(currentFrames().viewport);
+  const logical = tabLogicalSize(currentWindows().win, currentFrames().viewport);
   const zoom = currentWindows().win.webContents.getZoomFactor() || 1;
   return {
     width: logical.width / Math.max(1, currentFrames().cells.cols) / zoom,
@@ -6298,7 +6354,7 @@ function moveTerminalCaret(point) {
     unparkTerminalCaret();
     return;
   }
-  const logical = logicalContentSize(vp);
+  const logical = tabLogicalSize(currentWindows().win, vp);
   const zoom = currentWindows().win.webContents.getZoomFactor() || 1;
   const cellWidth = logical.width / Math.max(1, currentFrames().cells.cols);
   const cellHeight = logical.height / Math.max(1, currentFrames().cells.rows);
@@ -7540,6 +7596,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     } catch (error) {
       if (debugLogging) console.error(`tweb: popup sizing failed: ${error.message}`);
     }
+    popupTabs.add(child);
     adoptTab(child, details.url || want?.url || "about:blank", want ? want.activate : true);
   });
 
@@ -7593,6 +7650,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     // first click arrives. Waiting for the click meant that click went out before any session
     // existed and reached nobody — measured: the second click landed, the first never did.
     if (ensureDebugger(tab)) watchOopifSessions(tab);
+    void measurePopupSize(tab);
   });
   // Gone on the way out, whether the load worked or not. `did-stop-loading` covers the
   // ordinary end, a stop, and a failure alike — a bar left behind by an error page would be
@@ -8013,7 +8071,7 @@ function withButtonDown(modifiers, button) {
 
 function logicalMousePoint(rawX, rawY) {
   const vp = currentFrames().viewport || queryViewportSize();
-  const logical = logicalContentSize(vp);
+  const logical = tabLogicalSize(currentWindows().win, vp);
   if (paneIsInTmux()) {
     // tmux delivers pane-relative cell coordinates even when 1016 was requested.
     return {
@@ -8022,9 +8080,11 @@ function logicalMousePoint(rawX, rawY) {
     };
   }
   const scale = screen.getPrimaryDisplay().scaleFactor || 1;
+  // A popup's frame is stretched over the pane, so a pane point is that fraction of the popup.
+  const pane = logicalContentSize(vp);
   return {
-    x: Math.max(0, Math.floor((rawX - 1) / scale)),
-    y: Math.max(0, Math.floor((rawY - 1) / scale)),
+    x: Math.max(0, Math.floor(((rawX - 1) / scale) * (logical.width / pane.width))),
+    y: Math.max(0, Math.floor(((rawY - 1) / scale) * (logical.height / pane.height))),
   };
 }
 
@@ -8119,7 +8179,7 @@ function dispatchMouse(cb, rawX, rawY, release) {
   const state = inputState();
   if (type === "mouseMove" && button && paneIsInTmux() && !native) {
     const vp = currentFrames().viewport || queryViewportSize();
-    const logical = logicalContentSize(vp);
+    const logical = tabLogicalSize(currentWindows().win, vp);
     const cell = { x: logical.width / vp.cols, y: logical.height / vp.rows };
     for (const point of interpolatePoints(state.lastDragPoint, { x, y }, cell)) {
       sendPointerEvent(currentWindows().win, {
@@ -8227,7 +8287,7 @@ function nativeGeometry() {
 // A fraction of the pane as the window point `sendInputEvent` takes. Kept fractional: the CDP route
 // carries sub-pixel positions, and rounding here would put back a grid, only a finer one.
 function nativePanePoint(hit) {
-  const logical = logicalContentSize(currentFrames().viewport || queryViewportSize());
+  const logical = tabLogicalSize(currentWindows().win, currentFrames().viewport || queryViewportSize());
   return {
     x: Math.min(logical.width - 1, Math.max(0, hit.fx * logical.width)),
     y: Math.min(logical.height - 1, Math.max(0, hit.fy * logical.height)),
@@ -8317,7 +8377,7 @@ nativeInput.on("scroll", (event) => {
     if (!precise) return;
     // Points to the window's DIPs. The pane's page is laid out at its logical size, which is the
     // pane's points only when the render scale matches the display's.
-    const logical = logicalContentSize(currentFrames().viewport || queryViewportSize());
+    const logical = tabLogicalSize(currentWindows().win, currentFrames().viewport || queryViewportSize());
     const perPoint = logical.width / (geometry.cols * geometry.cellW);
     // `scrollingDeltaY` already follows the natural-scrolling setting and is positive when the
     // content moves down — `sendInputEvent`'s sign, as the terminal's notches are.
