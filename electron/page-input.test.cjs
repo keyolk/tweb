@@ -268,6 +268,13 @@ test("the window Electron made for an opener is taken into the tab list", () => 
   assert.match(adopt, /child\.setContentSize\(logical\.width, logical\.height\)/);
 });
 
+test("a page cannot resize or move its own window", () => {
+  // A popup's `resizeTo` left the offscreen view painting at the page's size while the window
+  // still reported the pane's, so every frame was dropped and the pane stayed blank.
+  const refuse = body('onContents("content-bounds-updated", (event, bounds) => {', 'onContents("did-create-window"');
+  assert.match(refuse, /event\.preventDefault\(\);/);
+});
+
 test("middle-click still does not steal focus, while window.open does", () => {
   const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-create-window"');
   assert.match(handler, /const activate = details\.disposition !== "background-tab";/);
