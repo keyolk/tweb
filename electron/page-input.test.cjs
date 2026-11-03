@@ -275,6 +275,30 @@ test("a page cannot resize or move its own window", () => {
   assert.match(refuse, /event\.preventDefault\(\);/);
 });
 
+// Electron 43 never resizes an offscreen popup after creation, and a popup opened by a popup
+// paints at deviceScaleFactor 1, so a popup's frames are scaled to the pane rather than dropped.
+test("a popup's frames are scaled to the pane instead of dropped", () => {
+  const adopt = body('onContents("did-create-window", (child, details) => {', 'onContents("did-start-navigation"');
+  assert.match(adopt, /popupTabs\.add\(child\);\s*adoptTab\(child/);
+  const queue = body("function queueFrame(tab, image", "function repaintActiveTab");
+  const scaled = queue.indexOf("image.resize(");
+  const dropped = queue.indexOf("tweb: frame dropped");
+  assert.ok(scaled !== -1 && scaled < dropped, "a popup's frame is scaled before the size check drops it");
+  assert.match(queue, /popupTabs\.has\(tab\)/);
+  // The damage rect is in the popup's pixels, so a scaled frame goes out whole.
+  assert.match(queue, /dirty = null;/);
+});
+
+test("pointer input lands on the popup's real size, not the pane's", () => {
+  for (const fn of ["function logicalMousePoint(", "function nativePanePoint(", "function cellMetrics("]) {
+    const source = body(fn, "\n}\n");
+    assert.match(source, /tabLogicalSize\(currentWindows\(\)\.win,/, `${fn} maps onto the tab's own size`);
+  }
+  assert.match(body("function tabLogicalSize(", "\n}\n"), /popupWindowSizes\.get\(tab\)/);
+  // Measured from the page: `getContentSize()` reports what was asked for, not what the popup is.
+  assert.match(body("async function measurePopupSize(", "\n}\n"), /\[outerWidth, outerHeight\]/);
+});
+
 test("middle-click still does not steal focus, while window.open does", () => {
   const handler = body("setWindowOpenHandler((details) => {", 'onContents("did-create-window"');
   assert.match(handler, /const activate = details\.disposition !== "background-tab";/);
