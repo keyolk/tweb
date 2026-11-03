@@ -7514,6 +7514,16 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     return { action: "deny" };
   });
 
+  // A page never sizes its own window here: the pane does. `window.resizeTo`/`moveTo` on an
+  // opened popup otherwise reaches the offscreen view and leaves it painting at the page's
+  // size while `getContentSize()` still reports the pane's, so the reconciler sees nothing to
+  // fix and `queueFrame` drops every frame as the wrong size — the pane stays blank. Measured on
+  // a Multicampus course player, whose popup calls `resizeTo` to its own 1142x840 on load.
+  onContents("content-bounds-updated", (event, bounds) => {
+    event.preventDefault();
+    if (debugLogging) console.error(`tweb: page resize refused ${bounds.width}x${bounds.height}`);
+  });
+
   // The window Electron just made for an opener, taken into the tab list.
   //
   // Nothing else would ever show it: it is created hidden and offscreen like every tab here,
