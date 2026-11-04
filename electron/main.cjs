@@ -2684,6 +2684,7 @@ function writeWindowSession() {
       url: tabSessionUrls.get(tab) || tab.webContents.getURL(),
       zoom: tabZoomFactors.get(tab) ?? defaultZoomFactor(),
       engine: tabEngine(tab),
+      popup: popupTabs.has(tab),
     }];
   }), currentWindows().activeTabIndex, defaultZoomFactor());
   // A bare startup used to replace the last useful session with about:blank
@@ -3686,6 +3687,13 @@ function scheduleLoadingProgress(tab, progress) {
     sendToMainTabFrame(tab, "tweb-loading", { progress });
   }, LOADING_INDICATOR_DELAY_MS);
   loadingTimersByTab.set(tab, timer);
+}
+
+function mainFrameTakesShortcuts(tab) {
+  if (!tab || tab.isDestroyed()) return false;
+  const frame = tab.webContents.mainFrame;
+  return Boolean(frame && !frame.isDestroyed() && !frame.detached
+    && readyFrameKeys(tab).has(frameKey(frame)));
 }
 
 function sendToFocusedTabFrame(tab, channel, ...args) {
@@ -8990,6 +8998,17 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
   // isTrusted.
   if (!inputState().vimium || inputState().insertMode || modifiers.includes("meta")) {
     dispatchNativeKey(currentWindows().win.webContents, key, text, modifiers, eventKind);
+    return;
+  }
+  // J/K are bound in the preload, which sends `previous-tab`/`next-tab` back here. A tab whose
+  // page has no preload — a restored popup that never loaded, a page that crashed it — drops every
+  // key, and then the one way off that tab was lost with it: the pane looked stuck. The engine
+  // switches tabs itself then. With no preload there is no hint round or visual mode that could
+  // have claimed the key for something else.
+  if (pressed && (key === "J" || key === "K") && !control && !modifiers.includes("alt")
+    && !mainFrameTakesShortcuts(currentWindows().win)) {
+    if (debugLogging) console.error(`tweb: ${key} switched tabs without a preload`);
+    cycleTab(key === "J" ? -1 : 1);
     return;
   }
   sendToFocusedTabFrame(currentWindows().win, "tweb-terminal-key", {
