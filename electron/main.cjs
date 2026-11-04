@@ -2357,6 +2357,14 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
 
 function repaintActiveTab() {
   if (!currentPane().visible || !currentWindows().win || currentWindows().win.isDestroyed()) return;
+  // A floating page is in its OS window, and the pane shows the float badge instead. Re-placing
+  // the cached frame here, on a reveal, covered the badge with the page as it was before it
+  // floated; the badge is redrawn instead, so switching back to the window still says where the
+  // page went.
+  if (inputState().floating) {
+    writeFloatStatus();
+    return;
+  }
   const frame = tabFrames.get(currentWindows().win);
   if (frame && frame.generation === currentFrames().generation && !frame.image.isEmpty()) {
     queueFrame(currentWindows().win, frame.image, true);
@@ -4219,8 +4227,8 @@ function writeFloatStatus() {
   // The Kitty placement goes first: it is the last frame the pane was showing and it sits on
   // top of the terminal text, so the status line would be drawn behind it.
   deletePlacement();
-  const label = fullscreenFloat ? "FULLSCREEN  page on another monitor  press w to pin"
-    : "FLOATING  page in an OS window  press w to pin";
+  const label = fullscreenFloat ? "FULLSCREEN\npage on another monitor, press w to pin"
+    : "FLOATING\npage in an OS window, press w to pin";
   const cells = currentFrames().cells;
   writerFor(currentPane()).write(centeredStatusSequence(label, cells.cols, cells.rows));
 }

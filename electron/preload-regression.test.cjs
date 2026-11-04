@@ -3217,3 +3217,15 @@ test("pinning a floating page re-places the frame instead of waiting for a paint
   assert.ok(pin.indexOf("repaintActiveTab();") > clear);
   assert.match(pin, /tab\.webContents\.invalidate\(\)/);
 });
+
+// A reveal (switching back to the window) re-placed the cached frame over the float badge, so
+// the pane showed the page as it was before it floated, with the badge barely legible on top.
+test("a reveal while floating redraws the badge, not the old frame", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const repaint = main.slice(main.indexOf("function repaintActiveTab()"),
+    main.indexOf("// --- viewport size query ---"));
+  const guard = repaint.indexOf("if (inputState().floating) {");
+  assert.ok(guard > 0);
+  assert.ok(guard < repaint.indexOf("queueFrame("), "the guard must come before the frame is re-sent");
+  assert.match(repaint.slice(guard, guard + 120), /writeFloatStatus\(\);\s+return;/);
+});
