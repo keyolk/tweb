@@ -287,13 +287,16 @@ test("Home, End and the arrows scroll the picked surface", () => {
   for (const source of [electron]) {
     const start = source.indexOf('if (!editable && key === "Home")');
     assert.ok(start > 0, "the non-editable scroll branch is missing");
-    const block = source.slice(start, start + 400)
+    const block = source.slice(start, start + 800)
       .split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
 
     assert.match(block, /key === "Home"\) scrollSurfaceTo\(0\)/);
     assert.match(block, /key === "End"\) scrollSurfaceTo\(scrollSurfaceEnd\(\)\)/);
     assert.match(block, /key === "ArrowUp"\) scrollSurfaceBy\(0, -40\)/);
     assert.match(block, /key === "ArrowDown"\) scrollSurfaceBy\(0, 40\)/);
+    // Left/Right too: a page wider than the pane pans with h/l, and the arrows did nothing.
+    assert.match(block, /key === "ArrowLeft"\) scrollSurfaceBy\(-40, 0\)/);
+    assert.match(block, /key === "ArrowRight"\) scrollSurfaceBy\(40, 0\)/);
 
     // The window calls are what picking a surface exists to avoid.
     assert.doesNotMatch(block, /[^e]scrollTo\(\{/);
