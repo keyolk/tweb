@@ -4267,6 +4267,17 @@ function toggleFloat(fullscreen = false) {
     // Clear the status text so the returning page is not obscured by it.
     // ESC[2J clears the screen; the next frame replaces the placement.
     writerFor(currentPane()).write(`\x1b[2J`);
+    // Floating deleted the placement (`writeFloatStatus`), and nothing put it back: the next
+    // frame was trusted to, but a still page paints no next frame, and a small one goes out as a
+    // patch placed over a base that is no longer there. The pane stayed black until a key or a
+    // click made the page paint. The terminal still holds the image, so re-placing it covers the
+    // pane at once, and a whole frame from the cache (or a forced paint) brings it up to date.
+    replacePlacement();
+    repaintActiveTab();
+    // The cached frame predates the float; whatever the page did in the OS window since then
+    // arrives with a fresh paint.
+    const tab = currentWindows().win;
+    if (tab && !tab.isDestroyed()) tab.webContents.invalidate();
     restoreFocusFromFloat({ skipHide: wasFullscreen });
   }
 }
