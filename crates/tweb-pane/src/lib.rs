@@ -17,6 +17,7 @@ mod engine_app;
 pub mod graphics;
 pub mod hosted;
 pub mod image_id;
+pub mod image_sweep;
 pub mod input;
 pub mod pane_writer;
 pub mod remote_terminal;
@@ -536,6 +537,10 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         &pane,
         std::process::id(),
     );
+    // Recorded so a pane killed before its teardown runs still has its image deleted, by the
+    // tmux hooks installed beside it. See `image_sweep`.
+    let _image_registration = image_sweep::Registration::record(&pane, image_id);
+    image_sweep::install_hooks();
 
     // The daemon path, off unless asked for. Every uncertainty inside this call falls through to
     // the spawn below, which is the path that ships — so a pane that opted in and found no daemon,
