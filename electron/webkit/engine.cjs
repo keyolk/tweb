@@ -345,9 +345,13 @@ class WebKitEngine extends EventEmitter {
 
   // There is no DevTools page to serve; Safari's Web Inspector attaches to every pane instead.
   async devtoolsFor(contents) {
-    if (contents instanceof WebKitWebContents) contents.openDevTools();
+    if (!(contents instanceof WebKitWebContents)) return { ok: false, message: "not a WebKit page" };
+    contents.openDevTools();
+    // Answered as the success it is: the inspector is open. `ok: false` made the CLI exit with an
+    // error while Safari's window was already on screen.
     return {
-      ok: false,
+      ok: true,
+      opened: "safari",
       message: "WebKit pages are inspected with Safari's Web Inspector, which was opened for this page"
         + " (also reachable from Safari > Develop > this Mac > tweb-webkit)",
     };

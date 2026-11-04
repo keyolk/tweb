@@ -135,6 +135,9 @@ installPrintShim();
     { name: "engine-electron", label: "Switch tab engine: Electron", action: () => send("switch-engine", "electron") },
     { name: "engine-chrome", label: "Switch tab engine: Chrome", action: () => send("switch-engine", "chrome") },
     { name: "engine-webkit", label: "Switch tab engine: WebKit", action: () => send("switch-engine", "webkit") },
+    // Chrome's DevTools in a pane beside this one, or Safari's Web Inspector for a WebKit tab. It
+    // was CLI-only (`tweb devtools`), so the page in front of the user had no way to reach it.
+    { name: "devtools", label: "Open DevTools", action: () => send("open-devtools") },
     { name: "fullscreen", label: "Fullscreen", action: () => send("toggle-fullscreen") },
     // Starts a recording, or stops one and pastes its timeline into the agent pane (`gr`).
     { name: "record", label: "Record for agent (start / stop)", action: () => send("record-toggle") },
