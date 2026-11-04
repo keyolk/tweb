@@ -3214,6 +3214,9 @@ test("pinning a floating page re-places the frame instead of waiting for a paint
   assert.ok(clear > 0, "the pin path must clear the status text");
   // After the clear, or the clear would wipe what was just placed.
   assert.ok(pin.indexOf("replacePlacement();") > clear);
+  // Gated on the pane being on screen: with `allow-passthrough=all` an ungated re-place drew the
+  // page over whatever window the user was viewing, and nothing there ever deleted it.
+  assert.match(pin, /if \(currentPane\(\)\.visible\) replacePlacement\(\);/);
   assert.ok(pin.indexOf("repaintActiveTab();") > clear);
   assert.match(pin, /tab\.webContents\.invalidate\(\)/);
 });
