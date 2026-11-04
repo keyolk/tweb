@@ -464,6 +464,51 @@ fn platform_tag() -> Result<String> {
     Ok(format!("{platform}-{arch}"))
 }
 
+/// Marks the Electron.app around `executable` as an agent app (`LSUIElement`), so macOS never
+/// gives an engine a Dock tile.
+///
+/// main.cjs already sets the activation policy to "prohibited" and hides the dock icon, but that
+/// runs after launch: Launch Services has registered the process as a regular app by then, and the
+/// Dock adds a tile ("Electron", the bundle's name) for it. Measured on macOS 27: six engines
+/// started together showed six extra tiles until their policy changed, and engines started by a
+/// `tweb daemon restart` kept theirs — seven "Electron" tiles for seven panes. With the key in
+/// Info.plist the Dock never adds one, even for that first moment.
+///
+/// Editing Info.plist leaves the signature as it was: Electron's own build is ad-hoc and
+/// linker-signed with no sealed resources, and `codesign --verify` reports the same before and
+/// after. Best effort: a bundle we cannot write (a read-only install) only keeps its tiles.
+pub fn keep_out_of_dock(executable: &Path) {
+    let Some(contents) = executable.parent().and_then(Path::parent) else {
+        return;
+    };
+    if contents.file_name().and_then(|name| name.to_str()) != Some("Contents") {
+        return;
+    }
+    let plist = contents.join("Info.plist");
+    let Ok(text) = std::fs::read_to_string(&plist) else {
+        return;
+    };
+    if let Some(updated) = with_agent_key(&text) {
+        if let Err(err) = std::fs::write(&plist, updated) {
+            tracing::debug!(path = %plist.display(), %err, "cannot mark Electron as an agent app");
+        }
+    }
+}
+
+/// `text` with `LSUIElement` set, or `None` when it already has the key or is not the XML plist
+/// shape Electron ships.
+fn with_agent_key(text: &str) -> Option<String> {
+    if text.contains("<key>LSUIElement</key>") {
+        return None;
+    }
+    let end = text.rfind("</dict>")?;
+    Some(format!(
+        "{}\t<key>LSUIElement</key>\n\t<true/>\n{}",
+        &text[..end],
+        &text[end..]
+    ))
+}
+
 /// The directory a one-shot install puts the runtime in.
 pub fn runtime_dir() -> PathBuf {
     let version = electron_version().unwrap_or_else(|_| "unknown".to_string());
@@ -676,6 +721,16 @@ mod tests {
 
     /// The runtime download is named after this, so a range prefix left in place
     /// would ask GitHub for a release that does not exist.
+    #[test]
+    fn electron_is_marked_an_agent_app_once() {
+        let shipped = "<plist version=\"1.0\">\n<dict>\n\t<key>CFBundleName</key>\n\t<string>Electron</string>\n</dict>\n</plist>\n";
+        let marked = super::with_agent_key(shipped).unwrap();
+        assert!(marked.ends_with("\t<key>LSUIElement</key>\n\t<true/>\n</dict>\n</plist>\n"));
+        assert!(marked.contains("<string>Electron</string>"));
+        assert_eq!(super::with_agent_key(&marked), None);
+        assert_eq!(super::with_agent_key("not a plist"), None);
+    }
+
     #[test]
     fn the_electron_version_drops_its_range_prefix() {
         let version = super::electron_version().expect("version");

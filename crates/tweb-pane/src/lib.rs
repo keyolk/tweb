@@ -1399,8 +1399,12 @@ pub fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     // Resolve workspace-relative selections before changing into the Electron app
     // directory, or `electron/node_modules/...` becomes `electron/electron/...`.
     let directory = std::env::current_dir().context("cannot resolve the current directory")?;
+    let executable = electron_executable()?;
+    // Here, not at install: runtimes unpacked before this, and workspace node_modules, need it too.
+    #[cfg(target_os = "macos")]
+    engine_app::keep_out_of_dock(&executable);
     Ok(resolve_electron_paths(
-        electron_executable()?,
+        executable,
         electron_app_directory()?,
         &directory,
     ))
