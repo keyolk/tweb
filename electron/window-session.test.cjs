@@ -303,6 +303,20 @@ test("blank-only state does not replace the last useful session", () => {
   ], 0, 0.8), null);
 });
 
+// A popup's page came from its opener (a POSTed SSO form on Multicampus), so its URL reopens
+// nothing: restored, it stayed blank and, as the active tab, swallowed the keys.
+test("save leaves popups out and moves the active index off them", () => {
+  assert.deepEqual(windowSessionForSave([
+    { url: "https://lc.multicampus.com/go/#/me/lms", zoom: 0.8 },
+    { url: "https://learning.multicampus.com/lrn/common/lrnSsoLogin", zoom: 0.8, popup: true },
+    { url: "https://learning.multicampus.com/lrnvw/main/common/lrnvwMain_L", zoom: 0.8, popup: true },
+  ], 1, 0.8), {
+    version: 1,
+    activeIndex: 0,
+    tabs: [{ url: "https://lc.multicampus.com/go/#/me/lms", zoom: 0.8 }],
+  });
+});
+
 test("save omits internal tabs and remaps the active index", () => {
   assert.deepEqual(windowSessionForSave([
     { url: "about:blank", zoom: 0.8 },

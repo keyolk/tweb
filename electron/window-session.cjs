@@ -283,10 +283,13 @@ function normalizeWindowSession(parsed, defaultZoomFactor) {
   };
 }
 
+// A popup (`window.open`) is left out. Its page was set up by its opener — Multicampus hands the
+// course window a POSTed SSO form — so its URL alone does not reopen it: restored, it stayed blank
+// or stuck on the "Opening …" placeholder, and as the active tab it took the keys with it.
 function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
   if (!Array.isArray(tabs) || tabs.length === 0) return null;
   const entries = tabs.slice(0, 50).flatMap((entry, sourceIndex) => {
-    if (!entry || !isRestorableUrl(entry.url)) return [];
+    if (!entry || entry.popup || !isRestorableUrl(entry.url)) return [];
     return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex, ...sessionEngine(entry.engine) }];
   });
   if (entries.length === 0) return null;

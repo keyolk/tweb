@@ -1732,6 +1732,25 @@ test("undeliverable shortcuts repair themselves", () => {
   assert.match(answer.slice(0, 200), /ipcRenderer\.send\("tweb-preload-ready", \{ shortcutFrame \}\)/);
 });
 
+// J/K live in the preload. A restored popup that never loaded had none, so it dropped every key,
+// J/K included, and the pane could not leave that tab: Multicampus came back as one blank tab.
+test("J/K switch tabs even on a tab whose page has no preload", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const dispatch = main.slice(main.indexOf("function dispatchNamedKey("),
+    main.indexOf("function dispatchKey(codepoint"));
+  const fallback = dispatch.indexOf("!mainFrameTakesShortcuts(currentWindows().win)");
+  assert.ok(fallback > 0, "dispatchNamedKey must check the preload before handing J/K to it");
+  assert.match(dispatch.slice(fallback, fallback + 300), /cycleTab\(key === "J" \? -1 : 1\);\s+return;/);
+  // After the insert-mode passthrough: a J typed into a text field is still a J.
+  assert.ok(dispatch.indexOf("dispatchNativeKey(currentWindows().win.webContents") < fallback);
+  // And before the send that would drop it.
+  assert.ok(fallback < dispatch.indexOf('sendToFocusedTabFrame(currentWindows().win, "tweb-terminal-key"'));
+  // The same readiness the send itself checks, so a working page still gets J/K from its preload.
+  const ready = main.slice(main.indexOf("function mainFrameTakesShortcuts(tab)"),
+    main.indexOf("function sendToFocusedTabFrame(tab, channel"));
+  assert.match(ready, /readyFrameKeys\(tab\)\.has\(frameKey\(frame\)\)/);
+});
+
 // Both sets are keyed by frame and go stale together, but only one was pruned on navigation.
 // A leftover shortcut key makes the sender believe a dead frame can take shortcuts, so it
 // skips the fall-back to the main frame and drops the key instead.
