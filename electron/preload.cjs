@@ -621,6 +621,10 @@ installPrintShim();
       else if (!editable && key === "End") scrollSurfaceTo(scrollSurfaceEnd());
       else if (!editable && key === "ArrowUp") scrollSurfaceBy(0, -40);
       else if (!editable && key === "ArrowDown") scrollSurfaceBy(0, 40);
+      // Left/Right were missing, so a page wider than the pane (Multicampus pins its login to a
+      // 1300px fixed layout) could be panned with h/l but not with the arrows.
+      else if (!editable && key === "ArrowLeft") scrollSurfaceBy(-40, 0);
+      else if (!editable && key === "ArrowRight") scrollSurfaceBy(40, 0);
       return;
     }
     if (key === "PageUp" || key === "PageDown") {
