@@ -4280,7 +4280,12 @@ function toggleFloat(fullscreen = false) {
     // patch placed over a base that is no longer there. The pane stayed black until a key or a
     // click made the page paint. The terminal still holds the image, so re-placing it covers the
     // pane at once, and a whole frame from the cache (or a forced paint) brings it up to date.
-    replacePlacement();
+    //
+    // Only when the pane is on screen. tmux `allow-passthrough=all` forwards a hidden pane's
+    // passthrough to whatever window the client is viewing, so an ungated re-place drew this
+    // page over another window — and nothing there deletes it, because that window's panes do
+    // not own the image. `repaintActiveTab` has the same gate; the next reveal places it.
+    if (currentPane().visible) replacePlacement();
     repaintActiveTab();
     // The cached frame predates the float; whatever the page did in the OS window since then
     // arrives with a fresh paint.
