@@ -220,50 +220,62 @@ test("the compensating zoom keeps the page's layout identical", () => {
 // While a tab floats the pane shows bare terminal, so this line is the only thing telling the
 // user where their page went and how to get it back. It was written at a hardcoded
 // `\x1b[12;1H`: row 12 whatever the pane's height, column 1 whatever its width.
-test("the status line is centred on both axes", () => {
-  const label = "FLOATING";
-  const seq = centeredStatusSequence(label, 80, 24);
-  // Row 12 of 24 is the middle; column 37 centres 8 characters in 80 cells.
-  assert.match(seq, /\x1b\[12;37H/);
+test("the status badge is centred on both axes", () => {
+  // "FLOATING" padded to 12 cells, 3 rows high: rows 11-13 of 24 and column 35 of 80.
+  const seq = centeredStatusSequence("FLOATING", 80, 24);
+  assert.match(seq, /\x1b\[11;35H/);
+  assert.match(seq, /\x1b\[12;35H\x1b\[0;30;103m\x1b\[1m  FLOATING  /);
+  assert.match(seq, /\x1b\[13;35H/);
   // Cleared first, then addressed: the clear is what removes the frame the pane was showing.
-  assert.ok(seq.indexOf("\x1b[2J") < seq.indexOf("\x1b[12;37H"));
-  // Bold cyan, and reset afterwards so the pane's own output is not left coloured.
-  assert.match(seq, /\x1b\[1m\x1b\[36mFLOATING\x1b\[0m$/);
+  assert.ok(seq.indexOf("\x1b[2J") < seq.indexOf("\x1b[11;35H"));
+  // Reset afterwards so the pane's own output is not left coloured.
+  assert.ok(seq.endsWith("\x1b[0m"));
+});
+
+// Bold cyan on the pane's own background was easy to miss. Every row of the badge is drawn on
+// a solid background, the blank ones too, so it reads as one block.
+test("every badge row has the solid background, and lines share one width", () => {
+  const seq = centeredStatusSequence("FLOATING\npage in an OS window, press w to pin", 80, 24);
+  const rows = seq.split(/\x1b\[\d+;\d+H/).slice(1);
+  assert.equal(rows.length, 4);
+  for (const row of rows) assert.ok(row.startsWith("\x1b[0;30;103m"), JSON.stringify(row));
+  const widths = rows.map((row) => row.replace(/\x1b\[[0-9;]*m/g, "").length);
+  assert.deepEqual(widths, [40, 40, 40, 40]);
 });
 
 test("the centre moves with the pane", () => {
-  // The bug was a fixed address. Three sizes, three different answers.
-  assert.match(centeredStatusSequence("ab", 10, 4), /\x1b\[2;5H/);
-  assert.match(centeredStatusSequence("ab", 100, 50), /\x1b\[25;50H/);
-  assert.match(centeredStatusSequence("ab", 40, 11), /\x1b\[6;20H/);
+  // The bug was a fixed address. Three sizes, three different answers ("ab" is 6x3 as a badge).
+  assert.match(centeredStatusSequence("ab", 10, 4), /\x1b\[1;3H/);
+  assert.match(centeredStatusSequence("ab", 100, 50), /\x1b\[24;48H/);
+  assert.match(centeredStatusSequence("ab", 40, 11), /\x1b\[5;18H/);
 });
 
-test("a label wider than the pane starts at column 1", () => {
+test("a badge wider than the pane starts at column 1", () => {
   // Not at a negative column, which is an address the terminal is entitled to reject — and a
-  // status line that silently does not appear is worse than one clipped at the right edge.
+  // status that silently does not appear is worse than one clipped at the right edge.
   const seq = centeredStatusSequence("a".repeat(60), 20, 10);
-  assert.match(seq, /\x1b\[5;1H/);
+  assert.match(seq, /\x1b\[4;1H/);
 });
 
 test("a degenerate pane still produces a valid address", () => {
   // Column and row 0 are not addressable, and a pane can report 0 cells while a resize is in
-  // flight. Every one of these has to land on 1;1 rather than on `[0;0H`.
+  // flight. Every one of these has to start at 1;1 rather than at `[0;0H`.
   for (const [cols, rows] of [[0, 0], [1, 1], [-5, -5], [NaN, NaN]]) {
     const seq = centeredStatusSequence("x", cols, rows);
     assert.match(seq, /\x1b\[1;1H/, `${cols}x${rows}`);
+    assert.doesNotMatch(seq, /\x1b\[(?:0|-\d+|NaN);(?:\d+|-\d+|NaN)H/);
   }
   assert.match(centeredStatusSequence("x", undefined, undefined), /\x1b\[1;1H/);
 });
 
 test("an odd remainder biases left, not right", () => {
-  // 5 characters in 10 cells leaves 5 over: floor puts the label at column 3 rather than 4.
-  // Matches a terminal's own wrapping bias and keeps the label fully on screen.
-  assert.match(centeredStatusSequence("abcde", 10, 3), /\x1b\[2;3H/);
+  // "abcde" is 9 cells as a badge; 10 cells leaves 1 over, and floor puts it at column 1.
+  assert.match(centeredStatusSequence("abcde", 10, 3), /\x1b\[1;1H/);
 });
 
 test("a missing label is still a valid sequence", () => {
   // Belt and braces: nothing should be able to make this emit `[NaN;NaNH`.
   for (const label of [undefined, null, ""]) {
-    assert.match(centeredStatusSequence(label, 20, 6), /\x1b\[3;\d+H/, String(label));
+    assert.match(centeredStatusSequence(label, 20, 6), /\x1b\[2;\d+H/, String(label));
   }
 });

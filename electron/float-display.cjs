@@ -113,18 +113,26 @@ function centeredDisplayBounds(displayBounds, width, height) {
 /// of `0` or a negative column is one the terminal is entitled to reject outright, and a
 /// status line that silently does not appear is worse than one slightly off centre.
 function centeredStatusSequence(label, cols, rows, escape = "\x1b") {
-  const text = String(label ?? "");
+  // A badge, not a line: lines are split on "\n", the first is the title, and the whole block
+  // sits on a solid background one blank row and two blank cells wider than its text. Bold cyan
+  // on the terminal's own background was easy to miss on a dark pane and close to invisible when
+  // anything was still drawn behind it.
+  const lines = String(label ?? "").split("\n");
+  const inner = Math.max(...lines.map((line) => line.length));
+  const box = [" ".repeat(inner + 4), ...lines.map((line) => `  ${line.padEnd(inner)}  `), " ".repeat(inner + 4)];
   const width = Math.max(1, Math.round(cols) || 1);
   const height = Math.max(1, Math.round(rows) || 1);
-  const row = Math.max(1, Math.ceil(height / 2));
-  // `(width - text.length) / 2 + 1` in cell terms: floor, so a label that cannot be centred
-  // exactly sits one cell left rather than one right — the same bias a terminal's own
-  // wrapping has, and it keeps a label wider than the pane starting at column 1 instead of
-  // off screen to the left.
-  const column = Math.max(1, Math.floor((width - text.length) / 2) + 1);
-  // Clear, address, then bold cyan and a reset. The clear is what removes the frame the pane
-  // was showing; see the caller for why the Kitty placement has to go first.
-  return `${escape}[2J${escape}[${row};${column}H${escape}[1m${escape}[36m${text}${escape}[0m`;
+  const top = Math.max(1, Math.floor((height - box.length) / 2) + 1);
+  // `(width - box width) / 2 + 1` in cell terms: floor, so a badge that cannot be centred
+  // exactly sits one cell left rather than one right — the same bias a terminal's own wrapping
+  // has, and it keeps a badge wider than the pane starting at column 1 instead of off screen.
+  const column = Math.max(1, Math.floor((width - box[0].length) / 2) + 1);
+  // Black on bright yellow reads against a dark pane and a white page alike. The title is bold.
+  const rowsOut = box.map((text, index) => `${escape}[${top + index};${column}H`
+    + `${escape}[0;30;103m${index === 1 ? `${escape}[1m` : ""}${text}`);
+  // The clear is what removes the frame the pane was showing; see the caller for why the Kitty
+  // placement has to go first. Reset at the end so the pane's own output is not left coloured.
+  return `${escape}[2J${rowsOut.join("")}${escape}[0m`;
 }
 
 /// How much to shrink a fullscreen float's surface so its frame matches the monitor.
