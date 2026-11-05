@@ -93,6 +93,13 @@
       "description": "Search suggestions in the omnibox: off, an engine name above, or a URL with %s returning OpenSearch JSON. Off by default because every keystroke typed there is sent to that provider."
     },
     {
+      "key": "search.keywords",
+      "type": "list",
+      "default": [],
+      "applies": "live",
+      "description": "Omnibox keyword searches, as keyword=engine or keyword=URL with %s: `gh tweb` searches GitHub. Added to the built-in g, d, b, p, gh, ghc, yt, w, nv, mdn, npm, crates, pkg, tr; keyword= with nothing after it removes one."
+    },
+    {
       "key": "engine.chrome_sites",
       "type": "list",
       "default": [],
