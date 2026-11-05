@@ -175,6 +175,10 @@ installPrintShim();
     { name: "permit", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "permit", argument: value }) },
     { name: "forbid", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "forbid", argument: value }) },
     { name: "permissions", action: (value) => send("site-permission", { op: "list", argument: value }) },
+    // Narrowest first. `:clear-data` alone reports what `all` would do rather than doing it.
+    { name: "clear-site", action: () => send("clear-data", { scope: "site" }) },
+    { name: "clear-cache", action: () => send("clear-data", { scope: "cache" }) },
+    { name: "clear-data", action: (value) => send("clear-data", { scope: value }) },
   ];
   // Both tables, by name. Palette rows win a collision, since a row the user can see is the one
   // they will expect `:` to reach.

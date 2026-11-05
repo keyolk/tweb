@@ -4587,6 +4587,10 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     handleSitePermissionCommand(tab, value);
     return;
   }
+  if (action === "clear-data") {
+    handleClearDataCommand(tab, value);
+    return;
+  }
   // A link the user clicked to a site pinned to another engine (the preload held it back). Not a
   // shortcut: it works with vimium off, and the page has already been told nothing.
   if (action === "pinned-link") {
@@ -7306,6 +7310,71 @@ function applyChromeSitePermissions(tab, url) {
       if (debugLogging) console.error(`tweb: chrome permission ${descriptor.name} for ${origin} failed: ${error.message}`);
     });
   }
+}
+
+// === Clearing browsing data ===========================================================
+//
+// `:clear-site` drops the current site's cookies and storage — the usual need, a dev server stuck on
+// a stale session. `:clear-cache` drops every site's cache and keeps every sign-in. `:clear-data all`
+// drops everything, every sign-in included, so it takes the word `all` and never runs bare.
+// Each engine keeps its own profile, so each clears the tab's engine: an Electron tab clears
+// Electron's session, a Chrome tab Chrome's (through CDP). WebKit has no API for it here.
+const CLEAR_SCOPES = { site: "site", cache: "cache", all: "all" };
+
+async function clearBrowsingData(tab, scope) {
+  const engine = tabEngine(tab);
+  const url = tab.webContents.getURL();
+  const origin = sitePermissionRules.originOf(url);
+  if (scope === "site" && (!origin || origin === "file://")) return "this page has no site to clear";
+  if (engine === "webkit") return "the WebKit engine cannot clear its data from tweb yet";
+  if (engine === "chrome") {
+    const page = tab.webContents.session;
+    // Through the page's own session: sent on the browser connection the call answered `{}` and
+    // cleared nothing (measured: a cookie and a localStorage key both survived it).
+    if (scope === "site") {
+      await page.send("Storage.clearDataForOrigin", { origin, storageTypes: "all" });
+    } else {
+      await page.send("Network.clearBrowserCache");
+      if (scope === "all") {
+        await page.send("Network.clearBrowserCookies");
+        // CDP has no "every origin"; `*` is refused. Every site in the history or an open tab is
+        // the set a user could have stored anything in.
+        const origins = new Set([
+          ...readGlobalHistory().map((entry) => sitePermissionRules.originOf(entry.url)),
+          ...currentWindows().tabs.map((candidate) => !candidate.isDestroyed() && sitePermissionRules.originOf(candidate.webContents.getURL())),
+        ].filter((candidate) => candidate && candidate !== "file://"));
+        for (const each of origins) {
+          await page.send("Storage.clearDataForOrigin", { origin: each, storageTypes: "all" }).catch(() => {});
+        }
+      }
+    }
+  } else {
+    const pageSession = session.defaultSession;
+    if (scope === "site") {
+      await pageSession.clearStorageData({ origin });
+    } else {
+      await pageSession.clearCache();
+      await pageSession.clearCodeCaches({});
+      if (scope === "all") {
+        await pageSession.clearStorageData();
+        await pageSession.clearAuthCache();
+        await pageSession.cookies.flushStore();
+      }
+    }
+  }
+  if (scope === "site") return `cleared cookies and storage for ${origin} — reload to start fresh`;
+  if (scope === "cache") return `cleared the ${engine} engine's cache; sign-ins kept`;
+  return `cleared everything in the ${engine} engine: cookies, storage and cache`;
+}
+
+function handleClearDataCommand(tab, value) {
+  const say = bindPane(() => tabPanes.get(tab), (text) => sendToMainTabFrame(tab, "tweb-flash", text));
+  const scope = CLEAR_SCOPES[String(value?.scope || "").trim().toLowerCase()];
+  if (!scope) {
+    say("clear-data takes `all`: it signs you out of every site. :clear-site and :clear-cache are narrower");
+    return;
+  }
+  clearBrowsingData(tab, scope).then(say, (error) => say(`clearing failed: ${error.message}`));
 }
 
 // `:permit mic`, `:forbid camera`, `:permissions` (and `:permissions reset`) for the current page.
