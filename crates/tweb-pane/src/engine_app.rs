@@ -72,6 +72,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/site-permissions.cjs"),
     ),
     (
+        "start-page.cjs",
+        include_str!("../../../electron/start-page.cjs"),
+    ),
+    (
         "settings-schema.json",
         include_str!("../../../electron/settings-schema.json"),
     ),

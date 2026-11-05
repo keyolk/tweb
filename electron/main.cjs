@@ -15,6 +15,7 @@ const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug
 const { BrowserWindow, ipcMain, session } = pageBackend;
 const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
 const sitePermissionRules = require("./site-permissions.cjs");
+const { isStartPage, parseListeningPorts, startPageUrl } = require("./start-page.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
 const { searchUrl, suggestUrl, parseSuggestions, keywordSearch, keywordTable } = require("./search-engines.cjs");
 // The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
@@ -4003,6 +4004,13 @@ function normalizeOmniboxInput(input) {
   const value = String(input || "").trim();
   if (!value) return null;
   if (/^(?:[a-z][a-z0-9+.-]*:\/\/|about:|data:|file:)/i.test(value)) return value;
+  // A port this machine is listening on: `3000` is the dev server, not a search for the number.
+  // Only a listening one, so a number nobody serves still searches.
+  if (/^:?\d{2,5}$/.test(value)) {
+    const port = Number(value.replace(":", ""));
+    const listening = listeningPorts.find((entry) => entry.port === port);
+    if (listening) return listening.url;
+  }
   // Ahead of the host check: `w example.com` is a Wikipedia search, not a typo for a URL.
   const keyword = keywordSearch(value, keywordTable(settings.get("search.keywords")));
   if (keyword) return keyword.url;
@@ -4241,6 +4249,9 @@ function omniboxModel() {
     entries: [
       ...tabEntries,
       ...history.map((entry, index) => ({ ...entry, kind: "history", recency: base - index })),
+      // Below history when nothing is typed (recency 0), matched like any row once something is:
+      // `3000` finds the dev server without `localhost:`.
+      ...listeningPorts.map((entry) => ({ kind: "port", url: entry.url, title: `localhost:${entry.port} · ${entry.command}`, recency: 0 })),
     ],
     // For the row that names the keyword search before Enter; the URL main opens is built the same way.
     keywords: keywordTable(settings.get("search.keywords")),
@@ -4622,6 +4633,8 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "omnibox-model":
       sendToFocusedTabFrame(tab, "tweb-omnibox", omniboxModel());
+      // For the next one: the omnibox opens on what is known and never waits on lsof.
+      void refreshListeningPorts();
       break;
     // `seq` travels back so the page can drop a reply to a query it has already moved past.
     case "omnibox-suggest": {
@@ -8249,13 +8262,43 @@ background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,mon
 Opening ${escaped}…</body>`)}`;
 }
 
+// The start page (start-page.cjs): this machine's localhost servers and the recent pages. Drawn at
+// once from what is known, then again when a fresh port list arrives — `lsof` takes ~200ms, too
+// long to hold the first paint for.
 function noWindowSessionPage() {
-  return `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html>
-<meta charset="utf-8"><title>TWeb</title>
-<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
-background:#161616;color:#9aa0a6;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;
-flex-direction:column;gap:8px">
-<div>No previous page to restore</div><div style="color:#6f747c">Press t to enter an address</div></body>`)}`;
+  return startPageUrl({ ports: listeningPorts, recent: readGlobalHistory(8), restoring: true });
+}
+
+let listeningPorts = [];
+let listeningPortsAt = 0;
+let listeningPortsPending = null;
+const LISTENING_PORTS_TTL_MS = 5000;
+
+function refreshListeningPorts() {
+  if (listeningPortsPending) return listeningPortsPending;
+  if (Date.now() - listeningPortsAt < LISTENING_PORTS_TTL_MS) return Promise.resolve(listeningPorts);
+  listeningPortsPending = new Promise((resolve) => {
+    execFile("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { encoding: "utf8", timeout: 3000, maxBuffer: 4 << 20 }, (error, stdout) => {
+      listeningPortsPending = null;
+      listeningPortsAt = Date.now();
+      // lsof exits 1 when one of the sockets it walked vanished mid-walk; what it printed still holds.
+      if (stdout) listeningPorts = parseListeningPorts(stdout);
+      else if (error && debugLogging) console.error(`tweb: lsof failed: ${error.message}`);
+      resolve(listeningPorts);
+    });
+  });
+  return listeningPortsPending;
+}
+
+// By what the tab was asked to load, not `getURL()`: an Electron tab whose first load has not
+// committed reports "", and the redraw was skipped there (Chrome tabs report the data URL at once).
+function refreshStartPage(tab) {
+  const record = currentPane();
+  void refreshListeningPorts().then(bindPane(() => record, () => {
+    if (tab.isDestroyed()) return;
+    const shown = tab.webContents.getURL() || tabSessionUrls.get(tab) || "";
+    if (isStartPage(shown) || (!shown && isStartPage(tabSessionUrls.get(tab)))) void tab.webContents.loadURL(noWindowSessionPage());
+  }));
 }
 
 function applyViewport(vp, origin = currentFrames().origin, frames = currentFrames(), record = currentPane()) {
@@ -8335,6 +8378,7 @@ function createWindow(url, frames = currentFrames(), { explicit = false } = {}) 
       ? noWindowSessionPage()
       : url;
     const tab = createTab(initialUrl, true);
+    if (isStartPage(initialUrl)) refreshStartPage(tab);
     // A new pane takes focus as it opens, before any focus hook could have seen it as tweb's.
     syncInputSource();
     return tab;
@@ -10209,6 +10253,8 @@ app.whenReady().then(async () => {
   }
   configureDownloads();
   configureSitePermissions();
+  // Warmed so the first omnibox already lists the servers.
+  void refreshListeningPorts();
   watchNetwork();
   serveLocalMarkdown();
   // A backstop, not the mechanism: `browser-window-created` above and the per-tab
