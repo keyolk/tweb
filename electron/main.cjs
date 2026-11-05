@@ -9676,6 +9676,19 @@ function closePaneOnce(record, reason) {
     } catch (error) {
       void error;
     }
+    // And straight to the terminals that were showing it. A pane closes because tmux killed it,
+    // so the delete above goes to a frontend whose pty is already gone and never arrives; the
+    // frontend's own exit delete asks tmux which clients view the pane, and tmux has forgotten
+    // the pane by then. The image stayed on screen over whatever took the pane's place — seen as
+    // a closed office pane still drawn across the window. The ids are this pane's own, so this
+    // cannot touch another pane's picture whichever window the client is on now.
+    try {
+      withPaneScope(record, () => {
+        for (const tty of vis()?.clientTtys || []) deleteImageFromClientTty(tty);
+      });
+    } catch (error) {
+      void error;
+    }
     frameContexts.delete(record.key);
   }
   const server = paneAgentServers.get(record.key);

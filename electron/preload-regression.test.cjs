@@ -3262,3 +3262,17 @@ test("DevTools opens from the palette through the CLI", () => {
   const gate = main.indexOf("if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;");
   assert.ok(main.indexOf('if (action === "open-devtools")') < gate);
 });
+
+// A pane closes because tmux killed it, so the delete written to the pane goes to a frontend whose
+// pty is gone, and the frontend's own exit delete asks tmux for the clients of a pane tmux has
+// already forgotten. The closed office pane's page stayed drawn across the window.
+test("closing a pane deletes its image on the terminals that showed it", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const close = main.slice(main.indexOf("function closePaneOnce(record, reason)"));
+  const cleanup = close.indexOf("withPaneScope(record, () => terminalCleanup(record));");
+  const direct = close.indexOf("for (const tty of vis()?.clientTtys || []) deleteImageFromClientTty(tty);");
+  assert.ok(cleanup > 0 && direct > cleanup, "the direct delete follows the pane-path delete");
+  // Inside the pane's scope, so `rawKittyDelete` names this pane's ids and `vis()` its clients.
+  assert.match(close.slice(cleanup, direct), /withPaneScope\(record, \(\) => \{\s*$/m);
+  assert.ok(direct < close.indexOf("frameContexts.delete(record.key);"));
+});
