@@ -6458,6 +6458,38 @@ function writeTerminalCaret(row, col) {
   }
 }
 
+// The mouse pointer's shape, from the page to the terminal (OSC 22).
+//
+// The page is pixels in a Kitty placement, so the terminal knows nothing of the link or text field
+// under the pointer and kept the arrow over all of them. Chromium still decides the shape and says
+// so in `cursor-changed`; Ghostty and kitty take a CSS cursor name in OSC 22. The shape is the
+// terminal window's, not the pane's, so it is put back to the default when the pointer leaves the
+// pane (see withNativePane) — otherwise a hand would stay over the shell next door.
+//
+// Chromium's names are mostly CSS's already; these are the ones that are not. Measured: a link
+// reports `hand`, which a terminal reading CSS names would not know.
+const POINTER_SHAPE_NAMES = { hand: "pointer", nodrop: "no-drop", custom: "default" };
+
+function pointerShapeName(type) {
+  if (!type || typeof type !== "string") return "default";
+  // Middle-button autoscroll (`m-panning`, `e-panning`, ...) has no CSS name of its own.
+  if (type.endsWith("-panning")) return "all-scroll";
+  return POINTER_SHAPE_NAMES[type] || type;
+}
+
+function writePointerShape(type) {
+  const input = inputState();
+  const name = pointerShapeName(type);
+  if ((input.pointerShape || "default") === name) return;
+  input.pointerShape = name;
+  const osc = `${ESC}]22;${name}${ESC}\\`;
+  try {
+    paneWrite(paneIsInTmux() ? wrapTmuxPassthrough(osc) : osc);
+  } catch (error) {
+    void error;
+  }
+}
+
 // Every graphics write parks the cursor at the pane origin and restores it afterwards, but
 // the restore is the terminal's single DECSC slot — which the caret's own placement does
 // not own. In practice the cursor ends up back at the origin, so a caret parked on a word
@@ -7557,6 +7589,10 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     console.error(`tweb: preload failed ${preloadPath}: ${error.stack || error.message}`);
   });
   watchConsole(contents);
+  // Only the tab the pane shows: a background tab's hover is not under anyone's pointer.
+  onContents("cursor-changed", (_event, type) => {
+    if (tab === currentWindows().win) writePointerShape(type);
+  });
   tabZoomFactors.set(tab, initialZoomFactor);
   contents.setZoomFactor(initialZoomFactor);
   contents.setBackgroundThrottling(true);
@@ -8405,13 +8441,17 @@ function withNativePane(x, y, fn, { allowOutside = false } = {}) {
     if (!hit) {
       // Over some other window now: the pane is not under the pointer, and coming back to it is
       // the terminal's to report, as leaving its rect is below.
-      if (nativeInput.window?.id !== paneNative.windowId) paneNative.latched = false;
+      if (nativeInput.window?.id !== paneNative.windowId) {
+        paneNative.latched = false;
+        writePointerShape("default");
+      }
       return;
     }
     if (!hit.inside && !(allowOutside && paneNative.held)) {
       // The pointer left. It is this pane's again once the terminal reports it here, not before:
       // a popup, another client's window or a neighbouring pane may be what it entered.
       paneNative.latched = false;
+      writePointerShape("default");
       return;
     }
     handled = true;
