@@ -673,9 +673,6 @@ pub fn inspect_targets() -> Vec<InspectTarget> {
 }
 
 fn inspect_target(pane: String, status: &Value, nearby: &[String]) -> Option<InspectTarget> {
-    if status.get("browser").and_then(Value::as_str) != Some("chrome") {
-        return None;
-    }
     let active = status
         .pointer("/tabs/tabs")
         .and_then(Value::as_array)
@@ -685,6 +682,16 @@ fn inspect_target(pane: String, status: &Value, nearby: &[String]) -> Option<Ins
         })
         .cloned()
         .unwrap_or(Value::Null);
+    // The active tab's engine, not the pane's: a tab moved with the engine badge is on Chrome in a
+    // pane started on Electron, and the engine answers `devtools` by the tab. `browser` is the
+    // fallback for an engine that predates per-tab engines.
+    let engine = active
+        .get("engine")
+        .and_then(Value::as_str)
+        .or_else(|| status.get("browser").and_then(Value::as_str));
+    if !matches!(engine, Some("chrome" | "webkit")) {
+        return None;
+    }
     let url = text_field(&active, "url");
     if url.starts_with("http://127.0.0.1:") && url.contains("/devtools/inspector.html") {
         return None;
@@ -792,6 +799,28 @@ mod tests {
         let devtools =
             "http://127.0.0.1:62052/devtools/inspector.html?ws=127.0.0.1:62052/devtools/page/X";
         assert!(super::inspect_target("%4".into(), &status("chrome", devtools), &nearby).is_none());
+    }
+
+    /// The tab's engine decides, not the pane's: a tab moved to Chrome with the engine badge in a
+    /// pane started on Electron was never offered, and a tab moved back off Chrome still was.
+    #[test]
+    fn devtools_targets_follow_the_active_tabs_engine() {
+        let nearby = Vec::new();
+        let tabbed = |browser: &str, engine: &str| {
+            json!({ "browser": browser, "tabs": { "tabs": [
+                { "active": true, "title": "Page", "url": "https://a.test/", "engine": engine },
+            ] } })
+        };
+        assert!(
+            super::inspect_target("%1".into(), &tabbed("electron", "chrome"), &nearby).is_some()
+        );
+        assert!(
+            super::inspect_target("%2".into(), &tabbed("chrome", "electron"), &nearby).is_none()
+        );
+        // WebKit opens Safari's Web Inspector, so it is a target as well.
+        assert!(
+            super::inspect_target("%3".into(), &tabbed("electron", "webkit"), &nearby).is_some()
+        );
     }
 
     /// Outside tmux there is no window to scope to, and the lookup must not shell

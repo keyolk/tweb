@@ -82,7 +82,7 @@ test("typed URLs, links and new tabs follow pins in place; redirects are only to
   assert.match(main, /case "new-tab": \{\s+const url = normalizeOmniboxInput\(value\);\s+if \(url\) openTabRouted\(tab, url, true\);/);
   assert.match(main, /if \(\/\^https\?:\/i\.test\(url\) && !tab\.isDestroyed\(\) && !followPin\(tab, url, "link"\)\)/);
   // did-navigate (redirects and every other load) only notices; it never moves the tab.
-  const notice = main.slice(main.indexOf("const pinNotices"), main.indexOf("function openInChromePane("));
+  const notice = main.slice(main.indexOf("const pinNotices"), main.indexOf("function openDevToolsPane("));
   assert.doesNotMatch(notice, /switchTabEngine|loadURL|execFile/);
   assert.match(notice, /navigationRoute\(tab, url, "redirect"\)/);
   assert.match(main, /noticePinnedNavigation\(tab, url\);/);

@@ -3419,6 +3419,7 @@ async function switchTabEngine(tab, engine, url = null, site = null, { rebuild =
   const target = url || tab.webContents.getURL() || tabSessionUrls.get(tab) || "about:blank";
   if (from === engine && !rebuild) {
     if (url) void tab.loadURL(url).catch(() => {});
+    else if (!site) flash(`Already on ${ENGINE_LABELS[engine]}`);
     return tab;
   }
   const available = remote && engine !== "electron"
@@ -3428,6 +3429,10 @@ async function switchTabEngine(tab, engine, url = null, site = null, { rebuild =
     flash(`${ENGINE_LABELS[engine]} unavailable: ${available.reason}`);
     return null;
   }
+  // Said at once: the old page stays on screen until the new engine has loaded it, which can take
+  // seconds on a cold Chrome, and with nothing said the switch looked like it had been ignored.
+  // Cookies and history are the engine's own, so they are named before the user finds out.
+  flash(`Moving to ${ENGINE_LABELS[engine]}… cookies and history stay on ${ENGINE_LABELS[from]}`);
   try {
     await pageBackend.ensureEngine(engine);
   } catch (error) {
@@ -3552,6 +3557,32 @@ function noticePin(tab, route) {
 function noticePinnedNavigation(tab, url) {
   const route = navigationRoute(tab, url, "redirect");
   if (route.action === "notice") noticePin(tab, route);
+}
+
+// `tweb devtools --pane <this pane>`: the CLI owns the split and the inspector pane, so the palette
+// reuses it rather than growing a second copy. Refused here with the same reasons the CLI gives,
+// said on the page, because the CLI's own error would go nowhere the user can see.
+function openDevToolsPane(tab) {
+  const paneId = currentPane()?.paneId;
+  const engine = tabEngine(tab);
+  const say = (text) => sendToMainTabFrame(tab, "tweb-flash", text);
+  if (engine === "electron") {
+    say("DevTools needs a Chrome or WebKit tab: engine badge → Chrome, then try again");
+    return;
+  }
+  if (!paneId || String(paneId).startsWith("pid-")) {
+    say("DevTools opens in a tmux pane beside this one; this pane is not in tmux");
+    return;
+  }
+  const tweb = process.env.TWEB_BIN || path.join(os.homedir(), ".local", "bin", "tweb");
+  say(engine === "webkit" ? "Opening Safari's Web Inspector…" : "Opening DevTools beside this pane…");
+  execFile(tweb, ["devtools", "--pane", paneId], {
+    stdio: "ignore", env: { ...process.env, TMUX_PANE: paneId },
+  }, (error) => {
+    if (!error) return;
+    console.error(`tweb: devtools for ${paneId} failed: ${error.message}`);
+    if (!tab.isDestroyed()) say(`DevTools failed: ${error.message.split("\n")[0]}`);
+  });
 }
 
 // `tweb split --engine chrome URL` beside this pane: the CLI that started this engine, told which
@@ -4238,7 +4269,7 @@ function writeFloatStatus() {
 const headlessEngine = process.platform === "linux"
   && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
 
-function toggleFloat(fullscreen = false) {
+function toggleFloat(fullscreen = false, { restoreFocus = true } = {}) {
   const state = inputState();
   // Floating moves the page into an OS window on the machine the ENGINE runs on. Headless, that
   // window exists and is drawn into nothing, so the pane would show "FLOATING" over a page no one
@@ -4291,7 +4322,7 @@ function toggleFloat(fullscreen = false) {
     // arrives with a fresh paint.
     const tab = currentWindows().win;
     if (tab && !tab.isDestroyed()) tab.webContents.invalidate();
-    restoreFocusFromFloat({ skipHide: wasFullscreen });
+    if (restoreFocus) restoreFocusFromFloat({ skipHide: wasFullscreen });
   }
 }
 
@@ -4450,6 +4481,28 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     if (/^https?:/i.test(url) && !tab.isDestroyed() && !followPin(tab, url, "link")) void tab.webContents.loadURL(url);
     return;
   }
+  // The engine and tab badges are clicked, not typed, and they stay on screen with shortcuts off
+  // (Ctrl-/). Behind the gate below their menus opened and then did nothing.
+  if (tab === currentWindows().win && !tab.isDestroyed()) {
+    if (action === "switch-engine") {
+      const engine = engineKind(value);
+      if (engine) void switchTabEngine(tab, engine);
+      else sendToMainTabFrame(tab, "tweb-flash", `Unknown engine "${value ?? ""}": electron, chrome or webkit`);
+      return;
+    }
+    if (action === "activate-tab") {
+      if (Number.isInteger(value) && value >= 0 && value < currentWindows().tabs.length) activateTab(value);
+      return;
+    }
+    if (action === "open-devtools") {
+      openDevToolsPane(tab);
+      return;
+    }
+    if (action === "close-tab-from-badge") {
+      if (Number.isInteger(value)) closeTab(value);
+      return;
+    }
+  }
   if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;
   if (debugLogging) console.error(`tweb: native shortcut ${action}`);
   const contents = tab.webContents;
@@ -4511,9 +4564,6 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "file-chooser-resolve":
       resolveFileChooser(tab, value);
       break;
-    case "activate-tab":
-      if (Number.isInteger(value) && value >= 0 && value < currentWindows().tabs.length) activateTab(value);
-      break;
     // The tab list closes a specific row; the bare shortcut closes the active tab.
     case "close-tab":
       // Closing from the list keeps it open, so it has to be redrawn — but only
@@ -4524,9 +4574,6 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     // The × in the tab badge's popover. Separate from `close-tab` because that one sets
     // `refreshTabListAfterClose`, which pushes the full `b` list model and would pop the big list
     // open over the popover. The popover redraws from the ordinary tab state instead.
-    case "close-tab-from-badge":
-      if (Number.isInteger(value)) closeTab(value);
-      break;
     case "restore-tab": restoreClosedTab(); break;
     case "reload": contents.reload(); break;
     case "zoom-in": setBrowserZoom("in"); break;
@@ -4771,11 +4818,6 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "new-tab": {
       const url = normalizeOmniboxInput(value);
       if (url) openTabRouted(tab, url, true);
-      break;
-    }
-    case "switch-engine": {
-      const engine = engineKind(value);
-      if (engine) void switchTabEngine(tab, engine);
       break;
     }
   }
@@ -6279,14 +6321,19 @@ async function dispatchAgentCommand(method, params) {
         }
         : { recording: false };
     }
+    // Through `toggleFloat`, the same path as `w`. These used to flip the flag and repaint, which
+    // skipped everything else `w` does: the headless refusal, the status badge, and on pin the
+    // screen clear and the re-placement — so a pane pinned from the CLI stayed black.
     case "float": {
-      inputState().floating = true;
-      updatePaintingState();
-      return { ok: true, floating: true };
+      if (!inputState().floating) toggleFloat();
+      return inputState().floating
+        ? { ok: true, floating: true }
+        : { ok: false, floating: false, message: "Floating needs a display; this engine runs headless" };
     }
     case "pin": {
-      inputState().floating = false;
-      updatePaintingState();
+      // The tmux selection is left where the caller is. `w` brings the user back to the pane they
+      // floated from; a CLI caller may be in another window on purpose.
+      if (inputState().floating) toggleFloat(false, { restoreFocus: false });
       return { ok: true, floating: false };
     }
     case "capture":

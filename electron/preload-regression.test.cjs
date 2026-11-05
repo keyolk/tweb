@@ -736,7 +736,12 @@ test("the tab badge list closes a tab in place", () => {
   assert.match(popover, /close\.onclick = \(event\) => \{[\s\S]*event\.stopPropagation\(\);[\s\S]*send\("close-tab-from-badge", tab\.index\)/);
   assert.match(electron, /if \(tabPopover && tabPopover\.style\.display === "block"\) showTabPopover\(tabPopoverPinned\);/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /case "close-tab-from-badge":\s*\n\s*if \(Number\.isInteger\(value\)\) closeTab\(value\);/);
+  // Ahead of the shortcut gate: the badge is clicked, and it works with shortcuts off (Ctrl-/).
+  assert.match(main, /if \(action === "close-tab-from-badge"\) \{\s+if \(Number\.isInteger\(value\)\) closeTab\(value\);/);
+  const gate = main.indexOf("if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;");
+  assert.ok(main.indexOf('if (action === "close-tab-from-badge")') < gate);
+  assert.ok(main.indexOf('if (action === "switch-engine")') < gate);
+  assert.ok(main.indexOf('if (action === "activate-tab")') < gate);
 });
 
 test("the shortcut help lists the float window and the command palette", () => {
@@ -2123,13 +2128,13 @@ test("floating mode relays frames to a display window instead of showing the tab
   assert.match(apply, /keepWindowHidden\(tab\)/);
   // inputState carries the floating flag.
   assert.match(main, /floating: false,/);
-  // agent RPC: float and pin toggle the flag.
+  // agent RPC: float and pin go through `toggleFloat`, the same path as `w`. Flipping the flag
+  // directly skipped the status badge and, on pin, the re-placement: the pane stayed black.
   const dispatch = main.slice(main.indexOf("function dispatchAgentCommand(method, params) {"),
     main.indexOf("function unparkTerminalCaret"));
-  assert.match(dispatch, /case "float"/);
-  assert.match(dispatch, /inputState\(\)\.floating = true/);
-  assert.match(dispatch, /case "pin"/);
-  assert.match(dispatch, /inputState\(\)\.floating = false/);
+  assert.match(dispatch, /case "float": \{\s+if \(!inputState\(\)\.floating\) toggleFloat\(\);/);
+  assert.match(dispatch, /case "pin": \{[\s\S]*?if \(inputState\(\)\.floating\) toggleFloat\(false, \{ restoreFocus: false \}\);/);
+  assert.doesNotMatch(dispatch, /inputState\(\)\.floating = (true|false)/);
 });
 
 // The tab keeps its offscreen surface reconciled while floating: the viewer draws the very
@@ -2220,7 +2225,7 @@ test("w key toggles floating mode from the browser", () => {
   assert.match(electron, /w: \(\) => send\("toggle-float"\)/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   assert.match(main, /case "toggle-float": toggleFloat\(\)/);
-  assert.match(main, /function toggleFloat\(fullscreen = false\)/);
+  assert.match(main, /function toggleFloat\(fullscreen = false, \{ restoreFocus = true \} = \{\}\)/);
   assert.match(main, /state\.floating = !state\.floating/);
 });
 
@@ -3231,6 +3236,31 @@ test("a reveal while floating redraws the badge, not the old frame", () => {
   assert.ok(guard > 0);
   assert.ok(guard < repaint.indexOf("queueFrame("), "the guard must come before the frame is re-sent");
   assert.match(repaint.slice(guard, guard + 120), /writeFloatStatus\(\);\s+return;/);
+});
+
+// An engine switch left the old page on screen with nothing said until the new engine had loaded
+// it, which read as the click being ignored; an unknown `:engine foo` and a switch to the engine
+// already in use were silent too.
+test("an engine switch says what it is doing before the page moves", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const sw = main.slice(main.indexOf("async function switchTabEngine("), main.indexOf("const ENGINE_TAB_READY_MS"));
+  const moving = sw.indexOf("flash(`Moving to ${ENGINE_LABELS[engine]}… cookies and history stay on ${ENGINE_LABELS[from]}`);");
+  assert.ok(moving > 0, "the switch must announce itself");
+  assert.ok(moving < sw.indexOf("await pageBackend.ensureEngine(engine)"), "before the engine starts");
+  assert.match(sw, /else if \(!site\) flash\(`Already on \$\{ENGINE_LABELS\[engine\]\}`\);/);
+  assert.match(main, /Unknown engine "\$\{value \?\? ""\}": electron, chrome or webkit/);
+});
+
+// DevTools was reachable only from the CLI. The palette row runs the same CLI for this pane and
+// says on the page why it cannot when the tab is on Electron.
+test("DevTools opens from the palette through the CLI", () => {
+  assert.match(electron, /\{ name: "devtools", label: "Open DevTools", action: \(\) => send\("open-devtools"\) \}/);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const open = main.slice(main.indexOf("function openDevToolsPane(tab)"), main.indexOf("function openInChromePane("));
+  assert.match(open, /execFile\(tweb, \["devtools", "--pane", paneId\]/);
+  assert.match(open, /if \(engine === "electron"\) \{\s+say\(/);
+  const gate = main.indexOf("if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;");
+  assert.ok(main.indexOf('if (action === "open-devtools")') < gate);
 });
 
 // A pane closes because tmux killed it, so the delete written to the pane goes to a frontend whose

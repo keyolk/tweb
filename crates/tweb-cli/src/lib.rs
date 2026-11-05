@@ -1403,6 +1403,14 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
         }
     };
     let result = agent::request(Some(pane), "devtools", json!({}))?;
+    // WebKit has no inspector page to put in a pane: the engine opens Safari's Web Inspector itself
+    // and says so.
+    if result.get("opened").is_some() {
+        if let Some(message) = result.get("message").and_then(serde_json::Value::as_str) {
+            println!("{message}");
+        }
+        return Ok(());
+    }
     let Some(url) = result.get("url").and_then(serde_json::Value::as_str) else {
         let message = result
             .get("message")
