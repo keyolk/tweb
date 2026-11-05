@@ -14,6 +14,8 @@ matters, and every failed attempt with the trace lines around it.
   f-rapid   `f` Escape `f` ... fast.   ok = every `f` drew; catches rounds that stay open
   j-scroll  `j`.                       latency in->first frame after it
   reload-f  reload, then `f` at once.  ok = it drew; catches the main frame not yet ready
+  tab-switch  `J`/`K` between two tabs, the second on --tab-engine.
+                                       ok = the other tab's first frame drew; latency in->that frame
 
 Usage:
   python3 bench/feel.py [--engine electron|chrome|webkit|both|all] [--tweb PATH] [--runs N]
@@ -261,6 +263,41 @@ def attempt_j(pane):
     return True, frame["t"] - arrived["t"], None
 
 
+def open_second_tab(pane, url, engine):
+    """Give the pane a second tab on `engine`, as a pane holding one Electron and one Chrome page."""
+    code, _, err = pane.agent("tab", "new", url, timeout=20)
+    if code != 0:
+        raise SystemExit(f"tab new failed: {err}")
+    # Moved before its URL commits, the tab is moved as about:blank: no targets for `f`, nothing
+    # for `j` to scroll, which reads as lost keys.
+    if not pane.wait_ready():
+        raise SystemExit("the new tab never became ready")
+    code, _, err = pane.agent("tab", "engine", engine, timeout=40)
+    if code != 0:
+        raise SystemExit(f"tab engine {engine} failed: {err}")
+    if not pane.wait_ready():
+        raise SystemExit(f"the {engine} tab never became ready")
+
+
+def attempt_tab(pane, key):
+    """One `J`/`K`. The latency is the key's arrival to the first frame the new tab sent."""
+    start = len(pane.trace())
+    pane.key(key)
+    activated = wait_for(pane, start, lambda r: r["step"] == "tab", 1.0)
+    if activated is None:
+        return False, None, {"why": "the key did not switch tabs", "trace": pane.trace()[start:]}
+    frame = wait_for(pane, start, lambda r: r["step"] == "frame" and r["t"] >= activated["t"], 2.0)
+    rows = pane.trace()[start:]
+    arrived = last_in(rows, key.encode().hex())
+    if not arrived:
+        return False, None, {"why": "the key never reached the engine", "trace": rows}
+    if frame is None:
+        return False, None, {"why": "the new tab drew nothing within 2s", "trace": rows}
+    # A user flipping between two tabs looks at each for a moment; so does the harness.
+    time.sleep(0.4)
+    return True, frame["t"] - arrived["t"], {"key": round(activated["t"] - arrived["t"], 1)}
+
+
 def run_scenario(pane, scenario, runs, url):
     results = []
     for index in range(runs):
@@ -279,6 +316,8 @@ def run_scenario(pane, scenario, runs, url):
             if index % 10 == 9:
                 pane.key("gg")
                 time.sleep(0.3)
+        elif scenario == "tab-switch":
+            outcome = attempt_tab(pane, "J" if index % 2 == 0 else "K")
         elif scenario == "reload-f":
             pane.agent("reload", timeout=20)
             time.sleep(0.05)
@@ -302,6 +341,8 @@ def percentile(values, q):
 def summarise(results):
     latencies = [lat for ok, lat, _ in results if ok and lat is not None]
     failures = [detail for ok, _, detail in results if not ok]
+    # tab-switch splits its latency: key arrival -> tab switched is the key path, the rest is paint.
+    keyed = [detail["key"] for ok, _, detail in results if ok and detail and "key" in detail]
     return {
         "runs": len(results),
         "failed": len(failures),
@@ -309,6 +350,7 @@ def summarise(results):
         "p95": percentile(latencies, 0.95),
         "max": percentile(latencies, 1.0),
         "failures": failures,
+        **({"key_p50": percentile(keyed, 0.5)} if keyed else {}),
     }
 
 
@@ -320,6 +362,8 @@ def main():
     parser.add_argument("--scenario", nargs="*", default=["f-open", "f-pick", "f-rapid", "j-scroll", "reload-f"])
     parser.add_argument("--url", nargs="*", default=None)
     parser.add_argument("--json", default=None)
+    parser.add_argument("--tab-engine", default=None, choices=["electron", "chrome", "webkit"],
+                        help="tab-switch: the second tab's engine (default: chrome, or electron on a chrome pane)")
     parser.add_argument("--workdir", default=None)
     parser.add_argument("--size", default=f"{COLS}x{ROWS}@{PX_W}x{PX_H}",
                         help="cols x rows @ pixel width x height, e.g. 180x100@1440x1800 for half a Retina screen")
@@ -341,11 +385,15 @@ def main():
                     print(f"{engine:8} {url}: page never became ready", flush=True)
                     continue
                 for scenario in args.scenario:
+                    if scenario == "tab-switch":
+                        second = args.tab_engine or ("electron" if engine == "chrome" else "chrome")
+                        open_second_tab(pane, url, second)
                     summary = summarise(run_scenario(pane, scenario, args.runs, url))
                     report.append({"engine": engine, "url": url, "scenario": scenario, **summary})
                     print(f"{engine:8} {scenario:9} {url.rsplit('/', 1)[-1][:28]:28} "
                           f"fail {summary['failed']:>2}/{summary['runs']:<3} "
-                          f"p50 {summary['p50']}ms p95 {summary['p95']}ms max {summary['max']}ms", flush=True)
+                          f"p50 {summary['p50']}ms p95 {summary['p95']}ms max {summary['max']}ms"
+                          + (f" (key->tab p50 {summary['key_p50']}ms)" if "key_p50" in summary else ""), flush=True)
                     for failure in summary["failures"][:3]:
                         print(f"           ! {failure['why']}", flush=True)
             finally:
