@@ -70,7 +70,14 @@ function windowSessionKeys(identity, slot = 0) {
   const stable = identity.serverStartedAt && identity.windowId
     ? sessionKey(["v3-id", identity.socketPath, identity.serverStartedAt, identity.windowId, `slot${slotNumber}`])
     : null;
-  return { primary, legacy: legacy === primary ? null : legacy, stable };
+  // The window's NAME, which outlives both: a window closed and opened again under the same name,
+  // or a tmux server restart, keeps it while the id and often the index change. Only for a name
+  // someone gave the window — an automatic name is the running command, and every window running
+  // `fish` would share one file.
+  const named = identity.windowName && !identity.windowNameAutomatic
+    ? sessionKey(["v4-name", identity.socketPath, identity.session, identity.windowName, `slot${slotNumber}`])
+    : null;
+  return { primary, legacy: legacy === primary ? null : legacy, stable, named };
 }
 
 /** Where a slot's claim file lives, beside the session file it guards. */
@@ -115,8 +122,13 @@ function parseSlotClaim(text) {
  * look held — and the cost of being wrong that way is a pane starting one slot higher,
  * never two live panes sharing one file.
  */
-function slotClaimIsStale(claim, isAlive) {
+function slotClaimIsStale(claim, isAlive, self = null) {
   if (!claim) return true;
+  // A claim this very process holds for a pane it no longer hosts. A host outlives its panes, so the
+  // pid test alone kept such a claim forever: measured, one engine held seven claims for panes
+  // closed hours before, and tweb opened again in one of those windows started on an empty slot 1
+  // instead of the window's tabs. Only this process can say which of its panes are attached.
+  if (self && claim.pid === self.pid && claim.pane && !self.attached(claim.pane)) return true;
   return !isAlive(claim.pid);
 }
 
@@ -191,7 +203,8 @@ function takeSlot(claimPath, mine, pid, io, paneId = null) {
   // For a different pane of the same process it must not: that is the host case, and treating it as
   // idempotent would give both panes one slot.
   if (claimOwnedBy(existing, pid, paneId)) return true;
-  if (!slotClaimIsStale(existing, io.isAlive)) return false;
+  const self = io.paneAttached ? { pid, attached: io.paneAttached } : null;
+  if (!slotClaimIsStale(existing, io.isAlive, self)) return false;
   io.removeClaim(claimPath);
   if (!io.createClaim(claimPath, mine)) return false;
   return claimOwnedBy(parseSlotClaim(io.readClaim(claimPath)), pid, paneId);
@@ -300,6 +313,18 @@ function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
   };
 }
 
+// A pane opened with a URL keeps the window's saved tabs and shows the URL among them: the tab
+// already holding it, or a new last tab. It used to start with the URL alone and save over the
+// saved list 100ms later, so `tweb split <url>` in a window lost every page that window had open.
+function sessionWithOpenedUrl(session, url) {
+  if (!isRestorableUrl(url)) return session;
+  if (!session) return null;
+  const existing = session.tabs.findIndex((tab) => tab.url === url);
+  if (existing >= 0) return { tabs: session.tabs, activeIndex: existing };
+  if (session.tabs.length >= 50) return session;
+  return { tabs: [...session.tabs, { url }], activeIndex: session.tabs.length };
+}
+
 module.exports = {
   abandonedClaimFiles,
   claimIsReleasable,
@@ -307,6 +332,7 @@ module.exports = {
   isRestorableUrl,
   normalizeWindowSession,
   parseSlotClaim,
+  sessionWithOpenedUrl,
   slotClaimIsStale,
   slotClaimPath,
   windowSessionForSave,

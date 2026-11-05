@@ -121,7 +121,9 @@ const {
   isRestorableUrl,
   normalizeWindowSession,
   parseSlotClaim,
+  sessionWithOpenedUrl,
   windowSessionForSave,
+  windowSessionKeys,
 } = require("./window-session.cjs");
 const {
   parseHistoryLines,
@@ -287,14 +289,7 @@ let navigationSerial = 0;
 function sess() {
   return currentPane().session;
 }
-// Deliberately not per-pane, because in a host it is never set: `resolveWindowSessionPaths` runs only
-// where `sess().identity` was built from the process's own `$TMUX_PANE`, and `ownTmuxPane` is null for a
-// hosted runtime. So `writeWindowSession` returns on its first guard and a host saves no session at
-// all. Restoring per-pane sessions in a host needs the claim to key off the ATTACH identity rather
-// than the process — a separate piece of work, and one that has to arbitrate against the per-pane
-// engines that may still hold those slots.
 
-let windowSessionSaveTimer = null;
 let hiddenWindowWatchdog = null;
 let orphanWatchdog = null;
 let agentServer = null;
@@ -2567,6 +2562,7 @@ function tabLabel(tab, index) {
 // and it needs its own file to save into just as much.
 function resolveWindowSessionPaths() {
   const directory = path.join(app.getPath("userData"), "window-sessions");
+  readWindowName(sess().identity);
   try {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   } catch (error) {
@@ -2603,6 +2599,10 @@ function resolveWindowSessionPaths() {
         try { unlinkSync(file); } catch {}
       },
       isAlive: processAlive,
+      // A per-pane engine has one pane, and it is the one asking.
+      paneAttached: hostedRuntime
+        ? (paneId) => paneRegistry.list().some((record) => record.paneId === paneId)
+        : null,
     },
   });
   if (!claim) return;
@@ -2613,10 +2613,58 @@ function resolveWindowSessionPaths() {
   sess().legacyPath = claim.keys.legacy
     ? path.join(directory, `${claim.keys.legacy}.json`)
     : null;
+  sess().namedPath = claim.keys.named
+    ? path.join(directory, `${claim.keys.named}.json`)
+    : null;
+  sess().slot = claim.slot;
   sess().claimPath = claim.claimPath;
   if (debugLogging) {
     console.error(`tweb: window session slot ${claim.slot} (claimed=${claim.claimed})`);
   }
+}
+
+// The window's name and whether tmux chose it, for the name key (`windowSessionKeys`). Asked here
+// rather than carried in the identity so a hosted pane's SESSION line and the per-pane probe stay
+// as they are; one tmux call at attach.
+function readWindowName(identity) {
+  if (!identity?.paneId) return;
+  try {
+    const [name, automatic] = execFileSync(
+      "tmux",
+      ["-S", identity.socketPath, "display-message", "-p", "-t", identity.paneId, "#{window_name}\t#{automatic-rename}"],
+      { encoding: "utf8", timeout: 1000 }
+    ).replace(/\n$/, "").split("\t");
+    identity.windowName = name || null;
+    identity.windowNameAutomatic = automatic !== "0";
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: window name lookup failed: ${error.message}`);
+  }
+}
+
+// A window renamed while the pane runs — `rca:#3557 calls-prod` became `rca-us1` — saves under its
+// new name from the next save on. Asynchronous: saves follow every navigation and tab switch.
+function refreshWindowName(done) {
+  const identity = sess().identity;
+  const scope = currentPane();
+  if (!identity?.paneId || !sess().path) {
+    done();
+    return;
+  }
+  execFile(
+    "tmux",
+    ["-S", identity.socketPath, "display-message", "-p", "-t", identity.paneId, "#{window_name}\t#{automatic-rename}"],
+    { encoding: "utf8", timeout: 1000 },
+    (error, stdout) => withPaneScope(scope, () => {
+      if (!error) {
+        const [name, automatic] = String(stdout).replace(/\n$/, "").split("\t");
+        identity.windowName = name || null;
+        identity.windowNameAutomatic = automatic !== "0";
+        const named = windowSessionKeys(identity, sess().slot || 0)?.named;
+        sess().namedPath = named ? path.join(path.dirname(sess().path), `${named}.json`) : null;
+      }
+      done();
+    })
+  );
 }
 
 // The claim file is deleted only by the process named in it, and only on a clean exit.
@@ -2645,7 +2693,7 @@ function releaseWindowSessionClaim() {
 // the window index for after a server restart.
 function writeWindowSessionState(state) {
   if (!sess().path || !state) return;
-  for (const target of [sess().stablePath, sess().path]) {
+  for (const target of [sess().stablePath, sess().namedPath, sess().path]) {
     if (!target) continue;
     const temporaryPath = `${target}.${process.pid}.tmp`;
     try {
@@ -2659,11 +2707,12 @@ function writeWindowSessionState(state) {
   }
 }
 
-function readWindowSession() {
-  if (!sess().restore || !sess().path) return null;
+function readWindowSession({ opening = false } = {}) {
+  if ((!sess().restore && !opening) || !sess().path) return null;
   // The window id first: within one tmux server it cannot belong to another window, while the
-  // index may have been another window's before a renumber.
-  for (const candidate of [sess().stablePath, sess().path, sess().legacyPath]) {
+  // index may have been another window's before a renumber. Then the name, which a window opened
+  // again or a server restart keeps; the index last.
+  for (const candidate of [sess().stablePath, sess().namedPath, sess().path, sess().legacyPath]) {
     if (!candidate) continue;
     try {
       const session = normalizeWindowSession(
@@ -2702,14 +2751,32 @@ function writeWindowSession() {
   writeWindowSessionState(state);
 }
 
+// Per pane. One timer for the whole engine let pane B's save cancel pane A's, and the callback ran
+// outside any pane's scope, so in a host it saved the first pane's tabs instead.
 function scheduleWindowSessionSave() {
   if (!sess().path || quitting) return;
-  if (windowSessionSaveTimer) clearTimeout(windowSessionSaveTimer);
-  windowSessionSaveTimer = setTimeout(() => {
-    windowSessionSaveTimer = null;
-    writeWindowSession();
+  const state = sess();
+  if (state.saveTimer) clearTimeout(state.saveTimer);
+  const scope = currentPane();
+  state.saveTimer = setTimeout(() => {
+    state.saveTimer = null;
+    withPaneScope(scope, () => refreshWindowName(() => {
+      if (!quitting) writeWindowSession();
+    }));
   }, 100);
-  windowSessionSaveTimer.unref();
+  state.saveTimer.unref();
+}
+
+// What a pane leaves behind when it goes: its tabs saved as they are now, not as of the last
+// debounced save, and its slot handed back so the next tweb in that window gets this list.
+function settleWindowSession() {
+  const state = sess();
+  if (state.saveTimer) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+  }
+  writeWindowSession();
+  releaseWindowSessionClaim();
 }
 
 function updatePaneTitle() {
@@ -8081,14 +8148,19 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
   reparkTerminalCaret();
 }
 
-function createWindow(url, frames = currentFrames()) {
+// `explicit`: the pane was opened with this URL, rather than handed the example.com placeholder.
+function createWindow(url, frames = currentFrames(), { explicit = false } = {}) {
   // A hosted pane's geometry came in its ATTACH; a per-pane engine measures its own terminal.
   // Querying the terminal under hosting would measure the DAEMON's, which has no pane.
   const vp = frames.viewport || queryViewportSize();
   frames.cells = { cols: vp.cols, rows: vp.rows };
   frames.viewport = vp;
 
-  const session = readWindowSession();
+  // Given a URL, the pane still keeps the window's saved tabs, with the URL shown among them.
+  // Restoring as well — a pane that fell back from the daemon after a lost session restores, and
+  // used to drop the URL it was opened with.
+  const opening = explicit && isRestorableUrl(url);
+  const session = opening ? sessionWithOpenedUrl(readWindowSession({ opening }), url) : readWindowSession();
   if (!session) {
     const initialUrl = sess().restore && !isRestorableUrl(url)
       ? noWindowSessionPage()
@@ -9654,6 +9726,7 @@ function handleAttach(command) {
   record.session.restore = Boolean(command.restoreSession);
 
   const url = normalizeUrl(command.url || "https://example.com");
+  const explicitUrl = Boolean(command.url);
   // Everything below this line is the shipping path, run for the attached pane: the same
   // `applyViewport`, the same `createWindow`, the same input and agent handling. It reaches the
   // right pane because every one of them takes the record and the frame context, which is what
@@ -9663,7 +9736,7 @@ function handleAttach(command) {
   // registers resolves back here from that entry, including `paint`.
   withPaneScope(record, () => {
     if (command.viewport) applyViewport(command.viewport, command.origin ?? null, frames, record);
-    createWindow(url, frames);
+    createWindow(url, frames, { explicit: explicitUrl });
     markInteractionActivity();
   });
 
@@ -9694,6 +9767,12 @@ function closePaneOnce(record, reason) {
   // image id — 19 pane resolutions fell back to the first pane, and `%12` stopped painting
   // altogether. Destroying the windows is what stops all three.
   withPaneScope(record, () => {
+    // Before the tabs go: with none left there is nothing to save.
+    try {
+      settleWindowSession();
+    } catch (error) {
+      console.error(`tweb: window session settle failed for ${record.paneId}: ${error.message}`);
+    }
     const windows = paneWindows.get(record.key);
     if (windows) {
       // `destroy()` fires `closed`, and that handler resolves its pane from `tabPanes` — so the
@@ -10050,13 +10129,10 @@ app.whenReady().then(async () => {
   // `whenReady` is async — a few tens of milliseconds of startup buys a session whose rules
   // are armed for request one.
   await setUpExtensions();
-  if (sess().restore) {
-    initializeTmuxVisibility();
-    createWindow(currentUrl);
-  } else {
-    createWindow(currentUrl);
-    setImmediate(initializeTmuxVisibility);
-  }
+  // Before the window either way: it is what keys the window session, and a pane opened with a URL
+  // reads the saved tabs too. Deferred, the first save overwrote them with the URL alone.
+  initializeTmuxVisibility();
+  createWindow(currentUrl, currentFrames(), { explicit: Boolean(process.env.TWEB_URL || commandLineUrl()) });
   markInteractionActivity();
   agentServer = startAgentServer({
     // The pane, not the process. `solePaneId` is this pane's registered identity — the same
@@ -10293,14 +10369,10 @@ app.on("before-quit", () => {
         clearInterval(hiddenWindowWatchdog);
         hiddenWindowWatchdog = null;
       }
-      if (windowSessionSaveTimer) {
-        clearTimeout(windowSessionSaveTimer);
-        windowSessionSaveTimer = null;
-      }
     }],
+    // Every pane's, not the first one's.
     ["window session", () => {
-      writeWindowSession();
-      releaseWindowSessionClaim();
+      forEachPane(() => settleWindowSession());
     }],
     ["graphics worker", () => {
       quitting = true;
