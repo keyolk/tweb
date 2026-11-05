@@ -520,7 +520,8 @@ test("bare open never restores or saves an internal blank page", () => {
   assert.match(main, /for \(const candidate of \[sess\(\)\.stablePath, sess\(\)\.namedPath, sess\(\)\.path, sess\(\)\.legacyPath\]\)/);
   // Per-pane now: `tweb open` with no url means "restore this window's tabs" and with a url means
   // "open that", and one host serves both at once.
-  assert.match(main, /sess\(\)\.restore && !isRestorableUrl\(url\)/);
+  // Nothing to open is the start page, whether or not a restore was asked for — never about:blank.
+  assert.match(main, /const initialUrl = !isRestorableUrl\(url\) && !\/\^data:\/i\.test\(url\) \? noWindowSessionPage\(\) : url;/);
   assert.match(main, /noWindowSessionPage\(\)/);
   assert.match(main, /if \(!isRestorableUrl\(url\) \|\| url\.startsWith\("tweb-action:"\)\) return;/);
   assert.match(main, /if \(isRestorableUrl\(entry\?\.url\) && !seen\.has\(entry\.url\)\)/);
@@ -700,7 +701,7 @@ test("each pane owns an interactive tab badge instead of publishing tabs in tmux
   }
 
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /function tabStateModel\(\)[\s\S]*title: candidate\.webContents\.getTitle\(\)/);
+  assert.match(main, /function tabStateModel\(\)[\s\S]*title: tabTitle\(candidate\)/);
   assert.match(main, /event\.reply\("tweb-tab-state", tabStateModel\(\)\)/);
   assert.match(main, /function activateTab\(index\)[\s\S]*sendTabState\(\)/);
   const paneTitle = main.slice(main.indexOf("function updatePaneTitle()"),
