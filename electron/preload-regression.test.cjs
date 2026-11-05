@@ -3213,9 +3213,12 @@ test("badges follow their targets and a pick clicks a point that reaches its tar
 // placed: the pane stayed black until the user pressed a key.
 test("pinning a floating page re-places the frame instead of waiting for a paint", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  const toggle = main.slice(main.indexOf("function toggleFloat("),
-    main.indexOf("function restoreFocusFromFloat("));
-  const pin = toggle.slice(toggle.indexOf("if (!state.floating) {\n    // Clear the status text"));
+  const toggle = main.slice(main.indexOf("function toggleFloat("), main.indexOf("function showPageBackInPane("));
+  assert.match(toggle, /if \(!state\.floating\) \{\n    showPageBackInPane\(\);/);
+  // The window closing takes the page back the same way, or its status text stayed in the pane.
+  const closed = main.slice(main.indexOf('display.on("closed"'));
+  assert.match(closed.slice(0, 1200), /showPageBackInPane\(\)/);
+  const pin = main.slice(main.indexOf("function showPageBackInPane("), main.indexOf("function restoreFocusFromFloat("));
   const clear = pin.indexOf("write(`\\x1b[2J`)");
   assert.ok(clear > 0, "the pin path must clear the status text");
   // After the clear, or the clear would wipe what was just placed.
