@@ -3960,8 +3960,9 @@ function activateTab(index) {
   // reports on focus — which switching soleWindows.tabs does not fire.
   moveTerminalCaret(null);
   // Zoom is shared per origin in Chromium, so a sibling tab on the same host can
-  // have moved it. Only the active tab is ever painted, so restoring this tab's
-  // own factor on activation is what makes zoom look per-tab.
+  // have moved it, and a zoom step made on another tab was only applied there.
+  // Only the active tab is ever painted, so applying the pane's factor on
+  // activation is what keeps every tab at it — see `paneZoomFactor`.
   const zoomFactor = effectiveZoomFactor(currentWindows().win);
   if (!currentWindows().win.isDestroyed() && currentWindows().win.webContents.getZoomFactor() !== zoomFactor) {
     currentWindows().win.webContents.setZoomFactor(zoomFactor);
@@ -7919,7 +7920,7 @@ function enforceHiddenWindows() {
   forEachPane(() => updatePaintingState());
 }
 
-function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
+function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
   // Every handler registered below runs as work belonging to this tab's pane.
   //
   // Registration cannot capture the pane: verified under Electron 43 that a `paint` handler
@@ -8236,7 +8237,7 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
 
 // `insertAt` places the tab at that index instead of at the end: an engine switch puts the new
 // tab where the one it replaces was (see switchTabEngine).
-function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFactor(), insertAt = null) {
+function adoptTab(tab, url, activate = true, initialZoomFactor = paneZoomFactor(), insertAt = null) {
   // The pane whose scope we were called in — `attachPane` establishes it, and a tab opened from an
   // existing tab inherits it through that tab's bound handlers. Recorded before `configureTab` so
   // the handlers it registers can resolve this tab the first time they fire.
@@ -8316,7 +8317,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
 function createTab(
   url = "about:blank",
   activate = true,
-  initialZoomFactor = defaultZoomFactor(),
+  initialZoomFactor = paneZoomFactor(),
   showInitialPlaceholder = currentWindows().tabs.length === 0,
   { engine = pageBackend.kind, insertAt = null } = {}
 ) {
@@ -8500,8 +8501,11 @@ function createWindow(url, frames = currentFrames(), { explicit = false } = {}) 
   }
 
   const moves = [];
+  // A session saved before zoom was per pane can hold a different zoom per tab; the active tab's
+  // is the one the person last looked at, so the whole pane comes back at it.
+  const zoom = session.tabs[session.activeIndex]?.zoom ?? defaultZoomFactor();
   for (const [index, tab] of session.tabs.entries()) {
-    const restored = createTab(tab.url, false, tab.zoom, index === session.activeIndex);
+    const restored = createTab(tab.url, false, zoom, index === session.activeIndex);
     if (tab.engine && tab.engine !== pageBackend.kind) moves.push([restored, tab.engine]);
   }
   activateTab(session.activeIndex);
@@ -8623,18 +8627,29 @@ function logicalMousePoint(rawX, rawY) {
   };
 }
 
+/// The zoom every tab of the current pane is at, which a new tab starts at too.
+///
+/// One per pane, not per tab: a zoom is about how much of the page fits the pane, which is the
+/// same for every tab in it, and tabs that each kept their own came back at a different size on
+/// every J/K. Read off the active tab because every tab of the pane holds the same value.
+function paneZoomFactor() {
+  const tab = currentWindows().win;
+  return (tab && tabZoomFactors.get(tab)) ?? defaultZoomFactor();
+}
+
 function setBrowserZoom(action) {
   if (!currentWindows().win) return;
   const contents = currentWindows().win.webContents;
   // Chromium keeps zoom per origin, so getZoomFactor() reports whatever another
-  // tab on the same host last set. Step from this tab's own remembered value.
+  // tab on the same host last set. Step from the pane's own remembered value.
   const current = tabZoomFactors.get(currentWindows().win) ?? contents.getZoomFactor();
   const next = action === "reset"
     ? defaultZoomFactor()
     : Math.min(2, Math.max(0.5, current * (action === "in" ? 1.2 : 1 / 1.2)));
   // The user's own factor is what is remembered and what a later pin restores; what is applied
-  // carries any fullscreen surface compensation on top of it.
-  tabZoomFactors.set(currentWindows().win, next);
+  // carries any fullscreen surface compensation on top of it. Every tab of the pane takes it —
+  // see `paneZoomFactor` — and a background tab applies it when it is activated.
+  for (const tab of currentWindows().tabs) tabZoomFactors.set(tab, next);
   contents.setZoomFactor(effectiveZoomFactor(currentWindows().win));
   contents.invalidate();
   broadcastCellMetrics();

@@ -236,6 +236,10 @@ impl EngineHost {
         host
     }
 
+    pub fn app_dir(&self) -> &Path {
+        &self.launcher.app_dir
+    }
+
     pub fn state(&self) -> EngineState {
         self.inner.lock().state.clone()
     }

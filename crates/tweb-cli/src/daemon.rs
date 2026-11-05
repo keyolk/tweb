@@ -56,8 +56,17 @@ pub fn restart() -> Result<()> {
     let path = twebd_binary()?;
     // `serve` is the long-running supervisor. It must not inherit this process's stdout — the
     // Kitty graphics channel owns that — so detach both stdout and stderr.
-    let status = Command::new(&path)
-        .arg("serve")
+    let mut serve = Command::new(&path);
+    serve.arg("serve");
+    // A restart is usually how newly installed code is loaded, but the engine app is named by
+    // whichever pane reattaches first — an old frontend, naming the app it extracted when it
+    // started. This `tweb` is the installed one, so its engine is pinned for the new daemon.
+    if let Ok((executable, app_dir)) = tweb_pane::find_electron() {
+        serve
+            .env(twebd::server::PINNED_ENGINE_EXECUTABLE, executable)
+            .env(twebd::server::PINNED_ENGINE_APP_DIR, app_dir);
+    }
+    let status = serve
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

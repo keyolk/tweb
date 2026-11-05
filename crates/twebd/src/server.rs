@@ -30,8 +30,17 @@ pub struct Supervisor {
     /// Created on the first hosted attach and shared by every pane after it. `None` until then, so
     /// a daemon nobody has asked to host anything owns no browser runtime.
     engine: parking_lot::Mutex<Option<Arc<EngineHost>>>,
+    /// The engine `tweb daemon restart` resolved, if it started this daemon. Used in place of the
+    /// first pane's: after a restart the first pane to reattach is whichever old frontend gets
+    /// there first, and it names the engine app it extracted when *it* started — an older build
+    /// than the one just installed. Without this a restart meant to load new code kept the old.
+    pinned_engine: Option<(String, String)>,
     started_at: Instant,
 }
+
+/// Set by `tweb daemon restart` on the `serve` it spawns; see `Supervisor::pinned_engine`.
+pub const PINNED_ENGINE_EXECUTABLE: &str = "TWEBD_ENGINE_EXECUTABLE";
+pub const PINNED_ENGINE_APP_DIR: &str = "TWEBD_ENGINE_APP_DIR";
 
 impl Supervisor {
     pub fn new(socket_path: PathBuf) -> Self {
@@ -39,8 +48,20 @@ impl Supervisor {
             registry: PaneRegistry::new(),
             socket_path,
             engine: parking_lot::Mutex::new(None),
+            pinned_engine: None,
             started_at: Instant::now(),
         }
+    }
+
+    /// A supervisor whose engine is the given one whatever the panes name. Only an engine app that
+    /// looks like one is pinned, so a bad pin falls back to the panes' rather than refusing all.
+    pub fn with_pinned_engine(mut self, executable: Option<String>, app_dir: Option<String>) -> Self {
+        if let (Some(executable), Some(app_dir)) = (executable, app_dir) {
+            if Path::new(&executable).exists() && app_dir_looks_like_an_engine(Path::new(&app_dir)) {
+                self.pinned_engine = Some((executable, app_dir));
+            }
+        }
+        self
     }
 
     pub fn uptime_ms(&self) -> u64 {
@@ -59,6 +80,10 @@ impl Supervisor {
         if let Some(engine) = slot.as_ref() {
             return engine.clone();
         }
+        let (executable, app_dir) = match &self.pinned_engine {
+            Some((executable, app_dir)) => (executable.as_str(), app_dir.as_str()),
+            None => (executable, app_dir),
+        };
         let app_dir = PathBuf::from(app_dir);
         let engine = if !Path::new(executable).exists() {
             Arc::new(EngineHost::unavailable(format!(
@@ -457,7 +482,10 @@ pub fn bind(runtime_dir: &Path) -> Result<Option<BoundDaemon>> {
         .with_context(|| format!("cannot bind {}", socket_path.display()))?;
     Ok(Some(BoundDaemon {
         listener,
-        supervisor: Arc::new(Supervisor::new(socket_path)),
+        supervisor: Arc::new(Supervisor::new(socket_path).with_pinned_engine(
+            std::env::var(PINNED_ENGINE_EXECUTABLE).ok(),
+            std::env::var(PINNED_ENGINE_APP_DIR).ok(),
+        )),
         _lock: lock,
     }))
 }
@@ -1135,5 +1163,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn engine_app(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("twebd-pin-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("main.cjs"), "").unwrap();
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_restarted_daemon_uses_the_engine_it_was_started_with_not_the_first_panes() {
+        // After `tweb daemon restart` the first pane to reattach is an old frontend naming the
+        // engine app it extracted at its own start; the installed build's app must win.
+        let pinned = engine_app("new");
+        let executable = std::env::current_exe().unwrap().display().to_string();
+        let supervisor = supervisor()
+            .with_pinned_engine(Some(executable.clone()), Some(pinned.display().to_string()));
+        let engine = supervisor.engine_for(&executable, "/nonexistent/old-app");
+        let state = engine.state().to_string();
+        assert!(!state.contains("old-app"), "{state}");
+        if !matches!(engine.state(), crate::engine_host::EngineState::Unavailable { .. }) {
+            assert_eq!(engine.app_dir(), pinned.as_path());
+        }
+        let _ = std::fs::remove_dir_all(&pinned);
+    }
+
+    #[test]
+    fn a_pin_that_is_not_an_engine_app_is_ignored() {
+        let executable = std::env::current_exe().unwrap().display().to_string();
+        let supervisor = supervisor()
+            .with_pinned_engine(Some(executable), Some("/nonexistent/app".to_string()));
+        assert!(supervisor.pinned_engine.is_none());
     }
 }
