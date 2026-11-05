@@ -14,6 +14,7 @@ const { app, clipboard, nativeImage, screen } = electron;
 const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug: true });
 const { BrowserWindow, ipcMain, session } = pageBackend;
 const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
+const sitePermissionRules = require("./site-permissions.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
 const { searchUrl, suggestUrl, parseSuggestions, keywordSearch, keywordTable } = require("./search-engines.cjs");
 // The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
@@ -4565,6 +4566,16 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     }
     return;
   }
+  // An answer to a permission prompt over the page, and the `:permit` family. Not behind the
+  // shortcut gate: a prompt must be answerable whatever mode the pane is in.
+  if (action === "permission-answer") {
+    answerPermissionPrompt(tab, Number(value?.id), String(value?.answer || "deny"));
+    return;
+  }
+  if (action === "site-permission") {
+    handleSitePermissionCommand(tab, value);
+    return;
+  }
   // A link the user clicked to a site pinned to another engine (the preload held it back). Not a
   // shortcut: it works with vimium off, and the page has already been told nothing.
   if (action === "pinned-link") {
@@ -7177,6 +7188,155 @@ async function setUpExtensions() {
   }
 }
 
+// === Site permissions (site-permissions.cjs) ===========================================
+//
+// Electron granted every request — microphone, camera, notifications, clipboard reads — to every
+// page until a handler said otherwise. Now each is allowed, denied or asked over the page, and a
+// site-wide answer is remembered. Electron tabs only; a Chrome tab is told through CDP
+// (`applyChromeSitePermissions`), since headless Chrome surfaces no request to answer.
+let sitePermissionStore = null;
+function sitePermissions() {
+  if (!sitePermissionStore) {
+    sitePermissionStore = sitePermissionRules.createStore(path.join(app.getPath("userData"), "site-permissions.json"));
+  }
+  return sitePermissionStore;
+}
+
+// One prompt per tab at a time; the rest wait their turn. A request whose tab goes away, or whose
+// page navigates, is refused rather than left holding a device call open forever.
+const permissionPrompts = new Map();
+let permissionPromptSerial = 0;
+
+function configureSitePermissions() {
+  const pageSession = session.defaultSession;
+  pageSession.setPermissionRequestHandler((contents, permission, callback, details = {}) => {
+    const kinds = sitePermissionRules.requestKinds(permission, details);
+    const origin = sitePermissionRules.originOf(details.requestingUrl || contents?.getURL?.());
+    const decision = sitePermissionRules.decide(kinds, sitePermissions().get(origin));
+    if (decision !== "ask") {
+      callback(decision === "allow");
+      return;
+    }
+    const tab = contents ? tabForContents(contents) : null;
+    if (!tab || !origin || !mainFrameTakesShortcuts(tab)) {
+      if (debugLogging) console.error(`tweb: permission ${kinds.join(",")} for ${origin} refused: no prompt surface`);
+      callback(false);
+      return;
+    }
+    queuePermissionPrompt(tab, { origin, kinds, callback });
+  });
+  pageSession.setPermissionCheckHandler((_contents, permission, requestingOrigin, details = {}) => {
+    const kinds = sitePermissionRules.requestKinds(permission, details);
+    const origin = sitePermissionRules.originOf(requestingOrigin) || sitePermissionRules.originOf(details.requestingUrl);
+    return sitePermissionRules.check(kinds, sitePermissions().get(origin));
+  });
+}
+
+function queuePermissionPrompt(tab, request) {
+  const queue = permissionPrompts.get(tab) || [];
+  request.id = ++permissionPromptSerial;
+  queue.push(request);
+  permissionPrompts.set(tab, queue);
+  if (queue.length === 1) showPermissionPrompt(tab);
+}
+
+function showPermissionPrompt(tab) {
+  const request = permissionPrompts.get(tab)?.[0];
+  if (!request || tab.isDestroyed()) return;
+  sendToMainTabFrame(tab, "tweb-permission-prompt", {
+    id: request.id,
+    origin: request.origin,
+    what: sitePermissionRules.describe(request.kinds),
+  });
+}
+
+function answerPermissionPrompt(tab, id, answer) {
+  const queue = permissionPrompts.get(tab);
+  const index = queue ? queue.findIndex((request) => request.id === id) : -1;
+  if (index < 0) return;
+  const [request] = queue.splice(index, 1);
+  const allowed = answer === "once" || answer === "always";
+  if (answer === "always" || answer === "never") sitePermissions().set(request.origin, request.kinds, allowed);
+  request.callback(allowed);
+  if (debugLogging) console.error(`tweb: permission ${request.kinds.join(",")} for ${request.origin}: ${answer}`);
+  if (queue.length) {
+    showPermissionPrompt(tab);
+  } else {
+    permissionPrompts.delete(tab);
+    sendToMainTabFrame(tab, "tweb-permission-prompt", null);
+  }
+}
+
+function refusePermissionPrompts(tab) {
+  const queue = permissionPrompts.get(tab);
+  if (!queue) return;
+  permissionPrompts.delete(tab);
+  for (const request of queue) request.callback(false);
+  sendToMainTabFrame(tab, "tweb-permission-prompt", null);
+}
+
+// Headless Chrome refuses every request itself, so a Chrome tab gets what the user granted before
+// the page asks: on each navigation, its origin's remembered decisions go to `Browser.setPermission`.
+function applyChromeSitePermissions(tab, url) {
+  if (tab.isDestroyed() || tabEngine(tab) !== "chrome") return;
+  const origin = sitePermissionRules.originOf(url);
+  if (!origin || origin === "file://") return;
+  const contents = tab.webContents;
+  for (const [kind, allowed] of Object.entries(sitePermissions().get(origin))) {
+    const descriptor = sitePermissionRules.CDP_DESCRIPTORS[kind];
+    if (!descriptor || typeof contents.connection?.send !== "function") continue;
+    void contents.connection.send("Browser.setPermission", {
+      permission: descriptor,
+      setting: allowed ? "granted" : "denied",
+      origin,
+    }).catch((error) => {
+      if (debugLogging) console.error(`tweb: chrome permission ${descriptor.name} for ${origin} failed: ${error.message}`);
+    });
+  }
+}
+
+// `:permit mic`, `:forbid camera`, `:permissions` (and `:permissions reset`) for the current page.
+const PERMISSION_KEYS = { y: "once", a: "always", n: "deny", N: "never", Escape: "deny" };
+function routePermissionKey(tab, key, modifiers, pressed) {
+  const request = tab && !tab.isDestroyed() ? permissionPrompts.get(tab)?.[0] : null;
+  if (!request || modifiers.some((modifier) => modifier !== "shift")) return false;
+  const answer = PERMISSION_KEYS[key];
+  if (!answer) return false;
+  if (pressed) answerPermissionPrompt(tab, request.id, answer);
+  return true;
+}
+
+function handleSitePermissionCommand(tab, value) {
+  const say = (text) => sendToMainTabFrame(tab, "tweb-flash", text);
+  const url = tab.webContents.getURL();
+  const origin = sitePermissionRules.originOf(url);
+  if (!origin) {
+    say("this page has no site to remember permissions for");
+    return;
+  }
+  const op = value?.op;
+  if (op === "list") {
+    if (String(value.argument || "").trim() === "reset") {
+      say(sitePermissions().forget(origin) ? `forgot permissions for ${origin}` : `nothing remembered for ${origin}`);
+      return;
+    }
+    const entries = Object.entries(sitePermissions().get(origin));
+    say(entries.length
+      ? `${origin}: ${entries.map(([kind, allowed]) => `${sitePermissionRules.LABELS[kind] || kind} ${allowed ? "allowed" : "blocked"}`).join(", ")}`
+      : `${origin}: nothing remembered — devices and notifications are asked`);
+    return;
+  }
+  const kind = sitePermissionRules.parseKind(value?.argument);
+  if (!kind) {
+    say("permit what? camera, mic, notifications, clipboard or midi");
+    return;
+  }
+  const allowed = op === "permit";
+  sitePermissions().set(origin, [kind], allowed);
+  applyChromeSitePermissions(tab, url);
+  say(`${sitePermissionRules.LABELS[kind]} ${allowed ? "allowed" : "blocked"} for ${origin}${tabEngine(tab) === "chrome" ? " — reload to use it" : ""}`);
+}
+
 function configureDownloads() {
   session.defaultSession.on("will-download", (_event, item) => {
     const destination = availableDownloadPath(item.getFilename());
@@ -7873,6 +8033,9 @@ function configureTab(tab, initialZoomFactor = defaultZoomFactor()) {
     scheduleWindowSessionSave();
   };
   onContents("did-navigate", (_event, url) => {
+    // A prompt belongs to the page that asked; a new document never answers it.
+    refusePermissionPrompts(tab);
+    applyChromeSitePermissions(tab, url);
     // The Chrome engine cannot sign in to Google (see cdp/sign-in-block.cjs); replace the refusal,
     // whose only button fails the same way, with what to do instead.
     if (tabEngine(tab) === "chrome" && isGoogleSignInRejection(url)) {
@@ -7976,6 +8139,7 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = defaultZoomFact
   }
 
   tab.on("closed", bindPane(() => tabPanes.get(tab), () => {
+    refusePermissionPrompts(tab);
     tabPanes.delete(tab);
     // A floating tab taking its viewer down with it. Ordered before the early return
     // below: a tab can be closed while floating whether or not it is still in the list.
@@ -9190,6 +9354,10 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
 
   if (pressed && routeHintShortcut(currentWindows().win, key, modifiers)) return;
 
+  // A permission prompt is answered here, not in the page: the key may be headed for a focused
+  // iframe whose preload has no prompt, and the answer must not depend on the pane's input mode.
+  if (routePermissionKey(currentWindows().win, key, modifiers, pressed)) return;
+
   const text = eventKind !== 3
     ? textCodepoints.length > 0
       ? textCodepoints.map((value) => keyName(value) || "").join("")
@@ -10040,6 +10208,7 @@ app.whenReady().then(async () => {
     return;
   }
   configureDownloads();
+  configureSitePermissions();
   watchNetwork();
   serveLocalMarkdown();
   // A backstop, not the mechanism: `browser-window-created` above and the per-tab

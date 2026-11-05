@@ -64,6 +64,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/deflate-policy.cjs
 	node --check electron/tmux-passthrough.cjs
 	node --check electron/search-engines.cjs
+	node --check electron/site-permissions.cjs
 	node --check electron/shm-frames.cjs
 	node --check electron/oopif-input.cjs
 	node --check electron/pointer-interpolation.cjs
