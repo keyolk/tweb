@@ -3929,7 +3929,7 @@ installPrintShim();
         title.textContent = entry.title || entry.url;
         title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:13px/1.35 system-ui,-apple-system,sans-serif";
         const detail = document.createElement("div");
-        const tag = { tab: "TAB  ", search: "SEARCH  ", keyword: "KEYWORD  " }[entry.kind] || "";
+        const tag = { tab: "TAB  ", search: "SEARCH  ", keyword: "KEYWORD  ", port: "LISTENING  " }[entry.kind] || "";
         detail.textContent = `${tag}${entry.url}`;
         detail.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6;font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
         row.append(title, detail);
