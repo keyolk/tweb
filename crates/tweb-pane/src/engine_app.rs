@@ -68,6 +68,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/search-engines.cjs"),
     ),
     (
+        "site-permissions.cjs",
+        include_str!("../../../electron/site-permissions.cjs"),
+    ),
+    (
         "settings-schema.json",
         include_str!("../../../electron/settings-schema.json"),
     ),

@@ -171,6 +171,10 @@ installPrintShim();
     { name: "open", argument: "url", action: (value) => send("navigate", value) },
     { name: "tab", argument: "url", action: (value) => send("new-tab", value) },
     { name: "engine", argument: "electron, chrome or webkit", action: (value) => send("switch-engine", value) },
+    // What this site may use (site-permissions.cjs). `:permissions reset` forgets the site.
+    { name: "permit", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "permit", argument: value }) },
+    { name: "forbid", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "forbid", argument: value }) },
+    { name: "permissions", action: (value) => send("site-permission", { op: "list", argument: value }) },
   ];
   // Both tables, by name. Palette rows win a collision, since a row the user can see is the one
   // they will expect `:` to reach.
@@ -289,6 +293,8 @@ installPrintShim();
   let helpHost = null;
   let helpScroller = null;
   let helpRuntimeInfo = null;
+  // The `/` filter over the help rows while the panel is open; see `filterHelp`.
+  let helpSearch = null;
   let contextMenuReturnFocus = null;
   let selectListState = null;
   let indicatorHost = null;
@@ -3619,6 +3625,7 @@ installPrintShim();
     helpHost = null;
     helpScroller = null;
     helpRuntimeInfo = null;
+    helpSearch = null;
     if (restoreMode) normalMode();
   }
 
@@ -3651,7 +3658,9 @@ installPrintShim();
     helpKey.textContent = "?";
     const escKey = document.createElement("kbd");
     escKey.textContent = "Esc";
-    headingHint.append("Shortcuts mode · close with ", helpKey, " or ", escKey);
+    const searchKey = document.createElement("kbd");
+    searchKey.textContent = "/";
+    headingHint.append("Shortcuts mode · ", searchKey, " search · close with ", helpKey, " or ", escKey);
     heading.append(headingTitle, headingHint);
     const close = document.createElement("button");
     close.type = "button";
@@ -3661,6 +3670,13 @@ installPrintShim();
     header.append(heading, close);
     const grid = document.createElement("div");
     grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:10px";
+    // `/` filters the rows by key or description, so a key is found by what it does.
+    const searchLine = document.createElement("div");
+    searchLine.style.cssText = "display:none;margin:0 0 12px;padding:7px 11px;border:1px solid #f6a723;border-radius:7px;background:#ffffff08;font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e8eaed";
+    const noMatch = document.createElement("div");
+    noMatch.style.cssText = "display:none;padding:11px;color:#9aa0a6";
+    const rows = [];
+    const groups = [];
     for (const [title, entries] of shortcutHelpSections) {
       const group = document.createElement("section");
       group.style.cssText = "padding:11px;border:1px solid #ffffff18;border-radius:7px;background:#ffffff08";
@@ -3677,15 +3693,18 @@ installPrintShim();
         detail.textContent = description;
         detail.style.cssText = "margin:0;color:#bdc1c6";
         list.append(key, detail);
+        rows.push({ group, key, detail, text: `${keys} ${description} ${title}`.toLowerCase() });
       }
       group.append(name, list);
       grid.append(group);
+      groups.push(group);
     }
+    helpSearch = { query: "", typing: false, line: searchLine, rows, groups, noMatch };
     // Filled when main answers `runtime-info`; empty until then, so the help never waits on it.
     const runtimeInfo = document.createElement("dl");
     runtimeInfo.style.cssText = "display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:0 0 12px;padding:8px 11px;border:1px solid #ffffff18;border-radius:7px;background:#ffffff08;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#bdc1c6";
     runtimeInfo.hidden = true;
-    panel.append(header, runtimeInfo, grid);
+    panel.append(header, runtimeInfo, searchLine, grid, noMatch);
     backdrop.append(panel);
     backdrop.addEventListener("click", (event) => {
       if (event.target === backdrop) cancelHelp();
@@ -3705,9 +3724,63 @@ installPrintShim();
     if (!helpHost) return false;
     event.preventDefault();
     event.stopImmediatePropagation();
+    const search = helpSearch;
+    if (search?.typing) {
+      // Typed as text, not as command letters: `j` here is a letter of the query.
+      const typed = typeof event.key === "string" ? event.key : key;
+      if (key === "Escape") {
+        if (search.query) search.query = "";
+        else search.typing = false;
+      } else if (key === "Enter") {
+        search.typing = false;
+      } else if (key === "Backspace") {
+        search.query = search.query.slice(0, -1);
+      } else if (typed.length === 1 && !event.ctrlKey && !event.metaKey) {
+        search.query += typed;
+      }
+      filterHelp();
+      return true;
+    }
+    if (key === "/") {
+      if (search) {
+        search.typing = true;
+        filterHelp();
+      }
+      return true;
+    }
+    // Esc drops a filter before it closes the panel, as it leaves any other mode one step at a time.
+    if (key === "Escape" && search?.query) {
+      search.query = "";
+      filterHelp();
+      return true;
+    }
     if (key === "?" || key === "Escape") cancelHelp();
     else scrollHelp(key, event);
     return true;
+  }
+
+  // Every word of the query must appear in the row's keys, description or section.
+  function filterHelp() {
+    const search = helpSearch;
+    if (!search) return;
+    const words = search.query.toLowerCase().split(/\s+/).filter(Boolean);
+    const shown = new Set();
+    for (const row of search.rows) {
+      const match = words.every((word) => row.text.includes(word));
+      row.key.style.display = match ? "" : "none";
+      row.detail.style.display = match ? "" : "none";
+      if (match) shown.add(row.group);
+    }
+    for (const group of search.groups) group.style.display = shown.has(group) ? "" : "none";
+    search.line.style.display = search.typing || search.query ? "block" : "none";
+    search.line.textContent = `/${search.query}${search.typing ? "▏" : ""}`;
+    // The runtime block above is not a shortcut, and while filtering it only pushes the matches down.
+    if (helpRuntimeInfo) helpRuntimeInfo.style.display = words.length ? "none" : "";
+    search.noMatch.style.display = shown.size ? "none" : "block";
+    search.noMatch.textContent = `no shortcut matches “${search.query}”`;
+    if (helpScroller) helpScroller.scrollTop = 0;
+    setMode("help", search.typing ? "type to filter · Enter keep · Esc clear" : search.query ? `/${search.query} · Esc clear` : "?·Esc close");
+    paintNow();
   }
 
   // The help panel is taller than a small pane, and every key is swallowed while it is open
@@ -5993,7 +6066,8 @@ installPrintShim();
 
     // Escape is handled before defaultPrevented/isComposing/editable checks so one
     // physical press always cancels the current TWeb mode.
-    if (key === "Escape" && hasTransientMode()) {
+    // Except a help filter, which Esc clears first (`handleHelpKey`).
+    if (key === "Escape" && hasTransientMode() && !(helpHost && (helpSearch?.typing || helpSearch?.query))) {
       event.preventDefault();
       event.stopImmediatePropagation();
       cancelTransient();
@@ -6374,6 +6448,48 @@ installPrintShim();
   // for is coming, and that is the newer and more surprising fact.
   // A one-line message from the engine, shown the way a key's own feedback is (`flash`), but long
   // enough to read: it was not a reaction to a key the user is watching for.
+  // A site asking for a device or notifications. Main holds the request and takes the answer keys
+  // itself (`routePermissionKey`), so this is the picture of the question and a place to click.
+  // Top frame only: main sends it to the main frame, and an iframe's copy would be a second box.
+  let permissionHost = null;
+  ipcRenderer.on("tweb-permission-prompt", (_event, prompt) => {
+    if (prompt === undefined || window !== window.top) return;
+    permissionHost?.remove();
+    permissionHost = null;
+    if (!prompt) return;
+    const host = document.createElement("div");
+    host.id = "__tweb_permission__";
+    host.style.cssText = "position:fixed;inset:0 0 auto 0;z-index:2147483647;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "open" });
+    const box = document.createElement("div");
+    box.style.cssText = "box-sizing:border-box;width:min(560px,calc(100vw - 32px));margin:14px auto;padding:12px 14px;border:2px solid #f6a723;border-radius:8px;background:#202124;color:#e8eaed;box-shadow:0 8px 28px #000a;pointer-events:auto;font:14px/1.4 system-ui,-apple-system,sans-serif";
+    const question = document.createElement("div");
+    const site = document.createElement("b");
+    site.textContent = String(prompt.origin || "This site").replace(/^https?:\/\//, "");
+    question.append(site, document.createTextNode(` wants to use the ${prompt.what}`));
+    const choices = document.createElement("div");
+    choices.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-top:10px";
+    for (const [key, label, answer] of [["y", "Allow once", "once"], ["a", "Always allow", "always"], ["n", "Deny", "deny"], ["N", "Never", "never"]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.style.cssText = "border:1px solid #5f6368;border-radius:5px;background:#303134;color:#e8eaed;padding:4px 9px;font:12px system-ui,-apple-system,sans-serif;cursor:pointer";
+      const keyLabel = document.createElement("span");
+      keyLabel.textContent = key;
+      keyLabel.style.cssText = "font:12px ui-monospace,Menlo,monospace;color:#f6a723;margin-right:6px";
+      button.append(keyLabel, document.createTextNode(label));
+      button.onmousedown = (event) => {
+        event.preventDefault();
+        send("permission-answer", { id: prompt.id, answer });
+      };
+      choices.append(button);
+    }
+    box.append(question, choices);
+    shadow.append(box);
+    document.documentElement.append(host);
+    permissionHost = host;
+    paintNow();
+  });
+
   ipcRenderer.on("tweb-flash", (_event, message) => {
     if (typeof message === "string" && message) flash(message, 2500);
   });
