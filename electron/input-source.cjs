@@ -40,7 +40,9 @@ function focusHookCommands(tweb, enabled = true) {
   // Three layers of quoting: the shell command run-shell runs, inside the run-shell command, inside
   // the if-shell command the hook stores. Each tmux layer is a double-quoted string, so `"`, `\` and
   // `$` are escaped once per layer; the binary path is single-quoted for the shell.
-  const run = (action) => `run-shell -b "${tmuxEscape(`${shellQuote(tweb)} __ime ${action} >/dev/null 2>&1`)}"`;
+  // `|| true`: tmux shows a failed run-shell on the person's screen ("returned 127"), and a hook
+  // left pointing at a removed build would do that on every focus change.
+  const run = (action) => `run-shell -b "${tmuxEscape(`${shellQuote(tweb)} __ime ${action} >/dev/null 2>&1 || true`)}"`;
   return [
     ["set-hook", "-g", "pane-focus-in[72]",
       `if-shell -F "#{&&:#{==:#{@tweb_browser},1},#{!=:#{@tweb_text},1}}" "${tmuxEscape(run("normal"))}"`],

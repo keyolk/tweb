@@ -63,7 +63,7 @@ pub fn base_for(tmux_server: &str, pane: &str, fallback: u32) -> u32 {
 /// predecessor's ids is what makes it clean up the stranded image — and `DefaultHasher`'s output is
 /// explicitly not stable across std releases. A toolchain upgrade must not silently reshuffle every
 /// pane onto a different pool.
-fn hash(text: &str) -> u64 {
+pub(crate) fn hash(text: &str) -> u64 {
     let mut value: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
         value ^= u64::from(*byte);

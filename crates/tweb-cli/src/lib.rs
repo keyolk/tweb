@@ -564,6 +564,10 @@ pub enum Command {
     /// pane-focus hooks and the engine. See ime.rs.
     #[command(name = "__ime", hide = true)]
     ImeInternal { action: String },
+    /// internal: delete the images of panes tmux no longer lists, run by tmux's pane, window and
+    /// session close hooks. See tweb-pane image_sweep.rs.
+    #[command(name = "__sweep-images", hide = true)]
+    SweepImagesInternal,
     /// internal: the pane frontend (launched by tmux; not a documented automation API).
     #[command(name = "__pane", hide = true)]
     PaneInternal {
@@ -922,6 +926,7 @@ pub async fn run() -> Result<()> {
                 ime::run(action);
             }
         }
+        Command::SweepImagesInternal => tweb_pane::image_sweep::run(),
         Command::PaneInternal { browser, page, url } => {
             // Without a URL, restore the tmux window session.
             let result = run_pane(page.as_deref().or(url.as_deref()), &browser).await;
