@@ -2335,7 +2335,9 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   // the window — against DESIGN.md 6.5, which gates on a hidden page's buffers converging
   // to zero. Nothing reads a background tab's frame: `repaintActiveTab` only ever asks for
   // `soleWindows.win`, and `activateTab` calls `invalidate()`, so a switched-to tab paints fresh either
-  // way. Dropping the entry is what makes it converge.
+  // way. Dropping the entry is what makes it converge. The exception is a Chrome-engine tab, whose
+  // frame `activateTab` keeps and re-places while the fresh capture is on its way; a hidden pane
+  // still clears every entry (`updatePaintingState`).
   if (tab === currentWindows().win) tabFrames.set(tab, { image, generation });
   else tabFrames.delete(tab);
   if (tab !== currentWindows().win || !currentPane().visible) return;
@@ -2777,7 +2779,7 @@ function updatePaintingState() {
     // runs every second and would otherwise resize the tab back to the pane, clobbering
     // the fullscreen resolution the viewer is showing.
     const logical = (floating && fullscreenFloat && fullscreenSize) ? fullscreenSize : logicalContentSize(currentViewport());
-    const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logical, held, floating);
+    const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logical, held, floating, keepsSizeInStandby(tab));
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
     // A floating tab's audio should keep playing — the display window's viewer draws
@@ -2798,6 +2800,11 @@ function updatePaintingState() {
 // `isPainting` is Electron 43 API, but the engine also runs against whatever the user
 // has cached, so an older runtime must degrade to the unconditional call rather than
 // throw inside the watchdog.
+// Only the Chrome engine pays for a collapsed surface on the way back; see `surfacePlan`.
+function keepsSizeInStandby(tab) {
+  return tabEngine(tab) === "chrome";
+}
+
 function readIsPainting(contents) {
   try {
     return typeof contents.isPainting === "function" ? contents.isPainting() : null;
@@ -3836,8 +3843,12 @@ function activateTab(index) {
     return;
   }
   const normalized = ((index % currentWindows().tabs.length) + currentWindows().tabs.length) % currentWindows().tabs.length;
+  // The tab being left keeps its last frame only if it is drawn from it on the way back.
+  const leaving = currentWindows().win;
+  if (leaving && leaving !== currentWindows().tabs[normalized] && !keepsSizeInStandby(leaving)) tabFrames.delete(leaving);
   currentWindows().activeTabIndex = normalized;
   currentWindows().win = currentWindows().tabs[normalized];
+  inputTrace.mark("tab", { index: normalized });
   inputState().clicks.reset();
   inputState().insertMode = false;
   if (currentWindows().win) insertModeOwners.delete(currentWindows().win);
@@ -3865,6 +3876,14 @@ function activateTab(index) {
   // id and replaces it in place. Deleting would uncover the bare terminal until
   // the new tab paints, which reads as a flicker on every switch.
   updatePaintingState();
+  // A Chrome-engine tab's first fresh frame is a device-pixel capture, ~70ms away, so the frame it
+  // last showed goes up at once and the capture replaces it. An Electron tab repaints in a few ms
+  // and keeps no frame while in the background.
+  const kept = tabFrames.get(currentWindows().win);
+  if (kept && kept.generation === currentFrames().generation && !kept.image.isEmpty() && currentPane().visible
+    && !inputState().floating) {
+    queueFrame(currentWindows().win, kept.image, true);
+  }
   currentWindows().win.webContents.invalidate();
   updatePaneTitle();
   sendTabState();
@@ -8052,7 +8071,8 @@ function applyViewport(vp, origin = currentFrames().origin, frames = currentFram
       // Fullscreen float uses the fullscreen display's size so the pane resize does not
       // clobber the fullscreen resolution.
       const resizeLogical = (isFloating && fullscreenFloat && fullscreenSize) ? fullscreenSize : logical;
-      applySurfacePlan(tab, surfacePlan(isActive, record.visible, resizeLogical, surfaceHeldForAgent(), isFloating));
+      applySurfacePlan(tab, surfacePlan(isActive, record.visible, resizeLogical, surfaceHeldForAgent(), isFloating,
+        keepsSizeInStandby(tab)));
     }
   }
   currentWindows().win?.webContents.invalidate();

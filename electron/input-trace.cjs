@@ -14,6 +14,7 @@
 //   space  the round closed and labels were handed out { id, total }
 //   end    the round ended                             { id, reason }
 //   frame  a whole frame or a patch went to the terminal { kind, bytes }
+//   tab    a tab became the active one                  { index }
 //
 // Off unless set, like TWEB_FRAME_PROBE: the steps that matter are a few milliseconds apart, and a
 // trace that is always on would show up in its own numbers. Writes are synchronous so a line is on

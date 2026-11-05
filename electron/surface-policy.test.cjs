@@ -38,6 +38,17 @@ test("a background tab in a hidden pane is collapsed, not doubly so", () => {
   assert.deepStrictEqual(surfacePlan(false, false, LOGICAL), surfacePlan(false, true, LOGICAL));
 });
 
+test("a standby background tab of a visible pane keeps its full size but does not paint", () => {
+  const plan = surfacePlan(false, true, LOGICAL, false, false, true);
+  assert.strictEqual(plan.painting, false);
+  assert.strictEqual(plan.height, 900, "a Chrome-engine tab pays a relayout to come back from a collapse");
+});
+
+test("a hidden pane collapses a standby tab like any other", () => {
+  assert.strictEqual(surfacePlan(false, false, LOGICAL, false, false, true).height, COLLAPSED_HEIGHT);
+  assert.strictEqual(surfacePlan(true, false, LOGICAL, false, false, true).height, COLLAPSED_HEIGHT);
+});
+
 test("throttling is off exactly when the tab would paint", () => {
   assert.strictEqual(surfacePlan(true, true, LOGICAL).backgroundThrottling, false);
   assert.strictEqual(surfacePlan(false, true, LOGICAL).backgroundThrottling, true);

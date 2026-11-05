@@ -34,7 +34,14 @@ const COLLAPSED_HEIGHT = 1;
 ///
 /// `held` overrides the collapse for the active tab: an agent is reading the page and
 /// needs it laid out at its real size. See `agentNeedsGeometry` for why.
-function surfacePlan(active, terminalVisible, logical, held = false, floating = false) {
+///
+/// `standby` keeps a background tab of a visible pane at its full size, painting nothing. The
+/// collapse is free to undo on Electron (above) but not on the Chrome engine: there a restore is
+/// a metrics override, a headless window resize and a full relayout before the first capture.
+/// Measured switching with `J`/`K` between an Electron and a Chrome tab (bench/feel.py
+/// tab-switch, 1440x1800): to the Electron tab p50 7ms, to the collapsed Chrome tab 112–400ms.
+/// A hidden pane still collapses every tab, so DESIGN.md 6.5's gate is unaffected.
+function surfacePlan(active, terminalVisible, logical, held = false, floating = false, standby = false) {
   const width = Math.max(1, Math.round(logical?.width || 1));
   const height = Math.max(1, Math.round(logical?.height || 1));
   // A floating tab detaches its display from the tmux pane: the OS window is the
@@ -51,7 +58,7 @@ function surfacePlan(active, terminalVisible, logical, held = false, floating = 
     // window's foreground, so throttling is turned off exactly when it would paint.
     backgroundThrottling: !laidOut,
     width,
-    height: laidOut ? height : Math.min(COLLAPSED_HEIGHT, height),
+    height: laidOut || (standby && terminalVisible) ? height : Math.min(COLLAPSED_HEIGHT, height),
     // Passed through to applySurfacePlan so it knows to show the OS window.
     floating,
   };

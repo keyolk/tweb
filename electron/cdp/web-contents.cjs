@@ -1443,11 +1443,15 @@ class CdpWebContents extends EventEmitter {
 
   getFrameRate() { return this.frameRate; }
 
+  // Captured at once, not through `invalidate`'s grace: a tab coming back has nothing in the
+  // screencast to wait for — the screencast is only starting — so the grace was 50ms of nothing
+  // ahead of every switch to this tab (bench/feel.py tab-switch).
   startPainting() {
     if (this.painting) return;
     this.painting = true;
     void this.startScreencast();
-    this.invalidate();
+    this.capture.forceNext = true;
+    this.requestCapture();
   }
 
   stopPainting() {
