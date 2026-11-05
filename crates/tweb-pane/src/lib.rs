@@ -952,8 +952,13 @@ fn restores_after(reason: &attach::SpawnReason) -> bool {
 const REATTACH_ATTEMPTS: u32 = 6;
 const REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
 
-/// [`try_hosted`], and again after a lost session, until the pane finishes or a reason other than a
-/// lost session says to spawn.
+/// [`try_hosted`], and again after a lost session or a daemon that could not be reached, until the
+/// pane finishes or a lasting reason says to spawn.
+///
+/// The unreachable daemon is the cold start: N panes opening at once (a tmux restore, respawning
+/// them after an upgrade) all race to start twebd, and the ones that lose the race for a moment saw
+/// `DaemonStartFailed` or `ConnectFailed` and started engines of their own. Measured: six panes
+/// respawned together, three ended on their own engines beside the daemon's.
 ///
 /// Falling back at once was the wrong move: every Electron engine opens the same profile directory,
 /// and Chromium's storage is one-process-at-a-time (LevelDB locks). Measured after a daemon restart:
@@ -964,16 +969,22 @@ const REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(750
 /// every icon stayed blank; every site keeping state in IndexedDB stalled the same way.
 async fn host_until_settled(url: &str, options: &PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
     let mut outcome = try_hosted(url, options.clone(), pane, image_id).await;
+    let mut again = options.clone();
     for attempt in 1..=REATTACH_ATTEMPTS {
-        let HostedOutcome::Spawn(attach::SpawnReason::HostedSessionLost(reason)) = &outcome else {
-            return outcome;
+        let reason = match &outcome {
+            HostedOutcome::Spawn(reason @ attach::SpawnReason::HostedSessionLost(_)) => {
+                // What the session was showing is in the window session by now (`restores_after`).
+                again.restore_session = true;
+                reason
+            }
+            HostedOutcome::Spawn(
+                reason @ (attach::SpawnReason::DaemonStartFailed(_) | attach::SpawnReason::ConnectFailed(_)),
+            ) => reason,
+            _ => return outcome,
         };
-        tracing::info!(%reason, attempt, "hosted session lost; going back to the daemon");
+        tracing::info!(%reason, attempt, "not hosted yet; going back to the daemon");
         tokio::time::sleep(REATTACH_DELAY).await;
-        // What the session was showing is in the window session by now (see `restores_after`).
-        let mut again = options.clone();
-        again.restore_session = true;
-        outcome = try_hosted(url, again, pane, image_id).await;
+        outcome = try_hosted(url, again.clone(), pane, image_id).await;
     }
     outcome
 }

@@ -177,6 +177,14 @@ pub type PaneSink = UnboundedSender<EngineEvent>;
 pub struct EngineHost {
     launcher: Launcher,
     inner: parking_lot::Mutex<HostState>,
+    /// Held from "is there an engine" to "it said READY", so only one start runs at a time.
+    ///
+    /// Without it every `open` that arrived during a start saw no stdin yet and started an engine
+    /// of its own. Measured with six panes opened together: the starts used up [`CRASH_BUDGET`]
+    /// before any engine had answered, the next requests were refused as "failed 3 times in 60s",
+    /// and those panes started per-pane engines on the same profile as the daemon's — Chromium's
+    /// storage then split between processes and `indexedDB.open` hung in the daemon's pages.
+    starting: tokio::sync::Mutex<()>,
 }
 
 struct HostState {
@@ -210,6 +218,7 @@ impl EngineHost {
                 sinks: HashMap::new(),
                 recent_starts_ms: Vec::new(),
             }),
+            starting: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -281,6 +290,9 @@ impl EngineHost {
             engine_wire::session_line(open),
             engine_wire::open_line(open)
         );
+        // Waited on by every pane that arrives during a start; the first one through starts the
+        // engine, and the rest find its stdin and only register.
+        let _starting = self.starting.lock().await;
         let needs_start = {
             let mut inner = self.inner.lock();
             if let EngineState::Unavailable { reason } = &inner.state {
@@ -316,6 +328,7 @@ impl EngineHost {
                 return Err(reason);
             }
         }
+        drop(_starting);
         let Some(stdin) = self.register(&key, sink) else {
             return Err("engine stdin closed".to_string());
         };
