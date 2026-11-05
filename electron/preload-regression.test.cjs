@@ -514,10 +514,10 @@ test("bare open never restores or saves an internal blank page", () => {
     `if \\(!sess\\(\\)\\.path \\|\\| (?:soleWindows|currentWindows\\(\\))\\.tabs\\.length === 0\\) return;`));
   assert.match(main, /function writeWindowSessionState\(state\)/);
   assert.match(main, /if \(!sess\(\)\.path \|\| !state\) return;/);
-  // Saved under the window id as well as the index (window-session.cjs `windowSessionKeys`).
-  assert.match(main, /for \(const target of \[sess\(\)\.stablePath, sess\(\)\.path\]\)/);
+  // Saved under the window id and name as well as the index (window-session.cjs `windowSessionKeys`).
+  assert.match(main, /for \(const target of \[sess\(\)\.stablePath, sess\(\)\.namedPath, sess\(\)\.path\]\)/);
   assert.match(main, /claimWindowSessionSlot\(\{/);
-  assert.match(main, /for \(const candidate of \[sess\(\)\.stablePath, sess\(\)\.path, sess\(\)\.legacyPath\]\)/);
+  assert.match(main, /for \(const candidate of \[sess\(\)\.stablePath, sess\(\)\.namedPath, sess\(\)\.path, sess\(\)\.legacyPath\]\)/);
   // Per-pane now: `tweb open` with no url means "restore this window's tabs" and with a url means
   // "open that", and one host serves both at once.
   assert.match(main, /sess\(\)\.restore && !isRestorableUrl\(url\)/);

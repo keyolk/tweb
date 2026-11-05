@@ -180,7 +180,10 @@ function createPaneRecord({
       path: null,
       legacyPath: null,
       stablePath: null,
+      namedPath: null,
+      slot: 0,
       claimPath: null,
+      saveTimer: null,
     },
     // Where this pane lives right now, who is looking at it, and how we know.
     //

@@ -9,6 +9,7 @@ const {
   isRestorableUrl,
   normalizeWindowSession,
   parseSlotClaim,
+  sessionWithOpenedUrl,
   slotClaimIsStale,
   windowSessionForSave,
   windowSessionKeys,
@@ -430,4 +431,61 @@ test("a tab's engine is kept across a save and a restore; an unknown one is drop
     { url: "https://example.com/", zoom: 0.8 },
   ]);
   assert.deepStrictEqual(normalizeWindowSession(saved, 0.8).tabs, saved.tabs);
+});
+
+// A window closed and opened again under its name, or a tmux server restart, keeps the name while
+// the id and the index change.
+test("a window's name keys its session across a new id, index and server", () => {
+  const named = { ...tmuxIdentity, windowName: "rca-us1", windowNameAutomatic: false };
+  const before = windowSessionKeys(named);
+  const after = windowSessionKeys({ ...named, windowId: "@40", windowIndex: "9", serverStartedAt: "200" });
+  assert.match(before.named, /^[0-9a-f]{24}$/);
+  assert.equal(before.named, after.named);
+  assert.notEqual(before.stable, after.stable);
+  assert.notEqual(windowSessionKeys(named, 1).named, before.named);
+  assert.notEqual(windowSessionKeys({ ...named, windowName: "rca-eu1" }).named, before.named);
+  assert.notEqual(windowSessionKeys({ ...named, session: "other" }).named, before.named);
+});
+
+test("an automatic or missing window name keys nothing", () => {
+  assert.equal(windowSessionKeys({ ...tmuxIdentity, windowName: "fish", windowNameAutomatic: true }).named, null);
+  assert.equal(windowSessionKeys(tmuxIdentity).named, null);
+});
+
+test("a pane opened with a URL keeps the saved tabs and shows the URL among them", () => {
+  const saved = { tabs: [{ url: "https://a.example/" }, { url: "https://b.example/" }], activeIndex: 0 };
+  assert.deepEqual(sessionWithOpenedUrl(saved, "https://b.example/"), { tabs: saved.tabs, activeIndex: 1 });
+  assert.deepEqual(sessionWithOpenedUrl(saved, "https://c.example/"), {
+    tabs: [...saved.tabs, { url: "https://c.example/" }],
+    activeIndex: 2,
+  });
+  assert.equal(sessionWithOpenedUrl(null, "https://c.example/"), null);
+  assert.equal(sessionWithOpenedUrl(saved, "about:blank"), saved);
+});
+
+// A host outlives its panes. Its own claim for a pane it no longer hosts is free; a claim for a pane
+// it still hosts, or another live process's, is not.
+test("a live host's claim for a pane it no longer hosts is stale", () => {
+  const alive = () => true;
+  const self = { pid: 50, attached: (pane) => pane === "%2" };
+  assert.equal(slotClaimIsStale({ pid: 50, pane: "%1" }, alive, self), true);
+  assert.equal(slotClaimIsStale({ pid: 50, pane: "%2" }, alive, self), false);
+  assert.equal(slotClaimIsStale({ pid: 51, pane: "%1" }, alive, self), false);
+  assert.equal(slotClaimIsStale({ pid: 50, pane: null }, alive, self), false);
+  assert.equal(slotClaimIsStale({ pid: 50, pane: "%1" }, alive), false);
+});
+
+test("a new pane in a window takes slot 0 from a closed pane of the same host", () => {
+  const files = new Map();
+  const io = {
+    readClaim: (file) => files.get(file) ?? null,
+    createClaim: (file, text) => (files.has(file) ? false : (files.set(file, text), true)),
+    removeClaim: (file) => files.delete(file),
+    isAlive: () => true,
+    paneAttached: (pane) => pane === "%9",
+  };
+  const first = claimWindowSessionSlot({ identity: tmuxIdentity, directory: "/d", pid: 50, paneId: "%1", io });
+  assert.equal(first.slot, 0);
+  const next = claimWindowSessionSlot({ identity: tmuxIdentity, directory: "/d", pid: 50, paneId: "%9", io });
+  assert.equal(next.slot, 0);
 });
