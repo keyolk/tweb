@@ -562,7 +562,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             medium.reason.clone(),
         )))
     } else if tunnel.is_none() {
-        Some(try_hosted(url, options.clone(), &pane, image_id).await)
+        Some(host_until_settled(url, &options, &pane, image_id).await)
     } else {
         None
     };
@@ -944,6 +944,38 @@ enum HostedOutcome {
 /// panes with four tabs between them came back with one each, the first URL each was opened with.
 fn restores_after(reason: &attach::SpawnReason) -> bool {
     matches!(reason, attach::SpawnReason::HostedSessionLost(_))
+}
+
+/// How many times, and how far apart, a pane whose hosted session ended goes back to the daemon
+/// before it starts an engine of its own. A daemon restart (an upgrade, `tweb daemon restart`) ends
+/// every session at once and the new daemon's engine is up within a few seconds.
+const REATTACH_ATTEMPTS: u32 = 6;
+const REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// [`try_hosted`], and again after a lost session, until the pane finishes or a reason other than a
+/// lost session says to spawn.
+///
+/// Falling back at once was the wrong move: every Electron engine opens the same profile directory,
+/// and Chromium's storage is one-process-at-a-time (LevelDB locks). Measured after a daemon restart:
+/// six panes each started an engine and the new daemon's engine came up six seconds later, the
+/// storage locks were split among them (Local Storage and the service worker database to one,
+/// the file system to another, none to the daemon's), and in the daemon's panes `caches.open` and
+/// `indexedDB.open` never settled. YouTube draws its icons out of CacheStorage, so its logo and
+/// every icon stayed blank; every site keeping state in IndexedDB stalled the same way.
+async fn host_until_settled(url: &str, options: &PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
+    let mut outcome = try_hosted(url, options.clone(), pane, image_id).await;
+    for attempt in 1..=REATTACH_ATTEMPTS {
+        let HostedOutcome::Spawn(attach::SpawnReason::HostedSessionLost(reason)) = &outcome else {
+            return outcome;
+        };
+        tracing::info!(%reason, attempt, "hosted session lost; going back to the daemon");
+        tokio::time::sleep(REATTACH_DELAY).await;
+        // What the session was showing is in the window session by now (see `restores_after`).
+        let mut again = options.clone();
+        again.restore_session = true;
+        outcome = try_hosted(url, again, pane, image_id).await;
+    }
+    outcome
 }
 
 /// Runs this pane against the daemon, or says why it cannot be.
