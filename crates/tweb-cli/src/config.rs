@@ -122,7 +122,23 @@ fn from_env(setting: &Setting, raw: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Comma-separated, or a JSON array of strings. The array form is what the file itself shows, so it is
+/// what people paste: split on commas it became `["okta.com"` and `"b"]`, and the pin it was meant to
+/// add broke the one already there. It is also the only way to write an entry that holds a comma.
 fn split_list(raw: &str) -> Vec<serde_json::Value> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('[') {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if items.iter().all(serde_json::Value::is_string) {
+                return items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::trim))
+                    .filter(|part| !part.is_empty())
+                    .map(|part| part.to_string().into())
+                    .collect();
+            }
+        }
+    }
     raw.split(',')
         .map(str::trim)
         .filter(|part| !part.is_empty())
@@ -596,6 +612,19 @@ mod tests {
         assert_eq!(
             resolve_with(&setting, &reread, &env).value,
             serde_json::json!(["a.test", "b.test"])
+        );
+        // Pasted as the file shows it: the same list, not `["okta.com"` and `"coder.example.com"]`.
+        let mut pasted = DocumentMut::new();
+        set_in(
+            &mut pasted,
+            &setting.key,
+            parse_input(&setting, r#"["okta.com", "coder.example.com"]"#).unwrap(),
+        );
+        assert!(
+            pasted
+                .to_string()
+                .contains(r#"chrome_sites = ["okta.com", "coder.example.com"]"#),
+            "{pasted}"
         );
         // A list holding anything but strings is not this setting.
         assert_eq!(

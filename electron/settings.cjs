@@ -170,14 +170,30 @@ function coerce(entry, value, fromEnv, env) {
     case "string":
       return typeof value === "string" ? value.trim() : undefined;
     case "list":
-      // Comma-separated in the environment, as `tweb config set` takes it too.
-      if (fromEnv) return String(value).split(",").map((part) => part.trim()).filter(Boolean);
+      // Comma-separated in the environment, as `tweb config set` takes it too — or a JSON array of
+      // strings, which is the only way to write an entry holding a comma (config.rs `split_list`).
+      if (fromEnv) return splitList(String(value));
       return Array.isArray(value) && value.every((item) => typeof item === "string")
         ? value.map((item) => item.trim()).filter(Boolean)
         : undefined;
     default:
       return undefined;
   }
+}
+
+function splitList(raw) {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+        return parsed.map((item) => item.trim()).filter(Boolean);
+      }
+    } catch {
+      // Not JSON after all: split it like any other value.
+    }
+  }
+  return raw.split(",").map((part) => part.trim()).filter(Boolean);
 }
 
 function resolve(fileValues, env = process.env) {

@@ -15,7 +15,7 @@ const pageBackend = require("./cdp/backend.cjs").createBackend(electron, { debug
 const { BrowserWindow, ipcMain, session } = pageBackend;
 const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-block.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
-const { searchUrl, suggestUrl, parseSuggestions } = require("./search-engines.cjs");
+const { searchUrl, suggestUrl, parseSuggestions, keywordSearch, keywordTable } = require("./search-engines.cjs");
 // The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
 // here because the mode resets that clear it run from functions defined well above that case.
 const insertModeOwners = new WeakMap();
@@ -4002,6 +4002,9 @@ function normalizeOmniboxInput(input) {
   const value = String(input || "").trim();
   if (!value) return null;
   if (/^(?:[a-z][a-z0-9+.-]*:\/\/|about:|data:|file:)/i.test(value)) return value;
+  // Ahead of the host check: `w example.com` is a Wikipedia search, not a typo for a URL.
+  const keyword = keywordSearch(value, keywordTable(settings.get("search.keywords")));
+  if (keyword) return keyword.url;
   if (/^(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(value)) return `http://${value}`;
   if (!/\s/.test(value) && (/^[^/]+\.[^/]+(?:\/|$)/.test(value) || /^[^/]+:\d+(?:\/|$)/.test(value))) {
     return `https://${value}`;
@@ -4238,6 +4241,8 @@ function omniboxModel() {
       ...tabEntries,
       ...history.map((entry, index) => ({ ...entry, kind: "history", recency: base - index })),
     ],
+    // For the row that names the keyword search before Enter; the URL main opens is built the same way.
+    keywords: keywordTable(settings.get("search.keywords")),
   };
 }
 

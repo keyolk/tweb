@@ -3778,6 +3778,7 @@ installPrintShim();
     let model = { current: location.href, entries: [] };
     let matches = [];
     let selected = 0;
+    let keywordPicked = false;
     // Search suggestions for the current input, when `search.suggest` is on. Main fetches them (see
     // `omniboxSuggestions`); `seq` drops a reply to a query the user has already typed past.
     let suggestions = [];
@@ -3806,8 +3807,19 @@ installPrintShim();
       ipcRenderer.removeListener("tweb-omnibox-suggest", onSuggestions);
     };
 
+    // `gh tweb`: the keyword search Enter will run, as the first row and selected, so the target is
+    // on screen before the key. Built from the same table main resolves with (`keywordTable`).
+    const keywordRow = (query) => {
+      const match = /^(\S+)\s+(\S[\s\S]*)$/.exec(query);
+      if (!match) return null;
+      const entry = (model.keywords || []).find((candidate) => candidate?.keyword === match[1].toLowerCase());
+      if (!entry || typeof entry.template !== "string") return null;
+      const text = match[2].trim();
+      return { kind: "keyword", title: `${entry.label}: ${text}`, url: entry.template.replace("%s", encodeURIComponent(text)) };
+    };
     const render = () => {
       const query = input.value.trim();
+      const keyword = keywordRow(query);
       const deduped = new Map();
       for (const entry of model.entries || []) {
         if (!entry?.url || deduped.has(entry.url)) continue;
@@ -3819,8 +3831,20 @@ installPrintShim();
       const offered = query ? suggestions.filter((entry) => entry?.url && !deduped.has(entry.url)).slice(0, SUGGEST_ROWS) : [];
       matches = [...deduped.values()]
         .sort((left, right) => query ? right.score - left.score : (right.recency || 0) - (left.recency || 0))
-        .slice(0, 10 - offered.length)
+        .slice(0, 10 - offered.length - (keyword ? 1 : 0))
         .concat(offered);
+      // Selected for the user only while the row is there: once the keyword is edited away, Enter
+      // goes back to opening what is typed rather than whichever history row now sits first.
+      if (keyword) {
+        matches.unshift(keyword);
+        if (selected < 0) {
+          selected = 0;
+          keywordPicked = true;
+        }
+      } else if (keywordPicked) {
+        selected = -1;
+        keywordPicked = false;
+      }
       if (selected >= 0) selected = Math.min(selected, Math.max(0, matches.length - 1));
       list.replaceChildren();
       list.style.display = matches.length ? "block" : "none";
@@ -3832,7 +3856,8 @@ installPrintShim();
         title.textContent = entry.title || entry.url;
         title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:13px/1.35 system-ui,-apple-system,sans-serif";
         const detail = document.createElement("div");
-        detail.textContent = `${entry.kind === "tab" ? "TAB  " : entry.kind === "search" ? "SEARCH  " : ""}${entry.url}`;
+        const tag = { tab: "TAB  ", search: "SEARCH  ", keyword: "KEYWORD  " }[entry.kind] || "";
+        detail.textContent = `${tag}${entry.url}`;
         detail.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6;font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
         row.append(title, detail);
         row.onmousedown = (event) => {
@@ -3853,7 +3878,11 @@ installPrintShim();
       if (!newTab && entry?.kind === "tab" && Number.isInteger(entry.index)) send("activate-tab", entry.index);
       else send(newTab ? "new-tab" : "navigate", value);
     };
-    input.addEventListener("input", () => { selected = -1; requestSuggestions(); render(); });
+    input.addEventListener("input", () => {
+      if (!keywordPicked) selected = -1;
+      requestSuggestions();
+      render();
+    });
     input.addEventListener("keydown", (event) => {
       event.stopPropagation();
       if (event.code === "Escape") {
@@ -3862,10 +3891,12 @@ installPrintShim();
       } else if (["ArrowDown", "Tab"].includes(event.code) && !event.shiftKey || event.ctrlKey && event.key.toLowerCase() === "j") {
         event.preventDefault();
         if (matches.length) selected = selected < 0 ? 0 : (selected + 1) % matches.length;
+        keywordPicked = false;
         render();
       } else if (event.code === "ArrowUp" || event.code === "Tab" && event.shiftKey || event.ctrlKey && event.key.toLowerCase() === "k") {
         event.preventDefault();
         if (matches.length) selected = selected < 0 ? matches.length - 1 : (selected - 1 + matches.length) % matches.length;
+        keywordPicked = false;
         render();
       } else if (event.code === "Enter") {
         event.preventDefault();

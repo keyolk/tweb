@@ -131,3 +131,12 @@ test("a string setting is taken as written, without the home expansion a path ge
   const { values } = settings.resolve({ [entry.key]: "  ~/not-a-path  " }, {});
   assert.equal(values[entry.key], "~/not-a-path");
 });
+
+test("a list from the environment may be a JSON array, so an entry can hold a comma", () => {
+  const env = { HOME: "/h", TWEB_CHROME_SITES: '["okta.com", "coder.example.com"]' };
+  assert.deepEqual(settings.resolve({}, env).values["engine.chrome_sites"], ["okta.com", "coder.example.com"]);
+  assert.deepEqual(
+    settings.resolve({}, { HOME: "/h", TWEB_CHROME_SITES: "a.test, b.test" }).values["engine.chrome_sites"],
+    ["a.test", "b.test"],
+  );
+});
