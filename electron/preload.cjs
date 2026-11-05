@@ -290,6 +290,7 @@ installPrintShim();
   let helpScroller = null;
   let helpRuntimeInfo = null;
   let contextMenuReturnFocus = null;
+  let selectListState = null;
   let indicatorHost = null;
   let indicatorLabel = null;
   let inputBadge = null;
@@ -5632,6 +5633,218 @@ installPrintShim();
     });
   }
 
+  // --- <select> list ---
+  //
+  // A <select> opens its list as a separate native widget: an NSMenu on macOS. The page is painted
+  // offscreen and only that paint reaches the terminal, so the list opened somewhere nobody can see
+  // and the click looked dead (Platform Portal's cluster picker, 2026-11-04). The Chrome engine is
+  // the same: its screencast carries the page, not the popup. So the native list is suppressed and
+  // tweb draws its own under the control, as it does the context menu.
+  //
+  // A preloadless same-origin frame's select is handled from this document: its mousedown is
+  // watched by `preloadlessChildDocument`, and the list is drawn here at the frame's offset.
+
+  // The top frame draws the list for every same-origin frame below it, preload or not. Keys go to
+  // the frame that has focus, and with the Chrome engine that is always the top frame, so a list a
+  // subframe drew there could never be moved through. A subframe the top cannot reach (a
+  // cross-origin one) draws its own, and Electron hands it its keys.
+  const selectsBelongToTop = !topFrame && (() => {
+    try {
+      return Boolean(window.top.document);
+    } catch (_) {
+      return false;
+    }
+  })();
+  const watchedSelectDocuments = new WeakSet();
+  function watchSelectDocument(doc) {
+    if (!doc || watchedSelectDocuments.has(doc)) return;
+    watchedSelectDocuments.add(doc);
+    doc.addEventListener("mousedown", handleSelectMouseDown, true);
+    // A frame's document is replaced on every load, and that load event reaches its parent
+    // document's capture phase. On the document, not the window: an element's load event does
+    // not propagate to the window.
+    doc.addEventListener("load", (event) => watchSelectFrame(event.target), true);
+    const scan = () => {
+      for (const frame of doc.querySelectorAll("iframe,frame")) watchSelectFrame(frame);
+    };
+    if (doc.readyState === "loading") doc.addEventListener("DOMContentLoaded", scan);
+    else scan();
+  }
+  function watchSelectFrame(element) {
+    if (!isTag(element, "iframe", "frame")) return;
+    let doc = null;
+    try {
+      doc = element.contentDocument;
+    } catch (_) {
+      return;
+    }
+    watchSelectDocument(doc);
+  }
+
+  function selectListOrigin(element) {
+    let x = 0;
+    let y = 0;
+    let win = element.ownerDocument?.defaultView;
+    while (win && win !== window) {
+      const frame = win.frameElement;
+      if (!frame) break;
+      const rect = frame.getBoundingClientRect();
+      x += rect.left + frame.clientLeft;
+      y += rect.top + frame.clientTop;
+      win = win.parent;
+    }
+    return { x, y };
+  }
+
+  function cancelSelectList(restoreMode = true) {
+    if (!selectListState) return;
+    const { host, returnFocus } = selectListState;
+    selectListState = null;
+    host.remove();
+    returnFocus?.focus?.({ preventScroll: true });
+    paintNow();
+    if (restoreMode) normalMode();
+  }
+
+  function chooseSelectOption(index) {
+    const state = selectListState;
+    const row = state?.rows[index];
+    if (!row) return;
+    cancelSelectList();
+    const { select } = state;
+    if (select.selectedIndex === row.option.index) return;
+    select.selectedIndex = row.option.index;
+    // What a person picking from the native list produces; React and Vue listen for these.
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function moveSelectList(step) {
+    const state = selectListState;
+    if (!state || !state.rows.length) return;
+    const count = state.rows.length;
+    paintSelectList(((state.selected + step) % count + count) % count);
+  }
+
+  function paintSelectList(index) {
+    const state = selectListState;
+    if (!state) return;
+    state.selected = index;
+    for (const [rowIndex, row] of state.rows.entries()) {
+      row.button.style.background = rowIndex === index ? "#3c4043" : "transparent";
+      row.button.style.outline = rowIndex === index ? "1px solid #8ab4f8" : "none";
+    }
+    state.rows[index]?.button.scrollIntoView({ block: "nearest" });
+    setMode("select", `${index + 1}/${state.rows.length}`);
+    paintNow();
+  }
+
+  function showSelectList(select) {
+    cancelTransient(false);
+    const returnFocus = activeElement();
+    const rows = [];
+    const host = document.createElement("div");
+    host.id = "__tweb_select__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "closed" });
+    const backdrop = document.createElement("div");
+    backdrop.style.cssText = "position:fixed;inset:0;pointer-events:auto";
+    backdrop.onmousedown = (event) => {
+      event.preventDefault();
+      cancelSelectList();
+    };
+    const list = document.createElement("div");
+    list.setAttribute("role", "listbox");
+    // Focused so the keys come to this frame: a frame's keys go to the preload of the frame that
+    // has focus, and with the Chrome engine a subframe draws its own list.
+    list.tabIndex = -1;
+    list.style.cssText = [
+      "position:fixed", "box-sizing:border-box", "overflow:auto", "padding:4px", "outline:0",
+      "border:1px solid #5f6368", "border-radius:6px", "background:#202124", "color:#f1f3f4",
+      "box-shadow:0 10px 30px #000a", "font:13px/1.35 system-ui,-apple-system,sans-serif", "pointer-events:auto",
+    ].join(";");
+    const hint = document.createElement("div");
+    hint.textContent = "j/k move · Enter pick · Esc";
+    hint.style.cssText = "padding:2px 8px 4px;color:#9aa0a6;font-size:11px";
+    list.append(hint);
+    for (const child of select.children) {
+      const group = isTag(child, "optgroup") ? child : null;
+      if (group) {
+        const label = document.createElement("div");
+        label.textContent = group.label;
+        label.style.cssText = "padding:5px 8px 2px;color:#9aa0a6;font-weight:600";
+        list.append(label);
+      }
+      for (const option of group ? group.children : [child]) {
+        if (!isTag(option, "option") || option.hidden) continue;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("role", "option");
+        button.textContent = option.label || option.text || " ";
+        button.disabled = option.disabled || Boolean(group?.disabled);
+        button.style.cssText = `display:block;box-sizing:border-box;width:100%;padding:5px 8px${group ? " 5px 18px" : ""};border:0;border-radius:4px;background:transparent;color:inherit;text-align:left;font:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer`;
+        if (option.selected) button.style.fontWeight = "600";
+        list.append(button);
+        if (button.disabled) {
+          button.style.opacity = ".42";
+          continue;
+        }
+        const index = rows.length;
+        rows.push({ option, button });
+        button.onmouseenter = () => paintSelectList(index);
+        button.onmousedown = (event) => event.preventDefault();
+        button.onclick = () => chooseSelectOption(index);
+      }
+    }
+    if (!rows.length) return;
+    shadow.append(backdrop, list);
+    document.documentElement.append(host);
+
+    const origin = selectListOrigin(select);
+    const box = select.getBoundingClientRect();
+    const left = origin.x + box.left;
+    const below = innerHeight - (origin.y + box.bottom) - 4;
+    const above = origin.y + box.top - 4;
+    // Below the control when it fits, as the native list opens; otherwise on the roomier side.
+    const downward = below >= Math.min(list.scrollHeight, 240) || below >= above;
+    list.style.minWidth = `${Math.max(120, box.width)}px`;
+    list.style.maxWidth = `calc(100vw - 8px)`;
+    list.style.maxHeight = `${Math.max(80, downward ? below : above)}px`;
+    list.style.left = `${Math.max(4, Math.min(left, innerWidth - list.offsetWidth - 4))}px`;
+    if (downward) list.style.top = `${origin.y + box.bottom}px`;
+    else list.style.bottom = `${innerHeight - (origin.y + box.top)}px`;
+
+    selectListState = { host, select, rows, selected: 0, returnFocus };
+    // Before the mode is set: a frame reports its mode to the engine only while it has focus.
+    list.focus({ preventScroll: true });
+    const current = rows.findIndex((row) => row.option.index === select.selectedIndex);
+    paintSelectList(Math.max(0, current));
+  }
+
+  function handleSelectMouseDown(event) {
+    if (event.button !== 0 || !vimiumEnabled) return;
+    const select = event.target?.closest?.("select");
+    if (!select || select.disabled || select.multiple || select.size > 1) return;
+    // The default action is opening the native list, which never reaches the terminal.
+    event.preventDefault();
+    event.stopPropagation();
+    if (selectListState?.select === select) cancelSelectList();
+    else showSelectList(select);
+  }
+
+  function handleSelectListKey(event, key) {
+    if (!selectListState) return false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (key === "Escape") cancelSelectList();
+    else if (key === "j" || key === "ArrowDown" || (event.ctrlKey && key === "n")) moveSelectList(1);
+    else if (key === "k" || key === "ArrowUp" || (event.ctrlKey && key === "p")) moveSelectList(-1);
+    else if (key === "g" || key === "Home") paintSelectList(0);
+    else if (key === "G" || key === "End") paintSelectList(selectListState.rows.length - 1);
+    else if (key === "Enter" || key === " ") chooseSelectOption(selectListState.selected);
+    return true;
+  }
+
   function contextTarget(point) {
     if (!topFrame || !Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return null;
     const element = document.elementFromPoint(point.x, point.y);
@@ -5687,6 +5900,7 @@ installPrintShim();
     cancelDownloads(false);
     cancelFileChooser();
     cancelHelp(false);
+    cancelSelectList(false);
     let restoredContextFocus = false;
     const contextMenu = document.getElementById("__tweb_context_menu__");
     if (contextMenu) {
@@ -5727,7 +5941,7 @@ installPrintShim();
   }
 
   function hasTransientMode() {
-    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || downloadsState || fileChooserState || helpHost || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
+    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || downloadsState || fileChooserState || helpHost || selectListState || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
 
   function handleNormalKey(event) {
@@ -5754,6 +5968,9 @@ installPrintShim();
       cancelTransient();
       return;
     }
+
+    // Before insert mode: the select the list belongs to counts as editable.
+    if (handleSelectListKey(event, key)) return;
 
     // Insert mode hands every key to the page so its own shortcuts work; Escape
     // is the one key TWeb keeps, otherwise there would be no way back.
@@ -6245,6 +6462,7 @@ installPrintShim();
   });
 
   addEventListener("keydown", handleNormalKey, true);
+  if (!selectsBelongToTop) watchSelectDocument(document);
   function handleFocusIn(event) {
     // Focus entering a preloadless frame arrives here as the IFRAME element; the field is
     // what `activeElement` finds inside it.

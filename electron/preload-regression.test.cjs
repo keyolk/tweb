@@ -3276,3 +3276,24 @@ test("closing a pane deletes its image on the terminals that showed it", () => {
   assert.match(close.slice(cleanup, direct), /withPaneScope\(record, \(\) => \{\s*$/m);
   assert.ok(direct < close.indexOf("frameContexts.delete(record.key);"));
 });
+
+// A <select> opens its list as a native widget, which the offscreen paint never carries, so the
+// click looked dead (Platform Portal's cluster picker, inside a same-origin iframe). The preload
+// suppresses the native list and draws its own, for the top document and every same-origin frame.
+test("a select opens tweb's own list instead of the native one nobody can see", () => {
+  const down = electron.slice(electron.indexOf("function handleSelectMouseDown(event)"));
+  assert.match(down.slice(0, 600), /event\.preventDefault\(\);[\s\S]*?showSelectList\(select\)/);
+  assert.match(down.slice(0, 300), /select\.multiple \|\| select\.size > 1/, "a listbox already draws in the page");
+  assert.match(electron, /if \(!selectsBelongToTop\) watchSelectDocument\(document\);/);
+  // Subframes' documents are watched from the top: preloadless ones have no other listener, and
+  // with the Chrome engine the top frame is the one that receives the keys.
+  const watch = electron.slice(electron.indexOf("function watchSelectDocument(doc)"));
+  assert.match(watch.slice(0, 900), /doc\.addEventListener\("load", \(event\) => watchSelectFrame\(event\.target\), true\);/);
+  // Picking fires what a native pick fires, so React/Vue state follows.
+  const choose = electron.slice(electron.indexOf("function chooseSelectOption(index)"));
+  assert.match(choose.slice(0, 700), /new Event\("input", \{ bubbles: true \}\)[\s\S]*?new Event\("change", \{ bubbles: true \}\)/);
+  // The list's keys are taken before insert mode, since a select counts as editable.
+  const key = electron.slice(electron.indexOf("function handleNormalKey(event)"));
+  assert.ok(key.indexOf("handleSelectListKey(event, key)") < key.indexOf("if (insertMode) {"));
+  assert.match(electron, /helpHost \|\| selectListState \|\|/);
+});
