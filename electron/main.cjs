@@ -2550,8 +2550,35 @@ function browserWindowOptions(vp = currentFrames().viewport || queryViewportSize
   };
 }
 
+// What a tab is showing, as the user should read it. A tab being made — the first load not committed,
+// or a tab an engine move is building — reports "" or about:blank from `getURL()`, and that went
+// into the tab list, the pane title and the agent's `tabs` as a page nobody opened. The URL it was
+// asked to load is what it is about to show.
+function tabUrl(tab) {
+  if (!tab || tab.isDestroyed()) return "";
+  const shown = tab.webContents.getURL();
+  if (shown && shown !== "about:blank") return shown;
+  const asked = tabSessionUrls.get(tab);
+  return asked && asked !== "about:blank" ? asked : shown || "";
+}
+
+// For lists: a start page is its data: URL underneath, a screenful of escaped HTML in a tab list.
+function tabDisplayUrl(tab) {
+  const url = tabUrl(tab);
+  return isStartPage(url) ? "tweb:start" : url;
+}
+
+function tabTitle(tab) {
+  if (!tab || tab.isDestroyed()) return "";
+  const title = tab.webContents.getTitle();
+  const url = tabUrl(tab);
+  if (title && title !== "about:blank") return title;
+  if (isStartPage(url)) return "TWeb";
+  return url || "New tab";
+}
+
 function tabLabel(tab, index) {
-  const title = tab.webContents.getTitle() || tab.webContents.getURL() || "New tab";
+  const title = tabTitle(tab);
   return `${index + 1}/${currentWindows().tabs.length} ${title}`;
 }
 
@@ -4234,18 +4261,20 @@ function omniboxModel() {
   // Open soleWindows.tabs always outrank history entries.
   const base = history.length;
   const tabEntries = currentWindows().tabs.flatMap((candidate, index) => {
-    if (candidate.isDestroyed()) return [];
-    const url = tabSessionUrls.get(candidate) || candidate.webContents.getURL() || "about:blank";
+    const url = tabUrl(candidate);
+    // A start page is not somewhere to go back to; listed, its data URL filled a row.
+    if (candidate.isDestroyed() || !url || isStartPage(url)) return [];
     return [{
       kind: "tab",
       index,
       url,
-      title: candidate.webContents.getTitle() || url,
+      title: tabTitle(candidate),
       recency: base + currentWindows().tabs.length - index,
     }];
   });
   return {
-    current: currentWindows().win && !currentWindows().win.isDestroyed() ? tabSessionUrls.get(currentWindows().win) || currentWindows().win.webContents.getURL() || "" : "",
+    // Empty on a start page, so `o` there opens on a blank line rather than a data: URL.
+    current: isStartPage(tabUrl(currentWindows().win)) ? "" : tabUrl(currentWindows().win),
     entries: [
       ...tabEntries,
       ...history.map((entry, index) => ({ ...entry, kind: "history", recency: base - index })),
@@ -4263,8 +4292,8 @@ function tabListModel() {
     activeIndex: currentWindows().activeTabIndex,
     tabs: currentWindows().tabs.map((candidate, index) => ({
       index,
-      title: candidate.webContents.getTitle() || "New tab",
-      url: candidate.webContents.getURL() || "about:blank",
+      title: tabTitle(candidate),
+      url: tabDisplayUrl(candidate),
     })),
   };
 }
@@ -4277,7 +4306,7 @@ function tabStateModel() {
     count: currentWindows().tabs.length,
     tabs: currentWindows().tabs.flatMap((candidate, index) => candidate.isDestroyed() ? [] : [{
       index,
-      title: candidate.webContents.getTitle() || candidate.webContents.getURL() || "New tab",
+      title: tabTitle(candidate),
       engine: tabEngine(candidate),
     }]),
     // The engine badge (preload `renderEngineBadge`) and the pin table its link check uses.
@@ -5550,8 +5579,8 @@ function agentTabList() {
     active: currentWindows().activeTabIndex,
     tabs: currentWindows().tabs.map((tab, index) => ({
       index,
-      title: tab.isDestroyed() ? "" : tab.webContents.getTitle(),
-      url: tab.isDestroyed() ? "" : tab.webContents.getURL(),
+      title: tabTitle(tab),
+      url: tabDisplayUrl(tab),
       active: index === currentWindows().activeTabIndex,
       engine: tabEngine(tab),
     })),
@@ -6375,7 +6404,8 @@ async function dispatchAgentCommand(method, params) {
       activateTab(Number(params.index));
       return agentTabList();
     case "tab-new":
-      openTabRouted(currentWindows().win, normalizeUrl(String(params.url || "about:blank")), true);
+      if (params.url) openTabRouted(currentWindows().win, normalizeUrl(String(params.url)), true);
+      else refreshStartPage(createTab(newTabPage(), true));
       return agentTabList();
     // A tab moved to another page engine in place, as the engine badge does. Answers once the new
     // tab is in the list, so the list returned shows it; `ok: false` says why it did not move.
@@ -8338,6 +8368,11 @@ function noWindowSessionPage() {
   return startPageUrl({ ports: listeningPorts, recent: readGlobalHistory(8), restoring: true });
 }
 
+// A tab opened with nothing in it: the same page, without the "nothing to restore" line.
+function newTabPage() {
+  return startPageUrl({ ports: listeningPorts, recent: readGlobalHistory(8), restoring: false });
+}
+
 let listeningPorts = [];
 let listeningPortsAt = 0;
 let listeningPortsPending = null;
@@ -8366,7 +8401,10 @@ function refreshStartPage(tab) {
   void refreshListeningPorts().then(bindPane(() => record, () => {
     if (tab.isDestroyed()) return;
     const shown = tab.webContents.getURL() || tabSessionUrls.get(tab) || "";
-    if (isStartPage(shown) || (!shown && isStartPage(tabSessionUrls.get(tab)))) void tab.webContents.loadURL(noWindowSessionPage());
+    if (!isStartPage(shown) && !(!shown && isStartPage(tabSessionUrls.get(tab)))) return;
+    // Redrawn as the same kind it was: a new tab has no "nothing to restore" line.
+    const restoring = String(shown || tabSessionUrls.get(tab)).includes(encodeURIComponent("No previous page"));
+    void tab.webContents.loadURL(restoring ? noWindowSessionPage() : newTabPage());
   }));
 }
 
@@ -8443,9 +8481,9 @@ function createWindow(url, frames = currentFrames(), { explicit = false } = {}) 
   const opening = explicit && isRestorableUrl(url);
   const session = opening ? sessionWithOpenedUrl(readWindowSession({ opening }), url) : readWindowSession();
   if (!session) {
-    const initialUrl = sess().restore && !isRestorableUrl(url)
-      ? noWindowSessionPage()
-      : url;
+    // Nothing to open is the start page, never about:blank: a bare open with no saved tabs, and a
+    // pane given nothing at all.
+    const initialUrl = !isRestorableUrl(url) && !/^data:/i.test(url) ? noWindowSessionPage() : url;
     const tab = createTab(initialUrl, true);
     if (isStartPage(initialUrl)) refreshStartPage(tab);
     // A new pane takes focus as it opens, before any focus hook could have seen it as tweb's.
