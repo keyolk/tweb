@@ -187,7 +187,7 @@ fn start_with(socket: &Path, twebd: Result<PathBuf, String>) -> Result<(), Strin
 /// A file rather than inherited stderr, which in a pane is the terminal — a daemon logging over
 /// the page would be a visible defect, and the log is wanted either way when a pane silently falls
 /// back.
-fn daemon_log() -> std::process::Stdio {
+pub fn daemon_log() -> std::process::Stdio {
     let Some(home) = std::env::var_os("HOME") else {
         return std::process::Stdio::null();
     };

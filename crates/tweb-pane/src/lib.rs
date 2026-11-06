@@ -571,6 +571,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         Some(HostedOutcome::Finished) => return Ok(()),
         Some(HostedOutcome::Spawn(reason)) if !matches!(reason, attach::SpawnReason::FlagOff) => {
             tracing::info!(reason = %reason, "spawning this pane's own engine");
+            record_fallback(&pane, &reason);
             options.restore_session |= restores_after(&reason);
         }
         Some(HostedOutcome::Spawn(_)) | None => {}
@@ -979,6 +980,14 @@ async fn host_until_settled(url: &str, options: &PaneOptions, pane: &str, image_
             }
             HostedOutcome::Spawn(
                 reason @ (attach::SpawnReason::DaemonStartFailed(_) | attach::SpawnReason::ConnectFailed(_)),
+            ) => reason,
+            // A daemon stopped while its engine is still starting answers every pane waiting on
+            // that start with this refusal ("engine exited before declaring itself a pane host"),
+            // and the next daemon is a moment away. On 2026-11-06 a pane started its own engine
+            // 1.7s after `tweb daemon restart`, well inside this loop's budget: something lasting
+            // sent it away, and this refusal is the one a restart produces.
+            HostedOutcome::Spawn(
+                reason @ attach::SpawnReason::Refused(twebd::protocol::RefusalReason::EngineUnavailable, _),
             ) => reason,
             _ => return outcome,
         };
@@ -1394,6 +1403,32 @@ fn electron_executable() -> Result<std::path::PathBuf> {
                 .join(", ")
         )
     })
+}
+
+/// Appends why this pane is starting its own engine to `logs/fallback.log`.
+///
+/// The `tracing` line above it is info, under a default filter of `tweb_pane=warn`, and stderr is
+/// the pane's terminal anyway. So on 2026-11-06, when five panes fell back during a daemon restart
+/// and split the profile, nothing recorded why, and the cause could not be traced afterwards.
+fn record_fallback(pane: &str, reason: &attach::SpawnReason) {
+    let directory = engine_app::cache_root().join("logs");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("fallback.log"))
+    else {
+        return;
+    };
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    // One write per line: panes fall back together, and O_APPEND keeps whole lines from
+    // interleaving.
+    let line = format!("{at} pane={pane} pid={} {reason}\n", std::process::id());
+    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
 }
 
 /// Where the engine's stderr goes.
