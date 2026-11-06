@@ -2207,6 +2207,22 @@ installPrintShim();
     return scrollSurface()?.scrollHeight ?? document.documentElement.scrollHeight;
   }
 
+  // One of the browser's own scroll keys, sent to the area picked from `v`. False with no area
+  // picked, so the key goes on to the page as before.
+  function scrollHeldSurface(key, shift) {
+    if (!scrollSurface() && !panSurface()) return false;
+    if (key === "ArrowDown") scrollSurfaceBy(0, 40);
+    else if (key === "ArrowUp") scrollSurfaceBy(0, -40);
+    else if (key === "ArrowLeft") scrollSurfaceBy(-40, 0);
+    else if (key === "ArrowRight") scrollSurfaceBy(40, 0);
+    else if (key === "PageDown" || key === " " && !shift) scrollSurfacePage(0.9);
+    else if (key === "PageUp" || key === " " && shift) scrollSurfacePage(-0.9);
+    else if (key === "Home") scrollSurfaceTo(0);
+    else if (key === "End") scrollSurfaceTo(scrollSurfaceEnd());
+    else return false;
+    return true;
+  }
+
   // Point the scroll keys at an inner area picked from `v`.
   function holdScrollArea(item) {
     scrollTarget = item.pan ? null : item.element;
@@ -3585,7 +3601,7 @@ installPrintShim();
         n: () => { if (!lastSearch) return false; stepSearch(true); },
         N: () => { if (!lastSearch) return false; stepSearch(false); },
       }],
-      ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k to scroll (Esc returns to the page) · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
+      ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k, the arrows and PageUp/PageDown to scroll (Esc returns to the page) · Enter clicks the pick · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
@@ -5228,8 +5244,8 @@ installPrintShim();
     const elementRectAtPick = item.element?.getBoundingClientRect?.() || null;
     visualState = { ...item, outline, selectionMade, elementRectAtPick };
     if (selectionMade) updateVisualSelection();
-    else if (item.kind === "image") setMode("visual", "image y·Y·u·D·o");
-    else setMode("visual", `${item.kind} y·Y·u·o·p`);
+    else if (item.kind === "image") setMode("visual", "image ⏎·y·Y·u·D·o");
+    else setMode("visual", `${item.kind} ⏎·y·Y·u·o·p`);
   }
 
   function startVisual() {
@@ -5278,6 +5294,16 @@ installPrintShim();
     flash("copied");
   }
 
+  // Enter on a `v` pick clicks it, as picking the same thing with `f` would have. Before, Enter
+  // was swallowed here, so a pick followed by Enter did nothing and the pick had to be redone
+  // with `f`. Clicked where it is now, not where it was when picked: the page may have moved.
+  function clickVisual() {
+    const item = visualState;
+    cancelVisual();
+    if (!item.element?.isConnected) return;
+    send("native-click", hintClickPoint(item));
+  }
+
   function handleVisualKey(event, key) {
     if (!visualState) return false;
     event.preventDefault();
@@ -5286,6 +5312,7 @@ installPrintShim();
     else if (moveVisualSelection(key)) return true;
     else if (key === "c" && !visualState.caret) enterCaret();
     else if (key === "v" && visualState.caret) selectFromCaret();
+    else if (key === "Enter" && !visualState.caret && !visualState.pageSelection) clickVisual();
     else if (key === "y") copyVisual(true);
     else if (key === "Y") copyVisual(false);
     else if (key === "u") {
@@ -6182,6 +6209,17 @@ installPrintShim();
       else if (key === "o") send("zoom-out");
       else if (key === "z") send("zoom-reset");
       else return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+
+    // A picked area takes every scroll key, not only `j`/`k`. The arrows and PageUp/PageDown
+    // used to go on to the page as a synthetic keydown first and were scrolled only if the page
+    // left them alone; an app that binds the arrows itself (a list, a dashboard, a feed) took
+    // them and moved its own main view, so in one picked area PageDown scrolled it and ArrowDown
+    // scrolled the page around it. Claimed here, before the page sees them.
+    if (scrollHeldSurface(key, event.shiftKey)) {
       event.preventDefault();
       event.stopImmediatePropagation();
       return;
