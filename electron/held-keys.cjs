@@ -7,23 +7,29 @@
 // engine used to answer each one with keyDown and keyUp in the same instant, so a page that reads
 // "is this key down right now" every frame — a game, a canvas, a slider — saw the key up on every
 // frame and barely moved. Measured on a canvas game: holding → gave keydown+keyup pairs 0 ms apart,
-// the first repeat 166 ms later, then one every ~33 ms.
+// the first repeat 166 ms later (InitialKeyRepeat 10 = 150 ms), then one every ~33 ms.
 //
-// Instead the keyUp waits: long enough after a first press to cover the initial repeat delay, and
-// long enough after a repeat to cover the repeat interval. Another press of the same key before
-// then is the autorepeat and only refreshes the timer, so the page sees one key held down. A real
-// release (kind 3, when the terminal does report releases) lets go at once.
-//
-// A tap now releases `firstMs` later instead of immediately. A page only notices that if it times
-// how long a key was held, which is rare and was already broken by the zero-length press.
+// So a press is held down and its keyUp waits. What the next press of the same key is depends on
+// the gap, because the OS autorepeat has a known shape:
+//   - inside the repeat cadence, or at/after the initial repeat delay: the key is still held, and
+//     it goes out as an autorepeat keyDown with no keyUp before it;
+//   - sooner than the initial delay: a person pressed it again (a double tap to dash, a mashed
+//     attack button), so the page gets keyUp then a fresh keyDown, as from a real keyboard.
+// The keyUp itself goes out once the next repeat is overdue. A real release (kind 3, when the
+// terminal reports one) lets go at once.
 
-const FIRST_MS = 320;
-const REPEAT_MS = 110;
-// Presses closer together than this are the terminal's autorepeat cadence, not a person tapping.
-const AUTOREPEAT_GAP_MS = 60;
+const DEFAULT_INITIAL_MS = 225; // macOS default InitialKeyRepeat 15 x 15 ms
+const DEFAULT_INTERVAL_MS = 30; // macOS KeyRepeat 2 x 15 ms
+// Presses closer together than this are the repeat cadence however the OS is configured.
+const CADENCE_MAX_MS = 60;
 
 function createHeldKeys({ setTimer = setTimeout, clearTimer = clearTimeout, now = () => Date.now(),
-  firstMs = FIRST_MS, repeatMs = REPEAT_MS } = {}) {
+  initialMs = DEFAULT_INITIAL_MS, intervalMs = DEFAULT_INTERVAL_MS } = {}) {
+  // A first repeat lands at or a little after the configured delay; anything clearly sooner is a
+  // second press. The windows wait past the next expected repeat with room for scheduling jitter.
+  const doubleTapMaxMs = initialMs * 0.9;
+  const firstMs = initialMs + 170;
+  const repeatMs = Math.max(110, intervalMs * 3);
   const held = new Map();
 
   function schedule(id, entry, ms) {
@@ -37,7 +43,7 @@ function createHeldKeys({ setTimer = setTimeout, clearTimer = clearTimeout, now 
 
   return {
     /// A press with no release to follow. `down(autoRepeat)` sends the keyDown (and any text);
-    /// `up()` sends the keyUp. Returns what was sent: "down", "repeat" or "redown".
+    /// `up()` sends the keyUp. Returns what was sent: "down", "repeat" or "again".
     press(id, down, up) {
       const at = now();
       const entry = held.get(id);
@@ -50,21 +56,19 @@ function createHeldKeys({ setTimer = setTimeout, clearTimer = clearTimeout, now 
       }
       const gap = at - entry.at;
       entry.at = at;
-      entry.up = up;
-      if (entry.repeating || gap <= AUTOREPEAT_GAP_MS) {
+      if (entry.repeating || gap <= CADENCE_MAX_MS || gap >= doubleTapMaxMs) {
         entry.repeating = true;
+        entry.up = up;
         down(true);
         schedule(id, entry, repeatMs);
         return "repeat";
       }
-      // A second press inside the first window: either the first autorepeat (~150-500 ms) or a
-      // quick double tap. Without a release event the two look the same, so it goes out as a new
-      // keyDown with no keyUp between: a page tracking held state keeps the key down, and one
-      // counting presses (double-tap to dash) still sees a second press.
+      // Pressed again before the OS could have repeated it: a real second press.
+      entry.up();
+      entry.up = up;
       down(false);
-      schedule(id, entry, repeatMs);
-      entry.repeating = true;
-      return "redown";
+      schedule(id, entry, firstMs);
+      return "again";
     },
 
     /// A real release. Sends the keyUp now if the key was being held; false when it was not.
@@ -89,7 +93,9 @@ function createHeldKeys({ setTimer = setTimeout, clearTimer = clearTimeout, now 
     isHeld(id) {
       return held.has(id);
     },
+
+    windows: { firstMs, repeatMs, doubleTapMaxMs },
   };
 }
 
-module.exports = { createHeldKeys, FIRST_MS, REPEAT_MS, AUTOREPEAT_GAP_MS };
+module.exports = { createHeldKeys, DEFAULT_INITIAL_MS, DEFAULT_INTERVAL_MS, CADENCE_MAX_MS };

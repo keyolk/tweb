@@ -9355,8 +9355,23 @@ const ACCELERATOR_KEYS = new Map([
 // Measured in offscreen Chromium: keyDown with "KeyK" reaches the page as
 // key="" keyCode=0, while "k" arrives as key="k" keyCode=75. Only the arrow
 // keys genuinely need translating.
-// Keys with no release event of their own are held across autorepeat (see held-keys.cjs).
-const heldKeys = createHeldKeys();
+// Keys with no release event of their own are held across autorepeat (see held-keys.cjs). The
+// windows come from the OS repeat settings so a double tap and a first autorepeat can be told
+// apart; both are in units of 15 ms on macOS.
+function keyRepeatSettings() {
+  if (process.platform !== "darwin") return {};
+  const read = (name) => {
+    try {
+      const value = Number(execFileSync("defaults", ["read", "-g", name], { timeout: 1000, encoding: "utf8" }).trim());
+      return Number.isFinite(value) && value > 0 ? value * 15 : undefined;
+    } catch {
+      // Unset means the system default, which createHeldKeys already assumes.
+      return undefined;
+    }
+  };
+  return { initialMs: read("InitialKeyRepeat"), intervalMs: read("KeyRepeat") };
+}
+const heldKeys = createHeldKeys(Object.fromEntries(Object.entries(keyRepeatSettings()).filter(([, v]) => v !== undefined)));
 // A chord with Ctrl or Cmd is a command, not something held; it keeps its instant keyUp so a
 // shortcut never lingers as a stuck modifier combination.
 const holdable = (modifiers) => !modifiers.includes("control") && !modifiers.includes("meta");

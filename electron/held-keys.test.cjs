@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { createHeldKeys, FIRST_MS, REPEAT_MS } = require("./held-keys.cjs");
+const { createHeldKeys } = require("./held-keys.cjs");
 
 // A fake clock: timers fire only when `advance` passes them, so each case reads as a timeline.
 function clock() {
@@ -33,37 +33,56 @@ function clock() {
   };
 }
 
+// The settings this machine was measured on: InitialKeyRepeat 10 (150 ms), KeyRepeat 2 (30 ms).
 function rig() {
   const c = clock();
-  const keys = createHeldKeys({ setTimer: c.setTimer, clearTimer: c.clearTimer, now: c.now });
+  const keys = createHeldKeys({ setTimer: c.setTimer, clearTimer: c.clearTimer, now: c.now, initialMs: 150, intervalMs: 30 });
   const log = [];
   const press = (id = "ArrowRight") => keys.press(id, (rep) => log.push(`${c.now()} down${rep ? "*" : ""}`), () => log.push(`${c.now()} up`));
   return { c, keys, log, press };
 }
 
 test("a tap is one keyDown and, after the first window, one keyUp", () => {
-  const { c, log, press } = rig();
+  const { c, keys, log, press } = rig();
   press();
   c.advance(1000);
-  assert.deepStrictEqual(log, ["0 down", `${FIRST_MS} up`]);
+  assert.deepStrictEqual(log, ["0 down", `${keys.windows.firstMs} up`]);
 });
 
-test("holding through terminal autorepeat stays down with no keyUp between repeats", () => {
-  // The cadence measured from tmux on macOS: first repeat after 166 ms, then every ~33 ms.
-  const { c, log, press } = rig();
+test("holding through terminal autorepeat stays down, repeats marked, no keyUp between", () => {
+  // The cadence measured from tmux: first repeat after 166 ms, then every ~33 ms.
+  const { c, keys, log, press } = rig();
   press();
   c.advance(166);
-  press();
+  assert.strictEqual(press(), "repeat", "the first repeat at the OS delay is a repeat, not a second press");
   for (let i = 0; i < 10; i++) {
     c.advance(33);
     press();
   }
   assert.ok(!log.some((l) => l.endsWith("up")), `no keyUp while held: ${log.join(", ")}`);
   assert.strictEqual(log[0], "0 down");
-  assert.ok(log.slice(2).every((l) => l.endsWith("down*")), "repeats are marked autorepeat");
+  assert.ok(log.slice(1).every((l) => l.endsWith("down*")), "every repeat is marked autorepeat");
   const last = c.now();
   c.advance(1000);
-  assert.strictEqual(log.at(-1), `${last + REPEAT_MS} up`, "released one repeat window after the last repeat");
+  assert.strictEqual(log.at(-1), `${last + keys.windows.repeatMs} up`);
+});
+
+test("a double tap faster than the repeat delay is keyUp then a fresh keyDown", () => {
+  const { c, log, press } = rig();
+  press();
+  c.advance(100);
+  assert.strictEqual(press(), "again");
+  assert.deepStrictEqual(log, ["0 down", "100 up", "100 down"]);
+});
+
+test("mashing a button gives one press per hit", () => {
+  const { c, log, press } = rig();
+  for (let i = 0; i < 4; i++) {
+    press("x");
+    c.advance(120);
+  }
+  assert.strictEqual(log.filter((l) => l.endsWith(" down")).length, 4);
+  assert.ok(!log.some((l) => l.endsWith("down*")));
 });
 
 test("a real release lets go at once and cancels the timer", () => {
@@ -81,25 +100,13 @@ test("a release for a key that is not held does nothing", () => {
   assert.deepStrictEqual(log, []);
 });
 
-test("a double tap reaches the page as two keyDowns", () => {
-  const { c, log, press } = rig();
-  press();
-  c.advance(120);
-  press();
-  c.advance(1000);
-  assert.deepStrictEqual(log.filter((l) => l.includes("down")).length, 2);
-  assert.strictEqual(log.filter((l) => l.endsWith("up")).length, 1);
-});
-
 test("different keys are held independently", () => {
-  const { c, log, press } = rig();
+  const { c, keys, log, press } = rig();
   press("ArrowRight");
   c.advance(100);
   press("x");
-  c.advance(250);
-  assert.deepStrictEqual(log, ["0 down", "100 down", `${FIRST_MS} up`]);
   c.advance(1000);
-  assert.strictEqual(log.at(-1), `${100 + FIRST_MS} up`);
+  assert.deepStrictEqual(log, ["0 down", "100 down", `${keys.windows.firstMs} up`, `${100 + keys.windows.firstMs} up`]);
 });
 
 test("releaseAll lets go of everything now", () => {
@@ -107,6 +114,6 @@ test("releaseAll lets go of everything now", () => {
   press("a");
   press("b");
   keys.releaseAll();
-  assert.deepStrictEqual(log.filter((l) => l.endsWith("up")).length, 2);
+  assert.strictEqual(log.filter((l) => l.endsWith("up")).length, 2);
   assert.strictEqual(keys.isHeld("a"), false);
 });
