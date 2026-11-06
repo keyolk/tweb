@@ -260,6 +260,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/hangul-keys.cjs"),
     ),
     (
+        "held-keys.cjs",
+        include_str!("../../../electron/held-keys.cjs"),
+    ),
+    (
         "input-source.cjs",
         include_str!("../../../electron/input-source.cjs"),
     ),
@@ -648,6 +652,23 @@ mod tests {
     // Makefile's `electron-check` target are syntax-checked. A file in one list and not
     // the other fails nowhere: `make check` passes, and the error surfaces when the app
     // directory is unpacked at runtime. Two files sat in that gap before this test.
+    // The opposite gap: a module main.cjs requires that is not embedded. Tests run from the
+    // checkout, where the file exists, so they pass; the installed engine unpacks without it
+    // and fails at startup. held-keys.cjs shipped this way in the first build of #234.
+    #[test]
+    fn every_local_module_main_requires_is_embedded() {
+        let main = FILES.iter().find(|(name, _)| *name == "main.cjs").map(|(_, body)| *body).unwrap();
+        let embedded: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
+        let missing: Vec<String> = main
+            .split("require(\"./")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|path| !embedded.contains(path))
+            .map(str::to_string)
+            .collect();
+        assert!(missing.is_empty(), "required by main.cjs but not embedded: {missing:?}");
+    }
+
     #[test]
     fn every_embedded_module_is_syntax_checked_by_make() {
         let makefile = include_str!("../../../Makefile");
