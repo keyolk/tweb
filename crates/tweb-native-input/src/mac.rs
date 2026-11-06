@@ -17,7 +17,12 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventMask, NSEventType, NSScreen,
 };
-use objc2_core_graphics::{CGEvent, CGWindowListCopyWindowInfo, CGWindowListOption};
+use objc2_core_graphics::{
+    CGEvent, CGEventSource, CGEventSourceStateID, CGPreflightListenEventAccess,
+    CGWindowListCopyWindowInfo, CGWindowListOption,
+};
+use std::collections::BTreeSet;
+use std::sync::{Condvar, Mutex};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
@@ -88,7 +93,10 @@ pub fn run() {
         std::process::exit(1);
     }
     spawn_reader();
-    emit(serde_json::json!({ "ev": "ready", "pid": std::process::id() }));
+    spawn_key_watcher();
+    // Whether this process may read the keyboard's state. Without Input Monitoring the key state
+    // reads always say "up", so the engine must not trust a release from here and keeps its timers.
+    emit(serde_json::json!({ "ev": "ready", "pid": std::process::id(), "keys": CGPreflightListenEventAccess() }));
     app.run();
     // Kept alive for the life of the run loop; a dropped monitor stops delivering.
     drop(monitors);
@@ -104,6 +112,10 @@ fn spawn_reader() {
                 let Ok(line) = line else { break };
                 if let Some(seconds) = wire::parse_arm(&line) {
                     ARMED_UNTIL.store((now() + seconds).to_bits(), Ordering::Release);
+                } else if let Some(code) = wire::parse_key_watch(&line) {
+                    let (lock, wake) = &WATCHED;
+                    lock.lock().unwrap_or_else(|e| e.into_inner()).insert(code);
+                    wake.notify_one();
                 }
             }
             std::process::exit(0);
@@ -252,4 +264,42 @@ fn on_screen_windows() -> Vec<Window> {
         });
     }
     windows
+}
+
+/// The keys the engine is holding down for a page, waiting to hear they went up.
+static WATCHED: (Mutex<BTreeSet<u16>>, Condvar) = (Mutex::new(BTreeSet::new()), Condvar::new());
+
+/// Reads each watched key's physical state every `KEY_POLL_INTERVAL` and reports the ones that
+/// went up as `{"ev":"ku","k":<code>}`. Sleeps on the condvar while nothing is watched, so an
+/// engine that never holds a key costs nothing here.
+///
+/// Inside tmux a pane hears no key releases (modifyOtherKeys has none), so this is the only way
+/// the engine learns when a held key was let go. HIDSystemState is the hardware state: it does
+/// not lag behind a slow app or count synthetic events.
+fn spawn_key_watcher() {
+    std::thread::Builder::new()
+        .name("tweb-native-input-keys".into())
+        .spawn(|| {
+            let (lock, wake) = &WATCHED;
+            loop {
+                let mut watched = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while watched.is_empty() {
+                    watched = wake.wait(watched).unwrap_or_else(|e| e.into_inner());
+                }
+                let up: Vec<u16> = watched
+                    .iter()
+                    .copied()
+                    .filter(|&code| !CGEventSource::key_state(CGEventSourceStateID::HIDSystemState, code))
+                    .collect();
+                for code in &up {
+                    watched.remove(code);
+                }
+                drop(watched);
+                for code in up {
+                    emit(serde_json::json!({ "ev": "ku", "k": code }));
+                }
+                std::thread::sleep(wire::KEY_POLL_INTERVAL);
+            }
+        })
+        .expect("key watcher thread starts");
 }

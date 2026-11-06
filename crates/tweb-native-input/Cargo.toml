@@ -22,5 +22,5 @@ block2 = "=0.6.2"
 objc2 = "=0.6.4"
 objc2-app-kit = "=0.3.2"
 objc2-core-foundation = "=0.3.2"
-objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "objc2", "CGEvent", "CGEventTypes", "CGWindow"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "objc2", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGWindow"] }
 objc2-foundation = "=0.3.2"
