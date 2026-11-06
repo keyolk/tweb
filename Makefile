@@ -119,6 +119,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/relative-placement.cjs
 	node --check electron/float-preload.cjs
 	node --check electron/hangul-keys.cjs
+	node --check electron/held-keys.cjs
 	node --check electron/input-source.cjs
 
 run: build ## Run TWeb on the Electron engine (URL=...)
