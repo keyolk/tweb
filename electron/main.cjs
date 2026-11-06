@@ -17,6 +17,7 @@ const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-blo
 const sitePermissionRules = require("./site-permissions.cjs");
 const { isStartPage, parseListeningPorts, startPageUrl } = require("./start-page.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
+const { createHeldKeys } = require("./held-keys.cjs");
 const { searchUrl, suggestUrl, parseSuggestions, keywordSearch, keywordTable } = require("./search-engines.cjs");
 // The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
 // here because the mode resets that clear it run from functions defined well above that case.
@@ -3922,6 +3923,8 @@ function modeLabel() {
 }
 
 function setCmdBypassEnabled(enabled) {
+  // Keys go a different way after the switch; one still held from before would never be let go.
+  heldKeys.releaseAll();
   inputState().bypass = enabled;
   setEditFlagFile(enabled);
   applyShortcutMode();
@@ -9352,14 +9355,30 @@ const ACCELERATOR_KEYS = new Map([
 // Measured in offscreen Chromium: keyDown with "KeyK" reaches the page as
 // key="" keyCode=0, while "k" arrives as key="k" keyCode=75. Only the arrow
 // keys genuinely need translating.
+// Keys with no release event of their own are held across autorepeat (see held-keys.cjs).
+const heldKeys = createHeldKeys();
+// A chord with Ctrl or Cmd is a command, not something held; it keeps its instant keyUp so a
+// shortcut never lingers as a stuck modifier combination.
+const holdable = (modifiers) => !modifiers.includes("control") && !modifiers.includes("meta");
+const heldId = (contents, key) => `${contents.id}:${key}`;
+
 function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
   const keyCode = ACCELERATOR_KEYS.get(key) || key;
   const event = {
     keyCode,
     modifiers,
   };
+  const up = () => { if (!contents.isDestroyed()) contents.sendInputEvent({ ...event, type: "keyUp" }); };
   if (eventKind === 3) {
-    contents.sendInputEvent({ ...event, type: "keyUp" });
+    if (!heldKeys.release(heldId(contents, key), up)) up();
+    return;
+  }
+  if (holdable(modifiers)) {
+    heldKeys.press(heldId(contents, key), (repeat) => {
+      if (contents.isDestroyed()) return;
+      contents.sendInputEvent({ ...event, modifiers: repeat ? [...modifiers, "isAutoRepeat"] : modifiers, type: "keyDown" });
+      if (text) contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
+    }, up);
     return;
   }
   // Cmd combinations go out as keyDown so Chromium runs its shortcut path.
@@ -9399,8 +9418,16 @@ function dispatchEditKey(tab, key, text, modifiers, eventKind) {
   });
   const keyCode = ACCELERATOR_KEYS.get(key) || key;
   const event = { keyCode, modifiers };
+  const up = () => { if (!contents.isDestroyed()) void send(toCdpKey({ ...event, type: "keyUp" })); };
   if (eventKind === 3) {
-    void send(toCdpKey({ ...event, type: "keyUp" }));
+    if (!heldKeys.release(heldId(contents, key), up)) up();
+    return;
+  }
+  if (holdable(modifiers)) {
+    heldKeys.press(heldId(contents, key), (repeat) => {
+      if (contents.isDestroyed()) return;
+      void send({ ...toCdpKey({ ...event, type: "keyDown" }, text || undefined), autoRepeat: repeat });
+    }, up);
     return;
   }
   void send(toCdpKey({ ...event, type: "keyDown" }, text || undefined));
