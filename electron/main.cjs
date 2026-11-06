@@ -2442,6 +2442,15 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+/// How a Chrome this process starts is launched: forced to the scale a tab at the default zoom is
+/// emulated at (see cdp/engine.cjs `start`), so the two cannot disagree on where a click lands.
+function chromeStartOptions() {
+  return {
+    scaleFactor: renderScaleFactor(),
+    browserScaleFactor: renderScaleFactor() * defaultZoomFactor(),
+  };
+}
+
 function renderScaleFactor() {
   if (Number.isFinite(configuredDeviceScaleFactor)) {
     return Math.min(3, Math.max(1, configuredDeviceScaleFactor));
@@ -10431,6 +10440,11 @@ app.whenReady().then(async () => {
   // would poll is the daemon's) and no agent socket (a socket named after this process is a name
   // in some other pane's namespace). Everything arrives with the first ATTACH.
   if (hostedRuntime) {
+    // The options a Chrome started later for a hosted pane is launched with. Without them a host's
+    // Chrome had no forced scale at all — a headless 1 under tabs emulated at 1.6 — so the input
+    // skew and the blurred frames `chromeStartOptions` exists for were the hosted panes' normal.
+    // The host's own engine is Electron, so this starts nothing.
+    void pageBackend.start(chromeStartOptions());
     // `hostReady` first, then the declaration, in that order and in this tick. stdin was resumed
     // before `whenReady` ran, so the daemon's first ATTACH can arrive as soon as READY is out —
     // declaring first would race it into the `!hostReady` refusal below.
@@ -10469,10 +10483,7 @@ app.whenReady().then(async () => {
   // is not something to fall back from silently — the user chose it for a site Electron cannot
   // open — so it is reported and the engine stops.
   try {
-    await pageBackend.start({
-      scaleFactor: renderScaleFactor(),
-      browserScaleFactor: renderScaleFactor() * defaultZoomFactor(),
-    });
+    await pageBackend.start(chromeStartOptions());
   } catch (error) {
     console.error(`tweb: chrome engine failed to start: ${error.message}`);
     app.quit();

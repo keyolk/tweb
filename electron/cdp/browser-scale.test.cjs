@@ -14,6 +14,8 @@ const read = (file) => fs.readFileSync(path.join(__dirname, file), "utf8");
 test("the engine launches Chrome at the pane's scale times the default zoom", () => {
   const main = read("../main.cjs");
   assert.match(main, /browserScaleFactor: renderScaleFactor\(\) \* defaultZoomFactor\(\)/);
+  // Both the pane's own engine and a daemon host, whose Chrome is started later for a pane.
+  assert.equal(main.match(/pageBackend\.start\(chromeStartOptions\(\)\)/g)?.length, 2);
   const engine = read("engine.cjs");
   assert.match(engine, /const launch = browserScaleFactor \|\| scaleFactor;/);
   assert.match(engine, /scaleFactor: launch,/);
