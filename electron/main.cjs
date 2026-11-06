@@ -10469,7 +10469,10 @@ app.whenReady().then(async () => {
   // is not something to fall back from silently — the user chose it for a site Electron cannot
   // open — so it is reported and the engine stops.
   try {
-    await pageBackend.start({ scaleFactor: renderScaleFactor() });
+    await pageBackend.start({
+      scaleFactor: renderScaleFactor(),
+      browserScaleFactor: renderScaleFactor() * defaultZoomFactor(),
+    });
   } catch (error) {
     console.error(`tweb: chrome engine failed to start: ${error.message}`);
     app.quit();
