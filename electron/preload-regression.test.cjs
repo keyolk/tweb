@@ -3301,3 +3301,29 @@ test("a select opens tweb's own list instead of the native one nobody can see", 
   assert.ok(key.indexOf("handleSelectListKey(event, key)") < key.indexOf("if (insertMode) {"));
   assert.match(electron, /helpHost \|\| selectListState \|\|/);
 });
+
+// A `v`-picked area takes the arrows and PageUp/PageDown before the page does. The arrows went on
+// to the page first, and an app that binds them moved its own main view: in one picked area
+// PageDown scrolled it and ArrowDown scrolled the page around it.
+test("a picked scroll area claims every scroll key before the page sees it", () => {
+  const normal = electron.slice(electron.indexOf("function handleNormalKey(event)"),
+    electron.indexOf("// This frame's share of a hint round"));
+  const claim = normal.indexOf("if (scrollHeldSurface(key, event.shiftKey))");
+  assert.notEqual(claim, -1);
+  assert.ok(claim < normal.indexOf("const action = normalKeyActions.get(key);"),
+    "claimed before the single-key shortcuts and before the page");
+  const held = electron.slice(electron.indexOf("function scrollHeldSurface(key, shift)"),
+    electron.indexOf("// Point the scroll keys at an inner area picked from `v`."));
+  assert.match(held, /if \(!scrollSurface\(\) && !panSurface\(\)\) return false;/);
+  for (const key of ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "PageDown", "PageUp", "Home", "End"]) {
+    assert.match(held, new RegExp(`key === "${key}"`), key);
+  }
+});
+
+test("Enter on a `v` pick clicks it", () => {
+  const visual = electron.slice(electron.indexOf("function handleVisualKey(event, key)"),
+    electron.indexOf("function handleVisualKey(event, key)") + 600);
+  assert.match(visual, /key === "Enter" && !visualState\.caret && !visualState\.pageSelection\) clickVisual\(\)/);
+  const click = electron.slice(electron.indexOf("function clickVisual()"), electron.indexOf("function handleVisualKey(event, key)"));
+  assert.match(click, /send\("native-click", hintClickPoint\(item\)\)/);
+});
