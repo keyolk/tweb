@@ -105,6 +105,19 @@ function chromeArgs(userDataDir, env = process.env, port = 0, scaleFactor = 0) {
 // Launched on a port tweb picked, it writes nothing — measured with Chrome 155 — so tweb records
 // that port in a file of its own, and every pane finds the shared Chrome by either file.
 const PICKED_PORT_FILE = "TwebDevToolsPort";
+// The `--force-device-scale-factor` the running Chrome was launched with. A Chrome that is already
+// up is reused whatever scale the pane asking for it wanted, and the input-skew correction has to
+// know the scale Chrome actually has, not the one asked for.
+const SCALE_FILE = "TwebScaleFactor";
+
+function readLaunchedScale(userDataDir) {
+  try {
+    const value = Number(fs.readFileSync(path.join(userDataDir, SCALE_FILE), "utf8").trim());
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch (_) {
+    return 0;
+  }
+}
 
 function readActivePort(userDataDir) {
   for (const name of ["DevToolsActivePort", PICKED_PORT_FILE]) {
@@ -149,9 +162,9 @@ function trace(line) {
 async function ensureChrome(userDataDir, { env = process.env, log = () => {}, scaleFactor = 0 } = {}) {
   fs.mkdirSync(userDataDir, { recursive: true });
   const existing = await probeBrowser(readActivePort(userDataDir));
-  if (existing) return { version: existing, launched: null };
+  if (existing) return { version: existing, launched: null, scaleFactor: readLaunchedScale(userDataDir) };
   // A file left by a Chrome that is gone would otherwise be read as the new one's port.
-  for (const name of ["DevToolsActivePort", PICKED_PORT_FILE]) {
+  for (const name of ["DevToolsActivePort", PICKED_PORT_FILE, SCALE_FILE]) {
     try { fs.rmSync(path.join(userDataDir, name), { force: true }); } catch (_) { /* best effort */ }
   }
   const binary = findChrome(env);
@@ -180,10 +193,13 @@ async function launchChrome(binary, userDataDir, env, port, tries, scaleFactor =
   if (port) {
     try { fs.writeFileSync(path.join(userDataDir, PICKED_PORT_FILE), `${port}\n`); } catch (_) { /* best effort */ }
   }
+  if (scaleFactor > 0) {
+    try { fs.writeFileSync(path.join(userDataDir, SCALE_FILE), `${scaleFactor}\n`); } catch (_) { /* best effort */ }
+  }
   for (let i = 0; i < tries; i += 1) {
     await sleep(100);
     const version = await probeBrowser(readActivePort(userDataDir));
-    if (version) return { version, launched: child };
+    if (version) return { version, launched: child, scaleFactor };
   }
   try { child.kill(); } catch (_) { /* already gone */ }
   try { fs.rmSync(path.join(userDataDir, PICKED_PORT_FILE), { force: true }); } catch (_) { /* best effort */ }

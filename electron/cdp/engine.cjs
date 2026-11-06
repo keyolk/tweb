@@ -203,16 +203,23 @@ class CdpEngine extends EventEmitter {
     this.handOff = handOffToUserChrome;
   }
 
-  // `scaleFactor` is the pane's device scale factor, for a Chrome this engine launches (see
-  // `chromeArgs`). A Chrome already running keeps the one it was started with.
-  async start({ scaleFactor = 0 } = {}) {
+  // `scaleFactor` is the pane's device scale factor. `browserScaleFactor` is the one a Chrome this
+  // engine launches is forced to (see `chromeArgs`): the pane's scale times the default zoom, so
+  // that it equals the scale a tab at that zoom is emulated at. Forced to the pane's scale alone
+  // (2) under an emulated 1.6, Chrome read mouse coordinates at one scale or the other from one
+  // event to the next — measured, `f` missed 5 of 14 clicks at zoom 0.8 and none at zoom 1, the
+  // misses landing at exactly 2/1.6 of the point. A Chrome already running keeps its own scale.
+  async start({ scaleFactor = 0, browserScaleFactor = 0 } = {}) {
     if (typeof this.userDataDir === "function") this.userDataDir = this.userDataDir();
-    // Read by the input-skew measurement (web-contents.cjs `measureInputScale`).
     this.scaleFactor = scaleFactor || 1;
-    const { version } = await ensureChrome(this.userDataDir, {
+    const launch = browserScaleFactor || scaleFactor;
+    const { version, scaleFactor: launched } = await ensureChrome(this.userDataDir, {
       log: (message) => this.debug && console.error(`tweb: ${message}`),
-      scaleFactor,
+      scaleFactor: launch,
     });
+    // Read by the input-skew measurement and the screencast size checks (web-contents.cjs). A
+    // Chrome found running from before the scale was recorded was launched at the pane's scale.
+    this.browserScale = launched || this.scaleFactor;
     this.version = version;
     this.userAgent = browserUserAgent(version["User-Agent"]);
     this.connection = await CdpConnection.connect(version.webSocketDebuggerUrl);

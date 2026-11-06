@@ -595,7 +595,7 @@ class CdpWebContents extends EventEmitter {
       // the pane's scale once `--force-device-scale-factor` sets it (see `chromeArgs`). Measured
       // with it forced to 2 under an emulated 1.6: clicks landed at 1.25x, a ratio of 0.8, which
       // a list of only 1 and the emulated scale rejected as a missed probe. Anything else still is.
-      const real = this.engine.scaleFactor || 1;
+      const real = this.engine.browserScale || this.engine.scaleFactor || 1;
       const candidates = [1, dsf, dsf / real, real / dsf];
       const match = candidates.find((value) => Math.abs(ratio - value) < 0.06 * Math.max(1, value));
       const scale = match ?? (this.inputScale || 1);
@@ -1183,7 +1183,7 @@ class CdpWebContents extends EventEmitter {
       const got = decoded.getSize();
       // A frame of the window rather than the viewport (see `fitWindowToViewport`) would be
       // stretched into the wrong picture. It is dropped; the settle capture draws the change.
-      if (!isViewportFrame(got, this.viewport, this.deviceScaleFactor, this.engine.scaleFactor)) {
+      if (!isViewportFrame(got, this.viewport, this.deviceScaleFactor, this.engine.browserScale || this.engine.scaleFactor)) {
         if (this.engine.debug && !capture.loggedMismatch) {
           capture.loggedMismatch = true;
           console.error(`tweb: screencast frame ${got.width}x${got.height} does not match the viewport `
@@ -1191,7 +1191,7 @@ class CdpWebContents extends EventEmitter {
         }
         if (!capture.refitting) {
           capture.refitting = true;
-          void this.fitWindowToViewport(windowArea(got, this.engine.scaleFactor)).finally(() => { capture.refitting = false; });
+          void this.fitWindowToViewport(windowArea(got, this.engine.browserScale || this.engine.scaleFactor)).finally(() => { capture.refitting = false; });
         }
         return;
       }
