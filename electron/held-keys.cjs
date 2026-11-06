@@ -22,6 +22,8 @@ const DEFAULT_INITIAL_MS = 225; // macOS default InitialKeyRepeat 15 x 15 ms
 const DEFAULT_INTERVAL_MS = 30; // macOS KeyRepeat 2 x 15 ms
 // Presses closer together than this are the repeat cadence however the OS is configured.
 const CADENCE_MAX_MS = 60;
+// With the keyboard's own release reported, the timer only guards against that report being lost.
+const NATIVE_SAFETY_MS = 1500;
 
 function createHeldKeys({ setTimer = setTimeout, clearTimer = clearTimeout, now = () => Date.now(),
   initialMs = DEFAULT_INITIAL_MS, intervalMs = DEFAULT_INTERVAL_MS } = {}) {
@@ -44,9 +46,28 @@ function createHeldKeys({ setTimer = setTimeout, clearTimer = clearTimeout, now 
   return {
     /// A press with no release to follow. `down(autoRepeat)` sends the keyDown (and any text);
     /// `up()` sends the keyUp. Returns what was sent: "down", "repeat" or "again".
-    press(id, down, up) {
+    ///
+    /// `native`: the real release will be reported (`release`), read from the keyboard itself.
+    /// Then every press of a key already held is its autorepeat, and the timer is only a safety
+    /// net in case that report never comes.
+    press(id, down, up, { native = false } = {}) {
       const at = now();
       const entry = held.get(id);
+      if (native) {
+        if (!entry) {
+          const fresh = { at, up, timer: null, repeating: false };
+          held.set(id, fresh);
+          down(false);
+          schedule(id, fresh, NATIVE_SAFETY_MS);
+          return "down";
+        }
+        entry.at = at;
+        entry.up = up;
+        entry.repeating = true;
+        down(true);
+        schedule(id, entry, NATIVE_SAFETY_MS);
+        return "repeat";
+      }
       if (!entry) {
         const fresh = { at, up, timer: null, repeating: false };
         held.set(id, fresh);
@@ -98,4 +119,15 @@ function createHeldKeys({ setTimer = setTimeout, clearTimer = clearTimeout, now 
   };
 }
 
-module.exports = { createHeldKeys, DEFAULT_INITIAL_MS, DEFAULT_INTERVAL_MS, CADENCE_MAX_MS };
+// macOS virtual key codes (ANSI layout) for the keys a page might hold: the ones whose release the
+// native helper can report. Anything else keeps the timer.
+const MAC_KEYCODES = new Map(Object.entries({
+  a: 0, s: 1, d: 2, f: 3, h: 4, g: 5, z: 6, x: 7, c: 8, v: 9, b: 11, q: 12, w: 13, e: 14, r: 15,
+  y: 16, t: 17, 1: 18, 2: 19, 3: 20, 4: 21, 6: 22, 5: 23, "=": 24, 9: 25, 7: 26, "-": 27, 8: 28,
+  0: 29, "]": 30, o: 31, u: 32, "[": 33, i: 34, p: 35, Enter: 36, l: 37, j: 38, "'": 39, k: 40,
+  ";": 41, "\\": 42, ",": 43, "/": 44, n: 45, m: 46, ".": 47, Tab: 48, " ": 49, "`": 50,
+  Backspace: 51, Escape: 53, ArrowLeft: 123, ArrowRight: 124, ArrowDown: 125, ArrowUp: 126,
+}));
+const macKeyCode = (key) => MAC_KEYCODES.get(key.length === 1 ? key.toLowerCase() : key);
+
+module.exports = { createHeldKeys, macKeyCode, DEFAULT_INITIAL_MS, DEFAULT_INTERVAL_MS, CADENCE_MAX_MS, NATIVE_SAFETY_MS };

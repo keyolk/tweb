@@ -90,7 +90,9 @@ function parseHelperLine(line) {
   const finite = (...keys) => keys.every((key) => Number.isFinite(value[key]));
   switch (value.ev) {
     case "ready":
-      return { ev: "ready" };
+      return { ev: "ready", keys: value.keys === true };
+    case "ku":
+      return Number.isInteger(value.k) ? { ev: "ku", code: value.k } : null;
     case "m":
       return finite("x", "y") ? { ev: "m", x: value.x, y: value.y, buttons: Number(value.b) || 0 } : null;
     case "s":
@@ -286,6 +288,8 @@ class NativeInput extends EventEmitter {
     this.window = null;
     this.samples = [];
     this.estimates = new Map();
+    // Whether the helper may read key state (Input Monitoring): null until its ready line.
+    this.keyAccess = null;
     // `TWEB_NATIVE_INPUT_TRACE=<file>`: one JSON line per terminal report, with the native samples
     // it was matched against and the grid estimate after it. How the grid was found not to settle.
     this.tracePath = env.TWEB_NATIVE_INPUT_TRACE || null;
@@ -338,6 +342,8 @@ class NativeInput extends EventEmitter {
     child.on("exit", (code, signal) => {
       this.child = null;
       this.status = "dead";
+      this.keyAccess = null;
+      this.emit("keys-lost");
       this.window = null;
       this.samples = [];
       this.log(`native input: helper exited (${signal || code}); falling back to the terminal's reports`);
@@ -356,9 +362,32 @@ class NativeInput extends EventEmitter {
     return this.status === "running" && this.now() - this.armedAt < ARM_SECONDS * 1000;
   }
 
+  /// Asks to hear when physical key `code` (a macOS virtual key code) goes up; a "keyup" event
+  /// follows. False when the helper cannot answer — not running, or no Input Monitoring access —
+  /// and the caller keeps its own timing instead.
+  watchKey(code) {
+    if (this.status === "idle" && !this.start()) return false;
+    if (this.status !== "running" || this.keyAccess !== true) return false;
+    try {
+      this.child.stdin.write(`key ${code}\n`);
+      return true;
+    } catch (error) {
+      this.log(`native input: key watch failed: ${error.message}`);
+      return false;
+    }
+  }
+
   onLine(line) {
     const event = parseHelperLine(line);
     if (!event) return;
+    if (event.ev === "ready") {
+      this.keyAccess = event.keys;
+      return;
+    }
+    if (event.ev === "ku") {
+      this.emit("keyup", event.code);
+      return;
+    }
     const now = this.now();
     if (event.ev === "w") {
       // A different window under the pointer: samples taken over the old one say nothing about

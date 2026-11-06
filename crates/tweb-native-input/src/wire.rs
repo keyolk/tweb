@@ -157,6 +157,21 @@ pub fn parse_arm(line: &str) -> Option<f64> {
     (seconds.is_finite() && seconds >= 0.0).then_some(seconds.min(60.0))
 }
 
+/// `key <code>`: the engine sent a key down with no release to follow (tmux reports none) and wants
+/// to hear when that physical key goes up. `<code>` is a macOS virtual key code.
+pub fn parse_key_watch(line: &str) -> Option<u16> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "key" {
+        return None;
+    }
+    let code: u16 = fields.next()?.parse().ok()?;
+    // Virtual key codes stop at 0x7F; anything above is not a key this could ever see down.
+    (code <= 0x7F && fields.next().is_none()).then_some(code)
+}
+
+/// How often watched keys are read. A frame at 120Hz: a release is noticed within one frame.
+pub const KEY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// Pointer moves arrive at the trackpad's rate, up to 120 a second and more with a gaming mouse.
 /// One per 8ms is a frame at 120Hz: as fine as anything can be drawn, and no more lines to parse.
 pub const MOVE_INTERVAL: f64 = 0.008;
@@ -293,5 +308,15 @@ mod tests {
         assert_eq!(parse_arm("arm -1"), None);
         assert_eq!(parse_arm("arm"), None);
         assert_eq!(parse_arm("positions 1"), None);
+    }
+
+    #[test]
+    fn key_watch_lines() {
+        assert_eq!(super::parse_key_watch("key 124"), Some(124));
+        assert_eq!(super::parse_key_watch("key 7"), Some(7));
+        assert_eq!(super::parse_key_watch("key 128"), None);
+        assert_eq!(super::parse_key_watch("key x"), None);
+        assert_eq!(super::parse_key_watch("key 1 2"), None);
+        assert_eq!(super::parse_key_watch("arm 2"), None);
     }
 }
