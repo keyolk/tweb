@@ -249,6 +249,11 @@ def attempt_f(pane, pick):
     return True, done["t"] - first, None
 
 
+# Seconds between `j` presses. The default keeps the pane in its active frame tier; past the
+# active window (700ms) every press starts from idle, the way a reader presses `j` once per screen.
+J_GAP = 0.12
+
+
 def attempt_j(pane):
     start = len(pane.trace())
     pane.key("j")
@@ -259,7 +264,7 @@ def attempt_j(pane):
         return False, None, {"why": "the key never reached the engine", "trace": rows}
     if frame is None:
         return False, None, {"why": "no frame followed within 1s", "trace": rows}
-    time.sleep(0.12)
+    time.sleep(J_GAP)
     return True, frame["t"] - arrived["t"], None
 
 
@@ -367,7 +372,10 @@ def main():
     parser.add_argument("--workdir", default=None)
     parser.add_argument("--size", default=f"{COLS}x{ROWS}@{PX_W}x{PX_H}",
                         help="cols x rows @ pixel width x height, e.g. 180x100@1440x1800 for half a Retina screen")
+    parser.add_argument("--j-gap", type=float, default=J_GAP,
+                        help="seconds between j presses; above 0.7 each press starts from the idle frame rate")
     args = parser.parse_args()
+    globals()["J_GAP"] = args.j_gap
 
     server, base = serve_fixtures()
     urls = args.url or [f"{base}/hints.html"]
