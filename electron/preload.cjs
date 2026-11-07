@@ -6730,6 +6730,13 @@ installPrintShim();
   // cannot, and main needs to know so it does not hand keys to a frame that
   // will silently drop them.
   ipcRenderer.send("tweb-preload-ready", { shortcutFrame });
+  // A page that drives the keyboard itself asks for every key (see `pageKeysWanted` in main).
+  // Any frame may ask: a claude.ai artifact is an iframe of another origin under the viewer.
+  const askPageKeys = () => {
+    if (document.querySelector('meta[name="tweb:keys" i][content="page" i]')) send("page-keys", true);
+  };
+  if (document.readyState === "loading") addEventListener("DOMContentLoaded", askPageKeys, { once: true });
+  else askPageKeys();
   // Tells a parent's `preloadlessChildDocument` that this frame handles its own keys.
   if (!topFrame && document.documentElement) document.documentElement.dataset.twebPreload = "1";
 }

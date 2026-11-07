@@ -17,7 +17,7 @@ const { isGoogleSignInRejection, signInNoticePage } = require("./cdp/sign-in-blo
 const sitePermissionRules = require("./site-permissions.cjs");
 const { isStartPage, parseListeningPorts, startPageUrl } = require("./start-page.cjs");
 const { toCdpKey } = require("./cdp/input.cjs");
-const { createHeldKeys } = require("./held-keys.cjs");
+const { createHeldKeys, macKeyCode } = require("./held-keys.cjs");
 const { searchUrl, suggestUrl, parseSuggestions, keywordSearch, keywordTable } = require("./search-engines.cjs");
 // The frame whose editable armed native key delivery, per tab (see "insert-mode"). Declared up
 // here because the mode resets that clear it run from functions defined well above that case.
@@ -3941,7 +3941,35 @@ function setBrowserShortcutsEnabled(enabled) {
 }
 
 function toggleBrowserShortcuts() {
+  // Ctrl-; is the user's own choice from here on: leaving the page must not undo it.
+  if (currentWindows().win) pageKeyTabs.delete(currentWindows().win);
   setCmdBypassEnabled(!inputState().bypass);
+}
+
+// A page that drives the keyboard itself (a game, a canvas editor) can ask for every key with
+// <meta name="tweb:keys" content="page">: the pane goes to edit mode while that page is the
+// active tab, and back when the tab navigates away or another tab is activated. Ctrl-; still
+// leaves it, so a page cannot keep the keys against the user — the tmux side owns that key.
+// `pageKeyWants`: tabs whose current document asked. `pageKeyTabs`: tabs whose edit mode was
+// turned on by that ask, so only those are turned off again (a Ctrl-; the user pressed is kept).
+const pageKeyWants = new WeakSet();
+const pageKeyTabs = new WeakSet();
+
+function pageKeysWanted(tab, wants) {
+  if (wants) pageKeyWants.add(tab);
+  else pageKeyWants.delete(tab);
+  if (tab === currentWindows().win) applyPageKeys(tab);
+}
+
+function applyPageKeys(tab) {
+  const wants = pageKeyWants.has(tab);
+  if (wants && !inputState().bypass) {
+    pageKeyTabs.add(tab);
+    setCmdBypassEnabled(true);
+  } else if (!wants && pageKeyTabs.has(tab)) {
+    pageKeyTabs.delete(tab);
+    if (inputState().bypass) setCmdBypassEnabled(false);
+  }
 }
 
 function activateTab(index) {
@@ -3954,6 +3982,11 @@ function activateTab(index) {
   // The tab being left keeps its last frame only if it is drawn from it on the way back.
   const leaving = currentWindows().win;
   if (leaving && leaving !== currentWindows().tabs[normalized] && !keepsSizeInStandby(leaving)) tabFrames.delete(leaving);
+  // Edit mode a page asked for belongs to that page's tab, not to whichever tab comes next.
+  if (leaving && leaving !== currentWindows().tabs[normalized] && pageKeyTabs.has(leaving)) {
+    pageKeyTabs.delete(leaving);
+    if (inputState().bypass) setCmdBypassEnabled(false);
+  }
   currentWindows().activeTabIndex = normalized;
   currentWindows().win = currentWindows().tabs[normalized];
   inputTrace.mark("tab", { index: normalized });
@@ -4641,6 +4674,10 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     handleClearDataCommand(tab, value);
     return;
   }
+  if (action === "page-keys") {
+    pageKeysWanted(tab, value === true);
+    return;
+  }
   // A link the user clicked to a site pinned to another engine (the preload held it back). Not a
   // shortcut: it works with vimium off, and the page has already been told nothing.
   if (action === "pinned-link") {
@@ -5004,6 +5041,8 @@ ipcMain.on("tweb-preload-ready", bindPane(
   if (frame === tab.webContents.mainFrame) {
     inputState().insertMode = false;
     insertModeOwners.delete(tab);
+    // Whatever the last page asked for went with it; the new one asks again once it has parsed.
+    pageKeysWanted(tab, false);
     inputState().textMode = false;
     syncInputSource();
   }
@@ -8908,6 +8947,19 @@ function withNativePane(x, y, fn, { allowOutside = false } = {}) {
 
 // A pointer move the terminal did not report: inside a cell, or between two of its reports.
 // Inside tmux only — outside it the terminal's own reports are already pixels.
+// The physical key went up: end every hold on it. A press made again since is a new watch.
+nativeInput.on("keyup", (code) => {
+  const ids = heldByCode.get(code);
+  if (!ids) return;
+  heldByCode.delete(code);
+  for (const id of ids) heldKeys.release(id);
+});
+// Without the helper no release will come: let go now rather than wait out the safety timer.
+nativeInput.on("keys-lost", () => {
+  heldByCode.clear();
+  heldKeys.releaseAll();
+});
+
 nativeInput.on("move", (event) => {
   if (!nativeEnabled()) return;
   withNativePane(event.x, event.y, (paneNative, hit) => {
@@ -9376,6 +9428,21 @@ const heldKeys = createHeldKeys(Object.fromEntries(Object.entries(keyRepeatSetti
 // shortcut never lingers as a stuck modifier combination.
 const holdable = (modifiers) => !modifiers.includes("control") && !modifiers.includes("meta");
 const heldId = (contents, key) => `${contents.id}:${key}`;
+// Held key ids by macOS key code, for the native helper's release reports.
+const heldByCode = new Map();
+
+/// Holds a key with no release event of its own. When the native helper can read the keyboard
+/// (Input Monitoring granted), the real release ends the hold; otherwise the repeat timing does.
+function holdKey(contents, key, down, up) {
+  const id = heldId(contents, key);
+  const code = macKeyCode(key);
+  const native = code !== undefined && nativeEnabled() && nativeInput.watchKey(code);
+  if (native) {
+    if (!heldByCode.has(code)) heldByCode.set(code, new Set());
+    heldByCode.get(code).add(id);
+  }
+  heldKeys.press(id, down, up, { native });
+}
 
 function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
   const keyCode = ACCELERATOR_KEYS.get(key) || key;
@@ -9389,7 +9456,7 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
     return;
   }
   if (holdable(modifiers)) {
-    heldKeys.press(heldId(contents, key), (repeat) => {
+    holdKey(contents, key, (repeat) => {
       if (contents.isDestroyed()) return;
       contents.sendInputEvent({ ...event, modifiers: repeat ? [...modifiers, "isAutoRepeat"] : modifiers, type: "keyDown" });
       if (text) contents.sendInputEvent({ type: "char", keyCode: text, modifiers });
@@ -9439,7 +9506,7 @@ function dispatchEditKey(tab, key, text, modifiers, eventKind) {
     return;
   }
   if (holdable(modifiers)) {
-    heldKeys.press(heldId(contents, key), (repeat) => {
+    holdKey(contents, key, (repeat) => {
       if (contents.isDestroyed()) return;
       void send({ ...toCdpKey({ ...event, type: "keyDown" }, text || undefined), autoRepeat: repeat });
     }, up);
