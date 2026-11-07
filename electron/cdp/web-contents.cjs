@@ -62,9 +62,13 @@ const INPUT_SCALE_RECHECK_MS = 3000;
 // Quiet time after the last screencast frame before a device-pixel capture sharpens the picture.
 const SETTLE_MS = 150;
 const INVALIDATE_GRACE_MS = 50;
-// The screencast is now what motion is drawn from, so its quality is visible; 90 keeps text legible
-// mid-scroll at a fraction of the bytes of 100.
-const SCREENCAST_QUALITY = 90;
+// The screencast is now what motion is drawn from, so its quality is visible. It is also on the
+// path of every key: Chrome encodes each frame before sending it, and the encode grows with the
+// quality. Measured on `j` over Wikipedia in a 1440x1800 pane, key to screencast frame: 37.7ms at
+// 90 (576KiB frames), 28.1ms at 70 (371KiB), 24.8ms at 50 (289KiB). At a Retina pane's scale 70
+// is not told apart from 90 by eye where 50 starts to fringe, and the settle capture redraws the
+// page sharp 150ms after it stops moving anyway.
+const SCREENCAST_QUALITY = 70;
 
 // The window's page area, in the DIPs `Browser.setWindowBounds` takes, from a screencast frame's
 // pixel size. A frame of the window is in device pixels once the browser's scale is forced; taken
@@ -89,9 +93,37 @@ function isViewportFrame(got, viewport, deviceScaleFactor, browserScaleFactor = 
   return near(1) || near(deviceScaleFactor || 1) || near(browserScaleFactor || 1);
 }
 
+// A screencast frame a pixel or two short of the pane, laid over the last drawn frame. Chrome
+// rounds the device height of some frames down — measured on Hacker News at dsf 1.6: 1440x1799
+// frames for a 1440x1800 pane, the first frame after most `j` presses. They are the top 1799 rows
+// of the right picture (mean difference 0.67 against the capture after them, top-aligned; 5.6
+// bottom-aligned, 2.8 scaled), so the missing rows are kept from the frame before. Refused as the
+// wrong size, each sent the scroll through a capture: `j` p50 115ms there against 9ms on Electron.
+// Null when `got` is not such a frame or there is nothing to fill from.
+function fillShortFrame(bitmap, got, base, want) {
+  if (!base || base.length !== want.width * want.height * 4) return null;
+  if (got.width > want.width || got.height > want.height) return null;
+  if (want.width - got.width > 2 || want.height - got.height > 2) return null;
+  const out = Buffer.from(base);
+  const row = got.width * 4;
+  for (let y = 0; y < got.height; y += 1) bitmap.copy(out, y * want.width * 4, y * row, y * row + row);
+  return out;
+}
+
 // `TWEB_CDP_PROFILE=1`: every 5s, where a frame's time went — the screenshot round trip, the PNG
-// decode, the bitmap copy, the damage diff — and how many screencast signals arrived per capture.
+// decode, the bitmap copy, the damage diff — how many screencast signals arrived per capture, and
+// what became of each screencast frame. A frame is either drawn or turned into a capture request,
+// and which of the two decides whether a key reaches the pane in ~16ms or in a capture's 50-120ms,
+// so the reasons are counted separately: `css` (not the pane's size), `incap` (sent while a
+// capture ran), `window` (a picture of the window), `still` (no change from the last one drawn),
+// `stale` (replaced by a newer frame before its turn). `timeouts` are captures that gave up after
+// CAPTURE_TIMEOUT_MS, a second in which the pane drew nothing.
 const PROFILE = process.env.TWEB_CDP_PROFILE === "1";
+function countCast(contents, reason) {
+  if (!PROFILE) return;
+  const casts = contents.castStats || (contents.castStats = {});
+  casts[reason] = (casts[reason] || 0) + 1;
+}
 function profileCapture(contents, sample) {
   const p = contents.profile || (contents.profile = { n: 0, at: Date.now(), sum: {} });
   p.n += 1;
@@ -100,9 +132,13 @@ function profileCapture(contents, sample) {
   const avg = (key) => (p.sum[key] / p.n).toFixed(key === "bytes" ? 0 : 1);
   console.error(`tweb: cdp profile ${p.n} captures/${((Date.now() - p.at) / 1000).toFixed(1)}s`
     + ` capture=${avg("capture")}ms decode=${avg("decode")}ms bitmap=${avg("bitmap")}ms diff=${avg("diff")}ms`
-    + ` png=${Math.round(avg("bytes") / 1024)}KiB changed=${p.sum.changed}/${p.n} signals=${contents.signals || 0}`);
+    + ` png=${Math.round(avg("bytes") / 1024)}KiB changed=${p.sum.changed}/${p.n} signals=${contents.signals || 0}`
+    + ` casts=${Object.entries(contents.castStats || {}).map(([k, v]) => `${k}:${v}`).join(",") || "none"}`
+    + ` timeouts=${contents.captureTimeouts || 0}`);
   contents.profile = null;
   contents.signals = 0;
+  contents.castStats = null;
+  contents.captureTimeouts = 0;
 }
 
 // main.cjs never sees a NativeImage constructor of its own here; it is injected so this file has
@@ -1170,9 +1206,10 @@ class CdpWebContents extends EventEmitter {
   // and only the newest is kept — older ones are already stale.
   presentScreencastFrame(data) {
     const capture = this.capture;
+    if (capture.pendingCast) countCast(this, "stale");
     capture.pendingCast = data;
     if (capture.castTimer || this.destroyed || !this.painting) return;
-    const wait = (capture.lastAt || 0) + 1000 / Math.max(1, this.frameRate) - Date.now();
+    const wait = capture.expedite ? 0 : (capture.lastAt || 0) + 1000 / Math.max(1, this.frameRate) - Date.now();
     capture.castTimer = setTimeout(() => {
       capture.castTimer = null;
       const next = capture.pendingCast;
@@ -1184,6 +1221,7 @@ class CdpWebContents extends EventEmitter {
       // A frame of the window rather than the viewport (see `fitWindowToViewport`) would be
       // stretched into the wrong picture. It is dropped; the settle capture draws the change.
       if (!isViewportFrame(got, this.viewport, this.deviceScaleFactor, this.engine.browserScale || this.engine.scaleFactor)) {
+        countCast(this, "window");
         if (this.engine.debug && !capture.loggedMismatch) {
           capture.loggedMismatch = true;
           console.error(`tweb: screencast frame ${got.width}x${got.height} does not match the viewport `
@@ -1214,10 +1252,18 @@ class CdpWebContents extends EventEmitter {
       // drawn per 40s run, ~30 of the pane's frames shrunk. Captured instead: none shrunk, `j`
       // p50 105ms → 135ms at zoom 0.8. At zoom 1 the browser and emulated scales agree and these
       // frames come at the pane's size, so nothing changes there.
-      const image = decoded;
+      let image = decoded;
+      let bitmap = null;
       if (got.width !== want.width || got.height !== want.height) {
-        this.requestCapture();
-        return;
+        const filled = fillShortFrame(decoded.toBitmap(), got, capture.lastCast, want);
+        if (!filled) {
+          countCast(this, "css");
+          this.requestCapture();
+          return;
+        }
+        countCast(this, "short");
+        bitmap = filled;
+        image = nativeImage.createFromBitmap(filled, { width: want.width, height: want.height, scaleFactor: 1 });
       }
       // A frame Chrome sent while a capture was running is not drawn either, whatever its size.
       // Some of them are the CSS-pixel picture stretched by the device scale factor to device
@@ -1228,7 +1274,17 @@ class CdpWebContents extends EventEmitter {
       // them apart (pageScaleFactor, deviceWidth and scrollOffset are those of a good frame) and
       // the arrival time inside the capture does not either, so the frame is a change signal
       // only and the capture it asks for draws the change.
-      if (capture.pendingInCapture) {
+      //
+      // That was measured before #166 forced the browser's scale, when the browser drew at 1x and
+      // the tab was emulated at 1.6, and the stretch is exactly that mismatch. With the two scales
+      // equal (#231 does this for a tab at the default zoom) no such frame was found: 40 frames
+      // sent during a capture on Wikipedia, GitHub and Hacker News while scrolling, every one the
+      // right picture by column profile and by eye, and ~140 such frames drawn showed none either.
+      // Refused, a key pressed while a settle capture ran waited for that capture and then one more.
+      // A tab zoomed away from the default puts the two scales apart again, and there they are
+      // still only a signal.
+      if (capture.pendingInCapture && !this.scalesAgree()) {
+        countCast(this, "incap");
         this.requestCapture();
         return;
       }
@@ -1236,12 +1292,20 @@ class CdpWebContents extends EventEmitter {
       // the two are encoded differently and differ in every pixel. Painting the whole frame was a
       // flicker — the pane went soft and the settle capture sharpened it 150ms later, for every
       // caret blink. The first frame has nothing to compare with and is left to the settle.
-      const bitmap = image.toBitmap();
+      if (capture.pendingInCapture) countCast(this, "incapDrawn");
+      if (!bitmap) bitmap = image.toBitmap();
       const previous = capture.lastCast;
       capture.lastCast = bitmap;
-      if (!previous || previous.length !== bitmap.length) return;
+      if (!previous || previous.length !== bitmap.length) {
+        countCast(this, "first");
+        return;
+      }
       const dirty = dirtyRect(previous, bitmap, want.width, want.height);
-      if (!dirty) return;
+      if (!dirty) {
+        countCast(this, "still");
+        return;
+      }
+      countCast(this, "drawn");
       // The pane now holds screencast pixels in this box, which the settled capture's own diff
       // cannot see: the page can be back to the picture `lastBitmap` holds (a caret that blinked
       // off and on again) and the box would never be redrawn sharp.
@@ -1253,8 +1317,15 @@ class CdpWebContents extends EventEmitter {
       // it, and the scroll reached the pane in ~100ms where Electron took ~3ms.
       capture.lastAt = Date.now();
       capture.castsDrawn = (capture.castsDrawn || 0) + 1;
+      capture.expedite = false;
       this.emit("paint", {}, dirty, image);
     }, Math.max(0, wait));
+  }
+
+  // Whether the tab is emulated at the scale the browser draws at; see `presentScreencastFrame`.
+  scalesAgree() {
+    const real = this.engine.browserScale || this.engine.scaleFactor || 1;
+    return Math.abs(real - (this.deviceScaleFactor || 1)) < 0.01;
   }
 
   scheduleSettle() {
@@ -1283,6 +1354,14 @@ class CdpWebContents extends EventEmitter {
     if (this.destroyed || !this.painting) return;
     const capture = this.capture;
     capture.forceNext = true;
+    // The frame an invalidate announces is drawn without waiting out the frame interval, the way
+    // Electron's `invalidate()` paints at once whatever the rate. The interval is what holds a
+    // playing page to its byte budget, and it held the first frame after a key with it: measured on
+    // GitHub, a pane in the 8fps playback tier drew `j` 118-244ms after the key, every one of them
+    // a screencast frame that had arrived at 14-28ms and sat out the 125ms interval. One frame per
+    // invalidate costs the budget nothing.
+    capture.expedite = true;
+    this.rearmWaits();
     if (!capture.screencast) {
       this.requestCapture();
       return;
@@ -1324,7 +1403,7 @@ class CdpWebContents extends EventEmitter {
     const capture = this.capture;
     if (!capture.dirty || capture.timer || capture.inFlight >= 1 || this.destroyed || !this.painting) return;
     const interval = 1000 / Math.max(1, this.frameRate);
-    const wait = capture.lastAt + interval - Date.now();
+    const wait = capture.expedite ? 0 : capture.lastAt + interval - Date.now();
     if (wait > 0) {
       capture.timer = setTimeout(() => {
         capture.timer = null;
@@ -1367,6 +1446,7 @@ class CdpWebContents extends EventEmitter {
     } catch (error) {
       // Timed out or failed: whatever changed is still unpainted.
       this.capture.dirty = true;
+      if (PROFILE) this.captureTimeouts = (this.captureTimeouts || 0) + 1;
       if (this.engine.debug && !this.destroyed) console.error(`tweb: capture failed ${error.message}`);
       return;
     } finally {
@@ -1406,6 +1486,7 @@ class CdpWebContents extends EventEmitter {
     if (PROFILE) profileCapture(this, { capture: t1 - t0, decode: t2 - t1, bitmap: t3 - t2, diff: performance.now() - t3, bytes: shot.data.length * 0.75, changed: Boolean(dirty) });
     if (!dirty && !this.capture.forceNext) return;
     this.capture.forceNext = false;
+    this.capture.expedite = false;
     this.emit("paint", {}, dirty ? clampRect(dirty, size) : whole, image);
   }
 
@@ -1437,8 +1518,32 @@ class CdpWebContents extends EventEmitter {
     }
   }
 
+  // A wait armed at the old rate is re-armed at the new one. The first key after the pane has sat at
+  // the idle rate otherwise waited out the idle interval — up to 250ms at 4fps — for a frame or a
+  // capture the active rate allows at once: `markInteractionActivity` raises the rate in the same
+  // turn as the key, after the screencast frame of the last change may already be waiting.
   setFrameRate(rate) {
+    const previous = this.frameRate;
     this.frameRate = Math.max(1, Number(rate) || 1);
+    if (this.frameRate > previous) this.rearmWaits();
+  }
+
+  // A frame or capture waiting out the frame interval is scheduled afresh, for when the interval
+  // has shrunk or an invalidate has waived it (`capture.expedite`).
+  rearmWaits() {
+    const capture = this.capture;
+    if (capture.timer) {
+      clearTimeout(capture.timer);
+      capture.timer = null;
+      this.pumpCapture();
+    }
+    if (capture.castTimer && capture.pendingCast) {
+      clearTimeout(capture.castTimer);
+      capture.castTimer = null;
+      const data = capture.pendingCast;
+      capture.pendingCast = null;
+      this.presentScreencastFrame(data);
+    }
   }
 
   getFrameRate() { return this.frameRate; }
