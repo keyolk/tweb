@@ -120,6 +120,9 @@ function fakeImages(pictures) {
       };
       return image;
     },
+    createFromBitmap(pixels, size) {
+      return { getSize: () => ({ width: size.width, height: size.height }), toBitmap: () => Buffer.from(pixels) };
+    },
   };
 }
 
@@ -311,6 +314,83 @@ test("a screencast frame sent while a capture ran is not drawn, only asks for a 
   created.onScreencastFrame({ sessionId: 2, data: "QQ==" });
   await settle();
   assert.strictEqual(paints.length, 1);
+});
+
+test("a screencast frame sent while a capture ran is drawn when the browser draws at the tab's scale", async () => {
+  const pictures = new Map([["Qg==", picture(5)]]);
+  const { created, paints } = screencastContents(pictures);
+  // #231: at the default zoom the browser is forced to the scale the tab is emulated at.
+  created.engine.browserScale = 2;
+  created.capture.lastCast = picture(3);
+  const captures = [];
+  created.requestCapture = () => captures.push(Date.now());
+  created.capture.inFlight = 1;
+  created.onScreencastFrame({ sessionId: 1, data: "Qg==" });
+  await settle();
+  assert.strictEqual(paints.length, 1);
+  assert.strictEqual(captures.length, 0);
+});
+
+test("a frame waiting out the idle interval goes out once the rate is raised", async () => {
+  const pictures = new Map([["QQ==", picture()], ["Qg==", picture(5)]]);
+  const { created, paints } = screencastContents(pictures);
+  created.capture.lastCast = picture(3);
+  created.frameRate = 4;
+  created.capture.lastAt = Date.now();
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  assert.deepStrictEqual(paints, [], "drawn inside the 250ms idle interval");
+  // 30fps: the 33ms interval since `lastAt` is still running, so the frame waits for its rest.
+  created.setFrameRate(30);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.strictEqual(paints.length, 1);
+});
+
+test("an invalidate lets the next frame skip the frame interval", async () => {
+  const pictures = new Map([["Qg==", picture(5)]]);
+  const { created, paints } = screencastContents(pictures);
+  created.capture.lastCast = picture(3);
+  created.capture.screencast = true;
+  // The capture behind the invalidate's grace is not what this is about.
+  created.requestCapture = () => {};
+  // The 8fps playback tier, a frame drawn just now: the next one would wait ~125ms.
+  created.frameRate = 8;
+  created.capture.lastAt = Date.now();
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  assert.deepStrictEqual(paints, []);
+  created.invalidate();
+  await settle();
+  assert.strictEqual(paints.length, 1);
+  assert.strictEqual(created.capture.expedite, false, "only one frame is let through");
+});
+
+// Measured on Hacker News at dsf 1.6: 1440x1799 frames for a 1440x1800 pane, the top rows of the
+// right picture.
+test("a screencast frame a row short of the pane is drawn over the last one", async () => {
+  const short = Buffer.alloc(4 * 1 * 4);
+  short.writeUInt32LE(0xffffffff, 1 * 4);
+  const pictures = new Map([["Qg==", { pixels: short, size: { width: 4, height: 1 } }]]);
+  const { created, paints } = screencastContents(pictures);
+  created.capture.lastCast = picture();
+  const captures = [];
+  created.requestCapture = () => captures.push(Date.now());
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  assert.strictEqual(captures.length, 0);
+  // Only the pixel that changed; the missing bottom row is the last frame's.
+  assert.deepStrictEqual(paints, [{ x: 1, y: 0, width: 1, height: 1 }]);
+});
+
+test("a screencast frame a row short is a capture request when nothing was drawn before it", async () => {
+  const pictures = new Map([["Qg==", { pixels: Buffer.alloc(4 * 1 * 4), size: { width: 4, height: 1 } }]]);
+  const { created, paints } = screencastContents(pictures);
+  const captures = [];
+  created.requestCapture = () => captures.push(Date.now());
+  created.presentScreencastFrame("Qg==");
+  await settle();
+  assert.deepStrictEqual(paints, []);
+  assert.strictEqual(captures.length, 1);
 });
 
 // The second of two captures in flight sometimes came back with the page shrunk into a corner.
