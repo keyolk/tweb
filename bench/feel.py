@@ -73,11 +73,65 @@ def serve_fixtures():
     return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
+def chrome_lock_pid(profile):
+    """The pid in a Chrome profile's `SingletonLock` symlink (`<host>-<pid>`), or None."""
+    try:
+        return int(os.readlink(Path(profile) / "SingletonLock").rsplit("-", 1)[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def end_process(pid, grace=2.0):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def reap_orphan_chromes(workdir):
+    """End the engine Chromes earlier runs in `workdir` left behind, and return how many.
+
+    The engine launches Chrome detached, so it outlives an engine that dies without its shutdown —
+    a SIGKILL, or a harness killed mid-run that never closed its pane. A pane's profile is unique
+    to the run, so nothing reuses that Chrome: measured, 529 processes and 25GB had piled up over
+    a day of runs, and the load they added was in the numbers. A run's own Chrome is ended in
+    `Pane.close`; this catches the ones whose run never got there, recognised by a profile that
+    is gone (the run deleted it) or whose run directory has no live pane.
+    """
+    # The path as `Pane` passed it to the engine, not resolved: /var is /private/var on macOS.
+    prefix = f"--user-data-dir={os.path.abspath(workdir)}/feel-"
+    out = subprocess.run(["ps", "-Ao", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+    reaped = 0
+    for line in out.splitlines():
+        pid, ppid, args = line.split(None, 2)
+        # Only the browser process: its helpers go with it, and they name the profile too.
+        if " --type=" in args or prefix not in args:
+            continue
+        profile = args.split("--user-data-dir=", 1)[1].split(" --", 1)[0]
+        # A live pane's Chrome is the child of its engine; an orphan has been reparented to launchd.
+        if ppid != "1" and Path(profile).exists():
+            continue
+        end_process(int(pid))
+        reaped += 1
+    return reaped
+
+
 class Pane:
     """One `tweb open` in its own PTY, its own user data, its own agent socket and trace."""
 
     def __init__(self, tweb, engine, url, workdir, size=(COLS, ROWS, PX_W, PX_H)):
-        self.dir = Path(tempfile.mkdtemp(prefix=f"feel-{engine}-", dir=workdir))
+        self.dir = Path(tempfile.mkdtemp(prefix=f"feel-{engine}-", dir=os.path.abspath(workdir)))
         self.trace_path = self.dir / "trace.jsonl"
         # A unix socket path is capped at 104 bytes on macOS, and a scratch workdir is often longer.
         self.socket = tempfile.mktemp(prefix="feel-", suffix=".sock", dir="/tmp")
@@ -179,6 +233,11 @@ class Pane:
         else:
             os.kill(self.pid, signal.SIGKILL)
         os.close(self.fd)
+        # An engine that did not shut down cleanly (the SIGKILL above, or a crash) leaves its
+        # detached Chrome running; see `reap_orphan_chromes`.
+        chrome = chrome_lock_pid(self.dir / "userData" / "chrome-profile")
+        if chrome:
+            end_process(chrome)
         # Each pane leaves a Chrome profile and its frame files behind, tens of MB a run; a long
         # session of runs once filled the disk. TWEB_FEEL_KEEP=1 keeps them for a post-mortem.
         if not os.environ.get("TWEB_FEEL_KEEP"):
@@ -381,6 +440,9 @@ def main():
     urls = args.url or [f"{base}/hints.html"]
     engines = {"both": ["electron", "chrome"], "all": ["electron", "chrome", "webkit"]}.get(args.engine, [args.engine])
     workdir = args.workdir or tempfile.gettempdir()
+    reaped = reap_orphan_chromes(workdir)
+    if reaped:
+        print(f"ended {reaped} engine Chrome(s) earlier runs left behind", flush=True)
     report = []
     for engine in engines:
         for url in urls:
