@@ -604,52 +604,55 @@ test("the caret starts inside the part of the selection that is on screen", () =
   assert.match(scroll, /const rect = focusRect\(selection\);/);
 });
 
-// The terminal cursor followed the web caret only inside form fields and
-// contenteditable, because that is where a caret normally lives. Visual caret mode
-// puts one on ordinary text, so nothing reported a position and the cursor stayed
-// where it was last parked — which read as the caret always starting in the pane's
-// top-left corner, wherever the selection actually was.
-test("the terminal cursor follows the visual caret on an ordinary page", () => {
-  assert.match(electron, /function visualCaretPoint\(\)/);
-  const visual = electron.slice(electron.indexOf("function visualCaretPoint()"),
-    electron.indexOf("function caretPoint()"));
-  // Only in caret mode, and from the collapsed selection — that is the caret.
-  assert.match(visual, /if \(!visualState\?\.caret\) return null;/);
-  assert.match(visual, /range\.collapse\(true\);/);
-  assert.match(visual, /getBoundingClientRect\(\)/);
-
-  // A collapsed range measures 0x0 whenever its container is an element rather than a
-  // text node, which is the normal case here: selecting an element's contents and
-  // collapsing lands on the element at offset 0. Measured on a real page, that is what
-  // made the position unreportable, so the descent to a text node is the actual fix.
-  assert.match(visual, /if \(!box\.width && !box\.height\)/);
-  assert.match(visual, /firstCharacterRect\(range\)/);
-  const measure = electron.slice(electron.indexOf("function firstCharacterRect(range)"),
-    electron.indexOf("function caretPoint()"));
-  assert.match(measure, /while \(node && node\.nodeType !== Node\.TEXT_NODE && node\.childNodes\?\.length\)/);
-  assert.match(measure, /node\.childNodes\[Math\.min\(offset, node\.childNodes\.length - 1\)\]/);
-  assert.match(measure, /probe\.setEnd\(node, start \+ 1\)/);
-
-  // caretPoint consults it before the editable paths, which bail on a plain page.
+// The terminal cursor used to be parked on the visual caret too. The terminal can only put
+// it on a cell edge, while the page's yellow bar sits on the exact character, so the two
+// stood a few pixels apart: two cursors that disagree about where the caret is. Nothing is
+// composed at a visual caret, so the bar is the caret and the terminal cursor stays hidden.
+test("the visual caret is the page's bar alone, with no terminal cursor beside it", () => {
+  assert.doesNotMatch(electron, /function visualCaretPoint\(\)/);
   const point = electron.slice(electron.indexOf("function caretPoint()"),
     electron.indexOf("function reportCaret()"));
-  assert.match(point, /const visual = visualCaretPoint\(\);\n\s+if \(visual\) return visual;/);
-  assert.match(point, /if \(!isEditable\(element\)/,
-    "the editable guard must stay: it is what made the visual caret invisible");
+  assert.match(point, /if \(visualState\?\.caret\) return null;/);
+  assert.match(point, /if \(!isEditable\(element\)/);
 
-  // The IME slot reserves cells and paints over the page for composition. Nothing is
-  // composed at a visual caret, so blanking text there would be pure loss.
-  const report = electron.slice(electron.indexOf("function reportCaret()"),
-    electron.indexOf("// Suggestion panels and popovers close on Escape"));
-  assert.match(report, /const composing = !visualState\?\.caret;/);
-  assert.match(report, /point && composing && caretAtContentEnd\(\) \? imeSlotRect/);
-
-  // Leaving visual mode has to release the cursor, since no other reporter covers a
-  // plain page and it would otherwise stay parked on the last caret.
+  // Entering and leaving the caret both re-report, so a focused field's cursor is hidden
+  // while the bar is up and comes back after.
+  const update = electron.slice(electron.indexOf("function updateVisualSelection()"),
+    electron.indexOf("// The caret starts where the selection starts"));
+  assert.match(update, /reportCaret\(\);/);
   const cancel = electron.slice(electron.indexOf("function cancelVisual(restoreMode = true)"),
     electron.indexOf("function enterVisual(item)"));
   assert.match(cancel, /const hadCaret = Boolean\(visualState\.caret\);/);
   assert.match(cancel, /if \(hadCaret\) reportCaret\(\);/);
+});
+
+// A text selection was the page's native selection plus a yellow box around the range's
+// bounding rect: wider than the text whenever the selection ended mid-line, and the native
+// colour broke off between blocks inside it. It is painted as a highlight on the glyphs
+// themselves now, with the native colour off, and the box is only for picks with no text.
+test("a visual selection is painted on its text, not boxed", () => {
+  const paint = electron.slice(electron.indexOf("function paintVisualHighlight()"),
+    electron.indexOf("// Places the outline and the caret bar"));
+  assert.match(paint, /new api\.Highlight\(range\.cloneRange\(\)\)/);
+  assert.match(paint, /if \(!api \|\| !visualState\.selectionMade \|\| !inDocumentTree\(range\)\)/);
+  assert.match(electron, /::selection\{background-color:transparent !important\}/);
+  const draw = electron.slice(electron.indexOf("function drawVisualSelection()"),
+    electron.indexOf("function updateVisualSelection()"));
+  assert.match(draw, /visualState\.outline\.style\.display = visualState\.highlighted \? "none" : "";/);
+  const cancel = electron.slice(electron.indexOf("function cancelVisual(restoreMode = true)"),
+    electron.indexOf("function enterVisual(item)"));
+  assert.match(cancel, /clearVisualHighlight\(\);/);
+});
+
+// The `f` pick mark was a 320ms CSS transition with an 18px glow. The pane shows only the
+// frames its clock takes, so the fade arrived as one or two arbitrary frames and looked cut
+// off. It is two painted steps now, and nothing of it reaches outside the target's box.
+test("the hint pick mark ends in painted steps, not a transition", () => {
+  const feedback = electron.slice(electron.indexOf("function showHintFeedback(item)"),
+    electron.indexOf("// A video's control bar is hover-gated"));
+  assert.doesNotMatch(feedback, /transition/);
+  assert.doesNotMatch(feedback, /0 0 18px/);
+  assert.equal(feedback.match(/paintNow\(\);/g).length, 3);
 });
 
 // One form named its control "id" and the whole hint pass died on it: `form.id`
@@ -947,7 +950,7 @@ test("collectors reach into a same-origin frame", () => {
 test("every function the preload calls is defined in it", () => {
   // CSS text carries function-looking tokens that are not calls.
   const cssFunctions = new Set(["calc", "clamp", "minmax", "repeat", "rgba", "rgb", "scale",
-    "translate", "translateX", "translateY", "var", "url", "type", "value", "attr", "linear", "cubic"]);
+    "translate", "translateX", "translateY", "var", "url", "type", "value", "attr", "linear", "cubic", "highlight"]);
   const builtins = new Set(["require", "setTimeout", "clearTimeout", "setInterval",
     "clearInterval", "parseInt", "parseFloat", "getComputedStyle", "getSelection",
     "addEventListener", "removeEventListener", "queueMicrotask", "requestAnimationFrame",
@@ -1435,18 +1438,16 @@ test("the terminal cursor is hidden until a caret is parked on it", () => {
   assert.match(unpark, /if \(input\.caretHidden\) return;/);
 });
 
-// The page draws its own caret bar, separate from the terminal cursor, and it was
-// positioned from the collapsed range's bounding rect. That measures 0x0 whenever the
+// The page draws its own caret bar, and it was positioned from the collapsed range's
+// bounding rect. That measures 0x0 whenever the
 // range's container is an element rather than a text node — the usual case after
 // collapsing to a selection start — so the bar was drawn at the viewport's top-left
 // corner. Two bars appeared: one on the caret, one in the corner.
-test("the page's caret bar is measured the same way as the terminal cursor", () => {
+test("the page's caret bar is measured on the character it sits before", () => {
   const update = electron.slice(electron.indexOf("function drawVisualSelection()"),
     electron.indexOf("function updateVisualSelection()"));
   assert.match(update, /const range = selection\.getRangeAt\(0\);/);
   assert.match(update, /rect\.width \|\| rect\.height \? rect : firstCharacterRect\(range\)/);
-  // The same helper the terminal cursor uses, so the two can never disagree about where
-  // the caret is.
   assert.match(electron, /function firstCharacterRect\(range\)/);
 });
 
@@ -1816,7 +1817,7 @@ test("leaving a mode re-reports the caret", () => {
 // The slot reserves cells past the caret and paints over them. At the end of a field that is
 // empty space; anywhere else it is the page's own text, three cells of it blurred out.
 test("the IME slot is withheld when the caret is not at the end", () => {
-  assert.match(electron, /const slot = point && composing && caretAtContentEnd\(\)/);
+  assert.match(electron, /const slot = point && caretAtContentEnd\(\)/);
   const helper = electron.slice(electron.indexOf("  function caretAtContentEnd()"),
     electron.indexOf("  function reportCaret()"));
   // Measured from `selectionStart`, which is where the caret is drawn. Shift+Home leaves

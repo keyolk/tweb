@@ -2270,6 +2270,14 @@ installPrintShim();
     if (restoreMode) normalMode();
   }
 
+  // A short mark on what a hint picked: the target's box and the point that was clicked.
+  //
+  // It was a CSS transition — fade, a 4% grow and an 18px glow — over 320ms. A pane does not
+  // show every frame the page paints: the frame clock drops to its idle rate, and a glow that
+  // large makes each frame's damage rect several times the target's. So the fade arrived as
+  // one or two arbitrary frames of it, and the mark seemed to break off mid-animation rather
+  // than end. Two fixed steps instead, each painted on purpose: full, then half, then gone.
+  // Every frame of it is one the pane actually shows, and all of it stays inside the box.
   function showHintFeedback(item) {
     const point = item.nativePoint || {
       x: item.rect.left + item.rect.width / 2,
@@ -2281,27 +2289,27 @@ installPrintShim();
     const shadow = host.attachShadow({ mode: "open" });
     const outline = document.createElement("div");
     outline.style.cssText = [
-      "position:fixed", `left:${Math.max(0, item.rect.left - 3)}px`, `top:${Math.max(0, item.rect.top - 3)}px`,
-      `width:${Math.max(8, item.rect.width + 6)}px`, `height:${Math.max(8, item.rect.height + 6)}px`,
-      "box-sizing:border-box", "border:3px solid #ffb300", "border-radius:7px", "background:#ffd75f33",
-      "box-shadow:0 0 0 2px #111b,0 0 18px #ffb300", "transition:opacity .32s ease,transform .32s ease",
+      "position:fixed", `left:${Math.max(0, item.rect.left - 2)}px`, `top:${Math.max(0, item.rect.top - 2)}px`,
+      `width:${Math.max(8, item.rect.width + 4)}px`, `height:${Math.max(8, item.rect.height + 4)}px`,
+      "box-sizing:border-box", "border:2px solid #fdd663", "border-radius:4px", "background:#fdd66326",
+      "box-shadow:0 0 0 1px #0009",
     ].join(";");
-    const ripple = document.createElement("div");
-    ripple.style.cssText = [
-      "position:fixed", `left:${point.x - 9}px`, `top:${point.y - 9}px`, "width:18px", "height:18px",
-      "box-sizing:border-box", "border:3px solid #fff", "border-radius:50%", "background:#ffb300aa",
-      "box-shadow:0 0 0 2px #111a", "transition:opacity .32s ease,transform .32s ease",
+    const dot = document.createElement("div");
+    dot.style.cssText = [
+      "position:fixed", `left:${point.x - 4}px`, `top:${point.y - 4}px`, "width:8px", "height:8px",
+      "box-sizing:border-box", "border-radius:50%", "background:#fdd663", "box-shadow:0 0 0 1px #000b",
     ].join(";");
-    shadow.append(outline, ripple);
+    shadow.append(outline, dot);
     document.documentElement.append(host);
     paintNow();
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      outline.style.opacity = "0";
-      outline.style.transform = "scale(1.04)";
-      ripple.style.opacity = "0";
-      ripple.style.transform = "scale(2.8)";
-    }));
-    setTimeout(() => host.remove(), 380);
+    setTimeout(() => {
+      host.style.opacity = "0.45";
+      paintNow();
+    }, 200);
+    setTimeout(() => {
+      host.remove();
+      paintNow();
+    }, 300);
   }
 
   // A video's control bar is hover-gated, so hints collected on an idle page
@@ -2787,38 +2795,6 @@ installPrintShim();
     paintNow();
   }
 
-  // Where the visual caret sits, for a page that is not editable at all. `caretPoint`
-  // below only knows about form fields and contenteditable, because that is where a web
-  // caret normally lives — but visual caret mode puts one on ordinary text, and the
-  // terminal cursor has to follow it there too. Without this the cursor stays wherever it
-  // was last parked, which reads as the caret starting in the pane's top-left corner no
-  // matter where the selection is.
-  function visualCaretPoint() {
-    if (!visualState?.caret) return null;
-    const selection = visualSelection();
-    if (!selection?.rangeCount) return null;
-    const range = selection.getRangeAt(0).cloneRange();
-    range.collapse(true);
-    let box = range.getBoundingClientRect();
-    // A collapsed range measures as 0x0 whenever its container is an element rather than
-    // a text node — which is the normal case here, since selecting an element's contents
-    // and collapsing lands on the element at offset 0. Descend to the text the caret is
-    // actually in front of and measure its first character instead.
-    if (!box.width && !box.height) {
-      const measured = firstCharacterRect(range);
-      if (!measured) return null;
-      box = measured;
-    }
-    // Frame-local coordinates, like the editable path below: `reportCaret` runs the
-    // result through `topViewportPoint`, which is what shifts a subframe into the top
-    // document.
-    return {
-      x: Math.max(0, Math.min(innerWidth - 1, box.left)),
-      y: Math.max(0, Math.min(innerHeight - 1, box.top)),
-      height: box.height || 16,
-    };
-  }
-
   // The box of the character a collapsed range sits in front of.
   function firstCharacterRect(range) {
     const owner = range.startContainer?.ownerDocument || document;
@@ -2886,8 +2862,12 @@ installPrintShim();
   }
 
   function caretPoint() {
-    const visual = visualCaretPoint();
-    if (visual) return visual;
+    // The visual caret has a terminal cursor of its own no longer. It used to be parked
+    // there, but the terminal can only put it on a cell edge while the page's yellow bar
+    // sits on the exact character — so the two stood a few pixels apart and read as two
+    // cursors that disagree. Nothing is ever composed at a visual caret, so the terminal
+    // cursor has no job there; the bar is the caret.
+    if (visualState?.caret) return null;
     const element = activeElement();
     if (!isEditable(element) || isTag(element, "select")) return null;
     const box = element.getBoundingClientRect();
@@ -3095,14 +3075,9 @@ installPrintShim();
     const caret = caretPoint();
     let point = caret ? topViewportPoint(caret) : null;
     let height = caret?.height;
-    // The IME slot is a composition area: it reserves cells past the caret and paints
-    // them over the page. That is right where typing goes, but the visual caret only
-    // navigates — nothing is ever composed there — so reserving cells would blank text
-    // for no reason. Move the terminal cursor to it and leave the page alone.
-    const composing = !visualState?.caret;
     // A subframe cannot draw the surface in the top document, so it reports the raw
     // caret and the top frame's own report wins as soon as focus moves there.
-    const slot = point && composing && caretAtContentEnd() ? imeSlotRect({ ...point, height }) : null;
+    const slot = point && caretAtContentEnd() ? imeSlotRect({ ...point, height }) : null;
     if (slot) {
       point = { x: slot.left, y: slot.top };
       height = slot.height;
@@ -5018,6 +4993,78 @@ installPrintShim();
     return { left: left + now.left - then.left, top: top + now.top - then.top, width, height };
   }
 
+  // The selection, painted by the engine into the text it covers (the CSS Custom Highlight
+  // API), with the page's own selection colour turned off while visual mode is up.
+  //
+  // It used to be the page's native selection plus one yellow outline around the range's
+  // bounding box. A selection that ends mid-line has a bounding box wider than the text, so
+  // the yellow box took in lines and words that were not selected, and the native colour —
+  // whatever the site's `::selection` says, light blue by default — broke off between
+  // blocks and line boxes inside it. Two colours that disagree on what is selected. A
+  // highlight paints exactly the glyphs the range covers, line by line, and moves with them
+  // when the page scrolls, so nothing has to be redrawn to keep up.
+  //
+  // In caret mode the block the hint picked stays faintly tinted, as context for the caret.
+  // A range in a shadow tree falls back to the outline: a `::highlight` rule applies only in
+  // the tree scope of the stylesheet that holds it, and ours is in the document.
+  const VISUAL_HIGHLIGHT = "tweb-visual";
+  const VISUAL_BLOCK_HIGHLIGHT = "tweb-visual-block";
+  const VISUAL_HIGHLIGHT_STYLE = [
+    `::highlight(${VISUAL_HIGHLIGHT}){background-color:rgba(253,214,99,.55)}`,
+    `::highlight(${VISUAL_BLOCK_HIGHLIGHT}){background-color:rgba(253,214,99,.16)}`,
+    "::selection{background-color:transparent !important}",
+    "*::selection{background-color:transparent !important}",
+  ].join("\n");
+
+  function highlightRegistry() {
+    const view = visualDocument().defaultView || window;
+    return view.CSS?.highlights && typeof view.Highlight === "function"
+      ? { registry: view.CSS.highlights, Highlight: view.Highlight } : null;
+  }
+
+  function inDocumentTree(range) {
+    return range && !(range.commonAncestorContainer?.getRootNode?.() instanceof ShadowRoot);
+  }
+
+  function paintVisualHighlight() {
+    if (!visualState) return;
+    const api = highlightRegistry();
+    const selection = visualSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (!api || !visualState.selectionMade || !inDocumentTree(range)) {
+      clearVisualHighlight();
+      return;
+    }
+    const doc = visualDocument();
+    if (!visualState.highlightStyle?.isConnected) {
+      const style = doc.createElement("style");
+      style.id = "__tweb_visual_highlight__";
+      style.textContent = VISUAL_HIGHLIGHT_STYLE;
+      (doc.head || doc.documentElement).append(style);
+      visualState.highlightStyle = style;
+    }
+    // Copies: the selection's own range is replaced by every `modify`, and a highlight
+    // holding it would keep painting where the selection used to be.
+    if (visualState.caret || range.collapsed) api.registry.delete(VISUAL_HIGHLIGHT);
+    else api.registry.set(VISUAL_HIGHLIGHT, new api.Highlight(range.cloneRange()));
+    const block = visualState.caret && inDocumentTree(visualState.blockRange) ? visualState.blockRange : null;
+    if (block) api.registry.set(VISUAL_BLOCK_HIGHLIGHT, new api.Highlight(block));
+    else api.registry.delete(VISUAL_BLOCK_HIGHLIGHT);
+    // A caret on a link or image pick has no block range, so its outline stays the context.
+    visualState.highlighted = !visualState.caret || Boolean(block);
+    paintNow();
+  }
+
+  function clearVisualHighlight() {
+    if (!visualState) return;
+    const api = highlightRegistry();
+    api?.registry.delete(VISUAL_HIGHLIGHT);
+    api?.registry.delete(VISUAL_BLOCK_HIGHLIGHT);
+    visualState.highlightStyle?.remove();
+    visualState.highlightStyle = null;
+    visualState.highlighted = false;
+  }
+
   // Places the outline and the caret bar, and nothing else. It is apart from
   // updateVisualSelection because the page keeps moving after a key is handled: Chromium
   // scrolls the moved caret into view, a page with `scroll-behavior: smooth` animates that
@@ -5034,6 +5081,9 @@ installPrintShim();
     if (!selection?.rangeCount) return;
     const range = selection.getRangeAt(0);
     const rect = range.getBoundingClientRect();
+    // The highlight is the selection's picture; a box around it would only add the
+    // bounding-box shape back.
+    visualState.outline.style.display = visualState.highlighted ? "none" : "";
     if (visualState.caret) {
       // A collapsed range measures 0x0 when its container is an element rather than a text
       // node, which is the usual case after collapsing to a selection start — so the bar
@@ -5062,8 +5112,10 @@ installPrintShim();
     if (visualState.caret) setMode("visual", "caret v·h·j·k·l·w·b·e·{·}");
     else setMode("visual", `text ${selection.toString().length} y·c·o·h·j·k·l·w·b·e`);
     scrollSelectionIntoView(selection);
+    paintVisualHighlight();
     drawVisualSelection();
-    // Parks the terminal cursor on the caret so IME composition stays visible.
+    // Takes the terminal cursor away while the visual caret is up, and gives it back to a
+    // focused field when `v` leaves the caret.
     reportCaret();
   }
 
@@ -5217,6 +5269,7 @@ installPrintShim();
     if (!visualState) return;
     const hadCaret = Boolean(visualState.caret);
     removeCaretBar();
+    clearVisualHighlight();
     visualState.outline.remove();
     if (visualState.selectionMade) visualSelection()?.removeAllRanges();
     visualState = null;
