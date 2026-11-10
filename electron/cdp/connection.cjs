@@ -157,12 +157,55 @@ function trace(line) {
   if (TRACE) console.error(`tweb: cdp ${line.slice(0, 300)}`);
 }
 
+function psCommand(pid) {
+  try {
+    return require("node:child_process").execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+  } catch (_) {
+    return "";
+  }
+}
+
+// The Chrome that holds `userDataDir`, found the way Chrome itself records it: `SingletonLock` is a
+// symlink to `<host>-<pid>` for as long as that Chrome runs. Null when there is none, or its pid is
+// gone (a stale lock). `command` is that process's argv, from which its debugging port is read.
+function liveProfileChrome(userDataDir, { readlink = fs.readlinkSync, ps = psCommand } = {}) {
+  let pid = 0;
+  try { pid = Number(String(readlink(path.join(userDataDir, "SingletonLock"))).split("-").pop()); } catch (_) { return null; }
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const command = ps(pid);
+  return command ? { pid, command } : null;
+}
+
+// The `--remote-debugging-port` a command line was launched with; 0 when it named none or asked
+// Chrome to pick one (that port is then in DevToolsActivePort).
+function debuggingPortOf(command) {
+  const match = /--remote-debugging-port=(\d+)/.exec(command || "");
+  return match ? Number(match[1]) : 0;
+}
+
 /// A running Chrome for `userDataDir`, launched if there is none. Resolves to its version info,
 /// including `webSocketDebuggerUrl`.
 async function ensureChrome(userDataDir, { env = process.env, log = () => {}, scaleFactor = 0 } = {}) {
   fs.mkdirSync(userDataDir, { recursive: true });
   const existing = await probeBrowser(readActivePort(userDataDir));
   if (existing) return { version: existing, launched: null, scaleFactor: readLaunchedScale(userDataDir) };
+  // The port file can be gone while its Chrome lives on: a probe that timed out once, or a launch
+  // that handed off to this Chrome, deleted it. Launching again cannot help — Chrome refuses a
+  // second instance on the same profile, so the new process exits and the launch fails after 15s,
+  // deleting the file again. Read the port off the live Chrome's own argv instead.
+  const holder = liveProfileChrome(userDataDir);
+  if (holder) {
+    const port = debuggingPortOf(holder.command);
+    const recovered = port ? await probeBrowser({ port, wsPath: "" }) : null;
+    if (recovered) {
+      log(`chrome pid ${holder.pid} already holds the profile; reusing its port ${port}`);
+      try { fs.writeFileSync(path.join(userDataDir, PICKED_PORT_FILE), `${port}\n`); } catch (_) { /* best effort */ }
+      return { version: recovered, launched: null, scaleFactor: readLaunchedScale(userDataDir) };
+    }
+    throw new Error(
+      `Chrome pid ${holder.pid} holds the profile ${userDataDir} but does not answer on a DevTools port; ` +
+      "quit it (or run `tweb chrome login` to reclaim an idle one) and try again");
+  }
   // A file left by a Chrome that is gone would otherwise be read as the new one's port.
   for (const name of ["DevToolsActivePort", PICKED_PORT_FILE, SCALE_FILE]) {
     try { fs.rmSync(path.join(userDataDir, name), { force: true }); } catch (_) { /* best effort */ }
@@ -379,4 +422,6 @@ module.exports = {
   findChrome,
   handOffToUserChrome,
   readActivePort,
+  liveProfileChrome,
+  debuggingPortOf,
 };
