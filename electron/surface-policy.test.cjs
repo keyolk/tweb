@@ -4,7 +4,7 @@ const { test } = require("node:test");
 const assert = require("node:assert");
 const {
   surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry,
-  restoredLayoutScript, COLLAPSED_HEIGHT,
+  restoredLayoutScript, presentedFrameScript, acceptsRestoredPaint, COLLAPSED_HEIGHT,
 } = require("./surface-policy.cjs");
 
 const LOGICAL = { width: 1440, height: 900 };
@@ -277,5 +277,72 @@ test("the deadline reaches the page as a number, whatever it was given", () => {
   // A caller that passes nonsense must not produce a script that throws in the page.
   for (const bad of [undefined, null, NaN, "soon", -5]) {
     assert.match(restoredLayoutScript(bad), /settle\("timeout"\), \d+\)/, String(bad));
+  }
+});
+
+// --- the presented-frame wait ---
+//
+// A hold that restores a collapsed surface gets a correctly sized paint at once, and it is the
+// compositor's frame from before the collapse. Keeping it made `screenshot` answer with the page
+// as it was before an `eval` or a click on a hidden pane (office-free-answer, 2026-11-10).
+
+function runPresentedScript(timeoutMs = 700) {
+  const frames = [];
+  const timers = new Map();
+  let nextTimer = 1;
+  const context = {
+    requestAnimationFrame: (fn) => { frames.push(fn); },
+    setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    Promise,
+  };
+  vm.createContext(context);
+  const promise = vm.runInContext(presentedFrameScript(timeoutMs), context);
+  return {
+    promise,
+    timers,
+    // One animation frame: runs what was queued before it, not what that queues in turn.
+    frame: () => { for (const fn of frames.splice(0)) fn(); },
+    fireTimeout: () => { for (const { fn } of [...timers.values()]) fn(); },
+  };
+}
+
+test("the page has presented only after the second animation frame", async () => {
+  const run = runPresentedScript();
+  let settled = null;
+  run.promise.then((how) => { settled = how; });
+  run.frame();
+  await Promise.resolve();
+  assert.strictEqual(settled, null, "one frame is the update after the resize, not yet the frame it drew");
+  run.frame();
+  assert.strictEqual(await run.promise, "frame");
+  assert.strictEqual(run.timers.size, 0, "the backstop is cleared");
+});
+
+test("a page that never runs animation frames settles on its own deadline", async () => {
+  const run = runPresentedScript();
+  run.fireTimeout();
+  assert.strictEqual(await run.promise, "timeout");
+});
+
+test("the presented-frame deadline reaches the page as a number, whatever it was given", () => {
+  assert.match(presentedFrameScript(700), /setTimeout\(\(\) => settle\("timeout"\), 700\)/);
+  for (const bad of [undefined, null, NaN, "soon", -5]) {
+    assert.match(presentedFrameScript(bad), /settle\("timeout"\), \d+\)/, String(bad));
+  }
+});
+
+test("a paint at the restored size is not the frame until the renderer has presented", () => {
+  const expected = { width: 1274, height: 1344 };
+  // The compositor's cached frame: right size, drawn before the collapse.
+  assert.strictEqual(acceptsRestoredPaint({ ...expected }, expected, false), false);
+  assert.strictEqual(acceptsRestoredPaint({ ...expected }, expected, true), true);
+});
+
+test("a paint of another size is never the restored frame", () => {
+  const expected = { width: 1274, height: 1344 };
+  // The collapse itself paints width x 2, and a pane resize paints at the old size.
+  for (const size of [{ width: 1274, height: 2 }, { width: 0, height: 0 }, { width: 1200, height: 1344 }]) {
+    assert.strictEqual(acceptsRestoredPaint(size, expected, true), false, JSON.stringify(size));
   }
 });

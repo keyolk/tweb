@@ -2070,6 +2070,24 @@ test("the full-page screenshot holds the surface open", () => {
   assert.strictEqual(agentNeedsGeometry("full-screenshot"), true);
 });
 
+// The hold's frame has to postdate the restore. Taking the first paint of the right size handed a
+// screenshot the compositor's pre-collapse frame, so a hidden pane showed the page before an
+// `eval` or a click — and the hold closing again left the renderer no time to draw the new one.
+test("the hold's frame is taken only after the page has presented a frame of its own", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const restored = main.slice(main.indexOf("function awaitRestoredFrame(contents)"),
+    main.indexOf("/// Runs `body` with the active tab laid out"));
+  assert.match(restored, /acceptsRestoredPaint\(image\.getSize\(\), expected, presented\)/);
+  assert.match(restored, /executeJavaScript\(presentedFrameScript\(SURFACE_PRESENT_TIMEOUT_MS\), true\)/);
+  // The repaint is asked for after the page presented, not before: an invalidate sent first is
+  // answered by the same stale frame.
+  assert.ok(restored.indexOf("presented = true") < restored.indexOf("contents.invalidate()"));
+  // The page's backstop must leave room for that repaint inside the overall deadline.
+  const present = Number(/const SURFACE_PRESENT_TIMEOUT_MS = (\d+);/.exec(main)[1]);
+  const overall = Number(/const SURFACE_RESTORE_TIMEOUT_MS = (\d+);/.exec(main)[1]);
+  assert.ok(present < overall);
+});
+
 // The inspect mode's y/h/t keys now send the element context to an agent too, not just the
 // clipboard. Orca's design mode does this as an attachment; tweb's inspect mode was
 // clipboard-only, so an agent had no way to receive what the user picked.

@@ -139,12 +139,47 @@ function restoredLayoutScript(timeoutMs) {
   })`;
 }
 
+// The script a restoring hold runs in the page, to wait until the renderer has produced a frame
+// of its own since the surface came back.
+//
+// A restored surface hands out a frame of the right size within a millisecond, and that frame is
+// the compositor's last one — drawn before the surface was collapsed. A hidden pane paints
+// nothing between agent calls, so anything the page did since (an `eval`, a click, a timer) is
+// not in it. Measured on a hidden pane: `eval` changes the background, the next `screenshot`
+// answered with the old colour on 4 of 8 runs, and the hold closed again before the renderer had
+// drawn anything, so the next call got the same old frame.
+//
+// Two animation frames is the signal that the renderer has run a full lifecycle at the restored
+// size: the first runs the update that follows the resize, the second runs after that update's
+// frame was committed. `timeoutMs` is a backstop for a page that never runs animation frames (a
+// throttled background page); the caller then falls back to the first correctly sized paint, which
+// is what it did before this wait existed.
+function presentedFrameScript(timeoutMs) {
+  return `new Promise((resolve) => {
+    const settle = (how) => {
+      clearTimeout(timer);
+      resolve(how);
+    };
+    const timer = setTimeout(() => settle("timeout"), ${Math.max(0, Math.round(timeoutMs) || 0)});
+    requestAnimationFrame(() => requestAnimationFrame(() => settle("frame")));
+  })`;
+}
+
+// Whether a paint is the frame a restoring hold is waiting for: the size it restored to, and
+// only once the renderer has presented a frame since (`presentedFrameScript`). A correctly sized
+// paint before that is the compositor's cached pre-collapse frame.
+function acceptsRestoredPaint(size, expected, presented) {
+  return Boolean(presented) && size.width === expected.width && size.height === expected.height;
+}
+
 module.exports = {
   surfacePlan,
   surfaceResizeNeeded,
   paintingTransition,
   agentNeedsGeometry,
   restoredLayoutScript,
+  presentedFrameScript,
+  acceptsRestoredPaint,
   COLLAPSED_HEIGHT,
 };
 

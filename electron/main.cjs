@@ -103,6 +103,7 @@ const {
 const { isOrphaned, watchedPid, abandonedFrameFiles } = require("./orphan-watch.cjs");
 const {
   surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry, restoredLayoutScript,
+  presentedFrameScript, acceptsRestoredPaint,
 } = require("./surface-policy.cjs");
 const { pressEvents, parseChord } = require("./agent-key.cjs");
 const { pdfKeyAction, pdfViewportScript, findPdfFrame } = require("./pdf-frame.cjs");
@@ -3011,6 +3012,10 @@ function surfaceHeldForAgent(windows = currentWindows()) {
 // take longer to produce its first frame at the new size. Bounded so a page that never
 // paints costs the call a beat rather than hanging it.
 const SURFACE_RESTORE_TIMEOUT_MS = 1500;
+// How long the page may take to present a frame at the restored size before the first correctly
+// sized paint is taken as it is. Short of SURFACE_RESTORE_TIMEOUT_MS, which also has to cover the
+// paint that follows.
+const SURFACE_PRESENT_TIMEOUT_MS = 700;
 
 // A restored surface is not a restored layout. The compositor delivers a correctly sized
 // frame within a millisecond or two, and the renderer takes ~380ms longer to lay the page
@@ -3040,10 +3045,18 @@ function awaitRestoredLayout(contents) {
 // would have gone back to the compositor for. Keeping it is both cheaper and steadier:
 // asking the compositor again during the restore kept failing intermittently (2 of 6 runs)
 // even after the frame had arrived.
+//
+// Not every paint at the restored size is the page as it is now. The first one arrives in a
+// millisecond and is the compositor's cached frame from before the collapse, so a change the
+// page made while the pane was hidden (an `eval`, a click) is not in it — and the hold closing
+// right after meant the renderer never got to draw it, call after call. Paints are therefore
+// ignored until the renderer has presented a frame of its own, and the repaint that is asked for
+// after that is the one kept.
 function awaitRestoredFrame(contents) {
   return new Promise((resolve) => {
     const expected = renderedFrameSize(currentViewport());
     let done = false;
+    let presented = false;
     const finish = (image) => {
       if (done) return;
       done = true;
@@ -3052,17 +3065,24 @@ function awaitRestoredFrame(contents) {
       resolve(image || null);
     };
     const onPaint = (_event, _dirty, image) => {
-      const size = image.getSize();
-      if (size.width === expected.width && size.height === expected.height) finish(image);
+      if (acceptsRestoredPaint(image.getSize(), expected, presented)) finish(image);
     };
     const timer = setTimeout(() => {
       if (debugLogging) console.error("tweb: surface restore produced no frame in time");
       finish(null);
     }, SURFACE_RESTORE_TIMEOUT_MS);
     contents.on("paint", onPaint);
-    // A hidden pane sits at 1fps and has just had `startPainting` called on it, so left
-    // alone the first frame could be a second away.
-    try { contents.invalidate(); } catch (error) { void error; }
+    // The page's own backstop is shorter than the overall deadline, so a page that never runs
+    // animation frames still leaves time for the repaint below. An unreachable renderer never
+    // answers, which the overall deadline covers.
+    contents.executeJavaScript(presentedFrameScript(SURFACE_PRESENT_TIMEOUT_MS), true)
+      .catch(() => "unreachable")
+      .then(() => {
+        presented = true;
+        // A hidden pane sits at 1fps and has just had `startPainting` called on it, so left
+        // alone the first frame could be a second away.
+        if (!done) { try { contents.invalidate(); } catch (error) { void error; } }
+      });
   });
 }
 
