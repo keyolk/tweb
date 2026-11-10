@@ -535,6 +535,28 @@ test("a subframe navigating drops its own children, not its siblings", () => {
   assert.deepStrictEqual(created.mainFrame.framesInSubtree.map((frame) => frame.frameId).sort(), ["A", "B"]);
 });
 
+// Chrome answers a key only after the page has handled it. Waiting for that answer before
+// sending the next key let one key out per round trip, so a backlog from a busy page never
+// drained: keys 30ms apart were still ~300ms late twenty keys after a 300ms stall.
+test("input is sent in order without waiting for Chrome's answer to the one before", async () => {
+  const { created } = contents();
+  created.measureInputScale = async () => 1;
+  const sent = [];
+  const answers = [];
+  created.session.send = (method, params) => {
+    sent.push(params.key || params.type || params.text);
+    return new Promise((resolve) => answers.push(resolve));
+  };
+  const first = created.sendInput("Input.dispatchKeyEvent", { type: "keyDown", key: "a" });
+  created.sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1, buttons: 0 });
+  created.sendInput("Input.dispatchKeyEvent", { type: "keyDown", key: "b" });
+  created.sendInput("Input.insertText", { text: "c" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepStrictEqual(sent, ["a", "mouseMoved", "b", "c"], "all four are out before any answer");
+  answers[0]({ ok: true });
+  assert.deepStrictEqual(await first, { ok: true }, "the caller still gets Chrome's answer");
+});
+
 // Measured in a real tmux pane at dsf 1.6: clicks within the cache's three seconds landed at
 // 1/1.6 of the way (5 of 12 per run), putting the caret lines away from where the user clicked.
 test("a press measures the input skew afresh; a move inside the cache window does not", async () => {
