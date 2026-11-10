@@ -1,5 +1,7 @@
 "use strict";
 
+const { parseOcclusionRects } = require("./floating-occlusion.cjs");
+
 // The stdin control protocol, parsed.
 //
 // The frontend has always pushed viewport, visibility and raw input over this channel as bare
@@ -14,6 +16,7 @@
 //
 //   RESIZE <cols> <rows> <width> <height> [<left> <top>]
 //   VIS <hex>
+//   OCC [<col>,<row>,<cols>,<rows> ...]   cells a tmux floating pane covers; see floating-occlusion.cjs
 //   INPUT <hex>
 //   @%3 RESIZE 80 24 800 480 20 0
 //   @%3 ATTACH <server> <gen> <imageId> <rate> <adaptive> <restore> <cols> <rows> <w> <h> <left> <top> <tty> <url>
@@ -42,6 +45,7 @@
 const RESIZE = /^RESIZE\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)(?:\s+(\d+)\s+(\d+))?$/;
 const VIS = /^VIS\s+([0-9a-f]*)$/i;
 const INPUT = /^INPUT\s+([0-9a-f]*)$/i;
+const OCC = /^OCC(?:\s+(.*))?$/;
 const ADDRESS = /^@(%[\w-]+)\s+(.*)$/;
 const DETACH = /^DETACH$/;
 // The pane's tmux window identity, hex-encoded, for the window-session slot.
@@ -102,6 +106,12 @@ function parseControlLine(rawLine) {
 
   const visibility = VIS.exec(rest);
   if (visibility) return { kind: "visibility", paneId, hex: visibility[1] };
+
+  const occlusion = OCC.exec(rest);
+  if (occlusion) {
+    const rects = parseOcclusionRects(occlusion[1] || "");
+    return rects ? { kind: "occlusion", paneId, rects } : null;
+  }
 
   const input = INPUT.exec(rest);
   // An odd-length payload is half a byte. It was silently ignored before this module and stays

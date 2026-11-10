@@ -19,6 +19,7 @@ pub mod hosted;
 pub mod image_id;
 pub mod image_sweep;
 pub mod input;
+pub mod occlusion;
 pub mod pane_writer;
 pub mod remote_terminal;
 pub mod resize;
@@ -288,6 +289,7 @@ fn forward_pane_state(
     pane: &str,
     previous_geometry: &mut Option<terminal::WindowGeometry>,
     previous_visibility: &mut Option<String>,
+    previous_occlusion: &mut Option<Vec<occlusion::CellRect>>,
 ) {
     if std::env::var_os("TMUX").is_none() {
         forward_changed_geometry(control_tx, previous_geometry);
@@ -308,6 +310,12 @@ fn forward_pane_state(
         let _ = control_tx.send(message);
     }
     if let Some(message) = visibility::changed_visibility_message(previous_visibility, &probe) {
+        let _ = control_tx.send(message);
+    }
+    // After RESIZE, so an engine that re-anchors on a resize has the new cell grid before it
+    // masks against cells counted from the pane's top-left.
+    let covered = occlusion::covered_cells(&probe.panes, pane);
+    if let Some(message) = occlusion::changed_occlusion_message(previous_occlusion, covered) {
         let _ = control_tx.send(message);
     }
 }
@@ -788,6 +796,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
             // Nothing has been pushed yet, so the first tick always sends — which is what
             // gets the engine off its no-frontend default and onto the real answer.
             let mut previous_visibility = None;
+            let mut previous_occlusion = None;
             loop {
                 tokio::select! {
                     // Bounded, for the same reason the typed-interrupt path is: a SIGTERM the
@@ -800,6 +809,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                             &pane,
                             &mut previous_geometry,
                             &mut previous_visibility,
+                            &mut previous_occlusion,
                         );
                     }
                     _ = geometry_poll.tick() => {
@@ -808,6 +818,7 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                             &pane,
                             &mut previous_geometry,
                             &mut previous_visibility,
+                            &mut previous_occlusion,
                         );
                     }
                     _ = sigusr1.recv() => {
@@ -1175,6 +1186,7 @@ async fn run_hosted_session(
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut previous_geometry = terminal::window_geometry();
             let mut previous_visibility = None;
+            let mut previous_occlusion = None;
             if let Some(geometry) = previous_geometry {
                 let _ = control_tx.send(resize_control_message(geometry));
             }
@@ -1188,6 +1200,7 @@ async fn run_hosted_session(
                     &pane,
                     &mut previous_geometry,
                     &mut previous_visibility,
+                    &mut previous_occlusion,
                 );
             }
         }

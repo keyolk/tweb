@@ -116,6 +116,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/patch-geometry.cjs"),
     ),
     (
+        "floating-occlusion.cjs",
+        include_str!("../../../electron/floating-occlusion.cjs"),
+    ),
+    (
         "frame-rate-policy.cjs",
         include_str!("../../../electron/frame-rate-policy.cjs"),
     ),

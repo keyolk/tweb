@@ -64,6 +64,7 @@ const { Recording, cleanPageEvent, oneLine, timelineMarkdown } = require("./reco
 const { evaluate } = require("./agent-eval.cjs");
 const { navigate: agentNavigateTab, historyWord } = require("./agent-navigate.cjs");
 const { patchGeometry, patchCursorMove, patchRelativeKeys, unionDamage } = require("./patch-geometry.cjs");
+const { sameRects, pixelRects, maskBitmap, placeIsCovered } = require("./floating-occlusion.cjs");
 const {
   findTerminalApp, parseProcessTable, parseTtyPids, preferredClientTty,
 } = require("./terminal-focus.cjs");
@@ -2129,6 +2130,9 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   const size = image.getSize();
   const geometry = patchGeometry(damage, frames.cells, size);
   if (!geometry) return false;
+  // A patch is drawn over the base frame at full opacity, so one that reaches a cell a floating
+  // pane covers would paint the page over the float again. The whole-frame path masks it.
+  if (placeIsCovered(geometry.place, frames.occlusion)) return false;
 
   const patchStarted = frameProbeMark();
   if (shmFramesEnabled && sendShmPatch(image, damage, geometry, frames, record, patchStarted)) return true;
@@ -2282,15 +2286,25 @@ function sendFrameNow(image, generation, queuedAt = 0n) {
     // Raw pixels skip the encode entirely; the worker swaps the channels and writes the
     // file. `toBitmap` hands back an owned copy, which is what the worker needs anyway —
     // the view `getBitmap` returns belongs to the frame and cannot be transferred.
+    const holes = pixelRects(currentFrames().occlusion, currentFrames().cells, size);
     if (rawFramesEnabled) {
       const bitmap = image.toBitmap();
+      maskBitmap(bitmap, size, holes);
       currentFrames().imageTransferred = true;
       transferFrame(bitmap, generation, "raw", size, { flushed, encoded: frameProbeMark(), queuedAt });
       return;
     }
     // Hand the base64 conversion and the terminal write off to a worker once the PNG exists.
     // Even under stdout backpressure, the Electron main thread and keyboard input keep going.
-    const png = image.toPNG();
+    // The PNG path only masks when something is covered: the round trip through a bitmap is a
+    // copy and a re-wrap the uncovered pane has no reason to pay.
+    let encodable = image;
+    if (holes.length) {
+      const bitmap = image.toBitmap();
+      maskBitmap(bitmap, size, holes);
+      encodable = nativeImage.createFromBitmap(bitmap, { width: size.width, height: size.height });
+    }
+    const png = encodable.toPNG();
     currentFrames().imageTransferred = true;
     transferFrame(png, generation, "png", size, { flushed, encoded: frameProbeMark(), queuedAt });
   } catch (error) {
@@ -2354,6 +2368,19 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   const elapsed = Date.now() - currentFrames().lastFrameSentAt;
   const delay = immediate ? 0 : Math.max(0, currentWindows().frameIntervalMs - elapsed);
   currentFrames().pendingFrameTimer = setTimeout(flushPendingFrame, delay);
+}
+
+// The frontend's floating-pane push. A change in either direction needs a whole frame now: a float
+// that appeared is still covered by the frame on screen, and one that went away left a hole the
+// next patch would not fill. The cached frame is re-sent, so this costs no new capture.
+function applyOcclusion(rects) {
+  const frames = currentFrames();
+  if (sameRects(frames.occlusion, rects)) return;
+  frames.occlusion = rects;
+  if (debugLogging) {
+    console.error(`tweb: floating panes cover ${rects.map((r) => `${r.cols}x${r.rows}@${r.col},${r.row}`).join(" ") || "nothing"}`);
+  }
+  repaintActiveTab();
 }
 
 function repaintActiveTab() {
@@ -10340,6 +10367,12 @@ function handleTargetedCommand(command, target) {
   // client attaching elsewhere must not count as someone using this pane.
   if (command.kind === "visibility") {
     applyVisibilityPush(command.hex);
+    return;
+  }
+
+  // Like VIS this is not interaction: a float opening beside the pane is not someone using it.
+  if (command.kind === "occlusion") {
+    applyOcclusion(command.rects);
     return;
   }
 

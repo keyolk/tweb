@@ -50,6 +50,9 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // leave an earlier, wider one showing around it — a deleted character stays on screen until
     // something forces a whole frame.
     patchedDamage: null,
+    // Cells of this pane a tmux floating pane covers, from the frontend's `OCC` line. Whole frames
+    // are transparent there and patches touching them are declined; see floating-occlusion.cjs.
+    occlusion: [],
 
     // The single-frame queue in front of the pane's rate limit.
     pendingFrame: null,

@@ -16,6 +16,7 @@
 //! electron/tmux-visibility.cjs — so the zoom rule and the tty set live in exactly one
 //! place instead of being reimplemented here and drifting.
 
+use crate::occlusion::{self, PaneBox};
 use crate::terminal::{WindowGeometry, WindowSize};
 
 /// Placement plus the client listing, exactly as tmux reported it.
@@ -26,6 +27,9 @@ pub struct TmuxProbe {
     pub placement: Option<(String, String, String)>,
     /// One entry per attached client, tab-separated, in the engine's field order.
     pub clients: Vec<String>,
+    /// Every pane in this pane's window, for the floating-pane occlusion — see occlusion.rs.
+    /// Empty on a tmux without floating panes: its `pane_z` is blank and no line parses.
+    pub panes: Vec<PaneBox>,
 }
 
 /// The chained probe. `display-message` resolves against the pane target, so it re-reads
@@ -52,6 +56,14 @@ pub fn probe_args(pane: &str) -> Vec<String> {
         "C\t#{client_tty}\t#{client_session}\t#{window_id}\
          \t#{window_zoomed_flag}\t#{pane_id}\t#{client_key_table}"
             .to_string(),
+        // The same tick learns where the floating panes are. `-t <pane>` lists the window the
+        // pane is in now, so a moved pane is measured against its new neighbours.
+        ";".to_string(),
+        "list-panes".to_string(),
+        "-t".to_string(),
+        pane.to_string(),
+        "-F".to_string(),
+        occlusion::LIST_PANES_FORMAT.to_string(),
     ]
 }
 
@@ -86,6 +98,7 @@ pub fn parse_probe(stdout: &str, pane: &str) -> TmuxProbe {
     let mut geometry = None;
     let mut placement = None;
     let mut clients = Vec::new();
+    let mut panes = Vec::new();
 
     for line in stdout.lines() {
         let Some((tag, rest)) = line.split_once('\t') else {
@@ -130,6 +143,7 @@ pub fn parse_probe(stdout: &str, pane: &str) -> TmuxProbe {
             "C" if !rest.split('\t').next().unwrap_or("").is_empty() => {
                 clients.push(rest.to_string());
             }
+            "F" => panes.extend(occlusion::parse_pane_box(rest)),
             _ => {}
         }
     }
@@ -138,6 +152,7 @@ pub fn parse_probe(stdout: &str, pane: &str) -> TmuxProbe {
         geometry,
         placement,
         clients,
+        panes,
     }
 }
 
@@ -326,5 +341,36 @@ mod tests {
         assert!(
             args[8].contains("#{window_zoomed_flag}") && args[8].contains("#{client_key_table}")
         );
+        assert_eq!(&args[9..12], [";", "list-panes", "-t"]);
+        assert_eq!(args[12], PANE);
+        assert!(args[14].contains("#{pane_z}") && args[14].contains("#{pane_floating_flag}"));
+    }
+
+    #[test]
+    fn reads_the_window_panes_beside_placement_and_clients() {
+        let parsed = probe(
+            "P\t80\t24\t0\t1\t7\t14\tmain\t@3\n\
+             C\t/dev/ttys001\tmain\t@3\t0\t%7\troot\n\
+             F\t%7\t0\t1\t0\t1\t80\t24\tsingle\t0\n\
+             F\t%9\t1\t0\t10\t4\t30\t8\tsingle\t0\n",
+        );
+        assert_eq!(parsed.clients.len(), 1);
+        assert_eq!(parsed.panes.len(), 2);
+        assert_eq!(
+            crate::occlusion::covered_cells(&parsed.panes, PANE),
+            vec![crate::occlusion::CellRect { col: 9, row: 2, cols: 32, rows: 10 }]
+        );
+        // The pane lines are not part of what the visibility push carries.
+        assert_eq!(
+            visibility_payload(&parsed).unwrap(),
+            "main\t@3\t%7\n/dev/ttys001\tmain\t@3\t0\t%7\troot"
+        );
+    }
+
+    #[test]
+    fn a_tmux_without_floating_panes_yields_no_pane_boxes() {
+        // Before 3.8 `pane_floating_flag` and `pane_z` expand to nothing.
+        let parsed = probe("P\t80\t24\t0\t0\t7\t14\tmain\t@3\nF\t%7\t\t\t0\t0\t80\t24\tsingle\t0\n");
+        assert!(parsed.panes.is_empty());
     }
 }
