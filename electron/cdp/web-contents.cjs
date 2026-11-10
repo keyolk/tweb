@@ -667,14 +667,24 @@ class CdpWebContents extends EventEmitter {
   // Every `Input.*` for the top frame goes through here, in order. Mouse events are scaled; keys
   // wait their turn behind any pointer event still queued so a click-then-type is not reordered.
   // An out-of-process frame's session is a different widget and is sent to directly.
+  //
+  // The queue holds an event only until it is WRITTEN, not until Chrome answers it. Chrome
+  // answers `Input.dispatchKeyEvent` once the renderer has run the page's handlers for it, so
+  // holding the queue for the answer let one key out per round trip: on a page whose main thread
+  // was busy for 300ms, keys typed 30ms apart were still arriving ~300ms late twenty keys later,
+  // where Electron had drained the same backlog after eight. Order does not need the answer —
+  // the commands go out on one socket in order, and Chrome hands them to the widget in that
+  // order. What does need waiting is a mouse event's scale probe, and that is awaited here.
   sendInput(method, params, sessionId = undefined) {
     if (sessionId && sessionId !== this.session.id) return this.connection.send(method, params, sessionId);
     if (method === "Input.dispatchMouseEvent") {
       if (params.type === "mousePressed") this.pointerHeld = true;
       else if (params.type === "mouseReleased" || (params.type === "mouseMoved" && !params.buttons)) this.pointerHeld = false;
     }
+    // Returns Chrome's answer boxed in an array: an async function returning the bare promise
+    // would adopt it, and the queue below would wait for the answer after all.
     const send = async () => {
-      if (method !== "Input.dispatchMouseEvent") return this.session.send(method, params);
+      if (method !== "Input.dispatchMouseEvent") return [this.session.send(method, params)];
       // A press is measured afresh, whatever the cache says. The skew comes and goes while the tab
       // is in use, and a press is where landing short shows: measured in a real tmux pane at dsf
       // 1.6, the fourth of four clicks landed at (106,260) instead of (177,442) — 1/1.6 of the way —
@@ -690,11 +700,12 @@ class CdpWebContents extends EventEmitter {
         sent.deltaX = (params.deltaX || 0) / zoom;
         sent.deltaY = (params.deltaY || 0) / zoom;
       }
-      return this.session.send(method, sent);
+      return [this.session.send(method, sent)];
     };
-    const next = (this.inputQueue || Promise.resolve()).then(send, send);
-    this.inputQueue = next.catch(() => {});
-    return next;
+    // `written` settles as soon as `send` has put the command on the socket.
+    const written = (this.inputQueue || Promise.resolve()).then(send, send);
+    this.inputQueue = written.catch(() => {});
+    return written.then(([answer]) => answer);
   }
 
   destroy() {
