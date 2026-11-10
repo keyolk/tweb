@@ -1309,6 +1309,12 @@ pub fn electron_binary_in(directory: &std::path::Path) -> Option<std::path::Path
 }
 
 /// `electron/` candidates for when we are running from the workspace.
+/// The content tag of the engine app embedded in this binary: the `<tag>` of `app-<tag>` in the
+/// engine cache, which is what `tweb diag` reports as `engineApp` for a pane running this build.
+pub fn embedded_engine_app_tag() -> String {
+    engine_app::content_tag()
+}
+
 /// The workspace's `electron/`, when THIS binary was built in that workspace.
 ///
 /// Decided by where the executable lives, never by the current directory. It used to also try
