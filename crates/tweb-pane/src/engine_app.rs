@@ -354,7 +354,8 @@ const BINARY_FILES: &[(&str, &[u8])] = &[(
 
 /// A content hash of the embedded app code. FNV-1a, to avoid pulling in another dependency.
 /// What is needed is not collision resistance but only "different contents, different directory".
-fn content_tag() -> String {
+/// The hash in the name of the cache directory this binary's embedded app unpacks to (`app-<tag>`).
+pub fn content_tag() -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let text = FILES.iter().map(|(name, body)| (*name, body.as_bytes()));
     for (name, body) in text.chain(BINARY_FILES.iter().copied()) {

@@ -69,6 +69,19 @@ The console and network logs are buffers that fill while the pane runs, across n
 can read them after an event, not only before. `tweb console --clear` and `tweb network --clear`
 read and then empty the buffer, so the next read shows only what happened after it.
 
+A screenshot can be older than the page. The DOM is the truth: `tweb eval` and `tweb snapshot` read
+the live page, while a picture is a frame the engine kept. When you changed the page and the PNG
+did not, check in this order:
+
+1. Hash two PNGs taken around the change (`shasum shot1.png shot2.png`, or compare the byte sizes).
+   The same hash after a visible change means a stale frame.
+2. Read stderr. A `tweb: this pane's engine runs app-X, not this tweb's app-Y` line means the pane's
+   engine predates the installed fixes (a long-running `twebd` keeps its old app after an install).
+   Do not run `tweb daemon restart` yourself: it closes every pane the daemon hosts, including the
+   user's. Report it and go on.
+3. Prove the claim from the DOM instead: `tweb eval "document.querySelector(...).textContent"`, or
+   `tweb snapshot`. Say in your report that the screenshot was stale and the DOM was the evidence.
+
 ## Tabs, devices, files
 
 ```sh

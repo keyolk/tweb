@@ -619,6 +619,34 @@ pub fn render(method: &str, result: &Value) -> String {
     }
 }
 
+/// Methods whose answer is a picture of the page, which is what an engine without the hidden-pane
+/// frame fixes (#241) gets wrong without saying so.
+fn takes_picture(method: &str) -> bool {
+    matches!(method, "screenshot" | "full-screenshot" | "capture")
+}
+
+/// A warning when the pane's engine runs a different embedded app than this `tweb` carries.
+///
+/// A `twebd` outlives `make install`: it keeps hosting the engine app it started with, so a fix
+/// that is installed and merged is not the code answering. A picture from such a pane can be a
+/// frame from before the page's last change, and the DOM (`eval`, `snapshot`) is right every time,
+/// so nothing else says why. Only two cache apps (`app-<tag>`) are compared: a development binary
+/// runs its workspace's `electron/`, which differs from any installed tag by design.
+pub fn stale_engine_notice(engine_app: &str, own_tag: &str) -> Option<String> {
+    let name = Path::new(engine_app).file_name()?.to_str()?;
+    let theirs = name.strip_prefix("app-")?;
+    if theirs == own_tag {
+        return None;
+    }
+    Some(format!(
+        "tweb: this pane's engine runs app-{theirs}, not this tweb's app-{own_tag}. It may be missing \
+         fixes that are installed, and a screenshot from it can show the page as it was before its \
+         last change. Compare consecutive PNGs by hash and read the DOM with `tweb eval` when they \
+         match. A `tweb daemon restart` loads the installed app, but it closes every pane the daemon \
+         hosts; save `tweb tabs` first."
+    ))
+}
+
 /// Run one command and print it.
 pub fn run(pane: Option<&str>, method: &str, params: Value, as_json: bool) -> Result<()> {
     let result = request(pane, method, params)?;
@@ -627,7 +655,24 @@ pub fn run(pane: Option<&str>, method: &str, params: Value, as_json: bool) -> Re
     } else {
         print!("{}", render_for_agent(method, &result));
     }
+    if takes_picture(method) {
+        warn_if_engine_is_stale(pane);
+    }
     Ok(())
+}
+
+/// Asks the pane which app its engine runs and says so on stderr when it is not this build's.
+/// Best effort: a pane that cannot answer `diag` costs the picture nothing.
+fn warn_if_engine_is_stale(pane: Option<&str>) {
+    let Ok(diag) = request(pane, "diag", json!({})) else {
+        return;
+    };
+    let Some(engine_app) = diag.get("engineApp").and_then(Value::as_str) else {
+        return;
+    };
+    if let Some(notice) = stale_engine_notice(engine_app, &tweb_pane::embedded_engine_app_tag()) {
+        eprintln!("{notice}");
+    }
 }
 
 /// [`render`], plus what the pane cannot know: for a snapshot, the site's playbook if one has
@@ -768,6 +813,32 @@ pub fn list_panes(as_json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn an_engine_running_another_installed_app_is_named() {
+        let notice = super::stale_engine_notice("/h/.cache/tweb/app-f5ef21bd4d732295", "4a9cfd33ca61c8f8")
+            .expect("a different cache app is stale");
+        assert!(notice.contains("app-f5ef21bd4d732295"), "{notice}");
+        assert!(notice.contains("app-4a9cfd33ca61c8f8"), "{notice}");
+        assert!(notice.contains("tweb daemon restart"), "{notice}");
+    }
+
+    #[test]
+    fn the_same_app_and_development_checkouts_are_not_warned_about() {
+        assert_eq!(super::stale_engine_notice("/h/.cache/tweb/app-aa", "aa"), None);
+        // A development binary runs its workspace's electron/, which is never an installed tag.
+        assert_eq!(super::stale_engine_notice("/w/tweb/electron", "aa"), None);
+        assert_eq!(super::stale_engine_notice("", "aa"), None);
+    }
+
+    #[test]
+    fn only_pictures_are_checked() {
+        assert!(super::takes_picture("screenshot"));
+        assert!(super::takes_picture("full-screenshot"));
+        assert!(super::takes_picture("capture"));
+        assert!(!super::takes_picture("eval"));
+        assert!(!super::takes_picture("snapshot"));
+    }
 
     fn status(browser: &str, url: &str) -> serde_json::Value {
         json!({ "browser": browser, "tabs": { "tabs": [
