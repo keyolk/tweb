@@ -284,7 +284,8 @@ const tabPanes = new Map();
 // Recovery attempts per tab, so a page that crashes its renderer on every load stops being
 // reloaded instead of looping forever. See renderer-recovery.cjs.
 const tabRendererRecoveries = new Map();
-// The person's last key, click or paste per tab (epoch-ms), and the memory guard's per-tab state.
+// The last key, click or paste per tab (epoch-ms) — the person's, or an agent call that reached the
+// page — and the memory guard's per-tab state.
 // WeakMaps: a closed tab takes its entries with it. See renderer-memory.cjs.
 const tabLastUserInput = new WeakMap();
 const tabMemoryGuard = new WeakMap();
@@ -5666,10 +5667,23 @@ function rendererMemorySnapshot() {
     });
   });
   const usage = rendererUsage(
-    app.getAppMetrics(),
+    rendererMetrics(),
     entries.map((entry) => ({ index: entry.index, pids: tabRendererPids(entry.tab) })),
   );
   return { entries, usage };
+}
+
+// `getAppMetrics()`, with each process's size replaced by its physical footprint where the native
+// addon can read it. workingSetSize leaves compressed pages out — measured, a renderer holding
+// 600MB read 98MB once macOS compressed it, while `top` showed 635M — and compressed pages are
+// exactly what a long-open page accumulates. Falls back to workingSetSize without the addon.
+function rendererMetrics() {
+  const footprint = typeof shmAddon?.physFootprint === "function" ? shmAddon.physFootprint : null;
+  return app.getAppMetrics().map((metric) => {
+    const bytes = footprint ? footprint(metric.pid) : null;
+    if (!Number.isFinite(bytes)) return metric;
+    return { ...metric, memory: { ...metric.memory, workingSetSize: Math.round(bytes / 1024) } };
+  });
 }
 
 /** Each tab's main-frame renderer: its size, and whether another tab's main frame shares it. */
@@ -6419,6 +6433,11 @@ function agentDevice(params) {
 function handleAgentCommand(method, params) {
   // Recorded before the call runs: a click that takes seconds is driving the whole time.
   if (presenceLib.noteAgentCall(panePresence(), method, params, Date.now())) sendPresence();
+  // An agent working a page counts as use, for the memory guard as much as a person does: a
+  // worker filling a form in a pane nobody is viewing is the hidden, silent tab the guard would
+  // otherwise reload under it. Bookkeeping calls (tabs, diag, console) touch no page and do not.
+  const agentTarget = currentWindows().win;
+  if (agentNeedsGeometry(method) && agentTarget && !agentTarget.isDestroyed()) tabLastUserInput.set(agentTarget, Date.now());
   return withAgentSurface(method, () => dispatchAgentCommand(method, params));
 }
 

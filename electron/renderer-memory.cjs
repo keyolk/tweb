@@ -3,30 +3,34 @@
 // How much memory each tab's renderer holds, and what to do when one grows past a limit.
 //
 // Observed 2026-11-11: one tweb renderer reached 2007MB in `top`'s MEM column, 1984MB of it
-// compressed, with the machine down to ~100MB free and swap full. Compressed means the pages were
-// written long ago and not touched since — a page that kept allocating for hours, not one that was
-// busy. Nothing in tweb said which pane or page it was, and the pid was gone by the time anyone
-// looked, so the first half of this module is attribution: `tweb diag` and `tweb tabs` name the
-// bytes per tab.
+// compressed, with the machine down to ~100MB free and swap full. Mostly compressed suggests pages
+// written and then left untouched — a page that accumulated rather than one that was busy (an
+// inference; the page was never identified). Nothing in tweb said which pane or page it was, and
+// the pid was gone by the time anyone looked, so the first half of this module is attribution:
+// `tweb diag` and `tweb tabs` name the bytes per tab.
 //
-// The number is Electron's `getAppMetrics()[].memory.workingSetSize`. On macOS that is the
-// process's footprint including compressed pages — measured on Electron 43.2.0 against a renderer
-// holding 480MB of typed arrays: workingSetSize 584MB, `top` MEM 500M, `ps` RSS 86MB. RSS is the
-// wrong number: under memory pressure it drops as pages are compressed, which is exactly when the
-// renderer is costing the most. The call costs ~0.3ms, so it can run on the engine's 1s tick.
+// The number is the process's physical footprint (`proc_pid_rusage` ri_phys_footprint, read by the
+// native addon): what `top` shows as MEM, resident plus compressed pages. Not RSS, and not
+// Electron's `getAppMetrics()` workingSetSize — both leave compressed pages out. Measured on a
+// renderer holding 600MB of typed arrays: right after allocation workingSetSize read 709MB; once
+// macOS compressed the pages it read 98MB while `top` read 635M (CMPRS 617M). The renderer that
+// took the machine down was 1984M compressed, so either of those would have reported it as small.
+// Without the addon the engine falls back to workingSetSize. One read per process is cheap enough
+// for the engine's 1s tick.
 //
 // The second half is the guard. A reload gives the memory back without a new process — measured,
 // same pid: grown to 4104MB, after `reload()` 893MB, the page's own baseline. So a tab past the
 // limit is reloaded, but only when nobody can lose anything by it: not the tab on screen, not one
 // playing sound, not one the user typed into recently. Those get a warning instead, once.
 
-/// Default limit, MB. Well above any page measured in ordinary use here (the office view and a
-/// brief sit at 70–110MB, a heavy SPA at 300–600MB) and below the 2GB that took the machine down.
+/// Default limit, MB. Far above the pages measured here (the office view 66–148MB, a brief or a
+/// data: page ~90MB) and below the 2GB that took the machine down.
 const DEFAULT_LIMIT_MB = 1536;
 /// A tab must stay over the limit this long before anything happens. One sample is a spike — a
 /// page decoding a large image, a GC that has not run — not a leak.
 const SUSTAIN_MS = 30_000;
-/// Input this recent means the user is working in the tab; reloading it would throw that away.
+/// Input this recent means someone is working in the tab — the person, or an agent driving it —
+/// and reloading it would throw that away.
 const QUIET_INPUT_MS = 5 * 60_000;
 /// After a reload, the same tab is left alone this long. A page that is back over the limit within
 /// minutes allocates on load, and reloading it in a loop would cost more than the memory.
@@ -42,7 +46,7 @@ const KB_PER_MB = 1024;
  * that has a frame in it, and its bytes are never summed across tabs.
  *
  * @param {{pid: number, type?: string, memory?: {workingSetSize?: number}}[]} metrics
- *   `app.getAppMetrics()`; `workingSetSize` is in KB
+ *   `app.getAppMetrics()` shape, `workingSetSize` in KB (main.cjs puts the footprint there)
  * @param {{index: number, pids: number[]}[]} tabs each tab's main-frame pid first, then its
  *   out-of-process frames' pids
  * @returns {{pid: number, mb: number, tabs: number[], main: number[]}[]} sorted largest first;
