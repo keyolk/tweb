@@ -402,10 +402,34 @@ captures. Both `kitten icat --unicode-placeholder --passthrough=tmux` and hand-b
 | retransmit under the **same** id (`a=t` or today's `a=T`) | **blank from the first chunk until the last** |
 | retransmit under a **second** id, then flip | the old frame stays until the flip — overlay and placeholder both |
 | `a=f` frame edit under a placeholder | kept on screen, but rejected: on Ghostty 1.4 its cost scales with the base image's area (Ghostty CPU 45% against 12-15% for a patch, 60x60 edits at 60Hz on a 2880x1800 base, measured 2026-10-29) |
+| whole-frame `a=f,r=1,x=0,y=0` (replace the root frame), chunks sent slowly | **no blank**: the old picture stays through the transfer and the new one is drawn at the last chunk, with no cell rewrite; `a=T` under the same id blanked for the whole transfer (measured 2026-11-12, see below) |
 
 The same-id blank applies to the shipping overlay path too. Locally a whole frame is one `t=f` command, so
 the blank is invisible. Over SSH the transport is `t=d` inline, a frame is tens of 3KB chunks, and the
 page is blank for each frame's transfer time. That is the most likely cause of the remote flicker.
+
+#### Probe: a whole frame replaced under one id (2026-11-12)
+
+Over SSH a remote placeholder pane alternated between two ids, and each flip renamed every cell:
+103KB of a 123KB frame and 30.6% of the remote tmux server (tmux 3.6, 200x50, 30fps page;
+#254 keeps the overlay on remote panes meanwhile). Replacing the root frame with `a=f` keeps one id,
+so the cells never change.
+
+Bare Ghostty 1.4.0 window, no tmux, so `q=0` replies come back. Four 200x150 images drawn through
+placeholders (`a=T,U=1`), each then replaced with 53 chunks of 3KB at 60ms (3.2s), window captured
+continuously. The window was kept in front and untouched: a covered Ghostty window does not redraw,
+and a first run read as "nothing changes" for that reason.
+
+| method | during the transfer (~10 captures) | after | cells rewritten |
+|---|---|---|---|
+| `a=T` same id (control) | **blank 10 of 11** | new | no |
+| `a=f,r=1,x=0,y=0` | old 10, new 1, blank 0 | new (70 of 70) | no |
+| `a=f,r=1` then the cells again | old 10, new 1, blank 0 | new | yes (not needed) |
+| `a=f` frame 2, then `a=a,c=2` | old 10, blank 0 | new | no |
+
+Every command answered `OK`. Still open before shipping it: the cost. `a=f` on a 2880x1800 base was
+45% Ghostty CPU for 60x60 edits at 60Hz (2026-10-29); a whole-frame replace at the remote rate
+(2-20 frames/s) has not been measured, nor through tmux 3.6 passthrough on the remote side.
 
 #### Design
 
