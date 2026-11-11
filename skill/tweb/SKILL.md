@@ -162,7 +162,9 @@ address", not the address.
 
 ## Which pane
 
-Every command takes `--pane %N`. When you leave it out, tweb chooses the pane as follows:
+Every command takes `--pane %N`. Both positions work: `tweb status --pane %N` and
+`tweb --pane %N status` mean the same. Put it after the subcommand in scripts, for example
+`tweb snapshot --pane %3` or `tweb tab new <url> --pane %3`. When you leave it out, tweb chooses the pane as follows:
 
 - If there is one browser pane, tweb uses it.
 - If there are several, tweb uses the browser pane in **your** tmux window. Browser panes in other
