@@ -138,13 +138,20 @@ function atLeast(version, minimum) {
  * @param {object} env
  * @param {boolean} env.inTmux whether the pane's bytes go through tmux
  * @param {string} [env.clientTermtype] tmux `#{client_termtype}`, the outer terminal's XTVERSION
+ * @param {boolean} [env.remote] the terminal is on another machine (`$TWEB_REMOTE_TERMINAL`)
  * @param {string} [env.override] `$TWEB_PLACEHOLDERS`: "0" forces off, "1" forces on
  * @returns {{ allowed: boolean, reason: string }}
  */
-function placeholdersDecision({ inTmux, clientTermtype, override } = {}) {
+function placeholdersDecision({ inTmux, clientTermtype, remote = false, override } = {}) {
   if (override === "0") return { allowed: false, reason: "TWEB_PLACEHOLDERS=0" };
   if (!inTmux) return { allowed: false, reason: "not in tmux" };
   if (override === "1") return { allowed: true, reason: "TWEB_PLACEHOLDERS=1" };
+  // Over SSH a remote frame is chunked inline, so it alternates between two ids, and each flip
+  // renames every cell: the cells were 103KB of a 123KB frame, 84% of the link, and the remote
+  // tmux server spent 30.6% CPU parsing them (tmux 3.6, 200x50 pane, 30fps page, against 20KB and
+  // 0.4% with the overlay; measured 2026-11-12). Until a whole frame can be replaced under one id
+  // without a blank (FEASIBILITY.md 2.5), a remote pane keeps the overlay.
+  if (remote) return { allowed: false, reason: "remote terminal" };
   const name = clientTermtype || "";
   if (!/ghostty/i.test(name)) return { allowed: false, reason: `not ghostty (${name || "unknown"})` };
   const version = parseVersion(name);

@@ -73,6 +73,13 @@ test("placeholders only inside tmux, on Ghostty 1.4 and later", () => {
   assert.equal(placeholdersDecision({ inTmux: false, clientTermtype: "ghostty 1.4.0" }).allowed, false);
 });
 
+// Each whole-frame flip renames every cell, and over SSH that was 84% of the link.
+test("a remote terminal keeps the overlay unless forced", () => {
+  const remote = { inTmux: true, clientTermtype: "ghostty 1.4.0", remote: true };
+  assert.deepEqual(placeholdersDecision(remote), { allowed: false, reason: "remote terminal" });
+  assert.equal(placeholdersDecision({ ...remote, override: "1" }).allowed, true);
+});
+
 test("TWEB_PLACEHOLDERS forces it, but never outside tmux", () => {
   assert.equal(placeholdersDecision({ inTmux: true, clientTermtype: "ghostty 1.4.0", override: "0" }).allowed, false);
   assert.equal(placeholdersDecision({ inTmux: true, clientTermtype: "kitty", override: "1" }).allowed, true);
