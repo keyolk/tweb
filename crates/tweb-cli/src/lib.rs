@@ -568,6 +568,10 @@ pub enum Command {
     /// session close hooks. See tweb-pane image_sweep.rs.
     #[command(name = "__sweep-images", hide = true)]
     SweepImagesInternal,
+    /// internal: tell every pane frontend on this tmux server to probe its pane now, run by
+    /// tmux's window/session switch hooks. See tweb-pane image_sweep.rs `WAKE_HOOKS`.
+    #[command(name = "__wake-panes", hide = true)]
+    WakePanesInternal,
     /// internal: the pane frontend (launched by tmux; not a documented automation API).
     #[command(name = "__pane", hide = true)]
     PaneInternal {
@@ -927,6 +931,7 @@ pub async fn run() -> Result<()> {
             }
         }
         Command::SweepImagesInternal => tweb_pane::image_sweep::run(),
+        Command::WakePanesInternal => tweb_pane::image_sweep::wake(),
         Command::PaneInternal { browser, page, url } => {
             // Without a URL, restore the tmux window session.
             let result = run_pane(page.as_deref().or(url.as_deref()), &browser).await;

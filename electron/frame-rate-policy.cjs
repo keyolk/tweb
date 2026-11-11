@@ -95,15 +95,30 @@ function playbackRateForArea(area, max, headroom = 1) {
  * behind reality, and spending too little only shows up as a picture that could have been
  * smoother. So it climbs slowly and retreats at once.
  *
+ * Only a window that actually sent frames is evidence of anything. "Nothing dropped" over a
+ * window that sent nothing says nothing about the far end, yet the climb used to count it: an
+ * idle pane settles every few seconds and a hidden one sends no frames at all, so either one
+ * reached the 4x ceiling within a minute without ever having pushed a frame. The budget was then
+ * 240MB/s instead of 60, and the first animation on that pane ran at the full 30fps — observed on
+ * a 1274x1358 Jira pane whose diag read `playbackHeadroom: 4`, `tiers.playback: 30`, `dropped: 0`.
+ *
  * @param {number} previous the headroom in force, 1 at startup
  * @param {number} droppedSince frames dropped to backpressure since the last judgement
+ * @param {number} [sentSince] frames (whole or patch) sent since the last judgement; too few hold it
  * @returns {number} the new headroom, a multiplier on the budget
  */
-function playbackHeadroom(previous, droppedSince) {
+function playbackHeadroom(previous, droppedSince, sentSince = Infinity) {
   const held = Number.isFinite(previous) && previous >= 1 ? previous : 1;
   if (Number(droppedSince) > 0) return Math.max(1, held * HEADROOM_RETREAT);
+  if (!(Number(sentSince) >= HEADROOM_MIN_SENT)) return held;
   return Math.min(HEADROOM_MAX, held + HEADROOM_STEP);
 }
+
+// The fewest frames a window must have carried to count as a test of the far end. A
+// playback window is 1.5s, so at the 8fps floor it carries about 12; a static page's settle
+// carries the one or two frames an interaction caused, which proves nothing about sustained
+// throughput.
+const HEADROOM_MIN_SENT = 4;
 
 // Additive increase, multiplicative decrease — and both deliberately gentle.
 //
@@ -300,7 +315,7 @@ function settledFrameRate(paints, tiers) {
 
 module.exports = {
   remoteFrameRateTiers, nextWireEstimate, REMOTE_BYTE_BUDGET, REMOTE_MIN_RATE,
-  playbackHeadroom,
+  playbackHeadroom, HEADROOM_MIN_SENT,
   frameRateTiers, floatingFrameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea,
   interactionRate, PLAYBACK_MIN_PAINTS, PLAYBACK_MIN_RATE, PLAYBACK_BYTE_BUDGET,
 };

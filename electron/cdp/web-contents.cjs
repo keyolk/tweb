@@ -118,6 +118,30 @@ function fillShortFrame(bitmap, got, base, want) {
 // capture ran), `window` (a picture of the window), `still` (no change from the last one drawn),
 // `stale` (replaced by a newer frame before its turn). `timeouts` are captures that gave up after
 // CAPTURE_TIMEOUT_MS, a second in which the pane drew nothing.
+// The headless window a tab that paints nothing should be in.
+//
+// `stopPainting` only stops the screencast. The renderer behind it kept running rAF, layout and
+// compositing for a page nobody could see: the launch flags (`--disable-renderer-backgrounding`,
+// `--disable-backgrounding-occluded-windows`) are there so a VISIBLE pane is never throttled, and
+// they keep a hidden one from being throttled too. Minimizing the target's own window is what
+// tells Chrome the page is hidden. Measured on Chrome 156 `--headless=new` with those flags, a
+// page animating a box with rAF and counting a 10ms interval:
+//
+//   window normal      121 rAF / 2s   201 ticks / 2s   visibilityState visible
+//   window minimized     0 rAF / 2s   201 ticks / 2s   visibilityState hidden
+//   back to normal     121 rAF / 2s   200 ticks / 2s   visibilityState visible
+//
+// Timers keep running, so an agent's `eval`/`wait` against a hidden pane still answers; only the
+// frame machinery stops. A capture of a minimized window comes back blank, which is why an agent
+// call that needs the page restores painting first (`withAgentSurface`), and that restores the
+// window here.
+//
+// A tab making sound stays normal: the page sees `visibilitychange`, and players commonly pause on
+// hidden — a pane switched away must not cut off the audio someone is listening to.
+function hiddenWindowState({ painting, audible }) {
+  return !painting && !audible ? "minimized" : "normal";
+}
+
 const PROFILE = process.env.TWEB_CDP_PROFILE === "1";
 function countCast(contents, reason) {
   if (!PROFILE) return;
@@ -466,6 +490,9 @@ class CdpWebContents extends EventEmitter {
     this.viewport = { width: options.width || 800, height: options.height || 600 };
     this.frameRate = 30;
     this.painting = true;
+    // The target window's state as last set; see `hiddenWindowState`.
+    this.windowState = "normal";
+    this.windowStateChain = Promise.resolve();
     this.audioMuted = false;
     this.audible = false;
     this.playing = false;
@@ -977,7 +1004,9 @@ class CdpWebContents extends EventEmitter {
       if (state.playing) this.playingFrames.add(key);
       else this.playingFrames.delete(key);
       this.playing = this.playingFrames.size > 0;
+      const wasAudible = this.audible;
       this.audible = this.audibleFrames.size > 0;
+      if (this.audible !== wasAudible && !this.painting) void this.syncWindowState();
       if (this.playing && !wasPlaying) this.emit("media-started-playing", {});
       else if (!this.playing && wasPlaying) this.emit("media-paused", {});
       return;
@@ -1151,6 +1180,9 @@ class CdpWebContents extends EventEmitter {
       const frame = this.windowFrame || { width: 0, height: 0 };
       const width = Math.round(this.viewport.width) + frame.width;
       const height = Math.round(this.viewport.height) + frame.height;
+      // A minimized window cannot take bounds, and sending them with `normal` would un-hide the
+      // page on every resize of a hidden pane. The size is applied when painting resumes.
+      if (this.windowState === "minimized") return;
       if (bounds.width === width && bounds.height === height) return;
       await this.connection.send("Browser.setWindowBounds", { windowId, bounds: { width, height, windowState: "normal" } });
     } catch (error) {
@@ -1565,14 +1597,41 @@ class CdpWebContents extends EventEmitter {
   startPainting() {
     if (this.painting) return;
     this.painting = true;
-    void this.startScreencast();
-    this.capture.forceNext = true;
-    this.requestCapture();
+    // Restored before the screencast starts, or its first frames are of a hidden page.
+    void this.syncWindowState().then(() => {
+      if (!this.painting) return;
+      void this.startScreencast();
+      this.capture.forceNext = true;
+      this.requestCapture();
+    });
   }
 
   stopPainting() {
     this.painting = false;
     void this.stopScreencast();
+    void this.syncWindowState();
+  }
+
+  // Puts the target's window in the state `hiddenWindowState` asks for. Serialized, because
+  // start and stop can follow each other within one reconcile and the second must not be
+  // overtaken by the first's round trip. Restoring re-applies the size the window missed while
+  // minimized (see `fitWindowToViewport`).
+  syncWindowState() {
+    this.windowStateChain = this.windowStateChain.then(async () => {
+      if (this.destroyed) return;
+      const wanted = hiddenWindowState({ painting: this.painting, audible: this.audible });
+      if (this.windowState === wanted) return;
+      try {
+        const { windowId } = await this.connection.send("Browser.getWindowForTarget", { targetId: this.targetId });
+        await this.connection.send("Browser.setWindowBounds", { windowId, bounds: { windowState: wanted } });
+        this.windowState = wanted;
+      } catch (error) {
+        if (this.engine.debug) console.error(`tweb: chrome window ${wanted} failed: ${error.message}`);
+        return;
+      }
+      if (wanted === "normal") await this.fitWindowToViewport();
+    });
+    return this.windowStateChain;
   }
 
   isPainting() { return this.painting; }
@@ -1833,6 +1892,7 @@ function scaleMouse(event, zoom) {
 }
 
 module.exports = {
+  hiddenWindowState,
   isViewportFrame,
   windowArea,
   PendingSession,

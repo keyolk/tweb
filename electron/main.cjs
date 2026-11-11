@@ -1989,7 +1989,12 @@ function settleFrameRate() {
   const frames = currentFrames();
   const droppedSince = frames.droppedGfxFrames - frames.droppedAtLastSettle;
   frames.droppedAtLastSettle = frames.droppedGfxFrames;
-  frames.playbackHeadroom = playbackHeadroom(frames.playbackHeadroom, droppedSince);
+  // Patches count: a video in a corner of a large page goes out as patches, and they load the
+  // terminal the same way whole frames do.
+  const sent = currentPane().frames.whole + currentPane().frames.patches;
+  const sentSince = sent - frames.sentAtLastSettle;
+  frames.sentAtLastSettle = sent;
+  frames.playbackHeadroom = playbackHeadroom(frames.playbackHeadroom, droppedSince, sentSince);
   const settled = settledFrameRate(currentWindows().paintsSinceSettle, currentPlaybackTiers());
   currentWindows().paintsSinceSettle = 0;
   // Remembered for the interaction path, which has no paint count of its own to judge from.

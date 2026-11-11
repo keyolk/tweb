@@ -183,6 +183,63 @@ pub fn changed_visibility_message(
     Some(message)
 }
 
+/// How long to wait before the next probe.
+///
+/// The tick used to run every 250ms whatever happened, and every tick is a `tmux` child
+/// process. Measured over 13s on a machine at load 200: each of two pane frontends spawned
+/// tmux 52 times, and nothing about either pane had changed in that window. So the interval
+/// stretches while probes keep coming back unchanged, and snaps back to the fast rate the
+/// moment one does not, or the moment something says a change is coming (SIGWINCH, or the
+/// tmux hooks' SIGUSR2 — see `image_sweep::WAKE_HOOKS`).
+///
+/// The slow end is bounded by what the hooks do not cover. A window switch, a session
+/// switch, attach/detach, zoom and break/join all wake the frontend at once, so a pane that
+/// becomes visible is painted within one probe of the event, not one slow interval. What is
+/// left to the timer is only what no hook reports (a pane moved without changing size by a
+/// layout command), and two seconds is how stale that is allowed to get.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollBackoff {
+    unchanged: u32,
+}
+
+pub const FAST_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+pub const SLOW_POLL: std::time::Duration = std::time::Duration::from_millis(2000);
+
+impl Default for PollBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PollBackoff {
+    pub fn new() -> Self {
+        Self { unchanged: 0 }
+    }
+
+    /// Something moved, or is about to: the next probes run at the fast rate.
+    pub fn reset(&mut self) {
+        self.unchanged = 0;
+    }
+
+    /// Records a probe's outcome and returns the wait before the next one. The interval
+    /// doubles per unchanged probe after the first few, so a pane that has just moved stays
+    /// at the fast rate for a second before it starts to relax.
+    pub fn after_probe(&mut self, changed: bool) -> std::time::Duration {
+        if changed {
+            self.unchanged = 0;
+        } else {
+            self.unchanged = self.unchanged.saturating_add(1);
+        }
+        self.interval()
+    }
+
+    pub fn interval(&self) -> std::time::Duration {
+        const FAST_PROBES: u32 = 4;
+        let steps = self.unchanged.saturating_sub(FAST_PROBES).min(8);
+        FAST_POLL.saturating_mul(1 << steps).min(SLOW_POLL)
+    }
+}
+
 /// Runs the chained probe. Returns `None` outside tmux or when the call fails, in which
 /// case the caller keeps whatever it already had rather than reporting a blank pane.
 pub fn run_probe(pane: &str) -> Option<TmuxProbe> {
@@ -199,6 +256,48 @@ pub fn run_probe(pane: &str) -> Option<TmuxProbe> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unchanged_pane_relaxes_to_the_slow_rate_and_a_change_snaps_back() {
+        let mut backoff = PollBackoff::new();
+        let waits: Vec<_> = (0..10).map(|_| backoff.after_probe(false)).collect();
+        assert_eq!(
+            waits[0], FAST_POLL,
+            "a pane that just started is probed fast"
+        );
+        assert_eq!(waits[3], FAST_POLL);
+        assert!(waits[4] > FAST_POLL, "relaxes after the first second");
+        assert_eq!(*waits.last().unwrap(), SLOW_POLL);
+        assert!(
+            waits.windows(2).all(|w| w[0] <= w[1]),
+            "never speeds up on its own"
+        );
+        assert_eq!(backoff.after_probe(true), FAST_POLL);
+    }
+
+    #[test]
+    fn a_wake_resets_to_the_fast_rate_without_a_probe() {
+        let mut backoff = PollBackoff::new();
+        for _ in 0..20 {
+            backoff.after_probe(false);
+        }
+        assert_eq!(backoff.interval(), SLOW_POLL);
+        backoff.reset();
+        assert_eq!(backoff.interval(), FAST_POLL);
+    }
+
+    #[test]
+    fn thirteen_idle_seconds_cost_a_handful_of_probes_not_fifty() {
+        // The measured baseline: 52 tmux children per pane per 13s at a fixed 250ms.
+        let mut backoff = PollBackoff::new();
+        let mut elapsed = std::time::Duration::ZERO;
+        let mut probes = 0;
+        while elapsed < std::time::Duration::from_secs(13) {
+            probes += 1;
+            elapsed += backoff.after_probe(false);
+        }
+        assert!(probes <= 12, "{probes} probes in 13s");
+    }
 
     const PANE: &str = "%7";
 

@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
-  playbackHeadroom,
+  playbackHeadroom, HEADROOM_MIN_SENT,
   frameRateTiers,
   floatingFrameRateTiers,
   playbackWindowMs,
@@ -254,6 +254,18 @@ test("the search settles in a band rather than swinging", () => {
   assert.ok(low > 1.5, `settled as low as ${low}, which is most of the way back to the floor`);
   assert.ok(high <= 3, `overshot to ${high}`);
   assert.ok(high / low < 1.6, `the band spans ${(high / low).toFixed(2)}x, which reads as pulsing`);
+});
+
+test("a window that sent nothing does not earn headroom", () => {
+  // Observed on a 1274x1358 Jira pane: idle for minutes, `dropped: 0`, `playbackHeadroom: 4`,
+  // and so `tiers.playback: 30` where the budget allows 9. Nothing was dropped because nothing
+  // was sent; that is not evidence the terminal could take 240MB/s.
+  let headroom = 1;
+  for (let i = 0; i < 40; i += 1) headroom = playbackHeadroom(headroom, 0, 0);
+  assert.equal(headroom, 1, "an idle or hidden pane must stay on the measured budget");
+  assert.equal(playbackHeadroom(2, 0, HEADROOM_MIN_SENT - 1), 2, "an interaction's one or two frames prove nothing");
+  assert.equal(playbackHeadroom(2, 0, HEADROOM_MIN_SENT), 2.25, "a window that carried playback climbs as before");
+  assert.equal(playbackHeadroom(2, 3, 0), 1.5, "a drop still gives ground whatever was sent");
 });
 
 test("a malformed headroom or drop count does not escape the bounds", () => {
