@@ -268,12 +268,14 @@ fn changed_geometry_message(
 fn forward_changed_geometry(
     control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     previous: &mut Option<terminal::WindowGeometry>,
-) {
+) -> bool {
     let current = terminal::window_geometry();
     tracing::debug!(?current, ?previous, "geometry poll");
     if let Some(message) = changed_geometry_message(previous, current) {
         let _ = control_tx.send(message);
+        return true;
     }
+    false
 }
 
 /// The tick that keeps the engine's view of this pane current: where it sits, how big it
@@ -283,33 +285,49 @@ fn forward_changed_geometry(
 ///
 /// Outside tmux there is nothing to be visible *to*, so only geometry is forwarded and the
 /// engine stays on its no-frontend default of always-visible.
+///
+/// Returns whether anything was pushed, which is what the poll's backoff runs on. A failed
+/// probe counts as a change: it is no evidence the pane is settled, and staying fast is the
+/// side that cannot leave a pane wrongly hidden.
 fn forward_pane_state(
     control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     pane: &str,
     previous_geometry: &mut Option<terminal::WindowGeometry>,
     previous_visibility: &mut Option<String>,
-) {
+) -> bool {
     if std::env::var_os("TMUX").is_none() {
-        forward_changed_geometry(control_tx, previous_geometry);
-        return;
+        return forward_changed_geometry(control_tx, previous_geometry);
     }
 
     let Some(probe) = visibility::run_probe(pane) else {
         // A failed probe says nothing about the pane, so report nothing. Pushing a blank
         // result would land as "no client can see this pane" and stop painting.
-        return;
+        return true;
     };
     tracing::debug!(?probe, "pane probe");
 
     // `window_geometry()` is deliberately not called here: it would spawn its own tmux
     // child for placement this probe already has. The PTY ioctl fallback it also owns
     // only matters when tmux cannot answer, which is the branch that returned above.
+    let mut changed = false;
     if let Some(message) = changed_geometry_message(previous_geometry, probe.geometry) {
         let _ = control_tx.send(message);
+        changed = true;
     }
     if let Some(message) = visibility::changed_visibility_message(previous_visibility, &probe) {
         let _ = control_tx.send(message);
+        changed = true;
     }
+    changed
+}
+
+/// SIGUSR2 is the tmux hooks' "look now" (`image_sweep::WAKE_HOOKS`): a window or session
+/// switch, attach/detach, zoom, or a pane moved. None of those sends SIGWINCH when the size
+/// stays the same, and the poll may be at its slow end, so without this a pane that comes
+/// into view would wait up to `SLOW_POLL` to paint.
+fn wake_signal() -> tokio::signal::unix::Signal {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGUSR2))
+        .expect("SIGUSR2")
 }
 
 fn tmux_passthrough(sequence: &str) -> String {
@@ -537,6 +555,12 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         &pane,
         std::process::id(),
     );
+    // Before the pid is recorded where the wake hooks find it: SIGUSR2's default action ends
+    // the process, so a window switch in the moment between the record and the poll loop
+    // taking the signal would have killed this pane. tokio keeps one handler per signal for the
+    // process, so this registration also covers the loops that ask for SIGUSR2 later, and a
+    // handler (unlike SIG_IGN) is not inherited by the engine across exec.
+    let _early_wake = wake_signal();
     // Recorded so a pane killed before its teardown runs still has its image deleted, by the
     // tmux hooks installed beside it. See `image_sweep`.
     let _image_registration = image_sweep::Registration::record(&pane, image_id);
@@ -782,40 +806,41 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
                 tokio::signal::unix::SignalKind::from_raw(libc::SIGUSR1),
             )
             .expect("SIGUSR1");
-            let mut geometry_poll = tokio::time::interval(std::time::Duration::from_millis(250));
-            geometry_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut sigusr2 = wake_signal();
+            // Backs off while nothing changes; see `visibility::PollBackoff`.
+            let mut backoff = visibility::PollBackoff::new();
             let mut previous_geometry = initial_geometry;
             // Nothing has been pushed yet, so the first tick always sends — which is what
             // gets the engine off its no-frontend default and onto the real answer.
             let mut previous_visibility = None;
+            let poll = tokio::time::sleep(std::time::Duration::ZERO);
+            tokio::pin!(poll);
             loop {
-                tokio::select! {
+                let probe_now = tokio::select! {
                     // Bounded, for the same reason the typed-interrupt path is: a SIGTERM the
                     // engine ignores used to leave this pane waiting on it forever.
-                    _ = sighup.recv() => end_engine(child_id).await,
-                    _ = sigterm.recv() => end_engine(child_id).await,
-                    _ = sigwinch.recv() => {
-                        forward_pane_state(
-                            &control_tx,
-                            &pane,
-                            &mut previous_geometry,
-                            &mut previous_visibility,
-                        );
-                    }
-                    _ = geometry_poll.tick() => {
-                        forward_pane_state(
-                            &control_tx,
-                            &pane,
-                            &mut previous_geometry,
-                            &mut previous_visibility,
-                        );
-                    }
+                    _ = sighup.recv() => { end_engine(child_id).await; false }
+                    _ = sigterm.recv() => { end_engine(child_id).await; false }
+                    _ = sigwinch.recv() => { backoff.reset(); true }
+                    _ = sigusr2.recv() => { backoff.reset(); true }
+                    _ = &mut poll => true,
                     _ = sigusr1.recv() => {
                         if std::env::var_os("TWEB_DEBUG").is_some() {
                             eprintln!("tweb-pane: keyboard mode restore signal");
                         }
                         terminal::restore_tracked_keyboard_mode();
+                        false
                     }
+                };
+                if probe_now {
+                    let changed = forward_pane_state(
+                        &control_tx,
+                        &pane,
+                        &mut previous_geometry,
+                        &mut previous_visibility,
+                    );
+                    let wait = backoff.after_probe(changed);
+                    poll.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
             }
         }
@@ -968,7 +993,12 @@ const REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(750
 /// the file system to another, none to the daemon's), and in the daemon's panes `caches.open` and
 /// `indexedDB.open` never settled. YouTube draws its icons out of CacheStorage, so its logo and
 /// every icon stayed blank; every site keeping state in IndexedDB stalled the same way.
-async fn host_until_settled(url: &str, options: &PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
+async fn host_until_settled(
+    url: &str,
+    options: &PaneOptions,
+    pane: &str,
+    image_id: u32,
+) -> HostedOutcome {
     let mut outcome = try_hosted(url, options.clone(), pane, image_id).await;
     let mut again = options.clone();
     for attempt in 1..=REATTACH_ATTEMPTS {
@@ -979,7 +1009,8 @@ async fn host_until_settled(url: &str, options: &PaneOptions, pane: &str, image_
                 reason
             }
             HostedOutcome::Spawn(
-                reason @ (attach::SpawnReason::DaemonStartFailed(_) | attach::SpawnReason::ConnectFailed(_)),
+                reason @ (attach::SpawnReason::DaemonStartFailed(_)
+                | attach::SpawnReason::ConnectFailed(_)),
             ) => reason,
             // A daemon stopped while its engine is still starting answers every pane waiting on
             // that start with this refusal ("engine exited before declaring itself a pane host"),
@@ -987,7 +1018,10 @@ async fn host_until_settled(url: &str, options: &PaneOptions, pane: &str, image_
             // 1.7s after `tweb daemon restart`, well inside this loop's budget: something lasting
             // sent it away, and this refusal is the one a restart produces.
             HostedOutcome::Spawn(
-                reason @ attach::SpawnReason::Refused(twebd::protocol::RefusalReason::EngineUnavailable, _),
+                reason @ attach::SpawnReason::Refused(
+                    twebd::protocol::RefusalReason::EngineUnavailable,
+                    _,
+                ),
             ) => reason,
             _ => return outcome,
         };
@@ -1171,8 +1205,10 @@ async fn run_hosted_session(
                 tokio::signal::unix::SignalKind::from_raw(libc::SIGWINCH),
             )
             .expect("SIGWINCH");
-            let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut sigusr2 = wake_signal();
+            // Backs off while nothing changes; see `visibility::PollBackoff`.
+            let mut backoff = visibility::PollBackoff::new();
+            let mut wait = std::time::Duration::ZERO;
             let mut previous_geometry = terminal::window_geometry();
             let mut previous_visibility = None;
             if let Some(geometry) = previous_geometry {
@@ -1180,15 +1216,17 @@ async fn run_hosted_session(
             }
             loop {
                 tokio::select! {
-                    _ = sigwinch.recv() => {}
-                    _ = poll.tick() => {}
+                    _ = sigwinch.recv() => backoff.reset(),
+                    _ = sigusr2.recv() => backoff.reset(),
+                    _ = tokio::time::sleep(wait) => {}
                 }
-                forward_pane_state(
+                let changed = forward_pane_state(
                     &control_tx,
                     &pane,
                     &mut previous_geometry,
                     &mut previous_visibility,
                 );
+                wait = backoff.after_probe(changed);
             }
         }
     });

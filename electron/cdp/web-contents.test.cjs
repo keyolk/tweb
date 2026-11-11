@@ -2,7 +2,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { CdpWebContents, isViewportFrame, windowArea } = require("./web-contents.cjs");
+const { CdpWebContents, hiddenWindowState, isViewportFrame, windowArea } = require("./web-contents.cjs");
 
 // Just enough of an engine to construct contents and feed it Page events by hand.
 function contents() {
@@ -616,4 +616,81 @@ test("a frame at the forced browser scale is never drawn; it asks for a capture"
   }
   assert.deepStrictEqual(paints, []);
   assert.strictEqual(captures.length, 2);
+});
+
+// A hidden pane's Chrome tab used to stop only its screencast: the launch flags that keep a
+// visible pane unthrottled kept the hidden page running rAF and compositing. Minimizing the
+// target window is what makes Chrome treat it as hidden (measured: 121 rAF/2s -> 0).
+test("a tab that paints nothing is minimized, unless it is making sound", () => {
+  assert.strictEqual(hiddenWindowState({ painting: false, audible: false }), "minimized");
+  assert.strictEqual(hiddenWindowState({ painting: false, audible: true }), "normal");
+  assert.strictEqual(hiddenWindowState({ painting: true, audible: false }), "normal");
+});
+
+function recordingContents() {
+  const sent = [];
+  const engine = {
+    connection: {
+      send: async (method, params) => {
+        sent.push({ method, params });
+        if (method === "Browser.getWindowForTarget") return { windowId: 7 };
+        if (method === "Browser.getWindowBounds") return { bounds: { width: 800, height: 600, windowState: "normal" } };
+        return {};
+      },
+    },
+    windowFor: () => null,
+  };
+  const session = { id: "S", on() {}, send: async () => ({}) };
+  const created = new CdpWebContents(engine, "MAIN", session);
+  // The window state is under test, not the frame pump that painting also restarts.
+  created.startScreencast = async () => {};
+  created.requestCapture = () => {};
+  return { created, states: () => sent.filter((c) => c.method === "Browser.setWindowBounds").map((c) => c.params.bounds) };
+}
+
+test("stopping and starting painting minimizes and restores the target window", async () => {
+  const { created, states } = recordingContents();
+  created.stopPainting();
+  await created.windowStateChain;
+  assert.deepStrictEqual(states(), [{ windowState: "minimized" }]);
+  created.startPainting();
+  await created.windowStateChain;
+  // Restored, then re-fitted to the viewport the window could not take while minimized.
+  assert.strictEqual(states()[1].windowState, "normal");
+  assert.strictEqual(created.windowState, "normal");
+});
+
+test("a resize of a hidden pane does not un-minimize its window", async () => {
+  const { created, states } = recordingContents();
+  created.stopPainting();
+  await created.windowStateChain;
+  created.viewport = { width: 1000, height: 700 };
+  await created.fitWindowToViewport();
+  assert.deepStrictEqual(states(), [{ windowState: "minimized" }]);
+});
+
+test("stop then start in one turn ends normal, in order", async () => {
+  const { created, states } = recordingContents();
+  created.stopPainting();
+  created.startPainting();
+  await created.windowStateChain;
+  await created.windowStateChain;
+  assert.strictEqual(created.windowState, "normal");
+  // Each step reads the state at the time it runs, so the stop that was overtaken does nothing
+  // rather than minimizing a tab that is painting again.
+  const kinds = states().map((b) => b.windowState).filter(Boolean);
+  assert.ok(kinds.length === 0 || kinds.at(-1) === "normal", `ended ${kinds.at(-1)}`);
+});
+
+test("sound starting on a hidden tab restores it; sound stopping minimizes it again", async () => {
+  const { created } = recordingContents();
+  created.stopPainting();
+  await created.windowStateChain;
+  assert.strictEqual(created.windowState, "minimized");
+  created.onBinding({ name: "__twebAudio", payload: JSON.stringify({ playing: true, audible: true }) }, "S");
+  await created.windowStateChain;
+  assert.strictEqual(created.windowState, "normal");
+  created.onBinding({ name: "__twebAudio", payload: JSON.stringify({ playing: false, audible: false }) }, "S");
+  await created.windowStateChain;
+  assert.strictEqual(created.windowState, "minimized");
 });

@@ -38,6 +38,25 @@ const HOOKS: [&str; 4] = [
     "session-closed",
 ];
 
+/// The tmux events after which a pane may have come into view or gone out of it without its
+/// size changing, so without a SIGWINCH. Each one runs `tweb __wake-panes`, which tells every
+/// recorded frontend on this server to probe now (SIGUSR2). That is what lets the frontend's
+/// poll relax to `visibility::SLOW_POLL` while nothing happens and still paint a pane at once
+/// when someone switches to it.
+///
+/// Human-paced events only: one short process per switch, against the four tmux children a
+/// second each frontend used to spawn whether anything happened or not.
+pub const WAKE_HOOKS: [&str; 8] = [
+    "session-window-changed",
+    "client-session-changed",
+    "client-attached",
+    "client-detached",
+    "window-zoomed",
+    "window-unzoomed",
+    "window-pane-changed",
+    "pane-moved",
+];
+
 /// Where the panes of one tmux server are recorded. Keyed by the server identity, because pane ids
 /// restart at `%0` on every server and a second server's `%3` is not this one's.
 pub fn registry_dir(runtime: &Path, server: &str) -> PathBuf {
@@ -62,7 +81,11 @@ impl Registration {
     /// to sweep it, and no pane id to name it by.
     pub fn record(pane: &str, base: u32) -> Option<Self> {
         let server = twebd::tmux::server_identity_from(std::env::var("TMUX").ok().as_deref())?;
-        Self::record_in(&registry_dir(&twebd::paths::runtime_dir(), &server), pane, base)
+        Self::record_in(
+            &registry_dir(&twebd::paths::runtime_dir(), &server),
+            pane,
+            base,
+        )
     }
 
     fn record_in(dir: &Path, pane: &str, base: u32) -> Option<Self> {
@@ -148,6 +171,64 @@ pub fn run() {
     }
 }
 
+/// The frontends recorded in `dir`, by pid. An entry is `"<base id> <pid>"`.
+fn recorded_pids(dir: &Path) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let content = std::fs::read_to_string(entry.path()).ok()?;
+            content.split_whitespace().nth(1)?.parse::<i32>().ok()
+        })
+        .filter(|pid| *pid > 1)
+        .collect()
+}
+
+/// Whether `pid` is a tweb pane frontend. The registry outlives a frontend that was killed, and
+/// pids are reused, so a stale entry could name an unrelated process — which SIGUSR2 would end.
+fn is_pane_frontend(pid: i32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 4096];
+        // SAFETY: the buffer is valid for its length; proc_pidpath writes at most that much.
+        let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if len <= 0 {
+            return false;
+        }
+        let path = String::from_utf8_lossy(&buf[..len as usize]);
+        Path::new(path.as_ref())
+            .file_name()
+            .is_some_and(|name| name == "tweb")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name == "tweb"))
+            .unwrap_or(false)
+    }
+}
+
+/// `tweb __wake-panes`: asks every recorded frontend of this tmux server to probe its pane now.
+/// Spawns nothing — no tmux call — so a hook that fires on every window switch costs one exec.
+pub fn wake() {
+    let Some(server) = twebd::tmux::server_identity_from(std::env::var("TMUX").ok().as_deref())
+    else {
+        return;
+    };
+    let dir = registry_dir(&twebd::paths::runtime_dir(), &server);
+    for pid in recorded_pids(&dir) {
+        if is_pane_frontend(pid) {
+            // SAFETY: plain kill(2); a pid that exited since the check gets ESRCH, which is fine.
+            unsafe {
+                libc::kill(pid, libc::SIGUSR2);
+            }
+        }
+    }
+}
+
 fn tmux_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -169,22 +250,38 @@ fn shell_quote(value: &str) -> String {
 /// and a hook left pointing at a binary that was removed would otherwise do that on every pane
 /// close. A sweep that cannot run only means the next one cleans up.
 pub fn hook_commands(tweb: &str) -> Vec<Vec<String>> {
-    let shell = format!(
-        "{} __sweep-images >/dev/null 2>&1 || true",
-        shell_quote(tweb)
-    );
-    let run = format!("run-shell -b \"{}\"", tmux_escape(&shell));
+    let run_of = |command: &str| {
+        let shell = format!("{} {command} >/dev/null 2>&1 || true", shell_quote(tweb));
+        format!("run-shell -b \"{}\"", tmux_escape(&shell))
+    };
+    let sweep = run_of("__sweep-images");
+    let wake = run_of("__wake-panes");
+    let set = |hook: &str, run: &str| {
+        vec![
+            "set-hook".to_string(),
+            "-g".to_string(),
+            format!("{hook}[{HOOK_INDEX}]"),
+            run.to_string(),
+        ]
+    };
     HOOKS
         .iter()
-        .map(|hook| {
-            vec![
-                "set-hook".to_string(),
-                "-g".to_string(),
-                format!("{hook}[{HOOK_INDEX}]"),
-                run.clone(),
-            ]
-        })
+        .map(|hook| set(hook, &sweep))
+        .chain(WAKE_HOOKS.iter().map(|hook| set(hook, &wake)))
         .collect()
+}
+
+/// All of `hook_commands` as one tmux invocation, chained with `;`, so a pane's start costs one
+/// child process for the hooks rather than one per hook.
+fn chained(commands: &[Vec<String>]) -> Vec<String> {
+    let mut args = Vec::new();
+    for (index, command) in commands.iter().enumerate() {
+        if index > 0 {
+            args.push(";".to_string());
+        }
+        args.extend(command.iter().cloned());
+    }
+    args
 }
 
 /// The binary the hooks run: the installed one, as the input-source hooks use (main.cjs
@@ -193,7 +290,9 @@ fn hook_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("TWEB_BIN").filter(|path| !path.is_empty()) {
         return PathBuf::from(path);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".local").join("bin").join("tweb")
 }
 
@@ -202,9 +301,12 @@ pub fn install_hooks() {
     if std::env::var_os("TMUX").is_none() {
         return;
     }
-    for args in hook_commands(&hook_binary().to_string_lossy()) {
-        let _ = Command::new("tmux").args(&args).status();
-    }
+    let args = chained(&hook_commands(&hook_binary().to_string_lossy()));
+    let _ = Command::new("tmux")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(test)]
@@ -212,10 +314,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tweb-image-sweep-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tweb-image-sweep-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -246,7 +346,10 @@ mod tests {
         let old = Registration::record_in(&dir, "%4", 100).unwrap();
         std::fs::write(entry_path(&dir, "%4"), "100 1").unwrap();
         drop(old);
-        assert_eq!(std::fs::read_to_string(entry_path(&dir, "%4")).unwrap(), "100 1");
+        assert_eq!(
+            std::fs::read_to_string(entry_path(&dir, "%4")).unwrap(),
+            "100 1"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -264,7 +367,7 @@ mod tests {
         let commands = hook_commands("/tmp/my dir/it's/tweb");
         let hooks: Vec<&str> = commands.iter().map(|args| args[2].as_str()).collect();
         assert_eq!(
-            hooks,
+            hooks[..4],
             [
                 "pane-exited[73]",
                 "after-kill-pane[73]",
@@ -276,5 +379,50 @@ mod tests {
             commands[0][3],
             r#"run-shell -b "'/tmp/my dir/it'\\''s/tweb' __sweep-images >/dev/null 2>&1 || true""#
         );
+    }
+
+    #[test]
+    fn every_way_a_pane_comes_into_view_without_a_resize_wakes_the_frontends() {
+        let commands = hook_commands("/usr/bin/tweb");
+        let wakes: Vec<&str> = commands
+            .iter()
+            .filter(|args| args[3].contains("__wake-panes"))
+            .map(|args| args[2].as_str())
+            .collect();
+        for hook in [
+            "session-window-changed[73]",
+            "client-session-changed[73]",
+            "client-attached[73]",
+            "window-unzoomed[73]",
+            "pane-moved[73]",
+        ] {
+            assert!(wakes.contains(&hook), "{hook} missing from {wakes:?}");
+        }
+    }
+
+    #[test]
+    fn the_hooks_are_installed_by_one_tmux_call() {
+        let args = chained(&hook_commands("/usr/bin/tweb"));
+        let sets = args.iter().filter(|arg| *arg == "set-hook").count();
+        assert_eq!(sets, HOOKS.len() + WAKE_HOOKS.len());
+        assert_eq!(args.iter().filter(|arg| *arg == ";").count(), sets - 1);
+    }
+
+    #[test]
+    fn the_wake_reads_pids_from_the_registry_and_skips_what_is_not_a_frontend() {
+        let dir = scratch("wake");
+        let me = Registration::record_in(&dir, "%5", 100).unwrap();
+        std::fs::write(entry_path(&dir, "%6"), "200 1").unwrap();
+        std::fs::write(entry_path(&dir, "%8"), "garbage").unwrap();
+        let pids = recorded_pids(&dir);
+        assert_eq!(
+            pids,
+            vec![std::process::id() as i32],
+            "pid 1 and garbage are never signalled"
+        );
+        // The test binary is not named `tweb`, so even a live recorded pid is left alone.
+        assert!(!is_pane_frontend(std::process::id() as i32));
+        drop(me);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
