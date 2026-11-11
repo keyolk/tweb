@@ -1,7 +1,8 @@
 //! tweb CLI — `tweb open/split/snapshot/click/profile/doctor`.
 //!
 //! DESIGN.md section 4.1. The subcommand always comes before the action, target selectors
-//! after: `tweb snapshot --pane %3`. Global selectors and per-subcommand selectors are never mixed.
+//! after: `tweb snapshot --pane %3`. A leading `--pane %3` is moved behind the subcommand
+//! (`hoist_leading_pane`), so `tweb --pane %3 snapshot` works too.
 
 pub mod agent;
 pub mod chrome;
@@ -839,6 +840,34 @@ fn default_open_args(mut args: Vec<OsString>) -> Vec<OsString> {
     if args.len() == 1 {
         args.push(OsString::from("open"));
     }
+    hoist_leading_pane(args)
+}
+
+/// Accepts `tweb --pane %N status` as well as `tweb status --pane %N`. `--pane` is declared per
+/// subcommand (AgentOptions, playbook, ...), so clap rejects it before the subcommand. Agents
+/// reasonably treat it as a global option; the flag moves to the end of the arguments, ahead of any
+/// `--`, so the leaf subcommand's parser sees it where it is defined.
+fn hoist_leading_pane(mut args: Vec<OsString>) -> Vec<OsString> {
+    let Some(first) = args.get(1).and_then(|a| a.to_str()) else {
+        return args;
+    };
+    let width = if first == "--pane" {
+        2
+    } else if first.starts_with("--pane=") {
+        1
+    } else {
+        return args;
+    };
+    // Needs the value (if separate) and a subcommand word after it.
+    if args.len() < 2 + width || args[1 + width].to_str().is_none_or(|w| w.starts_with('-')) {
+        return args;
+    }
+    let pane: Vec<OsString> = args.drain(1..1 + width).collect();
+    // The leaf subcommand (`tab new`) is what defines `--pane`, so it goes last, before `--`.
+    let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    for (i, item) in pane.into_iter().enumerate() {
+        args.insert(at + i, item);
+    }
     args
 }
 
@@ -1540,6 +1569,24 @@ mod tests {
         ]))
         .expect("engine-paths should parse");
         assert!(matches!(cli.command, Command::EnginePaths { json: true }));
+    }
+
+    #[test]
+    fn leading_pane_flag_is_accepted_before_the_subcommand() {
+        let parse = |v: &[&str]| {
+            Cli::try_parse_from(default_open_args(v.iter().map(OsString::from).collect()))
+        };
+        for form in [
+            ["tweb", "--pane", "%7", "status"].as_slice(),
+            ["tweb", "--pane=%7", "status"].as_slice(),
+            ["tweb", "status", "--pane", "%7"].as_slice(),
+        ] {
+            let cli = parse(form).unwrap_or_else(|e| panic!("{form:?}: {e}"));
+            let dbg = format!("{cli:?}");
+            assert!(dbg.contains("\"%7\""), "{form:?} lost the pane: {dbg}");
+        }
+        // Nested subcommands and a trailing `--` keep working.
+        parse(&["tweb", "--pane", "%7", "tab", "new", "about:blank"]).expect("nested");
     }
 
     #[test]
