@@ -3349,3 +3349,15 @@ test("Enter on a `v` pick clicks it", () => {
   const click = electron.slice(electron.indexOf("function clickVisual()"), electron.indexOf("function handleVisualKey(event, key)"));
   assert.match(click, /send\("native-click", hintClickPoint\(item\)\)/);
 });
+
+// A game in a pane read the arrows as tweb scrolling until the user found Ctrl-;. A page that drives
+// the keyboard asks for it with a meta tag; the engine must turn edit mode back off only when it
+// turned it on, so a Ctrl-; the user pressed is never undone by navigating.
+test("a page's tweb:keys meta puts the pane in edit mode and only that is undone", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(electron, /meta\[name="tweb:keys" i\]\[content="page" i\][\s\S]*?send\("page-keys", true\)/);
+  assert.match(main, /if \(action === "page-keys"\) \{\s*pageKeysWanted\(tab, value === true\);/);
+  assert.match(main, /function applyPageKeys\(tab\)[\s\S]*?pageKeyTabs\.add\(tab\);\s*setCmdBypassEnabled\(true\);/);
+  assert.match(main, /function toggleBrowserShortcuts\(\) \{[\s\S]*?pageKeyTabs\.delete\(currentWindows\(\)\.win\)/);
+  assert.match(main, /insertModeOwners\.delete\(tab\);\s*\/\/ Whatever the last page asked for[^\n]*\n\s*pageKeysWanted\(tab, false\);/);
+});
