@@ -501,8 +501,9 @@ test("a resize re-places the existing image instead of baring the pane", () => {
   // own range, never from anything process-wide.
   const replace = main.slice(main.indexOf("function deletePlacement(frames"),
     main.indexOf("// --- damage patches ---"));
-  assert.match(replace, /a=d,d=i,i=\$\{frames\.imageIds\.base\}/);
-  assert.match(replace, /a=p,i=\$\{frames\.imageIds\.base\}/);
+  // The base on screen, which alternates between the pane's two (`paneImageIds`).
+  assert.match(replace, /a=d,d=i,i=\$\{frames\.shownBase\}/);
+  assert.match(replace, /a=p,i=\$\{frames\.shownBase\}/);
 });
 
 test("bare open never restores or saves an internal blank page", () => {
@@ -563,9 +564,12 @@ test("another pane owning tmux zoom hides the browser image", () => {
   // The invariant is that a client no longer showing this pane gets the delete, whatever the loop
   // is spelled like — it now logs the eviction first, which `bench/host-multipane.py` gates on.
   // Which clients those are is `hideTransition`'s answer, tested in tmux-visibility.test.cjs.
-  assert.match(main, /for \(const tty of transition\.evicted\) \{[\s\S]*?deleteImageFromClientTty\(tty\);/);
+  // A placeholder pane is the exception: tmux stops drawing its cells, and its image data is kept
+  // so the page is back at once on return (placeholder-cells.cjs).
+  assert.match(main, /const evicted = usesPlaceholders\(\) \? \[\] : transition\.evicted;/);
+  assert.match(main, /for \(const tty of evicted\) \{[\s\S]*?deleteImageFromClientTty\(tty\);/);
   // And the delete that follows frames still queued in tmux, when the last client left.
-  assert.match(main, /if \(transition\.deleteInBand\) deleteImageInBand\(\);/);
+  assert.match(main, /if \(transition\.deleteInBand && !usesPlaceholders\(\)\) deleteImageInBand\(\);/);
   assert.match(main, /if \(becameVisible\) repaintActiveTab\(\);/);
 });
 
@@ -1332,7 +1336,7 @@ test("the caret is re-asserted after anything that moves the cursor", () => {
 
   // Every path that emits graphics: the two inline ones and the one that puts the worker's
   // whole frames on the pane. The last is the one that fires continuously.
-  const gfx = main.slice(main.indexOf("function writeGfxCommands(commands)"),
+  const gfx = main.slice(main.indexOf("function writeGfxCommands(commands"),
     main.indexOf("// --- terminal setup ---"));
   assert.equal((gfx.match(/reassertTerminalCaret\(\);/g) || []).length, 3,
     "writeGfxCommands, writeGfx and writeGfxChunked must all re-assert");
@@ -1360,11 +1364,12 @@ test("whole frames reach the terminal through the pane's writer, not the worker"
   assert.match(worker, /postMessage\(\{ type: "error", paneKey,/);
 
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  const commands = main.slice(main.indexOf("function writeGfxCommands(commands)"),
+  const commands = main.slice(main.indexOf("function writeGfxCommands(commands"),
     main.indexOf("// --- terminal setup ---"));
   // `Runs`: a run of commands may go out as several passthroughs (tmux-passthrough.cjs), but
-  // every one of them still goes through the pane's own writer.
-  assert.match(commands, /paneWrite\(graphicsPassthroughRuns\(raw\)\)/);
+  // every one of them still goes through the pane's own writer — together with the placeholder
+  // cells and the retire deletes, in the one write.
+  assert.match(commands, /paneWrite\(graphicsWithCells\(graphicsPassthroughRuns\(encode\(commands\)\), after, tail\)\)/);
 });
 
 // Wire names are matched by string equality across three process boundaries, so a rename on one
@@ -3348,4 +3353,21 @@ test("Enter on a `v` pick clicks it", () => {
   assert.match(visual, /key === "Enter" && !visualState\.caret && !visualState\.pageSelection\) clickVisual\(\)/);
   const click = electron.slice(electron.indexOf("function clickVisual()"), electron.indexOf("function handleVisualKey(event, key)"));
   assert.match(click, /send\("native-click", hintClickPoint\(item\)\)/);
+});
+
+// The diacritic table names 297 rows. A taller pane cannot address its lower rows, and the cell
+// encoder throws on it — from the worker's completion, which would stop the pane's frames. It keeps
+// the overlay instead.
+test("a pane taller than the placeholder table keeps the overlay", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const gate = main.slice(main.indexOf("function usesPlaceholders("), main.indexOf("function basePlaceholderCells("));
+  assert.match(gate, /frames\.cells\.rows <= PLACEHOLDER_MAX_ROWS/);
+});
+
+// The pane writer reads a string as latin1. Placeholder cells written as a string arrived as their
+// low bytes and the page was never drawn; they go out as UTF-8 buffers.
+test("placeholder cells reach the pane writer as UTF-8", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /Buffer\.from\(cells, "utf8"\)/);
+  assert.match(main, /write\(Buffer\.from\(basePlaceholderCells\(frames\), "utf8"\)\)/);
 });

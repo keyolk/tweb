@@ -41,6 +41,13 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // that outlived the data had the pane re-placing an image the terminal had dropped.
     imageTransferred: false,
     pendingImageDelete: false,
+    // Which of the pane's two whole-frame ids is the one placed, and which one the frame at the
+    // worker is being transmitted under. See `paneImageIds` for why there are two.
+    shownBase: ids.base,
+    inFlightBase: null,
+    // Patches a whole frame already contains, kept on screen until that frame is placed. A patch
+    // sent while the frame is in flight is newer than the frame and stays.
+    retireOnPlace: [],
 
     // The damage patches live over the base frame. A small pool, cycled: a patch id only has to
     // outlive the frame it patches.
@@ -107,9 +114,63 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
  * free an image another pane was still placing.
  */
 function nextPatchId(context) {
-  const id = context.imageIds.patchBase + context.nextPatchSlot;
-  context.nextPatchSlot = (context.nextPatchSlot + 1) % context.imageIds.patchIds.length;
-  return id;
+  const count = context.imageIds.patchIds.length;
+  // An id still waiting to be retired with an in-flight whole frame is skipped. Its pixels are on
+  // screen until that frame lands, and as a placeholder its cells still name it: reissuing it would
+  // draw the new patch into the old patch's cells too. Null when every id is waiting, and the
+  // caller sends the damage as a whole frame instead.
+  for (let tried = 0; tried < count; tried += 1) {
+    const id = context.imageIds.patchBase + context.nextPatchSlot;
+    context.nextPatchSlot = (context.nextPatchSlot + 1) % count;
+    if (!context.retireOnPlace.includes(id)) return id;
+  }
+  return null;
+}
+
+/**
+ * The id the next whole frame is transmitted under: whichever base is not on screen.
+ *
+ * Decided at dispatch, not when the frame was queued. The queue is one deep and a queued frame
+ * waits behind the one in flight, so only at dispatch is it known which id that one left placed.
+ */
+function takeWholeFrameBase(context) {
+  const [first, second] = context.imageIds.bases;
+  const target = context.shownBase === first ? second : first;
+  context.inFlightBase = target;
+  return target;
+}
+
+/**
+ * Settles which base is on screen once a whole frame completes. Returns the id to delete — the
+ * one the new frame replaced — or null when nothing was placed.
+ */
+function settleWholeFrameBase(context, { placed }) {
+  const target = context.inFlightBase;
+  context.inFlightBase = null;
+  if (!placed || target === null) return null;
+  const previous = context.shownBase;
+  context.shownBase = target;
+  return previous === target ? null : previous;
+}
+
+/**
+ * Moves the live patches to the retire list: a whole frame that contains them was just queued.
+ * The damage union goes with them, so a patch sent during the transfer covers only new damage.
+ */
+function retirePatchesOnPlace(context) {
+  for (const id of takeLivePatchIds(context)) {
+    if (!context.retireOnPlace.includes(id)) context.retireOnPlace.push(id);
+  }
+}
+
+/**
+ * The patch ids to delete now that a whole frame is placed. An id the pool has since reissued to
+ * a newer patch is still live, and is left alone.
+ */
+function takePatchesToRetire(context) {
+  const ids = context.retireOnPlace.filter((id) => !context.livePatchIds.includes(id));
+  context.retireOnPlace = [];
+  return ids;
 }
 
 /** Records a patch as live, so the next whole frame knows what to delete. */
@@ -233,4 +294,8 @@ module.exports = {
   applyFrameViewport,
   queueGfxFrame,
   completeGfxFrame,
+  takeWholeFrameBase,
+  settleWholeFrameBase,
+  retirePatchesOnPlace,
+  takePatchesToRetire,
 };

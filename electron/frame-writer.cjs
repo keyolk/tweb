@@ -30,11 +30,38 @@ const { writeSync } = require("node:fs");
  *
  * @param {(fd: number, buffer: Buffer, offset: number, length: number) => number} write
  */
-function writeFully(write, fd, bytes) {
+// How long a full non-blocking descriptor is waited on before the write gives up. The reader is
+// the supervisor draining a pipe, so a full pipe empties in milliseconds unless it is gone.
+//
+// The wait blocks the main thread, and that is the trade chosen: a stalled supervisor costs up to
+// this long per write instead of a silently truncated line. A truncated line is not one lost
+// frame — it takes the next line with it and leaves the terminal inside an unfinished `m=1`
+// transfer. Pane ttys are blocking descriptors and never reach this branch.
+const AGAIN_WAIT_MS = 2;
+const AGAIN_LIMIT_MS = 5000;
+
+function waitBriefly(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function writeFully(write, fd, bytes, { wait = waitBriefly } = {}) {
   const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes, "binary");
   let offset = 0;
+  let waited = 0;
   while (offset < buffer.length) {
-    const written = write(fd, buffer, offset, buffer.length - offset);
+    let written;
+    try {
+      written = write(fd, buffer, offset, buffer.length - offset);
+    } catch (error) {
+      // Electron's stdout is non-blocking: a full pipe is EAGAIN, not a wait. Giving up there
+      // drops the rest of a line the reader has already started — measured on the hosted control
+      // channel, FRAME lines cut at exactly 65536 bytes with the next line glued on, so the
+      // supervisor discarded both and the pane lost the frame's middle chunks.
+      if (error.code !== "EAGAIN" || waited >= AGAIN_LIMIT_MS) throw error;
+      wait(AGAIN_WAIT_MS);
+      waited += AGAIN_WAIT_MS;
+      continue;
+    }
     // A zero-length write with no error would spin forever. Treat it as the descriptor refusing
     // the rest and let the caller's error path decide.
     if (!(written > 0)) throw new Error(`short write on fd ${fd}: ${offset}/${buffer.length}`);

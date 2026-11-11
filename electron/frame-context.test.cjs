@@ -5,6 +5,7 @@ const test = require("node:test");
 const {
   createFrameContext, nextPatchId, notePatch, takeLivePatchIds, generationIsCurrent,
   applyFrameViewport, queueGfxFrame, completeGfxFrame,
+  takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire,
 } = require("./frame-context.cjs");
 const { createPaneRecord } = require("./pane-registry.cjs");
 
@@ -27,9 +28,11 @@ test("patch ids come from the pane's own range and cycle within it", () => {
   const frames = context(100);
   const issued = [];
   for (let i = 0; i < frames.imageIds.patchIds.length + 2; i += 1) issued.push(nextPatchId(frames));
-  assert.deepEqual(issued.slice(0, 8), [101, 102, 103, 104, 105, 106, 107, 108]);
+  assert.deepEqual(issued.slice(0, 7), [101, 102, 103, 104, 105, 106, 107]);
   // Wraps rather than growing without bound: a patch id only has to outlive its frame.
-  assert.deepEqual(issued.slice(8), [101, 102]);
+  assert.deepEqual(issued.slice(7), [101, 102]);
+  // 108 is the second whole-frame base, never a patch.
+  assert.ok(!issued.includes(108));
   assert.ok(issued.every((id) => frames.imageIds.patchIds.includes(id)));
 });
 
@@ -207,4 +210,70 @@ test("two panes' pipelines do not touch", () => {
   assert.equal(nextPatchId(right), 2001);
   queueGfxFrame(left, { generation: 2 });
   assert.equal(right.gfxBusy, false, "one pane's worker hand-off must not busy another's");
+});
+
+// Retransmitting a whole frame under the id on screen blanks the image from the first chunk to the
+// last (FEASIBILITY.md 2.5). Frames alternate between two ids so the old one stays until the new
+// one is placed.
+test("whole frames alternate between the pane's two bases, and the replaced one is freed", () => {
+  const frames = context(100);
+  assert.equal(frames.shownBase, 100);
+  assert.equal(takeWholeFrameBase(frames), 108);
+  assert.equal(settleWholeFrameBase(frames, { placed: true }), 100);
+  assert.equal(frames.shownBase, 108);
+  assert.equal(takeWholeFrameBase(frames), 100);
+  assert.equal(settleWholeFrameBase(frames, { placed: true }), 108);
+  assert.equal(frames.shownBase, 100);
+});
+
+test("a frame that was not placed leaves the shown base on screen", () => {
+  const frames = context(100);
+  takeWholeFrameBase(frames);
+  assert.equal(settleWholeFrameBase(frames, { placed: false }), null);
+  assert.equal(frames.shownBase, 100);
+  assert.equal(frames.inFlightBase, null);
+  // The next frame goes to the free base again, not onto the one on screen.
+  assert.equal(takeWholeFrameBase(frames), 108);
+});
+
+test("a whole frame retires the patches it contains, not the ones sent while it was in flight", () => {
+  const frames = context(100);
+  const older = nextPatchId(frames);
+  notePatch(frames, older, { x: 0, y: 0, width: 10, height: 10 });
+  retirePatchesOnPlace(frames);
+  // Still on screen until the frame lands, but no longer what the next patch must cover.
+  assert.deepEqual(frames.livePatchIds, []);
+  assert.equal(frames.patchedDamage, null);
+  const newer = nextPatchId(frames);
+  notePatch(frames, newer, { x: 5, y: 5, width: 4, height: 4 });
+  assert.deepEqual(takePatchesToRetire(frames), [older]);
+  assert.deepEqual(frames.livePatchIds, [newer]);
+  assert.deepEqual(frames.retireOnPlace, []);
+});
+
+test("no patch id is reissued while it waits to be retired", () => {
+  const frames = context(100);
+  const ids = [];
+  for (let i = 0; i < frames.imageIds.patchIds.length; i += 1) {
+    const id = nextPatchId(frames);
+    ids.push(id);
+    notePatch(frames, id, { x: 0, y: 0, width: 1, height: 1 });
+  }
+  retirePatchesOnPlace(frames);
+  // Every id now waits on the frame in flight. None is reissued: as a placeholder its cells still
+  // name it, and a new patch under that id would draw into them too. The caller sends a whole frame.
+  assert.equal(nextPatchId(frames), null);
+  assert.deepEqual(takePatchesToRetire(frames).sort(), ids.sort());
+  // Once retired they are free again.
+  assert.notEqual(nextPatchId(frames), null);
+});
+
+test("a patch id waiting on the frame in flight is skipped, not reissued", () => {
+  const frames = context(100);
+  const first = nextPatchId(frames);
+  notePatch(frames, first, { x: 0, y: 0, width: 1, height: 1 });
+  retirePatchesOnPlace(frames);
+  const issued = [];
+  for (let i = 0; i < frames.imageIds.patchIds.length; i += 1) issued.push(nextPatchId(frames));
+  assert.ok(!issued.includes(first));
 });
