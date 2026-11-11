@@ -584,8 +584,19 @@ pub fn render(method: &str, result: &Value) -> String {
                         .and_then(Value::as_str)
                         .map(|engine| format!(" [{engine}]"))
                         .unwrap_or_default();
+                    // The renderer's size, when the engine knows it (Electron tabs only). A shared
+                    // renderer is marked, because its bytes belong to every tab that lives in it.
+                    let memory = tab
+                        .get("memoryMb")
+                        .and_then(Value::as_u64)
+                        .map(|mb| {
+                            let shared = tab.get("sharedRenderer").and_then(Value::as_bool)
+                                == Some(true);
+                            format!(" {mb}MB{}", if shared { " shared" } else { "" })
+                        })
+                        .unwrap_or_default();
                     format!(
-                        "{}{}{} {} {}",
+                        "{}{}{}{} {} {}",
                         if tab.get("active").and_then(Value::as_bool).unwrap_or(false) {
                             "*"
                         } else {
@@ -593,6 +604,7 @@ pub fn render(method: &str, result: &Value) -> String {
                         },
                         tab.get("index").and_then(Value::as_i64).unwrap_or(-1),
                         engine,
+                        memory,
                         text_field(tab, "title"),
                         text_field(tab, "url")
                     )
@@ -838,6 +850,24 @@ mod tests {
         assert!(super::takes_picture("capture"));
         assert!(!super::takes_picture("eval"));
         assert!(!super::takes_picture("snapshot"));
+    }
+
+    #[test]
+    fn tabs_show_each_renderers_size_when_the_engine_knows_it() {
+        let result = json!({ "tabs": [
+            { "index": 0, "active": true, "engine": "electron", "memoryMb": 2007,
+              "sharedRenderer": false, "title": "Office", "url": "http://localhost:8796/" },
+            { "index": 1, "active": false, "engine": "electron", "memoryMb": 310,
+              "sharedRenderer": true, "title": "Brief", "url": "file:///b.html" },
+            { "index": 2, "active": false, "engine": "chrome", "memoryMb": null,
+              "title": "Okta", "url": "https://okta.test/" },
+        ] });
+        assert_eq!(
+            super::render("tabs", &result),
+            "*0 [electron] 2007MB Office http://localhost:8796/\n \
+             1 [electron] 310MB shared Brief file:///b.html\n \
+             2 [chrome] Okta https://okta.test/\n"
+        );
     }
 
     fn status(browser: &str, url: &str) -> serde_json::Value {

@@ -148,6 +148,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/renderer-recovery.cjs"),
     ),
     (
+        "renderer-memory.cjs",
+        include_str!("../../../electron/renderer-memory.cjs"),
+    ),
+    (
         "find-session.cjs",
         include_str!("../../../electron/find-session.cjs"),
     ),

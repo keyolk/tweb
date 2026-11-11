@@ -210,6 +210,7 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `zoom.default` | `0.8` | next new tab |
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
+| `memory.renderer_limit_mb` | `1536` (0 turns it off) | live |
 | `page.transparent` | `false` | next new tab |
 | `downloads.dir` | system Downloads | next engine start |
 | `ime.slot_cells` | `3` | live |

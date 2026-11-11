@@ -205,6 +205,34 @@ fn swap_into(bgra: &[u8], rgba: &mut [u8]) {
     }
 }
 
+/// A process's physical footprint in bytes — what `top` shows as MEM and Activity Monitor as
+/// Memory: resident pages plus compressed ones. `None` on another OS or when the pid is gone.
+///
+/// Electron's `getAppMetrics()` `workingSetSize` is not this. Measured on a renderer holding 600MB
+/// that macOS then compressed: `top` MEM 635M (CMPRS 617M) while workingSetSize fell from 709MB to
+/// 98MB. The renderer that took the machine down was 2007M MEM, 1984M of it compressed, so a guard
+/// reading workingSetSize would have seen ~25MB.
+pub fn phys_footprint(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the buffer is a zeroed rusage_info_v2 and the flavor asks for exactly that struct.
+        unsafe {
+            let mut info: libc::rusage_info_v2 = std::mem::zeroed();
+            let status = libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V2,
+                (&mut info as *mut libc::rusage_info_v2).cast(),
+            );
+            (status == 0).then_some(info.ri_phys_footprint)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 // Test builds leave the Node-API surface out: its symbols only exist inside the Electron process
 // that loads the addon, so a test executable referencing them would not link.
 #[cfg(not(test))]
@@ -246,6 +274,13 @@ mod node {
             height,
             pixels: pixels.into(),
         })
+    }
+
+    /// `physFootprint(pid)`: bytes, or null; see [`crate::phys_footprint`]. A number, not a
+    /// BigInt: a footprint stays far below 2^53.
+    #[napi(js_name = "physFootprint")]
+    pub fn phys_footprint(pid: i32) -> Option<f64> {
+        crate::phys_footprint(pid).map(|bytes| bytes as f64)
     }
 
     /// `unlinkShm(name)`: true when an object was removed.
@@ -309,6 +344,17 @@ mod tests {
         write_frame(&name, &[5; 8], false).unwrap();
         assert_eq!(read_back(&name, 8), vec![5; 8]);
         unlink(&name).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn footprint_counts_memory_the_process_holds() {
+        let before = phys_footprint(std::process::id() as i32).expect("own pid is readable");
+        let held: Vec<u8> = vec![1; 64 << 20];
+        let after = phys_footprint(std::process::id() as i32).unwrap();
+        assert!(after >= before + (48 << 20), "before {before} after {after}");
+        drop(held);
+        assert_eq!(phys_footprint(-1), None);
     }
 
     #[test]
