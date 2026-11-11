@@ -14,11 +14,16 @@ the user's own profile, so it is signed in where the user is signed in.
 ```sh
 tweb split http://localhost:5173      # new browser pane beside yours, in this tmux window
 tweb split ./report.html              # a local file works the same; relative paths are fine
-tweb panes                            # the pane ids the other commands take (split prints none)
+tweb split --json <url>               # prints {"pane":"%N"} instead of the bare id
+tweb panes                            # every browser pane; use it to check, never to decide to split again
 ```
 
-`tweb split` needs tmux and returns as soon as the pane is created. The page is still loading at
-that point, so run `tweb wait --load` before you read it. `tweb open URL` instead takes over the
+`tweb split` needs tmux and returns as soon as the pane is created. On success it prints the new
+pane id (`%622`) on stdout, and exits non-zero with the reason on stderr when no pane was made. The
+page is still loading at that point, so run `tweb wait --load --pane %N` before you read it. The id
+comes from tmux, but `tweb panes` lists a pane only after its browser has started, a few seconds
+later. If the pane is not in `tweb panes` yet, do not split again: that opens a second pane. Wait and
+run `tweb panes` once more, or use the printed id, e.g. `tweb tab new URL --pane %N`. `tweb open URL` instead takes over the
 current pane, which is your own. Use `split`.
 
 To show something you made, write it to an HTML file and `tweb split` the file.

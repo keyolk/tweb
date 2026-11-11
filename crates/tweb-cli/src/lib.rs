@@ -206,6 +206,9 @@ pub enum Command {
         url: Option<String>,
         #[arg(short = 'H')]
         horizontal: bool,
+        /// Print the new pane as JSON (`{"pane": "%N"}`) instead of the bare pane id.
+        #[arg(long)]
+        json: bool,
     },
     /// List automatable browser panes.
     Panes {
@@ -946,13 +949,21 @@ pub async fn run() -> Result<()> {
             browser,
             url,
             horizontal,
+            json,
         } => {
             let url = url.map(|value| resolve_url_argument(&value, &working_directory));
             // An omitted URL is preserved across tmux split-window too.
             let browser = browser.with_engine_for(url.as_deref());
             browser.ssh_target()?;
             browser.check_transparent()?;
-            split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
+            let pane = split_and_run_pane(url.as_deref(), &browser, horizontal, None, &[]).await?;
+            // The id is the only proof the caller gets that the pane exists. Without it a caller
+            // that saw no output split again and left two panes behind.
+            if json {
+                println!("{}", json!({ "pane": pane }));
+            } else {
+                println!("{pane}");
+            }
         }
         Command::ImeInternal { action } => {
             if let Some(action) = ime::Action::parse(&action) {
@@ -1356,7 +1367,8 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
 /// Arguments for tmux split-window. Knowing the calling pane, we split the window that pane
 /// belongs to rather than the client's active window.
 fn split_window_args(pane: Option<&str>, command: &str) -> Vec<String> {
-    let mut args = ["split-window", "-h", "-p", "50"]
+    // -P -F makes tmux print the new pane's id once the pane exists.
+    let mut args = ["split-window", "-h", "-p", "50", "-P", "-F", "#{pane_id}"]
         .map(String::from)
         .to_vec();
     if let Some(pane) = pane {
@@ -1374,7 +1386,7 @@ async fn split_and_run_pane(
     _horizontal: bool,
     beside: Option<&str>,
     extra_env: &[(&str, &str)],
-) -> Result<()> {
+) -> Result<String> {
     // Re-invoke the same executable through an internal subcommand. Nothing looks up a separate
     // binary, so a split pane cannot end up running a different build than this CLI.
     let executable = std::env::current_exe().context("cannot resolve the running tweb binary")?;
@@ -1414,14 +1426,33 @@ async fn split_and_run_pane(
         .map(str::to_string)
         .or_else(|| std::env::var("TMUX_PANE").ok());
     let split_args = split_window_args(target_pane.as_deref(), &pane_command);
-    let status = std::process::Command::new("tmux")
+    let output = std::process::Command::new("tmux")
         .args(split_args)
-        .status()?;
+        .output()
+        .context("cannot run tmux")?;
 
-    if !status.success() {
-        anyhow::bail!("tmux split-window failed: {:?}", status);
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux split-window failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    Ok(())
+    let pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !pane.starts_with('%') {
+        anyhow::bail!("tmux split-window printed no pane id: {pane:?}");
+    }
+    // split-window returning means the pane exists; asking tmux again catches a pane whose
+    // command exited at once (a bad binary path) before the caller is told it is there.
+    let alive = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", &pane, "#{pane_id}"])
+        .output()
+        .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == pane)
+        .unwrap_or(false);
+    if !alive {
+        anyhow::bail!("tmux pane {pane} is gone right after split-window");
+    }
+    Ok(pane)
 }
 
 /// `tweb devtools`: ask the pane for its page's DevTools URL and open it beside that pane.
@@ -1476,7 +1507,8 @@ async fn open_devtools(pane: Option<&str>) -> Result<()> {
         beside.as_deref(),
         &[("TWEB_START_VIMIUM", "0")],
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// The pane `tweb devtools` inspects when none was named: the only Chrome-engine pane, or the one
@@ -1760,11 +1792,31 @@ mod tests {
     fn split_targets_the_calling_pane() {
         assert_eq!(
             split_window_args(Some("%42"), "tweb __pane"),
-            vec!["split-window", "-h", "-p", "50", "-t", "%42", "tweb __pane"]
+            vec![
+                "split-window",
+                "-h",
+                "-p",
+                "50",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "%42",
+                "tweb __pane"
+            ]
         );
         assert_eq!(
             split_window_args(None, "tweb __pane"),
-            vec!["split-window", "-h", "-p", "50", "tweb __pane"]
+            vec![
+                "split-window",
+                "-h",
+                "-p",
+                "50",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "tweb __pane"
+            ]
         );
     }
 
