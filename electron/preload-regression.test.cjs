@@ -562,7 +562,10 @@ test("another pane owning tmux zoom hides the browser image", () => {
   assert.match(main, /const next = visibleTmuxClientTtys\(clients, vis\(\)\.placement\);/);
   // The invariant is that a client no longer showing this pane gets the delete, whatever the loop
   // is spelled like — it now logs the eviction first, which `bench/host-multipane.py` gates on.
-  assert.match(main, /if \(next\.has\(tty\)\) continue;[\s\S]*?deleteImageFromClientTty\(tty\);/);
+  // Which clients those are is `hideTransition`'s answer, tested in tmux-visibility.test.cjs.
+  assert.match(main, /for \(const tty of transition\.evicted\) \{[\s\S]*?deleteImageFromClientTty\(tty\);/);
+  // And the delete that follows frames still queued in tmux, when the last client left.
+  assert.match(main, /if \(transition\.deleteInBand\) deleteImageInBand\(\);/);
   assert.match(main, /if \(becameVisible\) repaintActiveTab\(\);/);
 });
 

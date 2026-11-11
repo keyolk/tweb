@@ -1,0 +1,5 @@
+<!doctype html><html><body style="margin:0;background:#000">
+<div id=b style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font:120px monospace;color:#fff"></div>
+<script>
+let n=0;function f(){n++;const b=document.getElementById('b');b.textContent=n;b.style.background='hsl('+(n*7%360)+',70%,40%)';requestAnimationFrame(f)}f();
+</script></body></html>

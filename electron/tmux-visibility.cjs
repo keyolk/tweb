@@ -15,7 +15,25 @@ function visibleTmuxClientTtys(stdout, identity) {
   return visible;
 }
 
-module.exports = { visibleTmuxClientTtys, parseVisibilityPush };
+// What a new client set means for the image already on the terminals.
+//
+// `evicted` are the clients that stopped showing the pane. The engine writes the delete straight
+// to each one's tty, which is immediate but bypasses tmux. Frames the pane wrote just before the
+// switch can still be queued on the way through tmux (the pane pty, and under twebd the frontend
+// as well). They reach the client after that direct delete, and with `allow-passthrough=all` tmux
+// still forwards them, because the client's session holds the pane's window. The page was then
+// left drawn over the window the client switched to, with nothing left to delete it.
+//
+// `deleteInBand` asks for a second delete through the pane's own output. That path is ordered
+// behind every frame already written, so it lands after the last one. Only when NO client shows
+// the pane any more: tmux forwards the in-band delete to every client of the session, so it would
+// blank the pane for a client that is still watching it.
+function hideTransition(previousTtys, nextTtys) {
+  const evicted = [...previousTtys].filter((tty) => !nextTtys.has(tty));
+  return { evicted, deleteInBand: evicted.length > 0 && nextTtys.size === 0 };
+}
+
+module.exports = { visibleTmuxClientTtys, parseVisibilityPush, hideTransition };
 
 // --- the frontend's visibility push ---
 //

@@ -55,7 +55,7 @@ const { engineKind } = require("./cdp/backend.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
 const { startAgentServer, runtimeDir } = require("./agent-server.cjs");
 const { buildBrowserContextMenu } = require("./context-menu.cjs");
-const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibility.cjs");
+const { visibleTmuxClientTtys, parseVisibilityPush, hideTransition } = require("./tmux-visibility.cjs");
 const { normalizeUrl } = require("./url-normalization.cjs");
 const { waitFor } = require("./agent-wait.cjs");
 const { elementCrop, findAgentPane, pasteToAgent, inspectMessage } = require("./agent-handoff.cjs");
@@ -1039,6 +1039,23 @@ function deleteImageFromClientTty(tty) {
   }
 }
 
+// The same delete, written through the pane's own output instead of to a client tty, so it is
+// ordered behind every frame the pane has already written. The image data is gone afterwards, so
+// the claim that the terminal holds it goes too: the reveal then sends a whole frame rather than
+// a patch or a re-place over a base the terminal no longer has.
+function deleteImageInBand(record = currentPane(), frames = currentFrames()) {
+  const ids = paneImageIds(record);
+  const commands = [ids.base, ...ids.patchIds].map((id) => `${ESC}_Ga=d,d=I,i=${id},q=2${ESC}\\`);
+  try {
+    writerFor(record).write(graphicsPassthroughRuns(commands, record));
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: in-band image delete failed ${record.paneId}: ${error.message}`);
+  }
+  takeLivePatchIds(frames);
+  frames.imageTransferred = false;
+  frames.pendingImageDelete = false;
+}
+
 const passthroughTable = "tweb-pass";
 const passthroughMouseKeys = [
   "MouseDown1Pane", "MouseDown2Pane", "MouseDown3Pane",
@@ -1455,10 +1472,10 @@ function applyClientListing(clients, placement) {
   vis().placement = placement;
   const next = visibleTmuxClientTtys(clients, vis().placement);
   const wasVisible = currentPane().visible;
+  const transition = hideTransition(vis().clientTtys, next);
   // A client that stopped showing this pane keeps the image placed on it, so the delete
   // goes to that tty directly.
-  for (const tty of vis().clientTtys) {
-    if (next.has(tty)) continue;
+  for (const tty of transition.evicted) {
     // Logged because it is a pane going blank, and the two reasons for it are indistinguishable
     // from the outside: a client that really stopped showing this pane, or this pane reading
     // another pane's client set and evicting itself from a terminal still watching it. That second
@@ -1469,6 +1486,9 @@ function applyClientListing(clients, placement) {
     }
     deleteImageFromClientTty(tty);
   }
+  // The direct delete above can overtake frames still queued on the way through tmux; this one
+  // follows them. See `hideTransition`.
+  if (transition.deleteInBand) deleteImageInBand();
   const becameVisible = [...next].some((tty) => !vis().clientTtys.has(tty));
   vis().clientTtys = next;
   const changed = recordVisibility(currentPane(), next.size > 0);
@@ -1681,9 +1701,12 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
   // The bookkeeping — was that frame stale, what runs next, and the `imageTransferred` reset
   // that goes with freeing a stale frame's data — is decided in `frame-context.cjs` and tested
   // there. What is left here is the writing, which is the part that needs a terminal.
-  const settled = completeGfxFrame(frames);
+  // Visibility is read when the frame comes back, not when it was sent: a window switch in
+  // between has already deleted the image from the client (see `completeGfxFrame`).
+  const settled = completeGfxFrame(frames, { visible: frames.record.visible !== false });
   // A frame the viewport has already moved past is never placed: the terminal would scale a
-  // stale-sized image into the new pane box. Its data is freed instead of drawn.
+  // stale-sized image into the new pane box. Its data is freed instead of drawn. So is a frame
+  // that finished after the pane was hidden.
   if (settled.stale) {
     writeGfx(`a=d,d=I,i=${frames.imageIds.base},q=2`, "");
   } else {

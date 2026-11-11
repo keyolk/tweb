@@ -197,16 +197,23 @@ function queueGfxFrame(context, frame) {
  * `imageTransferred` must go with it. Leaving the claim set had `replacePlacement` re-placing an
  * image the terminal no longer held, which `bench/GATES.md` records as self-closing *only while
  * one process owns one pane's generations*.
+ *
+ * `visible` is the pane's visibility when the completion arrives. A frame handed to the worker
+ * while the pane was on screen can finish after the pane's window was switched away. The hide
+ * has already deleted the image from the client, and placing this frame then would put it back
+ * over the window the client switched to. Nothing deletes it again, because that client is no
+ * longer in the pane's client set. So a hidden completion is stale too, and the frame queued
+ * behind it is not dispatched: the reveal repaints from a fresh frame.
  */
-function completeGfxFrame(context) {
-  const stale = context.activeGfxGeneration !== null
-    && !generationIsCurrent(context, context.activeGfxGeneration);
+function completeGfxFrame(context, { visible = true } = {}) {
+  const stale = !visible || (context.activeGfxGeneration !== null
+    && !generationIsCurrent(context, context.activeGfxGeneration));
   context.gfxBusy = false;
   context.activeGfxGeneration = null;
   if (stale) context.imageTransferred = false;
   const queued = context.pendingGfxFrame;
   context.pendingGfxFrame = null;
-  const next = queued && generationIsCurrent(context, queued.generation) ? queued : null;
+  const next = visible && queued && generationIsCurrent(context, queued.generation) ? queued : null;
   if (next) {
     context.gfxBusy = true;
     context.activeGfxGeneration = next.generation;

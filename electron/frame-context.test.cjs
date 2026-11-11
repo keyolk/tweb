@@ -155,6 +155,31 @@ test("a current completion keeps the claim and dispatches what was waiting", () 
   assert.equal(frames.pendingGfxFrame, null);
 });
 
+// A whole frame is in the worker when the pane's window is switched away. The hide has already
+// deleted the image from the client, so placing this frame would draw the page over the window the
+// client switched to, and nothing would delete it again.
+test("a completion that arrives after the pane was hidden is dropped, and so is the frame behind it", () => {
+  const frames = context();
+  applyFrameViewport(frames, VP(80, 24, 800, 480));
+  queueGfxFrame(frames, { generation: 1, tag: "a" });
+  frames.imageTransferred = true;
+  queueGfxFrame(frames, { generation: 1, tag: "b" });
+
+  const settled = completeGfxFrame(frames, { visible: false });
+  assert.equal(settled.stale, true, "the finished frame must be freed, not placed");
+  assert.equal(settled.next, null, "the queued frame must not go to the worker either");
+  assert.equal(frames.imageTransferred, false, "the reveal must send a whole frame, not a patch");
+  assert.equal(frames.gfxBusy, false, "the worker must be free for the reveal's frame");
+  assert.equal(frames.pendingGfxFrame, null);
+});
+
+test("a completion with no visibility given keeps the old behaviour", () => {
+  const frames = context();
+  applyFrameViewport(frames, VP(80, 24, 800, 480));
+  queueGfxFrame(frames, { generation: 1 });
+  assert.equal(completeGfxFrame(frames).stale, false);
+});
+
 test("a queued frame the pane has outgrown is dropped rather than dispatched", () => {
   const frames = context();
   applyFrameViewport(frames, VP(80, 24, 800, 480));
