@@ -35,6 +35,7 @@ tweb snapshot                         # interactive elements with refs: @a link 
 tweb snapshot --text                  # a reading view: also headings, links and text
 tweb click a                          # the ref without the @
 tweb fill s "agent@example.com"       # sets a value the way the page's framework sees it
+pass show work/okta | head -1 | tweb fill s --stdin   # a secret: off argv, never printed back
 tweb type "hello"                     # types into the focused element
 tweb press Enter                      # also Tab, Escape, ArrowDown…; --mod shift|control|alt|meta
 tweb select d Green                   # pick an <option>
@@ -54,6 +55,12 @@ tweb eval "document.title"            # JavaScript in the page; prints the resul
   snapshot, `s` may no longer be the button it was. Take a plain `snapshot` again before you act.
 - The refs are the labels the user sees when they press `f` in the pane. When the user says
   "click `sd`", that is the ref `sd`.
+- A password, token or code goes through `tweb fill <ref> --stdin`, piped straight from its store
+  (`pass show …`, `security find-generic-password -w …`). Never put it in the value argument, a
+  shell variable or `tweb type`: those reach `ps`, history or the output. `--stdin` prints only
+  `ok`, refuses an empty stdin, and drops one trailing newline. Check that it landed with a
+  boolean, `tweb eval "(()=>document.querySelector('#pw').value.length>0)()"`, never by reading
+  the value.
 - `click` is a trusted native click (`isTrusted` is true), not a synthetic DOM event. `fill` is safe
   to use with React and other frameworks.
 
@@ -192,6 +199,14 @@ Add `--json` to any command for machine-readable output.
   meanwhile, so take a new snapshot before you continue.
 - Some sites need the user's managed Google Chrome, for example Okta device trust. tweb opens those
   sites on its Chrome engine (`--engine chrome`). The same commands work there.
+- To open a site on the Chrome engine from now on, add its host to `engine.chrome_sites`. `set`
+  replaces the whole list, so read it first and append:
+  ```sh
+  tweb config get engine.chrome_sites            # e.g. okta.com,coder.example.com
+  tweb config set engine.chrome_sites "okta.com,coder.example.com,app.example.com"
+  ```
+  An entry covers the host and its subdomains. A typed URL or a followed link to it opens on
+  Chrome; a redirect stays where it is, so move that tab with `tweb tab engine chrome`.
 
 ## MCP
 

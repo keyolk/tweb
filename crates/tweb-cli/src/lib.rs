@@ -272,7 +272,14 @@ pub enum Command {
     /// Set the value of an input/textarea/contenteditable.
     Fill {
         r#ref: String,
-        value: String,
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        value: Option<String>,
+        /// Read the value from stdin instead of the command line, and never print it back.
+        /// For secrets: `pass show <entry> | head -1 | tweb fill <ref> --stdin` keeps the value
+        /// out of argv (`ps`), shell history and this command's output. One trailing newline is
+        /// dropped.
+        #[arg(long)]
+        stdin: bool,
         #[command(flatten)]
         agent: AgentOptions,
     },
@@ -1154,6 +1161,18 @@ pub async fn run() -> Result<()> {
             };
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
         }
+        // A value from stdin is a secret by contract: the page's reply carries the field's value
+        // back for anything but a password input (a username field, a token box), and `run`
+        // would print it. Say only that it worked.
+        fill @ Command::Fill { stdin: true, .. } => {
+            let (method, params, agent) = agent_call(fill, &working_directory)?;
+            agent::request(agent.pane.as_deref(), method, params)?;
+            if agent.json {
+                println!("{}", json!({ "ok": true }));
+            } else {
+                println!("ok");
+            }
+        }
         other => {
             let (method, params, agent) = agent_call(other, &working_directory)?;
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
@@ -1198,6 +1217,26 @@ fn active_tab_url(status: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The value `tweb fill --stdin` reads: everything on stdin, less one trailing newline, so
+/// `pass show … | head -1` and `printf '%s'` give the same value. An empty value is refused: an
+/// empty pipe (a `pass` that failed to decrypt) must not silently clear the field.
+fn read_fill_value(mut input: impl std::io::Read) -> Result<String> {
+    let mut value = String::new();
+    input
+        .read_to_string(&mut value)
+        .context("cannot read the fill value from stdin")?;
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    if value.is_empty() {
+        anyhow::bail!("tweb fill --stdin: stdin was empty; nothing filled");
+    }
+    Ok(value)
+}
+
 /// Map a page-driving subcommand onto its JSON-RPC method and params.
 fn agent_call(
     command: Command,
@@ -1234,8 +1273,15 @@ fn agent_call(
         Command::Fill {
             r#ref,
             value,
+            stdin,
             agent,
-        } => ("act", act(r#ref, "fill", Some(value)), agent),
+        } => {
+            let value = match value {
+                Some(value) if !stdin => value,
+                _ => read_fill_value(std::io::stdin().lock())?,
+            };
+            ("act", act(r#ref, "fill", Some(value)), agent)
+        }
         Command::Select {
             r#ref,
             value,
@@ -1757,6 +1803,40 @@ mod tests {
         assert_eq!(called, "navigate");
         assert_eq!(params["url"], "back.example.com");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// `fill --stdin` takes the value off the command line; the plain form keeps working, and
+    /// giving both is refused rather than guessing which one was meant.
+    #[test]
+    fn fill_takes_its_value_from_the_argument_or_stdin_not_both() {
+        let parsed = Cli::try_parse_from(["tweb", "fill", "e", "hello"]).expect("parse");
+        assert!(matches!(
+            parsed.command,
+            Command::Fill { stdin: false, ref value, .. } if value.as_deref() == Some("hello")
+        ));
+        let parsed = Cli::try_parse_from(["tweb", "fill", "e", "--stdin"]).expect("parse");
+        assert!(matches!(
+            parsed.command,
+            Command::Fill {
+                stdin: true,
+                value: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["tweb", "fill", "e", "x", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["tweb", "fill", "e"]).is_err());
+    }
+
+    #[test]
+    fn fill_stdin_drops_one_trailing_newline_and_refuses_empty() {
+        let read = |text: &str| super::read_fill_value(text.as_bytes());
+        assert_eq!(read("s3cret\n").unwrap(), "s3cret");
+        assert_eq!(read("s3cret\r\n").unwrap(), "s3cret");
+        assert_eq!(read("s3cret").unwrap(), "s3cret");
+        assert_eq!(read("two\n\n").unwrap(), "two\n");
+        assert_eq!(read(" padded ").unwrap(), " padded ");
+        assert!(read("").is_err());
+        assert!(read("\n").is_err());
     }
 
     /// `tweb link` is the controller's heartbeat: owner and ttl go through as given, and

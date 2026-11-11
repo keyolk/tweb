@@ -434,6 +434,7 @@ tweb panes                       # browser panes available to drive
 tweb snapshot                    # interactive elements + refs (--text for a reading snapshot)
 tweb click a                     # trusted native click (isTrusted=true)
 tweb fill s "agent@example.com"  # framework-safe value assignment
+pass show web/site | head -1 | tweb fill s --stdin  # a secret: not in argv, not printed back
 tweb select d Green
 tweb press Enter --mod shift
 tweb wait --selector "#result" --timeout 5000
