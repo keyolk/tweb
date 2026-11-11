@@ -162,6 +162,7 @@ const { isHostedRuntime, hostProtocolVersion } = require("./hosted-runtime.cjs")
 const {
   createFrameContext, nextPatchId: takeNextPatchId, notePatch, takeLivePatchIds,
   applyFrameViewport, queueGfxFrame: enqueueGfxFrame, completeGfxFrame,
+  takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire,
 } = require("./frame-context.cjs");
 const {
   createPaneWindows, surfaceHeld, holdSurface, releaseSurface,
@@ -1025,12 +1026,7 @@ function graphicsPassthroughRuns(commands, record = currentPane()) {
 function rawKittyDelete(record = currentPane()) {
   // The base image plus every damage patch slot. A client that stopped showing this pane
   // keeps whatever was placed on it, so leaving the patches would strand them there.
-  const ids = paneImageIds(record);
-  let raw = `${ESC}_Ga=d,d=I,i=${ids.base},q=2${ESC}\\`;
-  for (const id of ids.patchIds) {
-    raw += `${ESC}_Ga=d,d=I,i=${id},q=2${ESC}\\`;
-  }
-  return raw;
+  return paneImageIds(record).ownedIds.map((id) => `${ESC}_Ga=d,d=I,i=${id},q=2${ESC}\\`).join("");
 }
 
 function deleteImageFromClientTty(tty) {
@@ -1052,14 +1048,14 @@ function deleteImageFromClientTty(tty) {
 // the claim that the terminal holds it goes too: the reveal then sends a whole frame rather than
 // a patch or a re-place over a base the terminal no longer has.
 function deleteImageInBand(record = currentPane(), frames = currentFrames()) {
-  const ids = paneImageIds(record);
-  const commands = [ids.base, ...ids.patchIds].map((id) => `${ESC}_Ga=d,d=I,i=${id},q=2${ESC}\\`);
+  const commands = paneImageIds(record).ownedIds.map((id) => `${ESC}_Ga=d,d=I,i=${id},q=2${ESC}\\`);
   try {
     writerFor(record).write(graphicsPassthroughRuns(commands, record));
   } catch (error) {
     if (debugLogging) console.error(`tweb: in-band image delete failed ${record.paneId}: ${error.message}`);
   }
   takeLivePatchIds(frames);
+  frames.retireOnPlace = [];
   frames.imageTransferred = false;
   frames.pendingImageDelete = false;
 }
@@ -1645,6 +1641,8 @@ function noteShmFrameResult(message, frames) {
 }
 
 function sendGfxFrameToWorker(frame, frames = currentFrames()) {
+  // The id is chosen here, not when the frame was queued: see `takeWholeFrameBase`.
+  const header = frame.header.replace(WHOLE_FRAME_ID, String(takeWholeFrameBase(frames)));
   const pixels = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
     ? frame.png
     : Buffer.from(frame.png);
@@ -1655,7 +1653,7 @@ function sendGfxFrameToWorker(frame, frames = currentFrames()) {
       buffer: pixels.buffer,
       byteOffset: pixels.byteOffset,
       byteLength: pixels.byteLength,
-      header: frame.header,
+      header,
       format: frame.format || "png",
       width: frame.width,
       height: frame.height,
@@ -1668,6 +1666,7 @@ function sendGfxFrameToWorker(frame, frames = currentFrames()) {
     // it would never dispatch again and the pane would freeze on its last frame.
     frames.gfxBusy = false;
     frames.activeGfxGeneration = null;
+    frames.inFlightBase = null;
     console.error(`tweb: graphics dispatch failed: ${error.message}`);
   }
 }
@@ -1715,10 +1714,20 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
   // A frame the viewport has already moved past is never placed: the terminal would scale a
   // stale-sized image into the new pane box. Its data is freed instead of drawn. So is a frame
   // that finished after the pane was hidden.
+  const transmitted = frames.inFlightBase;
+  const placed = !settled.stale && Boolean(commands && commands.length > 0);
+  const replaced = settleWholeFrameBase(frames, { placed });
   if (settled.stale) {
-    writeGfx(`a=d,d=I,i=${frames.imageIds.base},q=2`, "");
+    // Only the id this frame went to. The one on screen is not this frame's to free: the hide
+    // that made it stale has already deleted it, and a resize re-places it.
+    if (transmitted !== null) writeGfx(`a=d,d=I,i=${transmitted},q=2`, "");
   } else {
-    writeGfxCommands(commands);
+    // The new frame first, the old one's delete after it, in one write: there is no moment
+    // between them with neither on screen. The patches go with the old frame — they were
+    // placed over it, and the new frame already contains what they covered.
+    const retire = [replaced, ...takePatchesToRetire(frames)].filter((id) => id !== null)
+      .map((id) => ({ header: `a=d,d=I,i=${id},q=2`, payload: "" }));
+    writeGfxCommands([...commands, ...retire]);
     const bytes = wireBytesOf(commands);
     frames.wholeWireBytes += bytes;
     frames.wireBytesPerWhole = nextWireEstimate(frames.wireBytesPerWhole, bytes);
@@ -1783,6 +1792,7 @@ gfxWorker.on("error", (error) => {
     frames.gfxBusy = false;
     frames.activeGfxGeneration = null;
     frames.pendingGfxFrame = null;
+    frames.inFlightBase = null;
   }
   console.error(`tweb: graphics writer crashed: ${error.stack || error.message}`);
 });
@@ -1907,9 +1917,7 @@ function terminalCleanup(record = currentPane()) {
   try {
     // Delete the base image and any damage patches still placed over it. A patch left
     // behind would outlive the pane as a stale image in the terminal's cache.
-    const ids = paneImageIds(record);
-    writeGfx(`a=d,d=I,i=${ids.base}`, "");
-    for (const id of ids.patchIds) {
+    for (const id of paneImageIds(record).ownedIds) {
       writeGfx(`a=d,d=I,i=${id}`, "");
     }
   } catch (e) {}
@@ -2066,10 +2074,14 @@ function notePaintActivity() {
 // frame's anonymous placement underneath the one the resize just made.
 const PLACEMENT_ID = 1;
 
+// Stands in for the image id in a whole frame's header until the frame is dispatched, which is
+// when it is known which of the pane's two bases is free (`takeWholeFrameBase`).
+const WHOLE_FRAME_ID = "@base@";
+
 // `d=i` drops the placements but keeps the image data, so it can be re-placed.
 function deletePlacement(frames = currentFrames()) {
   frames.pendingImageDelete = false;
-  writeGfx(`a=d,d=i,i=${frames.imageIds.base},q=2`, "");
+  writeGfx(`a=d,d=i,i=${frames.shownBase},q=2`, "");
 }
 
 // Chromium needs a moment to repaint at a new size, and tmux has already redrawn
@@ -2080,7 +2092,7 @@ function deletePlacement(frames = currentFrames()) {
 function replacePlacement(frames = currentFrames()) {
   if (!frames.imageTransferred) return;
   if (frames.pendingImageDelete) deletePlacement(frames);
-  writeGfx(`a=p,i=${frames.imageIds.base},p=${PLACEMENT_ID},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
+  writeGfx(`a=p,i=${frames.shownBase},p=${PLACEMENT_ID},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2", "");
 }
 
@@ -2110,7 +2122,9 @@ function replacePlacement(frames = currentFrames()) {
 // budget — and leaving them behind at exit is exactly the stale-image case DESIGN.md
 // section 7.7 gates on.
 function deletePatches(frames = currentFrames()) {
-  for (const id of takeLivePatchIds(frames)) writeGfx(`a=d,d=I,i=${id},q=2`, "");
+  const ids = new Set([...takeLivePatchIds(frames), ...frames.retireOnPlace]);
+  frames.retireOnPlace = [];
+  for (const id of ids) writeGfx(`a=d,d=I,i=${id},q=2`, "");
 }
 
 // Two ways to put a patch on its cell.
@@ -2129,7 +2143,7 @@ function patchPlacementSequence(id, place, frames = currentFrames(), format = "f
   const z = imageZ === 0 ? "" : `,z=${imageZ}`;
   if (relativePatches.allowed) {
     // Same z as the base: within one z the later placement draws on top, measured on Ghostty 1.4.
-    const parent = patchRelativeKeys(place, frames.cells, frames.imageIds.base, PLACEMENT_ID);
+    const parent = patchRelativeKeys(place, frames.cells, frames.shownBase, PLACEMENT_ID);
     const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},${parent},c=${place.cols},r=${place.rows}`
       + `${z},q=2`;
     return { header, prefix: "", suffix: "" };
@@ -2272,14 +2286,17 @@ function sendShmPatch(image, damage, geometry, frames, record, patchStarted) {
 
 function transferFrame(pixels, generation, format = "png", size = null, probe = null) {
   if (currentFrames().pendingImageDelete) deletePlacement();
-  // Any patch on screen describes damage this frame already contains, so it goes out with
-  // the frame that supersedes it. Dropping them earlier would bare the stale pixels
-  // underneath for as long as the encode takes.
-  deletePatches();
+  // Patches on screen are NOT deleted here. They describe damage this frame already contains,
+  // but this frame reaches the terminal only when the worker is done with it — over SSH that is
+  // the whole inline transfer later — and deleting them now bared the stale pixels underneath
+  // for all of that time. They are retired in the same write that places the new frame
+  // (`handleGfxWorkerReady`).
+  retirePatchesOnPlace(currentFrames());
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
-  // whose pixel size no longer matches still covers exactly the pane. `f=` is left to the
-  // worker, which knows whether it is writing a PNG or raw pixels.
-  const header = `a=T,i=${currentFrames().imageIds.base},p=${PLACEMENT_ID},C=1,`
+  // whose pixel size no longer matches still covers exactly the pane. The id is filled in at
+  // dispatch, where it is chosen; `f=` is left to the worker, which knows whether it is writing
+  // a PNG or raw pixels.
+  const header = `a=T,i=${WHOLE_FRAME_ID},p=${PLACEMENT_ID},C=1,`
     + `c=${currentFrames().cells.cols},r=${currentFrames().cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`);
   queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);

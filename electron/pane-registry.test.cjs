@@ -185,8 +185,13 @@ test("a pane's image ids all come from its record", () => {
   const ids = paneImageIds(pane);
   assert.equal(ids.base, 4242);
   assert.equal(ids.patchBase, 4243);
-  assert.equal(ids.patchIds.length, PATCH_ID_COUNT);
-  assert.deepEqual(ids.patchIds, [4243, 4244, 4245, 4246, 4247, 4248, 4249, 4250]);
+  // The last reserved id is the second whole-frame buffer, so the patch pool is one shorter.
+  assert.equal(ids.patchIds.length, PATCH_ID_COUNT - 1);
+  assert.deepEqual(ids.patchIds, [4243, 4244, 4245, 4246, 4247, 4248, 4249]);
+  assert.deepEqual(ids.bases, [4242, 4250]);
+  // Every id the pane can hold sits inside the range the frontend's deletes free.
+  assert.deepEqual(ids.ownedIds, [4242, 4243, 4244, 4245, 4246, 4247, 4248, 4249, 4250]);
+  assert.ok([...ids.bases, ...ids.patchIds].every((id) => ids.ownedIds.includes(id)));
   // Exclusive: the first id another pane may legally start at.
   assert.equal(ids.end, 4242 + IMAGE_ID_STRIDE);
   assert.equal(ids.end, 4251);

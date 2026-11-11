@@ -51,10 +51,21 @@ const IMAGE_ID_STRIDE = PATCH_ID_COUNT + 1;
 function paneImageIds(record) {
   const base = Number(record.imageId);
   const patchBase = base + 1;
+  // The last of the reserved ids is the second whole-frame buffer, not a patch slot. A whole frame
+  // retransmitted under the id already on screen blanks the image from its first chunk to its last
+  // — invisible for a one-command `t=f` frame, a visible blank for every remote `t=d` frame sent
+  // as tens of chunks (measured on Ghostty 1.4, FEASIBILITY.md 2.5). So whole frames alternate
+  // between two ids and the old one is deleted only once the new one is placed. Taken from inside
+  // the reserved range so the frontend's deletes (`raw_kitty_delete`, `image_sweep`), which free
+  // `base ..= base + PATCH_ID_COUNT`, still cover every id this pane can hold.
+  const alternateBase = base + PATCH_ID_COUNT;
   return {
     base,
     patchBase,
-    patchIds: Array.from({ length: PATCH_ID_COUNT }, (_, slot) => patchBase + slot),
+    patchIds: Array.from({ length: PATCH_ID_COUNT - 1 }, (_, slot) => patchBase + slot),
+    bases: [base, alternateBase],
+    // Every id the pane may have in the terminal, for the deletes that must leave nothing behind.
+    ownedIds: Array.from({ length: PATCH_ID_COUNT + 1 }, (_, slot) => base + slot),
     // Exclusive, so `last + 1` is the first id another pane may legally start at.
     end: base + IMAGE_ID_STRIDE,
   };

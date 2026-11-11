@@ -501,8 +501,9 @@ test("a resize re-places the existing image instead of baring the pane", () => {
   // own range, never from anything process-wide.
   const replace = main.slice(main.indexOf("function deletePlacement(frames"),
     main.indexOf("// --- damage patches ---"));
-  assert.match(replace, /a=d,d=i,i=\$\{frames\.imageIds\.base\}/);
-  assert.match(replace, /a=p,i=\$\{frames\.imageIds\.base\}/);
+  // The base on screen, which alternates between the pane's two (`paneImageIds`).
+  assert.match(replace, /a=d,d=i,i=\$\{frames\.shownBase\}/);
+  assert.match(replace, /a=p,i=\$\{frames\.shownBase\}/);
 });
 
 test("bare open never restores or saves an internal blank page", () => {

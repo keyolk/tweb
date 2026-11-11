@@ -374,6 +374,102 @@ tmux HEAD  PR #5274 grid-resident kitty image. Pre-merge. Validate on the integr
 Support is declared not as a version number but as "this capability was validated in this combination"
 (consistent with DESIGN.md section 15's policy).
 
+### 2.5 Design: TWeb writes the placeholders itself, on stock tmux (2026-11-11)
+
+#5274 is still not merged, and the overlay keeps leaving a page drawn over another window whenever a
+visibility probe, a hook or a delete is missed or overtaken (#245 fixed one ordering; the class remains).
+The placeholder half of #5274 does not need tmux's help: a placeholder is ordinary text, and stock tmux
+stores and redraws it like any other cell. So TWeb can transmit with `a=t`, create the virtual placement
+with `a=p,U=1`, and print the `U+10EEEE` cells into its own pane. tmux then owns visibility.
+
+#### What was measured
+
+tmux 3.8, Ghostty 1.4.0, a dedicated `tmux -L` server and a separate Ghostty window, judged from window
+captures. Both `kitten icat --unicode-placeholder --passthrough=tmux` and hand-built sequences.
+
+| Case | Result |
+|---|---|
+| render through tmux | drawn; the grid holds the placeholder cells (`capture-pane` counted 780 of 780) |
+| switch to another window | the image is gone |
+| switch back | the image is back with no retransmit |
+| `display-popup` over the image | the popup covers it; the image returns when the popup closes |
+| split | the image stays in its pane |
+| `kill-pane` | the image is gone |
+| corrupted id colour (control) | nothing is drawn — so the positive results are evidence |
+| a patch image over part of the base | its cells show the patch, the rest the base |
+| ids at or above 2^24 (TWeb's are ≥ 2^29) | drawn, with the third diacritic carrying the id's high byte |
+| client attached after the transmit | **blank** — the data only reached the clients attached at the time |
+| retransmit under the **same** id (`a=t` or today's `a=T`) | **blank from the first chunk until the last** |
+| retransmit under a **second** id, then flip | the old frame stays until the flip — overlay and placeholder both |
+| `a=f` frame edit under a placeholder | kept on screen, but rejected: on Ghostty 1.4 its cost scales with the base image's area (Ghostty CPU 45% against 12-15% for a patch, 60x60 edits at 60Hz on a 2880x1800 base, measured 2026-10-29) |
+
+The same-id blank applies to the shipping overlay path too. Locally a whole frame is one `t=f` command, so
+the blank is invisible. Over SSH the transport is `t=d` inline, a frame is tens of 3KB chunks, and the
+page is blank for each frame's transfer time. That is the most likely cause of the remote flicker.
+
+#### Design
+
+1. **Base id double-buffer.** A pane owns two base ids. A whole frame is transmitted to the idle id,
+   then the pane flips: `a=p,U=1` for the new id, the placeholder cells rewritten in the new id's colour,
+   and `a=d,d=I` for the old id. This fixes the remote blank on its own, and is worth doing on the overlay
+   path first. `image_id.rs` (`STRIDE` 16, base + 8 patches) has room for a second base; the layout
+   changes in Rust and `main.cjs` in lockstep.
+2. **Placeholder grid.** The cells are written in-band through the pane writer, so they are ordered with
+   the frames. Cost per flip, measured by encoding: 42KB at 120x36 cells, 122KB at 200x60 with every
+   cell carrying its diacritics; 17KB / 47KB when only the first cell of a row does and the rest inherit
+   from the left neighbour. The diacritic table has 297 entries, so a pane wider or taller than 297 cells
+   **requires** inheritance — not yet measured on Ghostty, first item to verify. On the remote path the
+   flip bytes count against `REMOTE_BYTE_BUDGET`.
+3. **Patches.** A patch is its own image with its own virtual placement; its cells are rewritten with the
+   patch id. A whole frame's flip rewrites every cell, which retires all patches in the same write. The
+   relative-placement path (`P=`) is not used here.
+4. **Text the engine writes into the pane.** The caret (`writeTerminalCaret`: CUP + `CSI 6 q`) only moves
+   the cursor and sets its shape, so it does not overwrite a cell. `writeFloatStatus` and the `ESC[2J` in
+   `showPageBackInPane` do destroy cells: the float status is meant to replace the page, and after the
+   clear the grid is rewritten with the next flip.
+5. **Late attach.** A `client-attached` / `client-session-changed` hook (next to the `image_sweep` hooks)
+   marks the pane so its next frame is a whole frame. Missing this hook leaves a blank pane until the next
+   frame — never a page over another window.
+6. **Gating.** Like `relative-placement.cjs`: placeholders only where the client's `client_termtype` names
+   a terminal it was measured on (Ghostty ≥ 1.4), `TWEB_PLACEHOLDERS=0/1` to force. Everything else keeps
+   the overlay path, which stays as it is.
+7. **What can then go.** On the placeholder path the visibility-driven deletes (client-tty delete,
+   in-band delete on hide, the `image_sweep` hooks) are not needed to keep the screen correct. They stay
+   for freeing image memory in the terminal, where a miss costs memory, not a wrong picture. Visibility is
+   still read to stop rendering hidden panes.
+
+#### Order of work
+
+1. Double-buffer the overlay path (item 1). **Done, 2026-11-11.** The second base is the last of the
+   pane's reserved ids (`base + PATCH_ID_COUNT`), so the frontend's deletes still cover it and no
+   Rust change was needed; the patch pool is one shorter. Patches a whole frame contains are retired
+   in the write that places it, not when it is queued. Measured:
+   - inline transport, local hosted engine, 20s of `bench/pages/animated-counter.html`: whole frames
+     transferred with no base on screen went from 332 of 332 to 1 of 432 (the first frame, which
+     has nothing before it).
+   - over SSH from Ghostty to `coder.regular`, same page, 2x200 window captures ~0.1s apart: page
+     bare in 9 and 11 captures before (one of them the window opening), 0 and 0 after.
+   - `bench/window-switch.py`, 30 trials: stale 0 at every frame-path delay, as before.
+
+   Found on the way: the hosted control channel lost lines. Electron's stdout is non-blocking and
+   `writeProtocolLine` ignored a short `writeSync`, so a FRAME line was cut at exactly 65536 bytes
+   with the next line glued on; `twebd` rejected both, and the pane lost those chunks. It now goes
+   through `writeFully`, which also waits out `EAGAIN`.
+2. Verify inheritance-only placeholders on Ghostty, and a 300+ column pane. **Done, 2026-11-11**,
+   tmux 3.8 + Ghostty 1.4:
+   - inheritance works: a 340x20 image with diacritics only on each row's first cell drew every
+     column, with markers every 50 columns and the last 10 in place. The 297-entry table limits rows
+     only, and a pane taller than 297 rows is not a case worth designing for.
+   - scrollback works: an image pushed off the top by text comes back with it in copy-mode.
+   - copy-mode selection is a real cost. tmux redraws the selected cells in reverse video, which
+     changes their colour, so the selected strip of the page disappears while it is selected; and
+     the copied text is `U+10EEEE` characters. Today the overlay hides the selection instead. A
+     tweb pane gives the mouse and keys to the page, so tmux copy-mode over it is rare, but the
+     placeholder path should bind copy-mode on a tweb pane to the page's own selection or refuse it.
+3. Placeholder path behind the gate (items 2-6), with `bench/window-switch.py` extended to count the
+   placeholder cells left in a hidden pane instead of placements.
+4. Remove the overlay-only cleanup from the placeholder path (item 7).
+
 ## 3. Input fidelity — Browser mode, the Korean IME, the mouse
 
 ### 3.1 Research findings
