@@ -93,7 +93,10 @@ impl Registration {
         let path = entry_path(dir, pane);
         // The pid goes in beside the id so a frontend only ever removes its own entry. After
         // `respawn-pane -k` the old frontend can exit after the new one recorded the same pane.
-        let owner = format!("{base} {}", std::process::id());
+        // The third field opts this frontend in to `wake`: it handles SIGUSR2. An entry
+        // written by an older frontend has no such field, and SIGUSR2's default action would
+        // end that pane, so `wake` leaves it alone.
+        let owner = format!("{base} {} {WAKE_MARK}", std::process::id());
         std::fs::write(&path, &owner).ok()?;
         Some(Self { path, owner })
     }
@@ -171,7 +174,12 @@ pub fn run() {
     }
 }
 
-/// The frontends recorded in `dir`, by pid. An entry is `"<base id> <pid>"`.
+/// The registry field that says a frontend handles SIGUSR2 (see `Registration::record_in`).
+const WAKE_MARK: &str = "w";
+
+/// The frontends recorded in `dir` that can take a wake, by pid. An entry is
+/// `"<base id> <pid> w"`; one without the mark is from a frontend that predates the wake and
+/// would be killed by it.
 fn recorded_pids(dir: &Path) -> Vec<i32> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -180,7 +188,9 @@ fn recorded_pids(dir: &Path) -> Vec<i32> {
         .flatten()
         .filter_map(|entry| {
             let content = std::fs::read_to_string(entry.path()).ok()?;
-            content.split_whitespace().nth(1)?.parse::<i32>().ok()
+            let mut fields = content.split_whitespace().skip(1);
+            let pid = fields.next()?.parse::<i32>().ok()?;
+            (fields.next() == Some(WAKE_MARK)).then_some(pid)
         })
         .filter(|pid| *pid > 1)
         .collect()
@@ -412,13 +422,26 @@ mod tests {
     fn the_wake_reads_pids_from_the_registry_and_skips_what_is_not_a_frontend() {
         let dir = scratch("wake");
         let me = Registration::record_in(&dir, "%5", 100).unwrap();
-        std::fs::write(entry_path(&dir, "%6"), "200 1").unwrap();
+        std::fs::write(entry_path(&dir, "%6"), "200 1 w").unwrap();
+        // An older frontend's entry: no wake mark, no SIGUSR2 handler. Signalling it would end
+        // the pane, so it is never listed whatever its pid.
+        std::fs::write(
+            entry_path(&dir, "%7"),
+            format!("300 {}", std::process::id() + 1),
+        )
+        .unwrap();
         std::fs::write(entry_path(&dir, "%8"), "garbage").unwrap();
+        assert!(
+            std::fs::read_to_string(entry_path(&dir, "%5"))
+                .unwrap()
+                .ends_with(" w"),
+            "a frontend that handles SIGUSR2 says so in its entry"
+        );
         let pids = recorded_pids(&dir);
         assert_eq!(
             pids,
             vec![std::process::id() as i32],
-            "pid 1 and garbage are never signalled"
+            "pid 1, garbage and unmarked (older) frontends are never signalled"
         );
         // The test binary is not named `tweb`, so even a live recorded pid is left alone.
         assert!(!is_pane_frontend(std::process::id() as i32));
