@@ -168,7 +168,7 @@ const {
   takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire,
 } = require("./frame-context.cjs");
 const {
-  createPaneWindows, surfaceHeld, holdSurface, releaseSurface,
+  createPaneWindows, surfaceHeld, holdSurface, releaseSurface, heldScreenshotFrame,
   applyFrameRate: applyPaneFrameRate, isThrottled,
 } = require("./pane-windows.cjs");
 const {
@@ -5903,13 +5903,41 @@ function enforceRendererMemory() {
 
 async function agentScreenshot(params) {
   const contents = agentContents();
-  // On a hidden pane the hold has already collected a frame at the restored size, and
-  // going back to the compositor for a second copy of it is what failed intermittently.
-  const image = currentWindows().agentSurfaceFrame || await contents.capturePage();
+  const image = await screenshotImage(contents);
   if (!params.path) return { png: image.toPNG().toString("base64") };
   const target = path.resolve(params.path);
   writeFileSync(target, image.toPNG());
   return { path: target, size: image.getSize() };
+}
+
+// The pixels `screenshot` returns.
+//
+// A visible pane paints on its own, so the compositor's frame is the page as it is now.
+//
+// A hidden pane does not. Its surface is collapsed between agent calls, so a change one call
+// made (an `eval scrollTo`, a click) is never drawn before the hold closes, and the next call's
+// hold gets the compositor's copy of the surface from before the collapse. Waiting for paints
+// does not help: `invalidate()` answers in the same millisecond with that same copy. Measured
+// on a hidden pane after a hidden `eval scrollTo(0,700)`, with `scrollY` reading 700 after
+// every shot: the kept frame showed y=0 in 8 of 10 screenshots, and taking the second paint
+// after a repaint instead showed y=0 in 10 of 10. `Page.captureScreenshot` makes the renderer
+// produce a frame for the capture, which is why the Chrome engine never had this; on the same
+// pane it returned y=700 every time. The kept frame and `capturePage` stay as fallbacks for a
+// renderer that does not answer.
+async function screenshotImage(contents, record = currentPane(), windows = currentWindows()) {
+  if (!record.visible && ensureDebugger({ webContents: contents })) {
+    try {
+      const shot = await contents.debugger.sendCommand("Page.captureScreenshot", { format: "png" });
+      const image = nativeImage.createFromBuffer(Buffer.from(shot.data, "base64"));
+      if (!image.isEmpty()) return image;
+    } catch (error) {
+      if (debugLogging) console.error(`tweb: hidden screenshot via CDP failed: ${error.message}`);
+    }
+  }
+  // On a hidden pane the hold has already collected a frame at the restored size, and going
+  // back to the compositor for a second copy of it is what failed intermittently. Only there:
+  // see heldScreenshotFrame for the stale frame a visible pane used to get.
+  return heldScreenshotFrame(windows, record.visible) || await contents.capturePage();
 }
 
 // How many viewports one full-page capture will stitch before it stops and returns what it has.

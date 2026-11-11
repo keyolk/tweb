@@ -3,7 +3,8 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
-  createPaneWindows, surfaceHeld, holdSurface, releaseSurface, applyFrameRate, isThrottled,
+  createPaneWindows, surfaceHeld, holdSurface, releaseSurface, heldScreenshotFrame, applyFrameRate,
+  isThrottled,
 } = require("./pane-windows.cjs");
 
 const TTL = 30_000;
@@ -95,6 +96,29 @@ test("one pane's hold does not touch another's", () => {
   holdSurface(driven, 1000, TTL);
   assert.equal(surfaceHeld(driven, 1100).held, true);
   assert.equal(surfaceHeld(idle, 1100).held, false);
+});
+
+// An expired hold took its count with it but left the frame, and every later screenshot
+// returned that frame: the page scrolled and the hash did not change.
+test("an expired hold drops the kept frame with its count", () => {
+  const windows = createPaneWindows();
+  holdSurface(windows, 1000, TTL);
+  windows.agentSurfaceFrame = { fake: "frame" };
+  assert.equal(surfaceHeld(windows, 1000 + TTL + 1).expired, true);
+  assert.equal(windows.agentSurfaceFrame, null);
+});
+
+// The kept frame is the paint a hidden pane's hold waited for. A visible pane's compositor is
+// current; the kept frame may come from a hold opened before the page moved.
+test("a screenshot uses the kept frame only on a hidden pane under a hold", () => {
+  const windows = createPaneWindows();
+  const frame = { fake: "frame" };
+  holdSurface(windows, 1000, TTL);
+  windows.agentSurfaceFrame = frame;
+  assert.equal(heldScreenshotFrame(windows, false), frame);
+  assert.equal(heldScreenshotFrame(windows, true), null);
+  windows.agentSurfaceHolds = 0;
+  assert.equal(heldScreenshotFrame(windows, false), null);
 });
 
 test("releasing a hold that is not there does not go negative", () => {

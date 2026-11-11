@@ -64,6 +64,10 @@ function surfaceHeld(windows, now) {
   if (now > windows.agentSurfaceHoldDeadline) {
     const outstanding = windows.agentSurfaceHolds;
     windows.agentSurfaceHolds = 0;
+    // The frame goes with the holds. Left behind, it outlived every hold that could have
+    // dropped it, and `screenshot` returned it on every later call: the page scrolled and
+    // the hash stayed the same, until some later hidden call happened to replace it.
+    windows.agentSurfaceFrame = null;
     return { held: false, expired: true, outstanding };
   }
   return { held: true, expired: false };
@@ -89,6 +93,20 @@ function releaseSurface(windows) {
   const last = windows.agentSurfaceHolds === 0;
   if (last) windows.agentSurfaceFrame = null;
   return last;
+}
+
+/**
+ * The frame a screenshot may use instead of asking the compositor, or null to ask it.
+ *
+ * The kept frame is only for a hidden pane under a hold: there it is the paint the hold waited
+ * for, and asking the compositor again during the restore was measured failing. A visible pane
+ * paints on its own, so its compositor is current. The kept frame is not: it was taken when some
+ * hold opened, possibly a `wait` that began while the pane was hidden and is still polling, and
+ * the page has scrolled since.
+ */
+function heldScreenshotFrame(windows, visible) {
+  if (visible || windows.agentSurfaceHolds <= 0) return null;
+  return windows.agentSurfaceFrame || null;
 }
 
 /**
@@ -118,6 +136,7 @@ module.exports = {
   surfaceHeld,
   holdSurface,
   releaseSurface,
+  heldScreenshotFrame,
   applyFrameRate,
   isThrottled,
 };
