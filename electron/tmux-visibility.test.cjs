@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { visibleTmuxClientTtys, parseVisibilityPush } = require("./tmux-visibility.cjs");
+const { visibleTmuxClientTtys, parseVisibilityPush, hideTransition } = require("./tmux-visibility.cjs");
 
 const identity = { session: "work", windowId: "@3", paneId: "%7" };
 
@@ -104,4 +104,33 @@ test("a pushed placement follows a pane moved to another window", () => {
 test("a pushed placement follows a pane joined into another session", () => {
   const push = parseVisibilityPush(encode("other\t@2\t%7\n/dev/ttys001\tother\t@2\t0\t%7\troot"));
   assert.deepEqual([...visibleTmuxClientTtys(push.clients, push.placement)], ["/dev/ttys001"]);
+});
+
+// The window switch the stale image came from: the only client moved to another window. The
+// direct delete to its tty can overtake frames still queued in tmux, so a second delete follows
+// them through the pane's own output.
+test("the last client leaving the pane asks for the delete in band as well", () => {
+  const t = hideTransition(new Set(["/dev/ttys001"]), new Set());
+  assert.deepEqual(t.evicted, ["/dev/ttys001"]);
+  assert.equal(t.deleteInBand, true);
+});
+
+// tmux forwards an in-band delete to every client of the session, so it must not go out while any
+// client still shows the pane: it would blank the page for that client.
+test("a client leaving while another still watches gets only its direct delete", () => {
+  const t = hideTransition(new Set(["/dev/ttys001", "/dev/ttys002"]), new Set(["/dev/ttys002"]));
+  assert.deepEqual(t.evicted, ["/dev/ttys001"]);
+  assert.equal(t.deleteInBand, false);
+});
+
+test("a pane that was already hidden sends nothing again", () => {
+  const t = hideTransition(new Set(), new Set());
+  assert.deepEqual(t.evicted, []);
+  assert.equal(t.deleteInBand, false);
+});
+
+test("a client arriving evicts nobody", () => {
+  const t = hideTransition(new Set(["/dev/ttys001"]), new Set(["/dev/ttys001", "/dev/ttys002"]));
+  assert.deepEqual(t.evicted, []);
+  assert.equal(t.deleteInBand, false);
 });
