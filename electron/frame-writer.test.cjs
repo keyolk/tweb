@@ -193,3 +193,26 @@ test("channelSink hands whole buffers to the frontend and its promise gates the 
   await writer.flush();
   assert.deepEqual(sent, ["frame-one", "frame-two"]);
 });
+
+// Electron's stdout is non-blocking. A full pipe threw EAGAIN or returned short, and the rest of a
+// hosted FRAME line was lost: lines were cut at exactly 65536 bytes with the next one glued on.
+test("writeFully waits out EAGAIN and finishes the buffer", () => {
+  const chunks = [];
+  let calls = 0;
+  const write = (fd, buffer, offset, length) => {
+    calls += 1;
+    if (calls === 2) throw Object.assign(new Error("again"), { code: "EAGAIN" });
+    const n = Math.min(length, 4);
+    chunks.push(buffer.subarray(offset, offset + n).toString());
+    return n;
+  };
+  let waits = 0;
+  assert.equal(writeFully(write, 1, "abcdefghij", { wait: () => { waits += 1; } }), 10);
+  assert.equal(chunks.join(""), "abcdefghij");
+  assert.equal(waits, 1);
+});
+
+test("writeFully gives up on an error that is not EAGAIN", () => {
+  const write = () => { throw Object.assign(new Error("gone"), { code: "EPIPE" }); };
+  assert.throws(() => writeFully(write, 1, "abc", { wait: () => {} }), /gone/);
+});

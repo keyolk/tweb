@@ -143,7 +143,7 @@ const {
   watchServiceWorkers,
 } = require("./extensions.cjs");
 const { extensionReport } = require("./extension-report.cjs");
-const { createPaneWriter, fdSink, channelSink } = require("./frame-writer.cjs");
+const { createPaneWriter, fdSink, channelSink, writeFully } = require("./frame-writer.cjs");
 const { serverIdentityFrom, paneKey } = require("./pane-identity.cjs");
 const {
   PaneRegistry, createPaneRecord, applyVisibility: recordVisibility,
@@ -680,7 +680,9 @@ function frameContextFor(paneKey) {
 function writeProtocolLine(line) {
   if (!hostedRuntime) return;
   try {
-    writeSync(1, line);
+    // Whole, never part: `writeSync` returns short on a full non-blocking pipe, and the rest of
+    // the line was silently lost — see `writeFully`.
+    writeFully(writeSync, 1, line);
   } catch (error) {
     // stdout closing means the supervisor is gone. The orphan watchdog is what reaps this
     // process; complaining once per frame here would fill the log while it does.
