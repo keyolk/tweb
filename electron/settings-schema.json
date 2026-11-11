@@ -53,6 +53,16 @@
       "description": "Drop to a low idle rate when nothing moves. `--no-adaptive-frame-rate` overrides it."
     },
     {
+      "key": "memory.renderer_limit_mb",
+      "type": "int",
+      "default": 1536,
+      "min": 0,
+      "max": 65536,
+      "env": "TWEB_RENDERER_LIMIT_MB",
+      "applies": "live",
+      "description": "A tab whose renderer stays above this many MB for 30 seconds is reloaded when it is hidden, silent and untouched for 5 minutes, which gives the memory back; otherwise the pane warns once. 0 turns it off. `tweb tabs` and `tweb diag` show each renderer's size."
+    },
+    {
       "key": "page.transparent",
       "type": "bool",
       "default": false,

@@ -108,6 +108,7 @@ const {
 const { pressEvents, parseChord } = require("./agent-key.cjs");
 const { pdfKeyAction, pdfViewportScript, findPdfFrame } = require("./pdf-frame.cjs");
 const { recoveryDecision } = require("./renderer-recovery.cjs");
+const { rendererUsage, memoryDecision } = require("./renderer-memory.cjs");
 const { IDLE: FIND_IDLE, findStep, endStep } = require("./find-session.cjs");
 const { withHistoryLock } = require("./history-lock.cjs");
 const {
@@ -283,6 +284,10 @@ const tabPanes = new Map();
 // Recovery attempts per tab, so a page that crashes its renderer on every load stops being
 // reloaded instead of looping forever. See renderer-recovery.cjs.
 const tabRendererRecoveries = new Map();
+// The person's last key, click or paste per tab (epoch-ms), and the memory guard's per-tab state.
+// WeakMaps: a closed tab takes its entries with it. See renderer-memory.cjs.
+const tabLastUserInput = new WeakMap();
+const tabMemoryGuard = new WeakMap();
 // Shared on purpose, and shared BEYOND this process: `historyPath` is one file per user-data
 // directory that every pane and every engine appends to under a lock, because history is the user's,
 // not the pane's. See `historyLockPath`.
@@ -5616,6 +5621,7 @@ function agentWaitFor(params) {
 }
 
 function agentTabList() {
+  const memory = tabMemoryByTab();
   return {
     active: currentWindows().activeTabIndex,
     tabs: currentWindows().tabs.map((tab, index) => ({
@@ -5624,8 +5630,114 @@ function agentTabList() {
       url: tabDisplayUrl(tab),
       active: index === currentWindows().activeTabIndex,
       engine: tabEngine(tab),
+      // MB of the renderer the tab's main frame runs in; null on the Chrome and WebKit engines,
+      // whose processes are not this one's children. See renderer-memory.cjs.
+      memoryMb: memory.get(tab)?.mb ?? null,
+      sharedRenderer: memory.get(tab)?.shared ?? false,
     })),
   };
+}
+
+// Every renderer process a tab uses: its main frame's first, then each out-of-process iframe's.
+// Empty for a tab on another engine, which has no Electron frames.
+function tabRendererPids(tab) {
+  if (!tab || tab.isDestroyed() || tabEngine(tab) !== "electron") return [];
+  const mainFrame = tab.webContents.mainFrame;
+  if (!mainFrame) return [];
+  const pids = [];
+  for (const frame of [mainFrame, ...(mainFrame.framesInSubtree || [])]) {
+    const pid = frame?.osProcessId;
+    if (Number.isSafeInteger(pid) && pid > 0 && !pids.includes(pid)) pids.push(pid);
+  }
+  return pids;
+}
+
+/**
+ * Renderer memory for every tab of every pane this engine serves.
+ *
+ * Process-wide rather than per pane: in a hosted engine two panes' tabs can share one renderer,
+ * and `getAppMetrics` is one call for all of them.
+ */
+function rendererMemorySnapshot() {
+  const entries = [];
+  forEachPane((record) => {
+    currentWindows().tabs.forEach((tab, index) => {
+      if (!tab.isDestroyed()) entries.push({ record, tab, index: entries.length, paneTabIndex: index });
+    });
+  });
+  const usage = rendererUsage(
+    app.getAppMetrics(),
+    entries.map((entry) => ({ index: entry.index, pids: tabRendererPids(entry.tab) })),
+  );
+  return { entries, usage };
+}
+
+/** Each tab's main-frame renderer: its size, and whether another tab's main frame shares it. */
+function tabMemoryByTab(snapshot = rendererMemorySnapshot()) {
+  const byTab = new Map();
+  for (const process of snapshot.usage) {
+    for (const index of process.main) {
+      byTab.set(snapshot.entries[index].tab, { pid: process.pid, mb: process.mb, shared: process.main.length > 1 });
+    }
+  }
+  return byTab;
+}
+
+/** What `diag` reports: every renderer, largest first, with the panes and tabs it serves. */
+function rendererMemoryReport() {
+  const snapshot = rendererMemorySnapshot();
+  return {
+    limitMb: settings.get("memory.renderer_limit_mb"),
+    renderers: snapshot.usage.map((process) => ({
+      pid: process.pid,
+      mb: process.mb,
+      tabs: process.tabs.map((index) => {
+        const entry = snapshot.entries[index];
+        return {
+          pane: entry.record?.paneId ?? ownTmuxPane ?? null,
+          index: entry.paneTabIndex,
+          url: tabDisplayUrl(entry.tab),
+          main: process.main.includes(index),
+        };
+      }),
+    })),
+  };
+}
+
+// The memory guard, on the engine's 1s tick. See renderer-memory.cjs for the policy and the
+// measurements behind it; this only gathers the facts and carries the decision out.
+function enforceRendererMemory() {
+  const limitMb = settings.get("memory.renderer_limit_mb");
+  if (!limitMb) return;
+  const snapshot = rendererMemorySnapshot();
+  const byTab = tabMemoryByTab(snapshot);
+  const now = Date.now();
+  for (const entry of snapshot.entries) {
+    withPaneScope(entry.record, () => {
+      const { tab } = entry;
+      const memory = byTab.get(tab);
+      const onScreen = tab === currentWindows().win && (currentPane().visible || inputState().floating);
+      const decision = memoryDecision({
+        mb: memory?.mb ?? null,
+        limitMb,
+        onScreen,
+        audible: !tab.webContents.audioMuted && tab.webContents.isCurrentlyAudible(),
+        shared: Boolean(memory?.shared),
+        lastInputAt: tabLastUserInput.get(tab) ?? null,
+        now,
+      }, tabMemoryGuard.get(tab));
+      tabMemoryGuard.set(tab, decision.state);
+      const url = tabDisplayUrl(tab);
+      if (decision.action === "reload") {
+        console.error(`tweb: renderer ${memory.pid} at ${memory.mb}MB (limit ${limitMb}MB), reloading hidden tab ${url}`);
+        // Same entry, same process: measured, a 4104MB renderer was back to 893MB after `reload()`.
+        tab.webContents.reload();
+      } else if (decision.action === "warn") {
+        console.error(`tweb: renderer ${memory.pid} at ${memory.mb}MB (limit ${limitMb}MB), not reloading ${url}: ${decision.reason}`);
+        sendToMainTabFrame(tab, "tweb-flash", `⚠ this page uses ${memory.mb}MB — reload (r) gives it back`);
+      }
+    });
+  }
 }
 
 async function agentScreenshot(params) {
@@ -6331,6 +6443,10 @@ function sendPresence(pane = currentPane()) {
 // A key, a click, a paste from the person in this pane. While an agent drives, say once that the
 // two of them are racing on one page.
 function noteUserInput() {
+  // Recorded before the presence check, which returns early whenever no agent is driving. The
+  // memory guard reads it: a tab the person worked in recently is never reloaded under them.
+  const inputTab = currentWindows().win;
+  if (inputTab && !inputTab.isDestroyed()) tabLastUserInput.set(inputTab, Date.now());
   if (!presenceLib.noteUserInput(panePresence(), Date.now())) return;
   const tab = currentWindows().win;
   const driving = presenceLib.presenceModel(panePresence(), Date.now()).driving;
@@ -6357,7 +6473,13 @@ async function dispatchAgentCommand(method, params) {
       } catch (error) {
         page = { error: String(error?.message || error) };
       }
-      return { ...engine, page };
+      let memory = null;
+      try {
+        memory = rendererMemoryReport();
+      } catch (error) {
+        memory = { error: String(error?.message || error) };
+      }
+      return { ...engine, memory, page };
     }
     // Reporting only, like `diag`. The loader keeps its results precisely so this can answer
     // without re-reading the profile directory.
@@ -10482,7 +10604,15 @@ app.whenReady().then(async () => {
     app.quit();
   }, 1000);
   orphanWatchdog.unref();
-  hiddenWindowWatchdog = setInterval(enforceHiddenWindows, 1000);
+  hiddenWindowWatchdog = setInterval(() => {
+    enforceHiddenWindows();
+    // Its own try: a failure reading metrics must not stop the hidden-window reconciler.
+    try {
+      enforceRendererMemory();
+    } catch (error) {
+      console.error(`tweb: memory guard failed: ${error.message}`);
+    }
+  }, 1000);
   hiddenWindowWatchdog.unref();
   enforceHiddenWindows();
   getTmuxPaneOrigin();
