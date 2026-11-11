@@ -251,7 +251,7 @@ test("a whole frame retires the patches it contains, not the ones sent while it 
   assert.deepEqual(frames.retireOnPlace, []);
 });
 
-test("a retired patch id the pool has reissued is not deleted with the frame", () => {
+test("no patch id is reissued while it waits to be retired", () => {
   const frames = context(100);
   const ids = [];
   for (let i = 0; i < frames.imageIds.patchIds.length; i += 1) {
@@ -260,9 +260,20 @@ test("a retired patch id the pool has reissued is not deleted with the frame", (
     notePatch(frames, id, { x: 0, y: 0, width: 1, height: 1 });
   }
   retirePatchesOnPlace(frames);
-  // The pool wraps during the transfer and hands the first id out again for a newer patch.
-  const reissued = nextPatchId(frames);
-  assert.equal(reissued, ids[0]);
-  notePatch(frames, reissued, { x: 0, y: 0, width: 1, height: 1 });
-  assert.ok(!takePatchesToRetire(frames).includes(reissued));
+  // Every id now waits on the frame in flight. None is reissued: as a placeholder its cells still
+  // name it, and a new patch under that id would draw into them too. The caller sends a whole frame.
+  assert.equal(nextPatchId(frames), null);
+  assert.deepEqual(takePatchesToRetire(frames).sort(), ids.sort());
+  // Once retired they are free again.
+  assert.notEqual(nextPatchId(frames), null);
+});
+
+test("a patch id waiting on the frame in flight is skipped, not reissued", () => {
+  const frames = context(100);
+  const first = nextPatchId(frames);
+  notePatch(frames, first, { x: 0, y: 0, width: 1, height: 1 });
+  retirePatchesOnPlace(frames);
+  const issued = [];
+  for (let i = 0; i < frames.imageIds.patchIds.length; i += 1) issued.push(nextPatchId(frames));
+  assert.ok(!issued.includes(first));
 });

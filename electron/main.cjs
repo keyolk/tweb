@@ -69,6 +69,9 @@ const {
 } = require("./terminal-focus.cjs");
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const { relativePatchesDecision } = require("./relative-placement.cjs");
+const {
+  placeholderBlock, placeholdersDecision, MAX_ROWS: PLACEHOLDER_MAX_ROWS,
+} = require("./placeholder-cells.cjs");
 const { passthroughRuns } = require("./tmux-passthrough.cjs");
 const {
   shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
@@ -912,6 +915,42 @@ const relativePatches = relativePatchesDecision({
   override: process.env.TWEB_RELATIVE_PATCHES,
 });
 console.error(`tweb: patch placement ${relativePatches.allowed ? "relative" : "absolute"} (${relativePatches.reason})`);
+
+// Whether this terminal draws the page through Unicode placeholders — see placeholder-cells.cjs.
+// The terminal half is decided here, once, from the same client facts as relative patches; the
+// tmux half is per pane (`usesPlaceholders`), because a hosted engine can serve a pane outside tmux
+// beside ones inside it. `inTmux: true` here only means "if the pane is in tmux".
+const placeholders = placeholdersDecision({
+  inTmux: true,
+  clientTermtype: attachedTerminalType(),
+  override: process.env.TWEB_PLACEHOLDERS,
+});
+console.error(`tweb: page cells ${placeholders.allowed ? "placeholders" : "overlay"} (${placeholders.reason})`);
+
+function usesPlaceholders(record = currentPane()) {
+  if (!placeholders.allowed || !paneIsInTmux(record)) return false;
+  // A pane taller than the diacritic table can name has no way to address its lower rows (a
+  // portrait monitor at a small font gets there). It keeps the overlay rather than losing them.
+  const frames = frameContexts.get(record.key);
+  return !frames || frames.cells.rows <= PLACEHOLDER_MAX_ROWS;
+}
+
+// The page's cells for whichever base is on screen, as plain pane text. Not passthrough: these are
+// grid cells tmux stores, which is the point. Pane-relative coordinates, so no origin is needed.
+function basePlaceholderCells(frames, id = frames.shownBase) {
+  return placeholderBlock(id, { rows: frames.cells.rows, cols: frames.cells.cols });
+}
+
+// Graphics strings and cell text as one buffer for the pane writer. The writer takes a string as
+// latin1 ("binary"), which is right for escape sequences and base64 and destroys anything past
+// U+00FF: the placeholder cells arrived as their low bytes and the page was never drawn. So the
+// cells are encoded as UTF-8 here and the graphics as the bytes they already are.
+function graphicsWithCells(graphics, cells, tail = "") {
+  if (!cells) return graphics + tail;
+  return Buffer.concat([
+    Buffer.from(graphics, "latin1"), Buffer.from(cells, "utf8"), Buffer.from(tail, "latin1"),
+  ]);
+}
 const deflateFrames = deflateFramesAllowed({
   clientTermname,
   term: process.env.TERM,
@@ -1477,9 +1516,13 @@ function applyClientListing(clients, placement) {
   const next = visibleTmuxClientTtys(clients, vis().placement);
   const wasVisible = currentPane().visible;
   const transition = hideTransition(vis().clientTtys, next);
+  // A placeholder pane has nothing to delete on a hide: its page is cells in the window the client
+  // left, and tmux stopped drawing them. Its image data stays in the terminal, so going back shows
+  // the page at once rather than after the next frame. Freed when the pane closes.
+  const evicted = usesPlaceholders() ? [] : transition.evicted;
   // A client that stopped showing this pane keeps the image placed on it, so the delete
   // goes to that tty directly.
-  for (const tty of transition.evicted) {
+  for (const tty of evicted) {
     // Logged because it is a pane going blank, and the two reasons for it are indistinguishable
     // from the outside: a client that really stopped showing this pane, or this pane reading
     // another pane's client set and evicting itself from a terminal still watching it. That second
@@ -1492,7 +1535,7 @@ function applyClientListing(clients, placement) {
   }
   // The direct delete above can overtake frames still queued on the way through tmux; this one
   // follows them. See `hideTransition`.
-  if (transition.deleteInBand) deleteImageInBand();
+  if (transition.deleteInBand && !usesPlaceholders()) deleteImageInBand();
   const becameVisible = [...next].some((tty) => !vis().clientTtys.has(tty));
   vis().clientTtys = next;
   const changed = recordVisibility(currentPane(), next.size > 0);
@@ -1602,8 +1645,18 @@ function markShmPane(frames) {
   }
 }
 
+// Shared memory is one reader's medium: the terminal unlinks the object once it has read it, so a
+// second client tmux forwards the same command to finds nothing. Under the overlay that cost a
+// patch the second client never drew, with the base still showing underneath. Under placeholders
+// there is nothing underneath — measured with two clients on one pane, the patched box was blank
+// in a quarter of captures on both. So a placeholder pane takes the file medium, which any number
+// of terminals can read.
+function shmUsableFor(frames) {
+  return shmFramesEnabled && !usesPlaceholders(frames.record);
+}
+
 function nextShmFrameName(frames) {
-  if (!shmFramesEnabled) return null;
+  if (!shmUsableFor(frames)) return null;
   markShmPane(frames);
   const slot = frames.shmSlot;
   frames.shmSlot = (slot + 1) % SHM_RING;
@@ -1679,13 +1732,17 @@ function sendGfxFrameToWorker(frame, frames = currentFrames()) {
 // One write for the whole run, not one per command. The direct transport splits a payload
 // into `m=1` continuation chunks that the terminal must read consecutively, and writing them
 // separately would let a caret sequence land in the middle of one.
-function writeGfxCommands(commands) {
+// `after` is plain pane text written behind the graphics and `retire` graphics written behind
+// that, all in the same write — the placeholder flip needs the new image, then the cells that point
+// at it, then the old image's delete, with no caret sequence able to land between them.
+function writeGfxCommands(commands, { after = "", retire = [] } = {}) {
   if (!commands || commands.length === 0) return;
-  const raw = commands.map((command) => `${ESC}_G${command.header}`
+  const encode = (list) => list.map((command) => `${ESC}_G${command.header}`
     + (command.payload && command.payload.length > 0 ? `;${command.payload}` : "")
     + `${ESC}\\`);
+  const tail = retire.length > 0 ? graphicsPassthroughRuns(encode(retire)) : "";
   try {
-    paneWrite(graphicsPassthroughRuns(raw));
+    paneWrite(graphicsWithCells(graphicsPassthroughRuns(encode(commands)), after, tail));
   } catch (error) {
     void error;
   }
@@ -1710,7 +1767,11 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
   // there. What is left here is the writing, which is the part that needs a terminal.
   // Visibility is read when the frame comes back, not when it was sent: a window switch in
   // between has already deleted the image from the client (see `completeGfxFrame`).
-  const settled = completeGfxFrame(frames, { visible: frames.record.visible !== false });
+  // A placeholder pane's frame may land while it is hidden: it draws into cells tmux is not
+  // showing, so it cannot appear over another window, and the reveal then has it already.
+  const settled = completeGfxFrame(frames, {
+    visible: frames.record.visible !== false || usesPlaceholders(frames.record),
+  });
   // A frame the viewport has already moved past is never placed: the terminal would scale a
   // stale-sized image into the new pane box. Its data is freed instead of drawn. So is a frame
   // that finished after the pane was hidden.
@@ -1727,8 +1788,19 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
     // placed over it, and the new frame already contains what they covered.
     const retire = [replaced, ...takePatchesToRetire(frames)].filter((id) => id !== null)
       .map((id) => ({ header: `a=d,d=I,i=${id},q=2`, payload: "" }));
-    writeGfxCommands([...commands, ...retire]);
-    const bytes = wireBytesOf(commands);
+    let cellBytes = 0;
+    if (usesPlaceholders(frames.record)) {
+      // Three parts in one write: the frame and its virtual placement, the cells pointing at it
+      // (which also overwrite every patch's cells, so the patches are retired visually here), and
+      // the deletes. Graphics are passthrough, the cells are not.
+      const cells = basePlaceholderCells(frames);
+      cellBytes = Buffer.byteLength(cells);
+      writeGfxCommands(commands, { after: cells, retire });
+    } else {
+      writeGfxCommands([...commands, ...retire]);
+    }
+    // The cells are on the link too — 68KB at 240x70 — so a remote pane's rate is paced on them.
+    const bytes = wireBytesOf(commands) + cellBytes;
     frames.wholeWireBytes += bytes;
     frames.wireBytesPerWhole = nextWireEstimate(frames.wireBytesPerWhole, bytes);
   }
@@ -1831,7 +1903,9 @@ function writeGfx(header, payload) {
 // same spot.
 const GFX_CHUNK = 3072;
 
-function writeGfxChunked(header, payload, prefix = "", suffix = "") {
+// `cells` is plain pane text written after the graphics in the same write: a placeholder patch's
+// cells, which must reach tmux's grid and so cannot travel inside the passthrough.
+function writeGfxChunked(header, payload, prefix = "", suffix = "", cells = "") {
   if (!payload || payload.length === 0) {
     writeGfx(header, "");
     return;
@@ -1853,7 +1927,7 @@ function writeGfxChunked(header, payload, prefix = "", suffix = "") {
   raw[0] = `${prefix}${raw[0]}`;
   raw[raw.length - 1] = `${raw[raw.length - 1]}${suffix}`;
   try {
-    paneWrite(graphicsPassthroughRuns(raw));
+    paneWrite(graphicsWithCells(graphicsPassthroughRuns(raw), cells));
   } catch (e) {}
   reassertTerminalCaret();
 }
@@ -2092,6 +2166,13 @@ function deletePlacement(frames = currentFrames()) {
 function replacePlacement(frames = currentFrames()) {
   if (!frames.imageTransferred) return;
   if (frames.pendingImageDelete) deletePlacement(frames);
+  if (usesPlaceholders(frames.record)) {
+    // A virtual placement at the new size and the cells for it. The cells of the old size that
+    // fall outside the new one are tmux's to drop: they were in the grid, and the grid was resized.
+    writeGfx(`a=p,U=1,i=${frames.shownBase},p=${PLACEMENT_ID},c=${frames.cells.cols},r=${frames.cells.rows},q=2`, "");
+    writerFor(frames.record).write(Buffer.from(basePlaceholderCells(frames), "utf8"));
+    return;
+  }
   writeGfx(`a=p,i=${frames.shownBase},p=${PLACEMENT_ID},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
     + (imageZ === 0 ? "" : `,z=${imageZ}`) + ",q=2", "");
 }
@@ -2141,6 +2222,16 @@ function deletePatches(frames = currentFrames()) {
 // `f=32,s=,v=,t=s` of a shared-memory patch.
 function patchPlacementSequence(id, place, frames = currentFrames(), format = "f=100") {
   const z = imageZ === 0 ? "" : `,z=${imageZ}`;
+  if (usesPlaceholders(frames.record)) {
+    // Its own image with its own virtual placement, drawn wherever its cells are: the block of the
+    // pane's cells it covers, rewritten with the patch's id. Its cells count from 0 — they are the
+    // patch's rows and columns, not the pane's. The next whole frame's cells overwrite them.
+    const header = `a=T,U=1,${format},i=${id},p=${PLACEMENT_ID},c=${place.cols},r=${place.rows},q=2`;
+    const cells = placeholderBlock(id, {
+      rows: place.rows, cols: place.cols, top: place.row + 1, left: place.col + 1,
+    });
+    return { header, prefix: "", suffix: "", cells };
+  }
   if (relativePatches.allowed) {
     // Same z as the base: within one z the later placement draws on top, measured on Ghostty 1.4.
     const parent = patchRelativeKeys(place, frames.cells, frames.shownBase, PLACEMENT_ID);
@@ -2181,7 +2272,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   if (!geometry) return false;
 
   const patchStarted = frameProbeMark();
-  if (shmFramesEnabled && sendShmPatch(image, damage, geometry, frames, record, patchStarted)) return true;
+  if (shmUsableFor(frames) && sendShmPatch(image, damage, geometry, frames, record, patchStarted)) return true;
   let png;
   try {
     png = image.crop(geometry.crop).toPNG();
@@ -2209,11 +2300,13 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   const patchEncoded = frameProbeMark();
 
   const id = takeNextPatchId(frames);
-  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames);
+  // Every pool id is waiting on the frame in flight; the damage goes out as a whole frame.
+  if (id === null) return false;
+  const { header, prefix, suffix, cells = "" } = patchPlacementSequence(id, geometry.place, frames);
   // The id may still hold an older patch from a previous cycle through the pool.
   writeGfx(`a=d,d=I,i=${id},q=2`, "");
   const encoded = png.toString("base64");
-  writeGfxChunked(header, encoded, prefix, suffix);
+  writeGfxChunked(header, encoded, prefix, suffix, cells);
   frames.patchWireBytes += encoded.length + header.length;
   frameProbeRecord("patch", {
     // No `pace`: a patch deliberately bypasses the pacer, which is the whole reason it
@@ -2262,11 +2355,12 @@ function sendShmPatch(image, damage, geometry, frames, record, patchStarted) {
   }
   const patchEncoded = frameProbeMark();
   const id = takeNextPatchId(frames);
+  if (id === null) return false;
   const { width, height } = geometry.crop;
-  const { header, prefix, suffix } = patchPlacementSequence(id, geometry.place, frames,
+  const { header, prefix, suffix, cells = "" } = patchPlacementSequence(id, geometry.place, frames,
     `f=32,s=${width},v=${height},t=s`);
   writeGfx(`a=d,d=I,i=${id},q=2`, "");
-  writeGfxChunked(header, Buffer.from(name).toString("base64"), prefix, suffix);
+  writeGfxChunked(header, Buffer.from(name).toString("base64"), prefix, suffix, cells);
   frameProbeRecord("patch", {
     patch: frameProbeMs(patchStarted, patchEncoded),
     transfer: frameProbeMs(patchEncoded, frameProbeMark()),
@@ -2296,9 +2390,15 @@ function transferFrame(pixels, generation, format = "png", size = null, probe = 
   // whose pixel size no longer matches still covers exactly the pane. The id is filled in at
   // dispatch, where it is chosen; `f=` is left to the worker, which knows whether it is writing
   // a PNG or raw pixels.
-  const header = `a=T,i=${WHOLE_FRAME_ID},p=${PLACEMENT_ID},C=1,`
+  // In placeholder mode the same command also makes the virtual placement (`U=1`), measured on
+  // Ghostty 1.4 to draw under cells already in the grid; the cells follow when it is placed.
+  // No z for a placeholder: the image IS the cell's content, so a z below the text drew the
+  // placeholder glyph's own fallback over it (measured, Ghostty 1.4: the page came out as rows of
+  // boxes). The cursor and the IME preedit `imageZ` exists for are drawn over cell content anyway.
+  const placeholder = usesPlaceholders();
+  const header = `a=T,${placeholder ? "U=1," : ""}i=${WHOLE_FRAME_ID},p=${PLACEMENT_ID},C=1,`
     + `c=${currentFrames().cells.cols},r=${currentFrames().cells.rows}`
-    + (imageZ === 0 ? "" : `,z=${imageZ}`);
+    + (imageZ === 0 || placeholder ? "" : `,z=${imageZ}`);
   queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
   inputTrace.mark("frame", { kind: "whole", format });
   currentPane().frames.whole += 1;

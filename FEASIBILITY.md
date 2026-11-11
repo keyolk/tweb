@@ -466,8 +466,32 @@ page is blank for each frame's transfer time. That is the most likely cause of t
      the copied text is `U+10EEEE` characters. Today the overlay hides the selection instead. A
      tweb pane gives the mouse and keys to the page, so tmux copy-mode over it is rare, but the
      placeholder path should bind copy-mode on a tweb pane to the page's own selection or refuse it.
-3. Placeholder path behind the gate (items 2-6), with `bench/window-switch.py` extended to count the
-   placeholder cells left in a hidden pane instead of placements.
+3. Placeholder path behind the gate (items 2-6). **Done, 2026-11-11.** On where measured: it turns on
+   for Ghostty >= 1.4 inside tmux, `TWEB_PLACEHOLDERS=0/1` forces it. `electron/placeholder-cells.cjs`
+   holds the encoding and the gate. Measured with a real pane (`tweb open`) in a dedicated tmux 3.8
+   server and Ghostty 1.4 windows, both with a per-pane engine and hosted by a twebd (where the
+   gate read `ghostty 1.4.0` from the right client):
+   - window switch away: the page is gone immediately and 2.5s later; back: whole again in ~210ms
+     (overlay, same harness: 200-380ms). popup covers it and it returns; split keeps it; kill-pane
+     removes it.
+   - patches (`bench/pages/smallpaint.html`): drawn in place through their own cells.
+   - a client attached late got the page from the reveal's whole frame — on an animating page. A
+     still page gives no next frame, so item 5's attach hook is still needed and is not built.
+   - a pane taller than 297 rows keeps the overlay (the table cannot name its lower rows).
+   - untested on the placeholder path: floating (`writeFloatStatus` / `showPageBackInPane`), and
+     copy-mode, which now copies `U+10EEEE` (item 2).
+   Three things the probes did not show and the real pane did:
+   - **no z for placeholder images.** The overlay draws at `z=-1` so IME preedit shows over the page;
+     a placeholder image at `z=-1` drew the placeholder glyph's fallback over it — rows of boxes.
+   - **every cell carries its marks.** Lean cells (marks on the first of a row) lost every cell right
+     of a popup while it was open: tmux redraws that stretch starting after the popup, so the
+     terminal's left neighbour is a popup character. Full marks cost 2.6x the bytes (178KB at
+     240x70, ~1ms to build) and are counted into the remote byte budget.
+   - **no shared memory.** The terminal unlinks a `t=s` object once read, so a second client gets
+     nothing; with no base underneath, the patched box was blank in ~25% of captures on both of two
+     clients. Placeholder panes use the file medium: 0 of 80 on each.
+   - the pane writer took strings as latin1, which cut every placeholder to its low byte. Cells are
+     written as UTF-8 buffers.
 4. Remove the overlay-only cleanup from the placeholder path (item 7).
 
 ## 3. Input fidelity — Browser mode, the Korean IME, the mouse

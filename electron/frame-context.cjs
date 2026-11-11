@@ -114,9 +114,17 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
  * free an image another pane was still placing.
  */
 function nextPatchId(context) {
-  const id = context.imageIds.patchBase + context.nextPatchSlot;
-  context.nextPatchSlot = (context.nextPatchSlot + 1) % context.imageIds.patchIds.length;
-  return id;
+  const count = context.imageIds.patchIds.length;
+  // An id still waiting to be retired with an in-flight whole frame is skipped. Its pixels are on
+  // screen until that frame lands, and as a placeholder its cells still name it: reissuing it would
+  // draw the new patch into the old patch's cells too. Null when every id is waiting, and the
+  // caller sends the damage as a whole frame instead.
+  for (let tried = 0; tried < count; tried += 1) {
+    const id = context.imageIds.patchBase + context.nextPatchSlot;
+    context.nextPatchSlot = (context.nextPatchSlot + 1) % count;
+    if (!context.retireOnPlace.includes(id)) return id;
+  }
+  return null;
 }
 
 /**

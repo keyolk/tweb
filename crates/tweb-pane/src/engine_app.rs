@@ -260,6 +260,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/relative-placement.cjs"),
     ),
     (
+        "placeholder-cells.cjs",
+        include_str!("../../../electron/placeholder-cells.cjs"),
+    ),
+    (
         "hangul-keys.cjs",
         include_str!("../../../electron/hangul-keys.cjs"),
     ),
