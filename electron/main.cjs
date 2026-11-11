@@ -166,6 +166,7 @@ const {
   createFrameContext, nextPatchId: takeNextPatchId, notePatch, takeLivePatchIds,
   applyFrameViewport, queueGfxFrame: enqueueGfxFrame, completeGfxFrame,
   takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire,
+  notePatchCells, wholeFrameCells, noteCellsWritten, forgetCells,
 } = require("./frame-context.cjs");
 const {
   createPaneWindows, surfaceHeld, holdSurface, releaseSurface, heldScreenshotFrame,
@@ -1097,6 +1098,7 @@ function deleteImageInBand(record = currentPane(), frames = currentFrames()) {
   frames.retireOnPlace = [];
   frames.imageTransferred = false;
   frames.pendingImageDelete = false;
+  forgetCells(frames);
 }
 
 const passthroughTable = "tweb-pass";
@@ -1693,9 +1695,20 @@ function noteShmFrameResult(message, frames) {
   }
 }
 
+// Whether whole frames alternate between the pane's two bases. They must where a frame reaches
+// the terminal in many chunks: inline (`t=d`) over SSH, where the first chunk removes the image
+// on screen. A local placeholder pane must not: alternating renames every cell, so each whole
+// frame rewrote the pane's text — 135-270KB through tmux, which tmux 3.8 parses a cell at a time
+// with a flush per combining mark. That pegged the tmux server at ~97% and lagged every pane by
+// tens of seconds. A local frame is one `t=f` command, so the same id has no gap to hide.
+function alternatesWholeFrameBase(record) {
+  return !(usesPlaceholders(record) && frameTransport === "file" && !remoteTerminal);
+}
+
 function sendGfxFrameToWorker(frame, frames = currentFrames()) {
   // The id is chosen here, not when the frame was queued: see `takeWholeFrameBase`.
-  const header = frame.header.replace(WHOLE_FRAME_ID, String(takeWholeFrameBase(frames)));
+  const base = takeWholeFrameBase(frames, { alternate: alternatesWholeFrameBase(frames.record) });
+  const header = frame.header.replace(WHOLE_FRAME_ID, String(base));
   const pixels = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
     ? frame.png
     : Buffer.from(frame.png);
@@ -1781,19 +1794,30 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
   if (settled.stale) {
     // Only the id this frame went to. The one on screen is not this frame's to free: the hide
     // that made it stale has already deleted it, and a resize re-places it.
-    if (transmitted !== null) writeGfx(`a=d,d=I,i=${transmitted},q=2`, "");
+    // Never the base on screen: a pane that does not alternate sent this frame under that id.
+    if (transmitted !== null && transmitted !== frames.shownBase) {
+      writeGfx(`a=d,d=I,i=${transmitted},q=2`, "");
+    }
   } else {
     // The new frame first, the old one's delete after it, in one write: there is no moment
     // between them with neither on screen. The patches go with the old frame — they were
     // placed over it, and the new frame already contains what they covered.
-    const retire = [replaced, ...takePatchesToRetire(frames)].filter((id) => id !== null)
+    const retiredPatches = takePatchesToRetire(frames);
+    const retire = [replaced, ...retiredPatches].filter((id) => id !== null)
       .map((id) => ({ header: `a=d,d=I,i=${id},q=2`, payload: "" }));
     let cellBytes = 0;
     if (usesPlaceholders(frames.record)) {
-      // Three parts in one write: the frame and its virtual placement, the cells pointing at it
-      // (which also overwrite every patch's cells, so the patches are retired visually here), and
-      // the deletes. Graphics are passthrough, the cells are not.
-      const cells = basePlaceholderCells(frames);
+      // Three parts in one write: the frame and its virtual placement, the cells pointing at it,
+      // and the deletes. Graphics are passthrough, the cells are not. The cells are only what the
+      // grid does not already hold (`wholeFrameCells`): all of them after a flip or a resize, else
+      // just the blocks of the retired patches, which still name the patch ids.
+      const plan = wholeFrameCells(frames, { now: Date.now(), retired: retiredPatches });
+      const cells = plan.full
+        ? basePlaceholderCells(frames)
+        : plan.rects.map((rect) => placeholderBlock(frames.shownBase, {
+          rows: rect.rows, cols: rect.cols, top: rect.row + 1, left: rect.col + 1,
+          rowOffset: rect.row, colOffset: rect.col,
+        })).join("");
       cellBytes = Buffer.byteLength(cells);
       writeGfxCommands(commands, { after: cells, retire });
     } else {
@@ -2171,6 +2195,7 @@ function replacePlacement(frames = currentFrames()) {
     // fall outside the new one are tmux's to drop: they were in the grid, and the grid was resized.
     writeGfx(`a=p,U=1,i=${frames.shownBase},p=${PLACEMENT_ID},c=${frames.cells.cols},r=${frames.cells.rows},q=2`, "");
     writerFor(frames.record).write(Buffer.from(basePlaceholderCells(frames), "utf8"));
+    noteCellsWritten(frames, Date.now());
     return;
   }
   writeGfx(`a=p,i=${frames.shownBase},p=${PLACEMENT_ID},C=1,c=${frames.cells.cols},r=${frames.cells.rows}`
@@ -2230,6 +2255,8 @@ function patchPlacementSequence(id, place, frames = currentFrames(), format = "f
     const cells = placeholderBlock(id, {
       rows: place.rows, cols: place.cols, top: place.row + 1, left: place.col + 1,
     });
+    // Remembered so the whole frame that retires this patch rewrites just this block.
+    notePatchCells(frames, id, place);
     return { header, prefix: "", suffix: "", cells };
   }
   if (relativePatches.allowed) {

@@ -48,6 +48,12 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // Patches a whole frame already contains, kept on screen until that frame is placed. A patch
     // sent while the frame is in flight is newer than the frame and stays.
     retireOnPlace: [],
+    // Placeholder panes: which cells the pane's grid holds. `cellsKey` names the base id and the
+    // block size the cells were last written for, and `patchCells` where each live patch's own
+    // cells sit. See `wholeFrameCells`.
+    cellsKey: null,
+    cellsWrittenAt: 0,
+    patchCells: new Map(),
 
     // The damage patches live over the base frame. A small pool, cycled: a patch id only has to
     // outlive the frame it patches.
@@ -133,8 +139,16 @@ function nextPatchId(context) {
  * Decided at dispatch, not when the frame was queued. The queue is one deep and a queued frame
  * waits behind the one in flight, so only at dispatch is it known which id that one left placed.
  */
-function takeWholeFrameBase(context) {
+function takeWholeFrameBase(context, { alternate = true } = {}) {
   const [first, second] = context.imageIds.bases;
+  // Two ids are for a frame that arrives in many chunks (inline over SSH), where the terminal
+  // drops the old image at the first chunk. A local frame is one `t=f` command and has no such
+  // gap, so it is sent under the id on screen — which keeps a placeholder pane's cells naming
+  // the right image without rewriting them.
+  if (!alternate) {
+    context.inFlightBase = context.shownBase;
+    return context.shownBase;
+  }
   const target = context.shownBase === first ? second : first;
   context.inFlightBase = target;
   return target;
@@ -151,6 +165,51 @@ function settleWholeFrameBase(context, { placed }) {
   const previous = context.shownBase;
   context.shownBase = target;
   return previous === target ? null : previous;
+}
+
+// How long a placeholder pane may go without its cells being rewritten whole. The cells are
+// pane text, and anything else that writes text there (a clear, a stray write) erases part of the
+// page until they are written again. Before, every whole frame rewrote them; that was 135-270KB
+// per frame through tmux, which pegged the tmux server and lagged every pane. One full write per
+// interval keeps the self-healing at a bounded cost.
+const PLACEHOLDER_CELLS_REFRESH_MS = 2000;
+
+/** Records where a placeholder patch's own cells were written. */
+function notePatchCells(context, id, place) {
+  context.patchCells.set(id, { row: place.row, col: place.col, rows: place.rows, cols: place.cols });
+}
+
+/**
+ * Which cells a placed whole frame has to write in a placeholder pane.
+ *
+ * `full` when the grid does not already name this base at this size (first frame, a resize, a
+ * flip to the other base) or the refresh interval has passed. Otherwise only the blocks of the
+ * patches being retired, which still name their patch ids: written back with the base's cells,
+ * the page shows through where the patch was.
+ */
+function wholeFrameCells(context, { now, retired = [] }) {
+  const { rows, cols } = context.cells;
+  const key = `${context.shownBase}:${rows}x${cols}`;
+  const rects = retired.map((id) => context.patchCells.get(id)).filter(Boolean);
+  for (const id of retired) context.patchCells.delete(id);
+  if (context.cellsKey !== key || now - context.cellsWrittenAt >= PLACEHOLDER_CELLS_REFRESH_MS) {
+    noteCellsWritten(context, now);
+    return { full: true, rects: [] };
+  }
+  return { full: false, rects };
+}
+
+/** Records that the grid now holds the base's cells at the current size, all of them. */
+function noteCellsWritten(context, now) {
+  context.cellsKey = `${context.shownBase}:${context.cells.rows}x${context.cells.cols}`;
+  context.cellsWrittenAt = now;
+  context.patchCells.clear();
+}
+
+/** Forgets the written cells, so the next whole frame writes them all. */
+function forgetCells(context) {
+  context.cellsKey = null;
+  context.patchCells.clear();
 }
 
 /**
@@ -298,4 +357,9 @@ module.exports = {
   settleWholeFrameBase,
   retirePatchesOnPlace,
   takePatchesToRetire,
+  notePatchCells,
+  wholeFrameCells,
+  noteCellsWritten,
+  forgetCells,
+  PLACEHOLDER_CELLS_REFRESH_MS,
 };

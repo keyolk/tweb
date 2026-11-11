@@ -6,6 +6,7 @@ const {
   createFrameContext, nextPatchId, notePatch, takeLivePatchIds, generationIsCurrent,
   applyFrameViewport, queueGfxFrame, completeGfxFrame,
   takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire,
+  notePatchCells, wholeFrameCells, noteCellsWritten, forgetCells, PLACEHOLDER_CELLS_REFRESH_MS,
 } = require("./frame-context.cjs");
 const { createPaneRecord } = require("./pane-registry.cjs");
 
@@ -276,4 +277,52 @@ test("a patch id waiting on the frame in flight is skipped, not reissued", () =>
   const issued = [];
   for (let i = 0; i < frames.imageIds.patchIds.length; i += 1) issued.push(nextPatchId(frames));
   assert.ok(!issued.includes(first));
+});
+
+// A local frame is one `t=f` command, so it has no chunked gap to hide. Alternating there renamed
+// every placeholder cell and rewrote the pane's text with every whole frame.
+test("a pane that does not alternate keeps sending under the base on screen", () => {
+  const frames = context(100);
+  assert.equal(takeWholeFrameBase(frames, { alternate: false }), 100);
+  assert.equal(settleWholeFrameBase(frames, { placed: true }), null, "nothing to free");
+  assert.equal(frames.shownBase, 100);
+});
+
+// The pane's grid already names the base at this size, so a whole frame writes no cells — the
+// 135-270KB per frame that pegged the tmux server.
+test("placeholder cells are written whole only when the grid does not already hold them", () => {
+  const frames = context(100);
+  frames.cells = { cols: 200, rows: 50 };
+  assert.deepEqual(wholeFrameCells(frames, { now: 1000 }), { full: true, rects: [] });
+  assert.deepEqual(wholeFrameCells(frames, { now: 1100 }), { full: false, rects: [] });
+  frames.cells = { cols: 200, rows: 40 };
+  assert.equal(wholeFrameCells(frames, { now: 1200 }).full, true, "a resize rewrites them");
+  takeWholeFrameBase(frames);
+  settleWholeFrameBase(frames, { placed: true });
+  assert.equal(wholeFrameCells(frames, { now: 1300 }).full, true, "a flip to the other base does");
+  forgetCells(frames);
+  assert.equal(wholeFrameCells(frames, { now: 1400 }).full, true, "a freed image does");
+});
+
+// A retired patch's cells still name the patch id; the page shows through only once they are
+// written back with the base's cells. Patches that stay are left alone.
+test("a whole frame rewrites just the blocks of the patches it retires", () => {
+  const frames = context(100);
+  frames.cells = { cols: 200, rows: 50 };
+  noteCellsWritten(frames, 1000);
+  notePatchCells(frames, 101, { row: 3, col: 4, rows: 2, cols: 5 });
+  notePatchCells(frames, 102, { row: 9, col: 9, rows: 1, cols: 1 });
+  assert.deepEqual(wholeFrameCells(frames, { now: 1100, retired: [101] }),
+    { full: false, rects: [{ row: 3, col: 4, rows: 2, cols: 5 }] });
+  assert.deepEqual(wholeFrameCells(frames, { now: 1200, retired: [101] }), { full: false, rects: [] });
+  assert.equal(frames.patchCells.has(102), true);
+});
+
+// The cells are pane text, and anything else writing there erases part of the page. A periodic
+// full write bounds how long that can last, at one block per interval rather than per frame.
+test("placeholder cells are rewritten whole once the refresh interval has passed", () => {
+  const frames = context(100);
+  noteCellsWritten(frames, 1000);
+  assert.equal(wholeFrameCells(frames, { now: 1000 + PLACEHOLDER_CELLS_REFRESH_MS - 1 }).full, false);
+  assert.equal(wholeFrameCells(frames, { now: 1000 + PLACEHOLDER_CELLS_REFRESH_MS }).full, true);
 });
