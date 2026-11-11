@@ -93,20 +93,31 @@ function isViewportFrame(got, viewport, deviceScaleFactor, browserScaleFactor = 
   return near(1) || near(deviceScaleFactor || 1) || near(browserScaleFactor || 1);
 }
 
-// A screencast frame a pixel or two short of the pane, laid over the last drawn frame. Chrome
-// rounds the device height of some frames down — measured on Hacker News at dsf 1.6: 1440x1799
-// frames for a 1440x1800 pane, the first frame after most `j` presses. They are the top 1799 rows
-// of the right picture (mean difference 0.67 against the capture after them, top-aligned; 5.6
-// bottom-aligned, 2.8 scaled), so the missing rows are kept from the frame before. Refused as the
-// wrong size, each sent the scroll through a capture: `j` p50 115ms there against 9ms on Electron.
-// Null when `got` is not such a frame or there is nothing to fill from.
-function fillShortFrame(bitmap, got, base, want) {
-  if (!base || base.length !== want.width * want.height * 4) return null;
-  if (got.width > want.width || got.height > want.height) return null;
-  if (want.width - got.width > 2 || want.height - got.height > 2) return null;
-  const out = Buffer.from(base);
-  const row = got.width * 4;
-  for (let y = 0; y < got.height; y += 1) bitmap.copy(out, y * want.width * 4, y * row, y * row + row);
+// A screencast frame within a pixel or two of the pane's size, fitted to it. Chrome rounds the
+// viewport to whole CSS pixels and then scales, so the device size is off by one either way:
+//
+// - short: measured on Hacker News at dsf 1.6, 1440x1799 frames for a 1440x1800 pane, the first
+//   frame after most `j` presses. They are the top 1799 rows of the right picture (mean difference
+//   0.67 against the capture after them, top-aligned; 5.6 bottom-aligned, 2.8 scaled), so the
+//   missing rows are kept from the frame before.
+// - long: a 1000x490 pane at zoom 0.8 is a 1250x612.5 CSS viewport, which Chrome rounds to 613
+//   and sends as 2000x981 for a 2000x980 pane — every frame, so every one was refused and the
+//   whole picture came from back-to-back device-pixel captures (Chrome at ~100% CPU on an
+//   animated page, 14 frames/s in the pane where Electron drew 22). The extra row is the half CSS
+//   pixel below the viewport, so it is cropped off the bottom.
+//
+// Refused as the wrong size, each sent the change through a capture: `j` p50 115ms there against
+// 9ms on Electron. Null when `got` is not such a frame, or rows or columns are missing and there
+// is no frame before to take them from.
+function fitNearFrame(bitmap, got, base, want) {
+  if (Math.abs(want.width - got.width) > 2 || Math.abs(want.height - got.height) > 2) return null;
+  const short = got.width < want.width || got.height < want.height;
+  if (short && (!base || base.length !== want.width * want.height * 4)) return null;
+  const out = short ? Buffer.from(base) : Buffer.alloc(want.width * want.height * 4);
+  const row = Math.min(got.width, want.width) * 4;
+  for (let y = 0; y < Math.min(got.height, want.height); y += 1) {
+    bitmap.copy(out, y * want.width * 4, y * got.width * 4, y * got.width * 4 + row);
+  }
   return out;
 }
 
@@ -1298,13 +1309,13 @@ class CdpWebContents extends EventEmitter {
       let image = decoded;
       let bitmap = null;
       if (got.width !== want.width || got.height !== want.height) {
-        const filled = fillShortFrame(decoded.toBitmap(), got, capture.lastCast, want);
+        const filled = fitNearFrame(decoded.toBitmap(), got, capture.lastCast, want);
         if (!filled) {
           countCast(this, "css");
           this.requestCapture();
           return;
         }
-        countCast(this, "short");
+        countCast(this, got.width < want.width || got.height < want.height ? "short" : "long");
         bitmap = filled;
         image = nativeImage.createFromBitmap(filled, { width: want.width, height: want.height, scaleFactor: 1 });
       }
@@ -1894,6 +1905,7 @@ function scaleMouse(event, zoom) {
 module.exports = {
   hiddenWindowState,
   isViewportFrame,
+  fitNearFrame,
   windowArea,
   PendingSession,
   CdpDebugger,

@@ -2,7 +2,9 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { CdpWebContents, hiddenWindowState, isViewportFrame, windowArea } = require("./web-contents.cjs");
+const {
+  CdpWebContents, hiddenWindowState, isViewportFrame, windowArea, fitNearFrame,
+} = require("./web-contents.cjs");
 
 // Just enough of an engine to construct contents and feed it Page events by hand.
 function contents() {
@@ -693,4 +695,54 @@ test("sound starting on a hidden tab restores it; sound stopping minimizes it ag
   created.onBinding({ name: "__twebAudio", payload: JSON.stringify({ playing: false, audible: false }) }, "S");
   await created.windowStateChain;
   assert.strictEqual(created.windowState, "minimized");
+});
+
+// A bitmap whose every pixel carries its own row and column, so a test can say where a pixel came
+// from. `tag` marks which frame it belongs to.
+function grid(width, height, tag) {
+  const out = Buffer.alloc(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) out.set([y, x, tag, 255], (y * width + x) * 4);
+  }
+  return out;
+}
+const at = (bitmap, width, x, y) => [...bitmap.subarray((y * width + x) * 4, (y * width + x) * 4 + 3)];
+
+// A 1000x490 pane at zoom 0.8 is a 1250x612.5 CSS viewport; Chrome rounds it to 613 and sends
+// 2000x981 for a 2000x980 pane. Every frame was refused, and an animated page was drawn by
+// back-to-back captures. The extra row is below the viewport, so it is cropped off the bottom.
+test("a frame a row long is cropped to the pane, top-aligned", () => {
+  const got = { width: 4, height: 4 };
+  const fitted = fitNearFrame(grid(4, 4, 7), got, null, { width: 4, height: 3 });
+  assert.equal(fitted.length, 4 * 3 * 4);
+  assert.deepStrictEqual(at(fitted, 4, 2, 0), [0, 2, 7]);
+  assert.deepStrictEqual(at(fitted, 4, 3, 2), [2, 3, 7]);
+});
+
+test("a frame a column long is cropped on the right", () => {
+  const fitted = fitNearFrame(grid(5, 3, 7), { width: 5, height: 3 }, null, { width: 4, height: 3 });
+  assert.deepStrictEqual(at(fitted, 4, 3, 1), [1, 3, 7]);
+});
+
+// Measured on Hacker News at dsf 1.6: 1440x1799 frames for a 1440x1800 pane, the top rows of the
+// right picture. The missing row is kept from the frame before.
+test("a frame a row short keeps the missing row from the frame before", () => {
+  const want = { width: 4, height: 3 };
+  const fitted = fitNearFrame(grid(4, 2, 7), { width: 4, height: 2 }, grid(4, 3, 1), want);
+  assert.deepStrictEqual(at(fitted, 4, 1, 1), [1, 1, 7]);
+  assert.deepStrictEqual(at(fitted, 4, 1, 2), [2, 1, 1]);
+});
+
+test("one dimension long and the other short is cropped and filled", () => {
+  const want = { width: 4, height: 3 };
+  const fitted = fitNearFrame(grid(3, 4, 7), { width: 3, height: 4 }, grid(4, 3, 1), want);
+  assert.deepStrictEqual(at(fitted, 4, 2, 2), [2, 2, 7]);
+  assert.deepStrictEqual(at(fitted, 4, 3, 2), [2, 3, 1], "the missing column comes from before");
+});
+
+test("a short frame with nothing to fill from, or one off by more than two, is refused", () => {
+  assert.equal(fitNearFrame(grid(4, 2, 7), { width: 4, height: 2 }, null, { width: 4, height: 3 }), null);
+  assert.equal(fitNearFrame(grid(4, 6, 7), { width: 4, height: 6 }, null, { width: 4, height: 3 }), null);
+  // A CSS-pixel frame at half the pane's size is not a rounding error, and stays a signal only.
+  assert.equal(fitNearFrame(grid(10, 5, 7), { width: 10, height: 5 }, grid(20, 10, 1), { width: 20, height: 10 }), null);
 });
