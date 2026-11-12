@@ -45,6 +45,12 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     // worker is being transmitted under. See `paneImageIds` for why there are two.
     shownBase: ids.base,
     inFlightBase: null,
+    // The pixel size and cell box of the image held under `shownBase`, while the terminal holds it
+    // placed. A frame of the same size can then replace its pixels in place (`a=f`), under the
+    // same id. Cleared wherever the image or its placement goes. See `takeWholeFrameBase`.
+    shownFrameKey: null,
+    inFlightFrameKey: null,
+    inFlightEdit: false,
     // Patches a whole frame already contains, kept on screen until that frame is placed. A patch
     // sent while the frame is in flight is newer than the frame and stays.
     retireOnPlace: [],
@@ -134,13 +140,33 @@ function nextPatchId(context) {
 }
 
 /**
- * The id the next whole frame is transmitted under: whichever base is not on screen.
+ * The id the next whole frame is transmitted under, and whether it replaces the pixels of the image
+ * already placed there (`edit`) rather than transmitting a new one.
  *
  * Decided at dispatch, not when the frame was queued. The queue is one deep and a queued frame
  * waits behind the one in flight, so only at dispatch is it known which id that one left placed.
+ *
+ * `editable` is for a frame that arrives in many chunks (inline over SSH). A new transmit under the
+ * id on screen drops that image at its first chunk, which is why such panes alternate two ids. But
+ * alternating renames every placeholder cell, and those cells were 84% of a remote pane's link.
+ * `a=f` on the root frame keeps the image and its placement while the chunks arrive (measured on
+ * Ghostty 1.4: no blank frame, cells untouched). It cannot grow the image ("EINVAL: frame
+ * dimensions exceed image") and a smaller frame would leave the old pixels around it, so only a
+ * frame of exactly the placed size and cell box is an edit. Anything else alternates as before.
  */
-function takeWholeFrameBase(context, { alternate = true } = {}) {
+function takeWholeFrameBase(context, { alternate = true, editable = false, size = null } = {}) {
   const [first, second] = context.imageIds.bases;
+  const key = size && size.width && size.height
+    ? `${size.width}x${size.height}:${context.cells.cols}x${context.cells.rows}`
+    : null;
+  context.inFlightFrameKey = key;
+  context.inFlightEdit = false;
+  if (editable && key !== null && context.imageTransferred && !context.pendingImageDelete
+    && context.shownFrameKey === `${context.shownBase}:${key}`) {
+    context.inFlightEdit = true;
+    context.inFlightBase = context.shownBase;
+    return context.shownBase;
+  }
   // Two ids are for a frame that arrives in many chunks (inline over SSH), where the terminal
   // drops the old image at the first chunk. A local frame is one `t=f` command and has no such
   // gap, so it is sent under the id on screen — which keeps a placeholder pane's cells naming
@@ -160,10 +186,19 @@ function takeWholeFrameBase(context, { alternate = true } = {}) {
  */
 function settleWholeFrameBase(context, { placed }) {
   const target = context.inFlightBase;
+  const key = context.inFlightFrameKey;
   context.inFlightBase = null;
-  if (!placed || target === null) return null;
+  context.inFlightFrameKey = null;
+  context.inFlightEdit = false;
+  if (!placed || target === null) {
+    // A frame sent under the id on screen and then dropped may have left that image half
+    // replaced, or freed; the next frame transmits a whole new one.
+    if (target !== null && target === context.shownBase) context.shownFrameKey = null;
+    return null;
+  }
   const previous = context.shownBase;
   context.shownBase = target;
+  context.shownFrameKey = key === null ? null : `${target}:${key}`;
   return previous === target ? null : previous;
 }
 
@@ -209,6 +244,7 @@ function noteCellsWritten(context, now) {
 /** Forgets the written cells, so the next whole frame writes them all. */
 function forgetCells(context) {
   context.cellsKey = null;
+  context.shownFrameKey = null;
   context.patchCells.clear();
 }
 
@@ -333,7 +369,10 @@ function completeGfxFrame(context, { visible = true } = {}) {
     && !generationIsCurrent(context, context.activeGfxGeneration));
   context.gfxBusy = false;
   context.activeGfxGeneration = null;
-  if (stale) context.imageTransferred = false;
+  if (stale) {
+    context.imageTransferred = false;
+    context.shownFrameKey = null;
+  }
   const queued = context.pendingGfxFrame;
   context.pendingGfxFrame = null;
   const next = visible && queued && generationIsCurrent(context, queued.generation) ? queued : null;

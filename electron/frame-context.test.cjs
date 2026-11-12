@@ -288,6 +288,66 @@ test("a pane that does not alternate keeps sending under the base on screen", ()
   assert.equal(frames.shownBase, 100);
 });
 
+// Over SSH a frame arrives in chunks. A new transmit under the id on screen blanks it, so the first
+// frame alternates; after that a frame of the same size replaces the placed image's pixels with
+// `a=f` under the same id, and the placeholder cells, which name that id, stay valid.
+test("a remote frame of the placed size is an edit under the base on screen", () => {
+  const frames = context(100);
+  frames.cells = { cols: 200, rows: 50 };
+  const size = { width: 2000, height: 1000 };
+  const opts = { alternate: true, editable: true, size };
+  // Nothing held yet: a transmit, to the other base.
+  assert.equal(takeWholeFrameBase(frames, opts), 108);
+  assert.equal(frames.inFlightEdit, false);
+  frames.imageTransferred = true;
+  assert.equal(settleWholeFrameBase(frames, { placed: true }), 100);
+  // Same size, same cell box: an edit of 108, nothing to free.
+  assert.equal(takeWholeFrameBase(frames, opts), 108);
+  assert.equal(frames.inFlightEdit, true);
+  assert.equal(settleWholeFrameBase(frames, { placed: true }), null);
+  assert.equal(frames.shownBase, 108);
+  assert.equal(takeWholeFrameBase(frames, opts), 108);
+  assert.equal(frames.inFlightEdit, true);
+  settleWholeFrameBase(frames, { placed: true });
+});
+
+test("a remote frame that cannot be an edit alternates", () => {
+  const frames = context(100);
+  frames.cells = { cols: 200, rows: 50 };
+  const size = { width: 2000, height: 1000 };
+  const opts = { alternate: true, editable: true, size };
+  takeWholeFrameBase(frames, opts);
+  frames.imageTransferred = true;
+  settleWholeFrameBase(frames, { placed: true });
+  // `a=f` cannot grow an image, and a smaller one would leave old pixels around it.
+  assert.equal(takeWholeFrameBase(frames, { ...opts, size: { width: 2010, height: 1000 } }), 100);
+  assert.equal(frames.inFlightEdit, false);
+  settleWholeFrameBase(frames, { placed: true });
+  // A new cell box at the same pixel size: the placement's c=/r= must change.
+  frames.cells = { cols: 201, rows: 50 };
+  assert.equal(takeWholeFrameBase(frames, { ...opts, size: { width: 2010, height: 1000 } }), 108);
+  assert.equal(frames.inFlightEdit, false);
+  settleWholeFrameBase(frames, { placed: true });
+  // The image freed (a window switch): the next frame must transmit.
+  forgetCells(frames);
+  assert.equal(takeWholeFrameBase(frames, { ...opts, size: { width: 2010, height: 1000 } }), 100);
+  assert.equal(frames.inFlightEdit, false);
+  settleWholeFrameBase(frames, { placed: true });
+  // An edit that was dropped may have left the image half replaced: the next one transmits.
+  assert.equal(takeWholeFrameBase(frames, { ...opts, size: { width: 2010, height: 1000 } }), 100);
+  assert.equal(frames.inFlightEdit, true);
+  settleWholeFrameBase(frames, { placed: false });
+  assert.equal(takeWholeFrameBase(frames, { ...opts, size: { width: 2010, height: 1000 } }), 108);
+  assert.equal(frames.inFlightEdit, false);
+  // A pane that is not editable never edits.
+  const local = context(100);
+  local.imageTransferred = true;
+  takeWholeFrameBase(local, { alternate: true, size });
+  settleWholeFrameBase(local, { placed: true });
+  takeWholeFrameBase(local, { alternate: true, size });
+  assert.equal(local.inFlightEdit, false);
+});
+
 // The pane's grid already names the base at this size, so a whole frame writes no cells — the
 // 135-270KB per frame that pegged the tmux server.
 test("placeholder cells are written whole only when the grid does not already hold them", () => {

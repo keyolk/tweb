@@ -1706,10 +1706,25 @@ function alternatesWholeFrameBase(record) {
   return !(usesPlaceholders(record) && frameTransport === "file" && !remoteTerminal);
 }
 
+// Whether a whole frame may replace the pixels of the image on screen in place (`a=f`). Only a
+// remote placeholder pane: its frame arrives in many chunks, and alternating ids there rewrote
+// every cell — 84% of the link. A local frame is one command under one id already.
+function editsWholeFrameInPlace(record) {
+  return remoteTerminal && usesPlaceholders(record);
+}
+
 function sendGfxFrameToWorker(frame, frames = currentFrames()) {
   // The id is chosen here, not when the frame was queued: see `takeWholeFrameBase`.
-  const base = takeWholeFrameBase(frames, { alternate: alternatesWholeFrameBase(frames.record) });
-  const header = frame.header.replace(WHOLE_FRAME_ID, String(base));
+  const base = takeWholeFrameBase(frames, {
+    alternate: alternatesWholeFrameBase(frames.record),
+    editable: editsWholeFrameInPlace(frames.record),
+    size: frame.width && frame.height ? { width: frame.width, height: frame.height } : null,
+  });
+  // An edit of the root frame keeps the image's placement, so it carries none of the transmit's
+  // placement keys; the worker adds the format and transport as for any frame.
+  const header = frames.inFlightEdit
+    ? `a=f,i=${base},r=1,x=0,y=0${frame.header.endsWith(",f=100") ? ",f=100" : ""}`
+    : frame.header.replace(WHOLE_FRAME_ID, String(base));
   const pixels = frame.png.byteOffset === 0 && frame.png.byteLength === frame.png.buffer.byteLength
     ? frame.png
     : Buffer.from(frame.png);
@@ -2180,6 +2195,8 @@ const WHOLE_FRAME_ID = "@base@";
 // `d=i` drops the placements but keeps the image data, so it can be re-placed.
 function deletePlacement(frames = currentFrames()) {
   frames.pendingImageDelete = false;
+  // The data stays but the placement goes, and an edit does not place: the next frame transmits.
+  frames.shownFrameKey = null;
   writeGfx(`a=d,d=i,i=${frames.shownBase},q=2`, "");
 }
 
