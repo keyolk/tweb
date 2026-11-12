@@ -402,10 +402,49 @@ captures. Both `kitten icat --unicode-placeholder --passthrough=tmux` and hand-b
 | retransmit under the **same** id (`a=t` or today's `a=T`) | **blank from the first chunk until the last** |
 | retransmit under a **second** id, then flip | the old frame stays until the flip — overlay and placeholder both |
 | `a=f` frame edit under a placeholder | kept on screen, but rejected: on Ghostty 1.4 its cost scales with the base image's area (Ghostty CPU 45% against 12-15% for a patch, 60x60 edits at 60Hz on a 2880x1800 base, measured 2026-10-29) |
+| whole-frame `a=f,r=1,x=0,y=0` (replace the root frame), chunks sent slowly | **no blank**: the old picture stays through the transfer and the new one is drawn at the last chunk, with no cell rewrite; `a=T` under the same id blanked for the whole transfer (measured 2026-11-12, see below) |
 
 The same-id blank applies to the shipping overlay path too. Locally a whole frame is one `t=f` command, so
 the blank is invisible. Over SSH the transport is `t=d` inline, a frame is tens of 3KB chunks, and the
 page is blank for each frame's transfer time. That is the most likely cause of the remote flicker.
+
+#### Probe: a whole frame replaced under one id (2026-11-12)
+
+Over SSH a remote placeholder pane alternated between two ids, and each flip renamed every cell:
+103KB of a 123KB frame and 30.6% of the remote tmux server (tmux 3.6, 200x50, 30fps page;
+#254 keeps the overlay on remote panes meanwhile). Replacing the root frame with `a=f` keeps one id,
+so the cells never change.
+
+Bare Ghostty 1.4.0 window, no tmux, so `q=0` replies come back. Four 200x150 images drawn through
+placeholders (`a=T,U=1`), each then replaced with 53 chunks of 3KB at 60ms (3.2s), window captured
+continuously. The window was kept in front and untouched: a covered Ghostty window does not redraw,
+and a first run read as "nothing changes" for that reason.
+
+| method | during the transfer (~10 captures) | after | cells rewritten |
+|---|---|---|---|
+| `a=T` same id (control) | **blank 10 of 11** | new | no |
+| `a=f,r=1,x=0,y=0` | old 10, new 1, blank 0 | new (70 of 70) | no |
+| `a=f,r=1` then the cells again | old 10, new 1, blank 0 | new | yes (not needed) |
+| `a=f` frame 2, then `a=a,c=2` | old 10, blank 0 | new | no |
+
+Every command answered `OK`. A PNG payload (`f=100`) is accepted too, inline and in 256-byte
+chunks, at the root's size or smaller; a larger one is refused with `EINVAL: frame dimensions exceed
+image`, so a resize still transmits a new image.
+
+Cost, measured 2026-11-12 (load average 8-25 throughout, so the small numbers are noise-level):
+
+| | Ghostty CPU (own window) | local tmux 3.8 CPU |
+|---|---|---|
+| `a=f` 2/s x 50KB | 0.1% | 0.4% |
+| `a=f` 10/s x 50KB | 1.0% | 2.0% |
+| `a=T` + cells 10/s x 50KB | 1.4% | - |
+| `a=f` 10/s x 250KB | 4.0% | 9.2% |
+| `a=T` + cells 10/s x 250KB | 3.3% | - |
+
+`a=f` costs Ghostty no more than the retransmit it replaces. On the remote host (tmux 3.6, 200x50
+pane, 30fps page, `TWEB_REMOTE_TERMINAL=1`), placeholders with `a=f` sent 23KB a frame and cost the
+tmux server 1.4%, against the overlay's 20KB and 0.5%, and against 123KB and 30.6% when every frame
+alternated ids and rewrote the cells. That is what turned placeholders back on for remote panes.
 
 #### Design
 

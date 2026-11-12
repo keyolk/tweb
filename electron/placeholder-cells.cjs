@@ -145,6 +145,11 @@ function placeholdersDecision({ inTmux, clientTermtype, override } = {}) {
   if (override === "0") return { allowed: false, reason: "TWEB_PLACEHOLDERS=0" };
   if (!inTmux) return { allowed: false, reason: "not in tmux" };
   if (override === "1") return { allowed: true, reason: "TWEB_PLACEHOLDERS=1" };
+  // A remote pane used to keep the overlay. Over SSH a frame is chunked inline and alternated
+  // between two ids, and each flip renamed every cell: 103KB of a 123KB frame, and 30.6% CPU in
+  // the remote tmux 3.6 server. A frame of the placed size now replaces the image's pixels with
+  // `a=f` under the same id (`takeWholeFrameBase`), so the cells stay: 23KB a frame against the
+  // overlay's 20KB, and 1.4% CPU against 0.5% (200x50 pane, 30fps page, measured 2026-11-12).
   const name = clientTermtype || "";
   if (!/ghostty/i.test(name)) return { allowed: false, reason: `not ghostty (${name || "unknown"})` };
   const version = parseVersion(name);
