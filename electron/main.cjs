@@ -108,7 +108,7 @@ const {
   surfacePlan, surfaceResizeNeeded, paintingTransition, agentNeedsGeometry, restoredLayoutScript,
   presentedFrameScript, acceptsRestoredPaint,
 } = require("./surface-policy.cjs");
-const { pressEvents, parseChord } = require("./agent-key.cjs");
+const { pressEvents, typeSteps, typedKeys, parseChord } = require("./agent-key.cjs");
 const { pdfKeyAction, pdfViewportScript, findPdfFrame } = require("./pdf-frame.cjs");
 const { recoveryDecision } = require("./renderer-recovery.cjs");
 const { rendererUsage, memoryDecision } = require("./renderer-memory.cjs");
@@ -5782,7 +5782,34 @@ function agentPressKey(rawKey, rawModifiers = []) {
   // Same reason as the real key path: sendInputEvent does not reach a PDF's extension
   // frame, so `tweb press PageDown` would answer ok while the viewer stayed on page 1.
   if (routePdfKey(key, modifiers)) return;
+  allowAgentKeys([key], modifiers);
   for (const event of pressEvents(key, modifiers)) contents.sendInputEvent(event);
+}
+
+// `tweb type`: each printable character is a key press, so the page sees keydown, keypress and
+// beforeinput as it would from a keyboard. What has no key on a layout (Hangul, emoji) is still
+// inserted as text. Before, the whole string was one `insertText`, which fills a field but raises
+// no key event, so a page listening for keys never heard a character of it.
+function agentTypeText(text) {
+  const contents = agentContents();
+  const steps = typeSteps(text);
+  allowAgentKeys(typedKeys(steps), []);
+  for (const step of steps) {
+    if (step.events) for (const event of step.events) contents.sendInputEvent(event);
+    else contents.insertText(step.text);
+  }
+}
+
+// An agent key reaches the page through the same `sendInputEvent` as a key the person typed, so
+// the preload cannot tell them apart by the event. Without a word from here its capture-phase
+// `handleNormalKey` read `g`, `j`, `]` as TWeb commands and stopped them before any page listener:
+// `tweb press g` answered ok and a brief's own `g` shortcut never fired. This names the keys the
+// agent is about to send; the preload lets each through once. Escape is not named — `Esc` stays
+// the way out of a TWeb overlay for an agent as well.
+function allowAgentKeys(keys, modifiers) {
+  const names = keys.filter((name) => name !== "Escape");
+  if (names.length === 0) return;
+  sendToFocusedTabFrame(agentTab(), "tweb-agent-keys", { keys: names, modifiers });
 }
 
 // The loop lives in agent-wait.cjs, against injected probes, so it can be tested without a page.
@@ -6757,7 +6784,7 @@ async function dispatchAgentCommand(method, params) {
       agentPressKey(String(params.key || ""), params.modifiers || []);
       return { ok: true };
     case "type":
-      agentContents().insertText(String(params.text ?? ""));
+      agentTypeText(String(params.text ?? ""));
       return { ok: true };
     case "eval": {
       // Through the debugger where there is one: `executeJavaScript` reports a thrown exception

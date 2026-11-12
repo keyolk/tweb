@@ -103,6 +103,11 @@ installPrintShim();
   let mediaHoverTimer = null;
   let mediaHoverNudge = 0;
   let passThroughEscape = false;
+  // Keys an agent `press`/`type` is sending, by name with a count, and when they stop counting.
+  // See `allowAgentKeys` in main.cjs: the same sendInputEvent carries the person's keys, so the
+  // engine says which ones are the agent's.
+  const agentKeys = new Map();
+  let agentKeysUntil = 0;
   let passThroughEscapeTimer = null;
   let scrollTarget = null;
   let panTarget = null;
@@ -6132,9 +6137,33 @@ installPrintShim();
     return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || downloadsState || fileChooserState || helpHost || selectListState || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
 
+  // Spends one allowance for this key, if the engine announced it recently.
+  //
+  // The announcement and the key travel on different channels, so the key can arrive first or the
+  // announcement can outlive a key that never comes. The expiry bounds both: late by a second and
+  // the key is treated as the person's, which is the behaviour before this existed.
+  function takeAgentKey(event, key) {
+    if (agentKeys.size === 0) return false;
+    if (Date.now() > agentKeysUntil) {
+      agentKeys.clear();
+      return false;
+    }
+    for (const name of new Set([event.key, key])) {
+      const left = agentKeys.get(name) || 0;
+      if (left <= 0) continue;
+      if (left === 1) agentKeys.delete(name);
+      else agentKeys.set(name, left - 1);
+      return true;
+    }
+    return false;
+  }
+
   function handleNormalKey(event) {
     if (!vimiumEnabled || !shortcutFrame) return;
     const key = physicalKey(event);
+    // Spent on a real keydown only. The terminal-text and terminal-key paths call this with a plain
+    // object that has no `type`; those are the person's keys and must not eat the agent's allowance.
+    const agentKey = event.type === "keydown" ? takeAgentKey(event, key) : false;
 
     // The Escape we asked the main process to deliver belongs to the page. Let
     // it run, then take focus back so the next key is a TWeb command again.
@@ -6189,6 +6218,13 @@ installPrintShim();
     if (handleSearchKey(event, key)) return;
     if (commandPaletteState) return;
     if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
+
+    // A key an agent sent on purpose belongs to the page, whatever it would mean as a TWeb command.
+    // Placed after the overlays above so a help, picker or palette that is open still takes its keys.
+    if (agentKey) {
+      if (eventIsEditable(event)) setMode("insert");
+      return;
+    }
 
     // The keys a Chrome refugee's hands already know. `H`/`L` do the same thing and are
     // what a vim user reaches for, but nobody arrives with that reflex — they arrive with
@@ -6633,6 +6669,14 @@ installPrintShim();
     } catch (error) {
       ipcRenderer.send("tweb-agent-response", { id: request.id, error: String(error?.message || error) });
     }
+  });
+
+  ipcRenderer.on("tweb-agent-keys", (_event, announced) => {
+    if (!announced || !Array.isArray(announced.keys)) return;
+    for (const name of announced.keys) {
+      if (typeof name === "string") agentKeys.set(name, (agentKeys.get(name) || 0) + 1);
+    }
+    agentKeysUntil = Date.now() + 1500;
   });
 
   ipcRenderer.on("tweb-frame-mode", (_event, state) => {

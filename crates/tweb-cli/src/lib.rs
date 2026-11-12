@@ -242,7 +242,7 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// Snapshot of the interactive elements. The refs match the `f` hint labels.
+    /// Snapshot of the interactive elements in view (scroll for the rest). The refs match the `f` hint labels.
     Snapshot {
         /// Reading snapshot that also includes links, headings and text.
         #[arg(long)]

@@ -31,12 +31,12 @@ To show something you made, write it to an HTML file and `tweb split` the file.
 ## Drive the page
 
 ```sh
-tweb snapshot                         # interactive elements with refs: @a link "Sign in" …
+tweb snapshot                         # interactive elements IN VIEW, with refs: @a link "Sign in" …
 tweb snapshot --text                  # a reading view: also headings, links and text
 tweb click a                          # the ref without the @
 tweb fill s "agent@example.com"       # sets a value the way the page's framework sees it
 pass show work/okta | head -1 | tweb fill s --stdin   # a secret: off argv, never printed back
-tweb type "hello"                     # types into the focused element
+tweb type "hello"                     # types into the focused element, one key press per character
 tweb press Enter                      # also Tab, Escape, ArrowDown…; --mod shift|control|alt|meta
 tweb select d Green                   # pick an <option>
 tweb check c / tweb uncheck c
@@ -47,6 +47,13 @@ tweb back / tweb forward / tweb reload
 tweb wait --selector "#result"        # or --text "Saved", --url /done, --load, --ms 500
 tweb eval "document.title"            # JavaScript in the page; prints the result
 ```
+
+`snapshot` lists what a person could click right now: elements inside the viewport and not covered
+by something else. A button further down the page, or under a sticky header or an overlay, is not
+in the list, so a count that looks short is usually a page that needs scrolling (`tweb eval
+"scrollTo(0, 4000)"`, then `snapshot` again) or a cover to dismiss. Measured on a 9000px brief:
+5 refs at the top, 16 after scrolling to the bottom. `press` and `type` deliver real keys to the
+page, so a page's own shortcuts (`g`, `]`, a canvas tool's `1`-`9`) see them.
 
 - Refs come from the **latest** `snapshot`. Take a new snapshot after anything that changes the
   page: a navigation, a click that opens a dialog, or new content appearing. A ref from an older
