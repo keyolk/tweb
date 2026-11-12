@@ -2,7 +2,9 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { pressEvents, insertedText, parseChord } = require("./agent-key.cjs");
+const fs = require("node:fs");
+const path = require("node:path");
+const { pressEvents, typeSteps, typedKeys, insertedText, parseChord } = require("./agent-key.cjs");
 
 const types = (events) => events.map((event) => event.type);
 const charOf = (events) => events.find((event) => event.type === "char")?.keyCode ?? null;
@@ -128,4 +130,94 @@ test("the chord's key and modifiers produce the shortcut events", () => {
   assert.deepStrictEqual(types(events), ["keyDown", "keyUp"]);
   assert.strictEqual(events[0].keyCode, "k");
   assert.deepStrictEqual(events[0].modifiers, ["meta"]);
+});
+
+// --- `tweb type` ---
+//
+// Measured: `tweb type x` returned ok and filled a field, but a capture-phase keydown listener on
+// the document stayed empty, because the text went in as one insertText.
+
+test("type sends every printable ASCII character as a key press", () => {
+  const steps = typeSteps("g]x");
+  assert.deepStrictEqual(steps.map((step) => step.key), ["g", "]", "x"]);
+  for (const step of steps) {
+    assert.deepStrictEqual(types(step.events), ["keyDown", "char", "keyUp"]);
+    assert.strictEqual(step.events[0].keyCode, step.key);
+    assert.strictEqual(charOf(step.events), step.key);
+  }
+});
+
+test("type keeps a space and an uppercase letter as characters, not shift chords", () => {
+  const steps = typeSteps("A b");
+  assert.deepStrictEqual(steps.map((step) => charOf(step.events)), ["A", " ", "b"]);
+  assert.deepStrictEqual(steps[0].events[0].modifiers, []);
+});
+
+test("type turns a newline and a tab into the Enter and Tab keys", () => {
+  const steps = typeSteps("a\n\tb");
+  assert.deepStrictEqual(steps.map((step) => step.key), ["a", "Enter", "Tab", "b"]);
+  assert.deepStrictEqual(types(steps[1].events), ["keyDown", "keyUp"], "Enter inserts no character");
+});
+
+// Hangul and emoji have no keyCode Chromium accepts, so they stay one insertText run rather
+// than become keyDown events that would type nothing.
+test("type leaves characters without a key as one run of text", () => {
+  const steps = typeSteps("a한글😀b");
+  assert.deepStrictEqual(steps.map((step) => step.text ?? step.key), ["a", "한글😀", "b"]);
+});
+
+test("type of nothing sends nothing", () => {
+  assert.deepStrictEqual(typeSteps(""), []);
+  assert.deepStrictEqual(typeSteps(undefined), []);
+  assert.deepStrictEqual(typedKeys(typeSteps("")), []);
+});
+
+test("typedKeys names only the key steps, with repeats", () => {
+  assert.deepStrictEqual(typedKeys(typeSteps("gg한")), ["g", "g"]);
+});
+
+// --- the preload must let an announced agent key through ---
+//
+// Measured on a file:// page with a capture-phase keydown listener: `press g` and `press j` left
+// the listener empty while `press 5` and `press q` did not. `g` and `j` are TWeb commands, and the
+// preload's own capture handler stopped them before the page. An agent key is announced by the
+// engine (`tweb-agent-keys`) and spent once.
+
+const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+
+test("the engine announces an agent key before it sends it, for both press and type", () => {
+  assert.match(main, /function allowAgentKeys\(keys, modifiers\)/);
+  assert.match(main, /sendToFocusedTabFrame\(agentTab\(\), "tweb-agent-keys"/);
+  const press = main.slice(main.indexOf("function agentPressKey("), main.indexOf("function agentTypeText("));
+  assert.ok(press.includes(".sendInputEvent("), "press body found");
+  assert.ok(press.indexOf("allowAgentKeys([key]") !== -1 && press.indexOf("allowAgentKeys([key]") < press.indexOf(".sendInputEvent("), "press: announce, then send");
+  const type = main.slice(main.indexOf("function agentTypeText("), main.indexOf("function allowAgentKeys("));
+  assert.ok(type.includes(".sendInputEvent("), "type body found");
+  assert.ok(type.indexOf("allowAgentKeys(typedKeys") !== -1 && type.indexOf("allowAgentKeys(typedKeys") < type.indexOf(".sendInputEvent("), "type: announce, then send");
+  assert.doesNotMatch(main, /case "type":\s*agentContents\(\)\.insertText/, "type must not be one insertText");
+});
+
+test("Escape is never announced, so it stays the way out of a TWeb overlay", () => {
+  assert.match(main, /keys\.filter\(\(name\) => name !== "Escape"\)/);
+});
+
+test("the preload spends an announced key once and lets it past the TWeb commands", () => {
+  assert.match(preload, /ipcRenderer\.on\("tweb-agent-keys"/);
+  const handler = preload.slice(preload.indexOf("function handleNormalKey(event)"));
+  const take = handler.indexOf("takeAgentKey(event, key)");
+  const passed = handler.indexOf("if (agentKey) {");
+  const commands = handler.indexOf("normalKeyActions.get(key)");
+  assert.ok(take !== -1 && passed !== -1 && commands !== -1);
+  assert.ok(take < passed && passed < commands, "the pass-through comes before the command table");
+  // Overlays keep their keys: the pass-through sits after the help, picker and palette handlers.
+  assert.ok(handler.indexOf("handlePickerKey(event, key)") < passed);
+});
+
+test("an announcement expires, so a key that never arrives cannot swallow a later one", () => {
+  assert.match(preload, /Date\.now\(\) > agentKeysUntil/);
+});
+
+test("only a real keydown spends the allowance", () => {
+  assert.match(preload, /event\.type === "keydown" \? takeAgentKey\(event, key\) : false/);
 });

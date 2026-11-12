@@ -101,4 +101,47 @@ function pressEvents(key, modifiers = []) {
   return events;
 }
 
-module.exports = { pressEvents, insertedText, parseChord, ACCELERATOR_KEYS };
+// Control characters a `type` text can carry that are keys rather than text.
+const KEY_FOR_CONTROL_CHAR = new Map([["\n", "Enter"], ["\r", "Enter"], ["\t", "Tab"]]);
+
+// Which characters go out as real keys. Printable ASCII has a key on every layout, so its
+// keyDown/char/keyUp is the same thing a typist produces. Everything else (Hangul, emoji, accents)
+// has no `keyCode` Chromium would accept, so it keeps `insertText`, which inserts the text
+// faithfully but raises no keydown — the best a layout-independent path can do for those.
+const isTypableKey = (char) => char.length === 1 && char >= " " && char <= "~";
+
+/// The steps one agent `type` turns into, in order.
+///
+/// `type` used to be a single `insertText` call: it changed the field's value and raised no
+/// keydown, keypress or beforeinput the way typing does, so a page that listens for keys (a
+/// search box that debounces on keydown, a canvas app's tool keys) never heard a character.
+/// Now each printable ASCII character is a key press, and a run of anything else stays one
+/// `insertText`. A step is `{ events, key }` (send the events; `key` names what a pane shortcut
+/// must let through) or `{ text }` (insert it).
+function typeSteps(text) {
+  const steps = [];
+  let pending = "";
+  const flush = () => {
+    if (pending) steps.push({ text: pending });
+    pending = "";
+  };
+  for (const char of String(text ?? "")) {
+    const named = KEY_FOR_CONTROL_CHAR.get(char);
+    if (named === undefined && !isTypableKey(char)) {
+      pending += char;
+      continue;
+    }
+    flush();
+    const key = named ?? char;
+    steps.push({ events: pressEvents(key, []), key });
+  }
+  flush();
+  return steps;
+}
+
+/// Every key name a `typeSteps` result needs a pane shortcut to let through.
+function typedKeys(steps) {
+  return steps.filter((step) => step.key !== undefined).map((step) => step.key);
+}
+
+module.exports = { pressEvents, typeSteps, typedKeys, insertedText, parseChord, ACCELERATOR_KEYS };
