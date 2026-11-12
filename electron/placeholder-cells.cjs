@@ -138,20 +138,18 @@ function atLeast(version, minimum) {
  * @param {object} env
  * @param {boolean} env.inTmux whether the pane's bytes go through tmux
  * @param {string} [env.clientTermtype] tmux `#{client_termtype}`, the outer terminal's XTVERSION
- * @param {boolean} [env.remote] the terminal is on another machine (`$TWEB_REMOTE_TERMINAL`)
  * @param {string} [env.override] `$TWEB_PLACEHOLDERS`: "0" forces off, "1" forces on
  * @returns {{ allowed: boolean, reason: string }}
  */
-function placeholdersDecision({ inTmux, clientTermtype, remote = false, override } = {}) {
+function placeholdersDecision({ inTmux, clientTermtype, override } = {}) {
   if (override === "0") return { allowed: false, reason: "TWEB_PLACEHOLDERS=0" };
   if (!inTmux) return { allowed: false, reason: "not in tmux" };
   if (override === "1") return { allowed: true, reason: "TWEB_PLACEHOLDERS=1" };
-  // Over SSH a remote frame is chunked inline, so it alternates between two ids, and each flip
-  // renames every cell: the cells were 103KB of a 123KB frame, 84% of the link, and the remote
-  // tmux server spent 30.6% CPU parsing them (tmux 3.6, 200x50 pane, 30fps page, against 20KB and
-  // 0.4% with the overlay; measured 2026-11-12). Until a whole frame can be replaced under one id
-  // without a blank (FEASIBILITY.md 2.5), a remote pane keeps the overlay.
-  if (remote) return { allowed: false, reason: "remote terminal" };
+  // A remote pane used to keep the overlay. Over SSH a frame is chunked inline and alternated
+  // between two ids, and each flip renamed every cell: 103KB of a 123KB frame, and 30.6% CPU in
+  // the remote tmux 3.6 server. A frame of the placed size now replaces the image's pixels with
+  // `a=f` under the same id (`takeWholeFrameBase`), so the cells stay: 23KB a frame against the
+  // overlay's 20KB, and 1.4% CPU against 0.5% (200x50 pane, 30fps page, measured 2026-11-12).
   const name = clientTermtype || "";
   if (!/ghostty/i.test(name)) return { allowed: false, reason: `not ghostty (${name || "unknown"})` };
   const version = parseVersion(name);

@@ -427,9 +427,24 @@ and a first run read as "nothing changes" for that reason.
 | `a=f,r=1` then the cells again | old 10, new 1, blank 0 | new | yes (not needed) |
 | `a=f` frame 2, then `a=a,c=2` | old 10, blank 0 | new | no |
 
-Every command answered `OK`. Still open before shipping it: the cost. `a=f` on a 2880x1800 base was
-45% Ghostty CPU for 60x60 edits at 60Hz (2026-10-29); a whole-frame replace at the remote rate
-(2-20 frames/s) has not been measured, nor through tmux 3.6 passthrough on the remote side.
+Every command answered `OK`. A PNG payload (`f=100`) is accepted too, inline and in 256-byte
+chunks, at the root's size or smaller; a larger one is refused with `EINVAL: frame dimensions exceed
+image`, so a resize still transmits a new image.
+
+Cost, measured 2026-11-12 (load average 8-25 throughout, so the small numbers are noise-level):
+
+| | Ghostty CPU (own window) | local tmux 3.8 CPU |
+|---|---|---|
+| `a=f` 2/s x 50KB | 0.1% | 0.4% |
+| `a=f` 10/s x 50KB | 1.0% | 2.0% |
+| `a=T` + cells 10/s x 50KB | 1.4% | - |
+| `a=f` 10/s x 250KB | 4.0% | 9.2% |
+| `a=T` + cells 10/s x 250KB | 3.3% | - |
+
+`a=f` costs Ghostty no more than the retransmit it replaces. On the remote host (tmux 3.6, 200x50
+pane, 30fps page, `TWEB_REMOTE_TERMINAL=1`), placeholders with `a=f` sent 23KB a frame and cost the
+tmux server 1.4%, against the overlay's 20KB and 0.5%, and against 123KB and 30.6% when every frame
+alternated ids and rewrote the cells. That is what turned placeholders back on for remote panes.
 
 #### Design
 

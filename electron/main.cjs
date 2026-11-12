@@ -924,7 +924,6 @@ console.error(`tweb: patch placement ${relativePatches.allowed ? "relative" : "a
 const placeholders = placeholdersDecision({
   inTmux: true,
   clientTermtype: attachedTerminalType(),
-  remote: remoteTerminal,
   override: process.env.TWEB_PLACEHOLDERS,
 });
 console.error(`tweb: page cells ${placeholders.allowed ? "placeholders" : "overlay"} (${placeholders.reason})`);
