@@ -31,6 +31,21 @@ test("columns past the table inherit, since nothing can name them", () => {
   assert.ok(text.endsWith(`${mark(DIACRITICS.length - 1)}${mark(0x20)}${PLACEHOLDER.repeat(3)}`));
 });
 
+// A whole frame rewrites a retired patch's block of the base; on a pane wider than the table that
+// block can start past the last named column. It threw, uncaught, in the Electron main process.
+test("a block starting past the table widens left to the last named column", () => {
+  const last = DIACRITICS.length - 1;
+  const block = placeholderBlock(0x20000110, {
+    rows: 1, cols: 4, top: 3, left: 355, rowOffset: 2, colOffset: 354,
+  });
+  assert.match(block, new RegExp(`\\x1b\\[3;${355 - (354 - last)}H`));
+  const text = strip(block);
+  assert.ok(text.startsWith(`${PLACEHOLDER}${mark(2)}${mark(last)}${mark(0x20)}`));
+  assert.ok(text.endsWith(PLACEHOLDER.repeat(354 - last + 3)));
+  // A patch's own image starts at column 0; an offset with no pane room to its left still throws.
+  assert.throws(() => placeholderBlock(0x20000110, { rows: 1, cols: 1, left: 1, colOffset: 354 }), /column offset/);
+});
+
 test("the id's low 24 bits are the colour and its high byte the third mark", () => {
   const block = placeholderBlock(0x2a010203, { rows: 1, cols: 1 });
   assert.match(block, /\x1b\[38;2;1;2;3m/);
