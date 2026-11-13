@@ -91,7 +91,20 @@ function placeholderBlock(id, { rows, cols, top = 1, left = 1, rowOffset = 0, co
   if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`placeholder: bad image id ${id}`);
   if (rows <= 0 || cols <= 0) return "";
   if (rowOffset + rows > MAX_ROWS) throw new Error(`placeholder: ${rowOffset + rows} rows > ${MAX_ROWS}`);
-  if (colOffset >= DIACRITICS.length) throw new Error(`placeholder: column offset ${colOffset}`);
+  // A block that starts past the last column the table can name has nothing to name its first cell
+  // with. A wide pane gets one whenever a retired patch sat in its right end and a whole frame
+  // rewrites that block (`wholeFrameCells`). Its cells could only inherit, from whatever the
+  // terminal has to their left, so the block is widened leftward to start on the last named column
+  // and the chain is rewritten from there. Only possible where the block's image column and pane
+  // column agree far enough, which is the base frame's case (a patch always starts at column 0).
+  const lastNamed = DIACRITICS.length - 1;
+  if (colOffset > lastNamed) {
+    const widen = colOffset - lastNamed;
+    if (left - widen < 1) throw new Error(`placeholder: column offset ${colOffset} at pane column ${left}`);
+    return placeholderBlock(id, {
+      rows, cols: cols + widen, top, left: left - widen, rowOffset, colOffset: lastNamed,
+    });
+  }
   const high = highByteMark(id);
   const named = Math.min(cols, DIACRITICS.length - colOffset);
   // The columns are the same on every row, so they are built once.
