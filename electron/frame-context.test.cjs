@@ -5,7 +5,7 @@ const test = require("node:test");
 const {
   createFrameContext, nextPatchId, notePatch, takeLivePatchIds, generationIsCurrent,
   applyFrameViewport, queueGfxFrame, completeGfxFrame,
-  takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire,
+  takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire, survivingPatches,
   notePatchCells, wholeFrameCells, noteCellsWritten, forgetCells, PLACEHOLDER_CELLS_REFRESH_MS,
 } = require("./frame-context.cjs");
 const { createPaneRecord } = require("./pane-registry.cjs");
@@ -250,6 +250,40 @@ test("a whole frame retires the patches it contains, not the ones sent while it 
   assert.deepEqual(takePatchesToRetire(frames), [older]);
   assert.deepEqual(frames.livePatchIds, [newer]);
   assert.deepEqual(frames.retireOnPlace, []);
+});
+
+// Two whole frames in the pipe: W1 at the worker, W2 queued behind it. The patch sent between their
+// transfers is newer than W1. Retired when W1 landed, it bared W1's older pixels — the command
+// palette showed the row it had left still highlighted beside the one it moved to.
+test("a frame retires only the patches its own transfer contains", () => {
+  const frames = context(100);
+  const before = nextPatchId(frames);
+  notePatch(frames, before, { x: 0, y: 0, width: 10, height: 10 }, { row: 0, col: 0, rows: 1, cols: 1 });
+  const first = retirePatchesOnPlace(frames);
+  const between = nextPatchId(frames);
+  notePatch(frames, between, { x: 0, y: 0, width: 10, height: 10 }, { row: 2, col: 3, rows: 4, cols: 5 });
+  const second = retirePatchesOnPlace(frames);
+  assert.ok(second > first);
+  assert.deepEqual(takePatchesToRetire(frames, first), [before]);
+  // Still on screen over W1, and still owed to W2.
+  assert.deepEqual(survivingPatches(frames), [{ id: between, place: { row: 2, col: 3, rows: 4, cols: 5 } }]);
+  assert.deepEqual(takePatchesToRetire(frames, second), [between]);
+  assert.deepEqual(survivingPatches(frames), []);
+});
+
+// A relative patch dies with the base it is a child of. One sent while a frame was in flight sits
+// over the old base, and has to be placed again under the new one when that frame lands.
+test("a patch sent while a frame is in flight survives that frame, in drawing order", () => {
+  const frames = context(100);
+  const old = nextPatchId(frames);
+  notePatch(frames, old, { x: 0, y: 0, width: 1, height: 1 }, { row: 0, col: 0, rows: 1, cols: 1 });
+  const seq = retirePatchesOnPlace(frames);
+  const a = nextPatchId(frames);
+  notePatch(frames, a, { x: 0, y: 0, width: 1, height: 1 }, { row: 1, col: 1, rows: 1, cols: 1 });
+  const b = nextPatchId(frames);
+  notePatch(frames, b, { x: 0, y: 0, width: 1, height: 1 }, { row: 2, col: 2, rows: 1, cols: 1 });
+  assert.deepEqual(takePatchesToRetire(frames, seq), [old]);
+  assert.deepEqual(survivingPatches(frames).map((patch) => patch.id), [a, b]);
 });
 
 test("no patch id is reissued while it waits to be retired", () => {

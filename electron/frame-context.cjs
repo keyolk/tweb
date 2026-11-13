@@ -52,8 +52,14 @@ function createFrameContext(record, { frameRate = 30 } = {}) {
     inFlightFrameKey: null,
     inFlightEdit: false,
     // Patches a whole frame already contains, kept on screen until that frame is placed. A patch
-    // sent while the frame is in flight is newer than the frame and stays.
+    // sent while the frame is in flight is newer than the frame and stays. Each entry is
+    // `{ id, seq }`: `seq` names the transfer whose frame contains the patch, and only a frame
+    // from that transfer or a later one may retire it (see `takePatchesToRetire`).
     retireOnPlace: [],
+    transferSeq: 0,
+    // Where each patch still on screen sits, in cells — so a patch can be placed again under a new
+    // base when the base it was a child of is deleted (see `survivingPatches`).
+    patchPlaces: new Map(),
     // Placeholder panes: which cells the pane's grid holds. `cellsKey` names the base id and the
     // block size the cells were last written for, and `patchCells` where each live patch's own
     // cells sit. See `wholeFrameCells`.
@@ -134,7 +140,7 @@ function nextPatchId(context) {
   for (let tried = 0; tried < count; tried += 1) {
     const id = context.imageIds.patchBase + context.nextPatchSlot;
     context.nextPatchSlot = (context.nextPatchSlot + 1) % count;
-    if (!context.retireOnPlace.includes(id)) return id;
+    if (!context.retireOnPlace.some((entry) => entry.id === id)) return id;
   }
   return null;
 }
@@ -253,24 +259,58 @@ function forgetCells(context) {
  * The damage union goes with them, so a patch sent during the transfer covers only new damage.
  */
 function retirePatchesOnPlace(context) {
+  context.transferSeq += 1;
+  const seq = context.transferSeq;
   for (const id of takeLivePatchIds(context)) {
-    if (!context.retireOnPlace.includes(id)) context.retireOnPlace.push(id);
+    if (!context.retireOnPlace.some((entry) => entry.id === id)) context.retireOnPlace.push({ id, seq });
   }
+  return seq;
 }
 
 /**
- * The patch ids to delete now that a whole frame is placed. An id the pool has since reissued to
- * a newer patch is still live, and is left alone.
+ * The patch ids to delete now that the frame of transfer `seq` is placed: the ones that frame
+ * contains. An id the pool has since reissued to a newer patch is still live, and is left alone.
+ *
+ * Only up to `seq`. With a frame in flight and the next one queued behind it, the queued frame's
+ * transfer has already moved the patches sent in between onto this list — patches NEWER than the
+ * frame in flight. Retiring them when that older frame landed bared its stale pixels where they
+ * had been, until the queued frame was placed or, if it never was, until something else changed:
+ * the command palette showed two highlighted rows.
  */
-function takePatchesToRetire(context) {
-  const ids = context.retireOnPlace.filter((id) => !context.livePatchIds.includes(id));
-  context.retireOnPlace = [];
+function takePatchesToRetire(context, seq = Infinity) {
+  const ids = [];
+  const kept = [];
+  for (const entry of context.retireOnPlace) {
+    if (entry.seq > seq) kept.push(entry);
+    else if (!context.livePatchIds.includes(entry.id)) ids.push(entry.id);
+  }
+  context.retireOnPlace = kept;
+  for (const id of ids) context.patchPlaces.delete(id);
   return ids;
 }
 
+/**
+ * The patches still on screen after a frame is placed, oldest first, with where each sits.
+ *
+ * A relative patch is a child of the base it was placed over, and deleting that base deletes the
+ * child (relative-placement.cjs). A patch sent while a frame was in flight was placed over the OLD
+ * base; when the frame lands and the old base is deleted, the patch went with it — and the frame,
+ * older than the patch, showed through until the next change. These are placed again under the new
+ * base, in order, before the old one is deleted.
+ */
+function survivingPatches(context) {
+  const ids = [...context.retireOnPlace.map((entry) => entry.id), ...context.livePatchIds];
+  return [...new Set(ids)]
+    .map((id) => ({ id, place: context.patchPlaces.get(id) }))
+    .filter((patch) => patch.place);
+}
+
 /** Records a patch as live, so the next whole frame knows what to delete. */
-function notePatch(context, id, damage) {
+function notePatch(context, id, damage, place = null) {
   if (!context.livePatchIds.includes(id)) context.livePatchIds.push(id);
+  // Reissued ids move to the end: the order is the order they were drawn in.
+  else context.livePatchIds = [...context.livePatchIds.filter((live) => live !== id), id];
+  if (place) context.patchPlaces.set(id, place);
   context.patchedDamage = damage;
 }
 
@@ -396,6 +436,7 @@ module.exports = {
   settleWholeFrameBase,
   retirePatchesOnPlace,
   takePatchesToRetire,
+  survivingPatches,
   notePatchCells,
   wholeFrameCells,
   noteCellsWritten,
