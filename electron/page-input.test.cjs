@@ -488,12 +488,15 @@ test("the picker read and the rect refresh both go through the bound", () => {
 // engine's main thread stopped with it. Sampled while stuck: 100% of the main thread was a timer
 // callback inside `write()`. The board greyed out and every agent call timed out.
 
-test("a patch over the immediate limit is handed to the paced path", () => {
-  assert.match(main, /const IMMEDIATE_PATCH_MAX_BYTES = 64 \* 1024;/);
+// The budget itself (a stream is held back, a single menu-sized patch goes) is patch-budget.test.cjs.
+test("a patch over the immediate budget is handed to the paced path", () => {
+  assert.match(main, /const immediatePatchBudget = createPatchBudget\(\);/);
   const patch = body("function sendPatch(image, dirty, generation", "  return true;\n}");
   // Checked after the encode — the size is only known then — and before anything is written.
-  const check = patch.indexOf("if (png.length > IMMEDIATE_PATCH_MAX_BYTES) return false;");
+  const check = patch.indexOf("if (!immediatePatchBudget.allows(png.length)) return false;");
   const write = patch.indexOf("writeGfxChunked(");
+  const note = patch.indexOf("immediatePatchBudget.note(png.length);");
   assert.ok(check > 0, "the size check is gone");
   assert.ok(check < write, "the size check must come before the write, or the write has already blocked");
+  assert.ok(note > write, "a written patch has to be counted, or a stream is never held back");
 });

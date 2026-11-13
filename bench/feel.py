@@ -16,6 +16,12 @@ matters, and every failed attempt with the trace lines around it.
   reload-f  reload, then `f` at once.  ok = it drew; catches the main frame not yet ready
   tab-switch  `J`/`K` between two tabs, the second on --tab-engine.
                                        ok = the other tab's first frame drew; latency in->that frame
+  palette-move  `c`, ArrowDown x5, Escape. latency `c` -> frame; per-key latency as "keys"
+  palette-type  `c`, `s` `w` `i`, Escape.  same, typing into the filter
+
+`--tmux` runs the pane in a private tmux server with a pixel-sized client attached, the path a
+real pane takes (file transport, PNG patches; placeholders with TWEB_PLACEHOLDERS=1). The trace
+then also tells patches from whole frames, which is where tmux panes lose time.
 
 Usage:
   python3 bench/feel.py [--engine electron|chrome|webkit|both|all] [--tweb PATH] [--runs N]
@@ -36,6 +42,7 @@ import http.server
 import json
 import os
 import pty
+import shlex
 import shutil
 import select
 import signal
@@ -128,9 +135,15 @@ def reap_orphan_chromes(workdir):
 
 
 class Pane:
-    """One `tweb open` in its own PTY, its own user data, its own agent socket and trace."""
+    """One `tweb open` in its own PTY, its own user data, its own agent socket and trace.
 
-    def __init__(self, tweb, engine, url, workdir, size=(COLS, ROWS, PX_W, PX_H)):
+    With `tmux` set the pane runs inside a private tmux server (`tmux -L`) and the PTY is a tmux
+    CLIENT attached to it, with pixel sizes set: the path a pane in a real tmux window takes —
+    file transport, PNG patches, placeholder cells when `TWEB_PLACEHOLDERS=1` — which the bare PTY
+    never exercises. Keys are written into the client, as a terminal would.
+    """
+
+    def __init__(self, tweb, engine, url, workdir, size=(COLS, ROWS, PX_W, PX_H), tmux=False):
         self.dir = Path(tempfile.mkdtemp(prefix=f"feel-{engine}-", dir=os.path.abspath(workdir)))
         self.trace_path = self.dir / "trace.jsonl"
         # A unix socket path is capped at 104 bytes on macOS, and a scratch workdir is often longer.
@@ -148,10 +161,31 @@ class Pane:
         args = [tweb, "open", url]
         if engine in ("chrome", "webkit"):
             args[2:2] = ["--engine", engine]
+        cols, rows, width, height = size
+        self.tmux = None
+        if tmux:
+            self.tmux = f"feel-{os.getpid()}-{self.dir.name[-6:]}"
+            env["TWEB_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="feelrt-", dir="/tmp")
+            base = ["tmux", "-L", self.tmux, "-f", "/dev/null"]
+            subprocess.run(base + ["new-session", "-d", "-s", "feel", "-x", str(cols), "-y", str(rows)],
+                           env=env, check=True)
+            for option in (["set", "-g", "allow-passthrough", "all"], ["set", "-g", "status", "off"],
+                           ["set", "-s", "default-terminal", "tmux-256color"]):
+                subprocess.run(base + option, env=env, check=True)
+            # The pane's environment comes from the server, which was started with `env`.
+            command = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items() if k.startswith("TWEB_"))
+            command += " exec " + " ".join(shlex.quote(a) for a in args)
+            subprocess.run(base + ["respawn-pane", "-k", "-t", "feel", command], env=env, check=True)
+            args = base + ["attach", "-t", "feel"]
+            # The client must find xterm-ghostty's terminfo or it exits at once ("missing or
+            # unsuitable terminal"); Ghostty ships it inside the app.
+            env["TERMINFO_DIRS"] = "/Applications/Ghostty.app/Contents/Resources/terminfo:"
+            tweb_exec = shutil.which("tmux")
+        else:
+            tweb_exec = tweb
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            os.execve(tweb, args, env)
-        cols, rows, width, height = size
+            os.execve(tweb_exec, args, env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, width, height))
         self.graphics = 0
         self.alive = True
@@ -233,6 +267,8 @@ class Pane:
         else:
             os.kill(self.pid, signal.SIGKILL)
         os.close(self.fd)
+        if self.tmux:
+            subprocess.run(["tmux", "-L", self.tmux, "kill-server"], capture_output=True)
         # An engine that did not shut down cleanly (the SIGKILL above, or a crash) leaves its
         # detached Chrome running; see `reap_orphan_chromes`.
         chrome = chrome_lock_pid(self.dir / "userData" / "chrome-profile")
@@ -327,6 +363,41 @@ def attempt_j(pane):
     return True, frame["t"] - arrived["t"], None
 
 
+def attempt_palette(pane, keys):
+    """`c`, then `keys` one at a time, then Escape. Latency per key: its arrival -> next frame.
+
+    The palette is a DOM overlay in the page, so every key is a page change the engine has to
+    turn into a frame. Returns the open latency and the per-key latencies in the detail.
+    """
+    def one(data, hex_byte):
+        start = len(pane.trace())
+        pane.key(data)
+        frame = wait_for(pane, start, lambda r: r["step"] == "frame", 2.0)
+        rows = pane.trace()[start:]
+        arrived = last_in(rows, hex_byte)
+        if not arrived or frame is None:
+            return None, rows
+        frame = next((r for r in rows if r["step"] == "frame" and r["t"] >= arrived["t"]), frame)
+        return frame["t"] - arrived["t"], rows
+
+    opened, rows = one("c", "63")
+    if opened is None:
+        pane.key("\x1b")
+        return False, None, {"why": "`c` drew no frame within 2s", "trace": rows}
+    moves = []
+    for data in keys:
+        time.sleep(J_GAP)
+        latency, rows = one(data, data.encode().hex()[-2:])
+        if latency is None:
+            pane.key("\x1b")
+            return False, opened, {"why": f"{data!r} drew no frame within 2s", "trace": rows}
+        moves.append(latency)
+    time.sleep(J_GAP)
+    pane.key("\x1b")
+    time.sleep(0.3)
+    return True, opened, {"moves": [round(m, 1) for m in moves]}
+
+
 def open_second_tab(pane, url, engine):
     """Give the pane a second tab on `engine`, as a pane holding one Electron and one Chrome page."""
     code, _, err = pane.agent("tab", "new", url, timeout=20)
@@ -380,6 +451,10 @@ def run_scenario(pane, scenario, runs, url):
             if index % 10 == 9:
                 pane.key("gg")
                 time.sleep(0.3)
+        elif scenario == "palette-move":
+            outcome = attempt_palette(pane, ["\x1b[B"] * 5)
+        elif scenario == "palette-type":
+            outcome = attempt_palette(pane, list("swi"))
         elif scenario == "tab-switch":
             outcome = attempt_tab(pane, "J" if index % 2 == 0 else "K")
         elif scenario == "reload-f":
@@ -407,6 +482,7 @@ def summarise(results):
     failures = [detail for ok, _, detail in results if not ok]
     # tab-switch splits its latency: key arrival -> tab switched is the key path, the rest is paint.
     keyed = [detail["key"] for ok, _, detail in results if ok and detail and "key" in detail]
+    moves = [m for ok, _, detail in results if ok and detail for m in detail.get("moves", [])]
     return {
         "runs": len(results),
         "failed": len(failures),
@@ -415,6 +491,8 @@ def summarise(results):
         "max": percentile(latencies, 1.0),
         "failures": failures,
         **({"key_p50": percentile(keyed, 0.5)} if keyed else {}),
+        **({"move_p50": percentile(moves, 0.5), "move_p95": percentile(moves, 0.95),
+            "move_max": percentile(moves, 1.0)} if moves else {}),
     }
 
 
@@ -429,6 +507,8 @@ def main():
     parser.add_argument("--tab-engine", default=None, choices=["electron", "chrome", "webkit"],
                         help="tab-switch: the second tab's engine (default: chrome, or electron on a chrome pane)")
     parser.add_argument("--workdir", default=None)
+    parser.add_argument("--tmux", action="store_true",
+                        help="run the pane inside a private tmux server, as a real tmux window does")
     parser.add_argument("--size", default=f"{COLS}x{ROWS}@{PX_W}x{PX_H}",
                         help="cols x rows @ pixel width x height, e.g. 180x100@1440x1800 for half a Retina screen")
     parser.add_argument("--j-gap", type=float, default=J_GAP,
@@ -448,7 +528,7 @@ def main():
         for url in urls:
             cells, pixels = args.size.split("@")
             size = tuple(int(v) for v in cells.split("x")) + tuple(int(v) for v in pixels.split("x"))
-            pane = Pane(args.tweb, engine, url, workdir, size)
+            pane = Pane(args.tweb, engine, url, workdir, size, tmux=args.tmux)
             try:
                 if not pane.wait_ready():
                     report.append({"engine": engine, "url": url, "error": "page never became ready"})
@@ -463,7 +543,9 @@ def main():
                     print(f"{engine:8} {scenario:9} {url.rsplit('/', 1)[-1][:28]:28} "
                           f"fail {summary['failed']:>2}/{summary['runs']:<3} "
                           f"p50 {summary['p50']}ms p95 {summary['p95']}ms max {summary['max']}ms"
-                          + (f" (key->tab p50 {summary['key_p50']}ms)" if "key_p50" in summary else ""), flush=True)
+                          + (f" (key->tab p50 {summary['key_p50']}ms)" if "key_p50" in summary else "")
+                          + (f" | keys p50 {summary['move_p50']}ms p95 {summary['move_p95']}ms max {summary['move_max']}ms"
+                             if "move_p50" in summary else ""), flush=True)
                     for failure in summary["failures"][:3]:
                         print(f"           ! {failure['why']}", flush=True)
             finally:

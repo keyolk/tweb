@@ -72,6 +72,7 @@ const { relativePatchesDecision } = require("./relative-placement.cjs");
 const {
   placeholderBlock, placeholdersDecision, MAX_ROWS: PLACEHOLDER_MAX_ROWS,
 } = require("./placeholder-cells.cjs");
+const { createPatchBudget } = require("./patch-budget.cjs");
 const { passthroughRuns } = require("./tmux-passthrough.cjs");
 const {
   shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
@@ -2287,10 +2288,10 @@ function patchPlacementSequence(id, place, frames = currentFrames(), format = "f
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
 }
 
-// The largest patch the immediate path will send, in encoded bytes. A caret or a typed word is a
-// few KB; the whiteboard damage that blocked the main thread was 360KB and up. 64KB keeps every
-// keystroke on the immediate path with a wide margin while sending nothing that size unpaced.
-const IMMEDIATE_PATCH_MAX_BYTES = 64 * 1024;
+// How much the immediate path will send, in encoded bytes (patch-budget.cjs). A caret or a typed
+// word is a few KB and always goes; the whiteboard damage that blocked the main thread was 360KB
+// and up, back to back, and never does.
+const immediatePatchBudget = createPatchBudget();
 
 // Returns true when the damage was sent as a patch, false when the caller should fall back
 // to transferring the whole frame.
@@ -2340,7 +2341,11 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   // which go through the worker; a patch never waits for anything, so it is never dropped and
   // never counted. Declining here hands the damage to the whole-frame path, which is paced to
   // the frame rate and drops rather than blocks when the terminal falls behind.
-  if (png.length > IMMEDIATE_PATCH_MAX_BYTES) return false;
+  //
+  // The limit is a budget (patch-budget.cjs) rather than a flat cap: what blocked the thread was a
+  // STREAM of large patches, and a flat 64KB sent every larger single one — the command palette
+  // opening, its selection moving — to the whole-frame path, a 20MB frame for a corner of the pane.
+  if (!immediatePatchBudget.allows(png.length)) return false;
   const patchEncoded = frameProbeMark();
 
   const id = takeNextPatchId(frames);
@@ -2351,6 +2356,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
   writeGfx(`a=d,d=I,i=${id},q=2`, "");
   const encoded = png.toString("base64");
   writeGfxChunked(header, encoded, prefix, suffix, cells);
+  immediatePatchBudget.note(png.length);
   frames.patchWireBytes += encoded.length + header.length;
   frameProbeRecord("patch", {
     // No `pace`: a patch deliberately bypasses the pacer, which is the whole reason it
@@ -2377,7 +2383,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
 // What this removes is everything that kept patches small. The PNG path pays a SYNCHRONOUS
 // `toPNG()` on this thread that scales with area (patch-geometry.cjs: p90 24ms at the 0.2 limit,
 // 422ms at 0.85), and then writes the base64 inline — the 360-430KB whiteboard patches that
-// blocked this thread in `write()` (see `IMMEDIATE_PATCH_MAX_BYTES`). Here the cost is the crop's
+// blocked this thread in `write()` (see `immediatePatchBudget`). Here the cost is the crop's
 // copy plus one more copy into the mapping, and the tty sees a few dozen bytes, so neither the
 // encode nor the byte cap applies. The area limit is left as it is: raising it is a separate,
 // measured change.
