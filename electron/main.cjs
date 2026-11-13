@@ -166,7 +166,7 @@ const { isHostedRuntime, hostProtocolVersion } = require("./hosted-runtime.cjs")
 const {
   createFrameContext, nextPatchId: takeNextPatchId, notePatch, takeLivePatchIds,
   applyFrameViewport, queueGfxFrame: enqueueGfxFrame, completeGfxFrame,
-  takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire,
+  takeWholeFrameBase, settleWholeFrameBase, retirePatchesOnPlace, takePatchesToRetire, survivingPatches,
   notePatchCells, wholeFrameCells, noteCellsWritten, forgetCells,
 } = require("./frame-context.cjs");
 const {
@@ -1097,6 +1097,7 @@ function deleteImageInBand(record = currentPane(), frames = currentFrames()) {
   }
   takeLivePatchIds(frames);
   frames.retireOnPlace = [];
+  frames.patchPlaces.clear();
   frames.imageTransferred = false;
   frames.pendingImageDelete = false;
   forgetCells(frames);
@@ -1714,6 +1715,8 @@ function editsWholeFrameInPlace(record) {
 }
 
 function sendGfxFrameToWorker(frame, frames = currentFrames()) {
+  // Which patches this frame contains, for when it lands (`takePatchesToRetire`).
+  frames.inFlightSeq = frame.seq;
   // The id is chosen here, not when the frame was queued: see `takeWholeFrameBase`.
   const base = takeWholeFrameBase(frames, {
     alternate: alternatesWholeFrameBase(frames.record),
@@ -1818,9 +1821,12 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
     // The new frame first, the old one's delete after it, in one write: there is no moment
     // between them with neither on screen. The patches go with the old frame — they were
     // placed over it, and the new frame already contains what they covered.
-    const retiredPatches = takePatchesToRetire(frames);
+    const retiredPatches = takePatchesToRetire(frames, frames.inFlightSeq);
     const retire = [replaced, ...retiredPatches].filter((id) => id !== null)
       .map((id) => ({ header: `a=d,d=I,i=${id},q=2`, payload: "" }));
+    // Patches newer than this frame stay on screen; as children of the base about to be deleted
+    // they would go with it, so they are placed again under the new one first (`survivingPatches`).
+    const replaces = replaced !== null ? patchReplacements(frames) : [];
     let cellBytes = 0;
     if (usesPlaceholders(frames.record)) {
       // Three parts in one write: the frame and its virtual placement, the cells pointing at it,
@@ -1837,7 +1843,7 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
       cellBytes = Buffer.byteLength(cells);
       writeGfxCommands(commands, { after: cells, retire });
     } else {
-      writeGfxCommands([...commands, ...retire]);
+      writeGfxCommands([...commands, ...replaces, ...retire]);
     }
     // The cells are on the link too — 68KB at 240x70 — so a remote pane's rate is paced on them.
     const bytes = wireBytesOf(commands) + cellBytes;
@@ -1909,8 +1915,8 @@ gfxWorker.on("error", (error) => {
   console.error(`tweb: graphics writer crashed: ${error.stack || error.message}`);
 });
 
-function queueGfxFrame(png, header, generation, format = "png", size = null, frames = currentFrames()) {
-  const frame = { png, header, generation, format, width: size?.width, height: size?.height };
+function queueGfxFrame(png, header, generation, format = "png", size = null, frames = currentFrames(), seq) {
+  const frame = { png, header, generation, format, width: size?.width, height: size?.height, seq };
   // Whether it goes now or waits — and whether it is already too old to be worth either — is
   // decided in `frame-context.cjs`, which is where the one-deep queue's reasons are written down.
   const ready = enqueueGfxFrame(frames, frame);
@@ -2246,8 +2252,9 @@ function replacePlacement(frames = currentFrames()) {
 // budget — and leaving them behind at exit is exactly the stale-image case DESIGN.md
 // section 7.7 gates on.
 function deletePatches(frames = currentFrames()) {
-  const ids = new Set([...takeLivePatchIds(frames), ...frames.retireOnPlace]);
+  const ids = new Set([...takeLivePatchIds(frames), ...frames.retireOnPlace.map((entry) => entry.id)]);
   frames.retireOnPlace = [];
+  frames.patchPlaces.clear();
   for (const id of ids) writeGfx(`a=d,d=I,i=${id},q=2`, "");
 }
 
@@ -2286,6 +2293,20 @@ function patchPlacementSequence(id, place, frames = currentFrames(), format = "f
   }
   const header = `a=T,${format},i=${id},p=${PLACEMENT_ID},C=1,c=${place.cols},r=${place.rows}${z},q=2`;
   return { header, ...patchCursorMove(place, frames.origin, frames.cells, ESC) };
+}
+
+// The placements that put the surviving patches back over the base now on screen. Only relative
+// patches are children of a base; an absolute one is placed at a cell and a placeholder one is
+// cells in the grid, and neither goes with the base. A put (a=p) on the patch's own image re-places it
+// under the same placement id, so nothing is transmitted again.
+function patchReplacements(frames) {
+  if (usesPlaceholders(frames.record) || !relativePatches.allowed) return [];
+  const z = imageZ === 0 ? "" : `,z=${imageZ}`;
+  return survivingPatches(frames).map(({ id, place }) => ({
+    header: `a=p,i=${id},p=${PLACEMENT_ID},${patchRelativeKeys(place, frames.cells, frames.shownBase, PLACEMENT_ID)}`
+      + `,c=${place.cols},r=${place.rows}${z},q=2`,
+    payload: "",
+  }));
 }
 
 // How much the immediate path will send, in encoded bytes (patch-budget.cjs). A caret or a typed
@@ -2365,7 +2386,7 @@ function sendPatch(image, dirty, generation, frames = currentFrames(), record = 
     transfer: frameProbeMs(patchEncoded, frameProbeMark()),
     total: frameProbeMs(patchStarted, frameProbeMark()),
   }, png.length);
-  notePatch(frames, id, damage);
+  notePatch(frames, id, damage, geometry.place);
   inputTrace.mark("frame", { kind: "patch", bytes: png.length });
   record.frames.patches += 1;
   const patchFramesSent = record.frames.patches;
@@ -2416,7 +2437,7 @@ function sendShmPatch(image, damage, geometry, frames, record, patchStarted) {
     transfer: frameProbeMs(patchEncoded, frameProbeMark()),
     total: frameProbeMs(patchStarted, frameProbeMark()),
   }, bitmap.length);
-  notePatch(frames, id, damage);
+  notePatch(frames, id, damage, geometry.place);
   inputTrace.mark("frame", { kind: "patch", bytes: bitmap.length, medium: "shm" });
   record.frames.patches += 1;
   frames.shmPatches += 1;
@@ -2435,7 +2456,7 @@ function transferFrame(pixels, generation, format = "png", size = null, probe = 
   // the whole inline transfer later — and deleting them now bared the stale pixels underneath
   // for all of that time. They are retired in the same write that places the new frame
   // (`handleGfxWorkerReady`).
-  retirePatchesOnPlace(currentFrames());
+  const seq = retirePatchesOnPlace(currentFrames());
   // c=/r= make the terminal scale the image into the pane's cell box, so a frame
   // whose pixel size no longer matches still covers exactly the pane. The id is filled in at
   // dispatch, where it is chosen; `f=` is left to the worker, which knows whether it is writing
@@ -2449,7 +2470,8 @@ function transferFrame(pixels, generation, format = "png", size = null, probe = 
   const header = `a=T,${placeholder ? "U=1," : ""}i=${WHOLE_FRAME_ID},p=${PLACEMENT_ID},C=1,`
     + `c=${currentFrames().cells.cols},r=${currentFrames().cells.rows}`
     + (imageZ === 0 || placeholder ? "" : `,z=${imageZ}`);
-  queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size);
+  queueGfxFrame(pixels, format === "raw" ? header : `${header},f=100`, generation, format, size,
+    currentFrames(), seq);
   inputTrace.mark("frame", { kind: "whole", format });
   currentPane().frames.whole += 1;
   // Only the first few: enough to see when a page actually reached the pane, which
