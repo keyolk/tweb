@@ -113,7 +113,33 @@ function abandonedShmFrames(names, selfPid, isAlive) {
   return abandoned;
 }
 
+// Which medium one pane's frames take right now, given that shm is allowed for this engine at all.
+//
+// Shared memory has one reader: the terminal that reads an object unlinks it. Under the overlay a
+// second tmux client only missed a patch and kept the base underneath; under placeholders there is
+// nothing underneath, so a second client showed blank boxes (measured: a quarter of captures, both
+// clients). That is why placeholder panes used to take the file medium unconditionally.
+//
+// But the hazard needs a second client, and tmux forwards passthrough only to the clients that are
+// showing the pane — the same set the visibility push reports. With exactly one of them, one reader
+// is all there is, and the file medium only costs: on a Retina placeholder pane every whole frame
+// was a 6.9MB raw file write and read, and a playing YouTube video dropped a quarter of its frames
+// (observed 2026-11-18, 77 of 314 over 10s, with 15 frames dropped to backpressure). So a
+// placeholder pane takes shm while one client shows it, and goes back to the file the moment a
+// second appears. Zero clients (hidden, or not known yet) keeps the file: nothing is drawn then, and
+// "unknown" must not be the case that gambles.
+function paneShmMedium({ shmEnabled, placeholders, clientCount } = {}) {
+  if (!shmEnabled) return { shm: false, reason: "shm is off for this engine" };
+  if (!placeholders) return { shm: true, reason: "overlay pane" };
+  const count = Number(clientCount);
+  if (count === 1) return { shm: true, reason: "placeholder pane with one client" };
+  if (Number.isFinite(count) && count > 1) {
+    return { shm: false, reason: `placeholder pane with ${count} clients (shm has one reader)` };
+  }
+  return { shm: false, reason: "placeholder pane with no client showing it" };
+}
+
 module.exports = {
-  shmFramesDecision, shmFrameName, shmPatchName, paneShmNames, shmMarkerName, abandonedShmFrames,
+  shmFramesDecision, paneShmMedium, shmFrameName, shmPatchName, paneShmNames, shmMarkerName, abandonedShmFrames,
   SHM_RING, SHM_PATCH_RING, SHM_MARKER_PATTERN, CONSUMES_SHM,
 };
