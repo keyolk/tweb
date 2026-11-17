@@ -75,6 +75,7 @@ const {
 const { createPatchBudget } = require("./patch-budget.cjs");
 const { passthroughRuns } = require("./tmux-passthrough.cjs");
 const { parkSequence, unparkSequence } = require("./terminal-caret.cjs");
+const { markdownLink, clipboardUrl } = require("./copy-format.cjs");
 const {
   shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
   SHM_RING, SHM_PATCH_RING,
@@ -4489,6 +4490,66 @@ function omniboxModel() {
   };
 }
 
+// The original image file, fetched through the tab's own session so a signed-in image comes as
+// the page sees it. Null when there is no fetchable URL (a canvas, a blob), the engine has no
+// Electron session (Chrome, WebKit), or the bytes are not a format nativeImage decodes.
+async function fetchOriginalImage(contents, src) {
+  if (typeof src !== "string" || !/^(https?|data):/i.test(src)) return null;
+  const session = contents?.session;
+  if (!session || typeof session.fetch !== "function") return null;
+  try {
+    const response = await session.fetch(src);
+    if (!response.ok) return null;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length === 0 || buffer.length > 64 * 1024 * 1024) return null;
+    const image = nativeImage.createFromBuffer(buffer);
+    return image.isEmpty() ? null : image;
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: image fetch failed: ${error.message}`);
+    return null;
+  }
+}
+
+// Copies an image and says which copy it made. The original keeps its full resolution and
+// whatever is scrolled off screen; the fallback is the region as drawn, which is all a canvas or a
+// video frame has. The capture waits a tick so the renderer can drop its visual outline first —
+// it works for img, canvas, SVG and video in offscreen Chromium, where copyImageAt may not
+// update the pasteboard.
+async function copyImageToClipboard(tab, contents, value) {
+  const say = (text) => sendToMainTabFrame(tab, "tweb-flash", text);
+  const original = await fetchOriginalImage(contents, value?.src);
+  if (original) {
+    clipboard.writeImage(original);
+    const { width, height } = original.getSize();
+    say(`image ${width}×${height}`);
+    return;
+  }
+  if (![value?.x, value?.y, value?.width, value?.height].every(Number.isFinite)) {
+    say("image copy failed");
+    return;
+  }
+  const rect = {
+    x: Math.max(0, Math.round(value.x)),
+    y: Math.max(0, Math.round(value.y)),
+    width: Math.max(1, Math.round(value.width)),
+    height: Math.max(1, Math.round(value.height)),
+  };
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  try {
+    const image = await contents.capturePage(rect);
+    if (image.isEmpty()) {
+      say("image copy failed");
+      return;
+    }
+    clipboard.writeImage(nativeImage.createFromBuffer(image.toPNG()));
+    const { width, height } = image.getSize();
+    say(`image ${width}×${height} · as shown`);
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: image copy failed: ${error.message}`);
+    say("image copy failed");
+  }
+}
+
 function tabListModel() {
   return {
     activeIndex: currentWindows().activeTabIndex,
@@ -4990,26 +5051,27 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     case "chrome-pane":
       openInChromePane(tab, contents.getURL(), null);
       break;
+    // The `y` menu's image rows and `v`'s image pick: the original through the tab's session, else
+    // the pixels shown (copyImageToClipboard).
     case "copy-image":
-      if ([value?.x, value?.y, value?.width, value?.height].every(Number.isFinite)) {
-        const rect = {
-          x: Math.max(0, Math.round(value.x)),
-          y: Math.max(0, Math.round(value.y)),
-          width: Math.max(1, Math.round(value.width)),
-          height: Math.max(1, Math.round(value.height)),
-        };
-        // Let the renderer remove its visual outline before capturing the
-        // rendered image region. This works for img, canvas, SVG and video in
-        // offscreen Chromium, where copyImageAt may not update the pasteboard.
-        setTimeout(() => {
-          void contents.capturePage(rect).then((image) => {
-            if (!image.isEmpty()) clipboard.writeImage(nativeImage.createFromBuffer(image.toPNG()));
-          }).catch((error) => {
-            if (debugLogging) console.error(`tweb: image copy failed: ${error.message}`);
-          });
-        }, 0);
-      }
+      void copyImageToClipboard(tab, contents, value);
       break;
+    // `yl` with nothing picked: the tab's own title and address, which a subframe cannot read.
+    case "copy-page-markdown":
+      clipboard.writeText(markdownLink(contents.getTitle() || contents.getURL(), contents.getURL()));
+      break;
+    // Normal mode's `p` / `P` with no field focused.
+    case "open-clipboard-url": {
+      const text = clipboard.readText();
+      const url = clipboardUrl(text);
+      if (!url) {
+        sendToMainTabFrame(tab, "tweb-flash", text.trim() ? "the clipboard holds no URL" : "the clipboard is empty");
+        break;
+      }
+      if (value?.newTab) openTabRouted(tab, url, true);
+      else if (!followPin(tab, url, "typed")) void contents.loadURL(url);
+      break;
+    }
     case "download":
       downloadUrl(contents, value);
       break;
