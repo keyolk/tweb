@@ -128,7 +128,7 @@ installPrintShim();
   // The palette is a fuzzy-search menu: type letters to filter by label, and the
   // match runs immediately. `j`/`k` + `Enter` is the fallback when the filter
   // leaves more than one entry. There are no keyboard-shortcut hints in the
-  // list — shortcuts like `gd`/`gh`/`b` already work from normal mode, and
+  // list — shortcuts like `gd`/`gh`/`T` already work from normal mode, and
   // listing them here would only duplicate them. The palette is for actions
   // that do not have a key: "Open in Chrome" is the reason it exists.
   let commandPaletteState = null;
@@ -165,31 +165,31 @@ installPrintShim();
   // the palette would duplicate the key (DESIGN.md 15.3), but `:` is reached by name and a name
   // is exactly what someone who cannot remember the key is looking for.
   const namedCommands = [
-    { name: "reload", action: () => send("reload") },
-    { name: "float", action: () => send("toggle-float") },
-    { name: "back", action: () => send("history-back") },
-    { name: "forward", action: () => send("history-forward") },
-    { name: "tabs", action: () => showTabList() },
+    { name: "reload", help: "reload the page (r)", action: () => send("reload") },
+    { name: "float", help: "float the page into a desktop window, or back (W)", action: () => send("toggle-float") },
+    { name: "back", help: "history back (H)", action: () => send("history-back") },
+    { name: "forward", help: "history forward (L)", action: () => send("history-forward") },
+    { name: "tabs", help: "search open tabs (T)", action: () => showTabList() },
     // In-page overlays, not shortcut sends — `gh`/`gd` reach these same functions.
-    { name: "history", action: () => showHistory() },
-    { name: "downloads", action: () => showDownloads() },
-    { name: "close", action: () => send("close-tab") },
-    { name: "url", action: () => send("copy-url") },
-    { name: "print", action: () => send("print-paper") },
-    { name: "zoom", action: () => send("zoom-reset") },
+    { name: "history", help: "history page (gh)", action: () => showHistory() },
+    { name: "downloads", help: "downloads (gd)", action: () => showDownloads() },
+    { name: "close", help: "close this tab (x)", action: () => send("close-tab") },
+    { name: "url", help: "copy the page URL (yy)", action: () => send("copy-url") },
+    { name: "print", help: "print on paper with lpr (gp)", action: () => send("print-paper") },
+    { name: "zoom", help: "reset zoom (zz)", action: () => send("zoom-reset") },
     // The two that take a value. They report their own error when it is missing, since
     // `:open` with nothing to open is a mistake worth naming rather than a silent no-op.
-    { name: "open", argument: "url", action: (value) => send("navigate", value) },
-    { name: "tab", argument: "url", action: (value) => send("new-tab", value) },
-    { name: "engine", argument: "electron, chrome or webkit", action: (value) => send("switch-engine", value) },
+    { name: "open", help: "open a URL or search here", argument: "url", action: (value) => send("navigate", value) },
+    { name: "tab", help: "open a URL or search in a new tab", argument: "url", action: (value) => send("new-tab", value) },
+    { name: "engine", help: "move this tab to another page engine", argument: "electron, chrome or webkit", action: (value) => send("switch-engine", value) },
     // What this site may use (site-permissions.cjs). `:permissions reset` forgets the site.
-    { name: "permit", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "permit", argument: value }) },
-    { name: "forbid", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "forbid", argument: value }) },
-    { name: "permissions", action: (value) => send("site-permission", { op: "list", argument: value }) },
+    { name: "permit", help: "let this site use a device or API", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "permit", argument: value }) },
+    { name: "forbid", help: "stop this site using a device or API", argument: "camera, mic, notifications, clipboard or midi", action: (value) => send("site-permission", { op: "forbid", argument: value }) },
+    { name: "permissions", help: 'list what this site may use · "reset" forgets the site', action: (value) => send("site-permission", { op: "list", argument: value }) },
     // Narrowest first. `:clear-data` alone reports what `all` would do rather than doing it.
-    { name: "clear-site", action: () => send("clear-data", { scope: "site" }) },
-    { name: "clear-cache", action: () => send("clear-data", { scope: "cache" }) },
-    { name: "clear-data", action: (value) => send("clear-data", { scope: value }) },
+    { name: "clear-site", help: "clear this site’s cookies and storage", action: () => send("clear-data", { scope: "site" }) },
+    { name: "clear-cache", help: "clear the HTTP cache", action: () => send("clear-data", { scope: "cache" }) },
+    { name: "clear-data", help: 'clear browsing data by scope — alone, says what "all" would clear', action: (value) => send("clear-data", { scope: value }) },
   ];
   // Both tables, by name. Palette rows win a collision, since a row the user can see is the one
   // they will expect `:` to reach.
@@ -1120,7 +1120,7 @@ installPrintShim();
     // coming from, so the user knows which pane to go to instead of guessing.
     audioBadge.textContent = audioState.muted ? `🔇 ${audioState.owner || "other pane"}` : "";
     audioBadge.title = audioState.muted
-      ? `Audio muted — ${audioState.owner || "another pane"} owns it · press m to take it back`
+      ? `Audio muted — ${audioState.owner || "another pane"} owns it · press ga to take it back`
       : "";
     audioBadge.style.display = audioState.muted ? "" : "none";
     // An agent's request stays on screen for the whole recording: the user may come back to the
@@ -1302,7 +1302,13 @@ installPrintShim();
       const letter = event.code.slice(3).toLowerCase();
       return event.shiftKey ? letter.toUpperCase() : letter;
     }
-    if (/^Digit[0-9]$/.test(event.code)) return event.code.slice(5);
+    // Shifted digits are the US symbols. They used to come back as the bare digit, so `$`, `^`, `#`
+    // never reached a handler: visual `$` (end of line) was dead, and Vimium's `^` / `g$` had
+    // nothing to bind to.
+    if (/^Digit[0-9]$/.test(event.code)) {
+      const digit = event.code.slice(5);
+      return event.shiftKey ? ")!@#$%^&*("[Number(digit)] : digit;
+    }
     const keys = {
       Slash: event.shiftKey ? "?" : "/",
       Semicolon: event.shiftKey ? ":" : ";",
@@ -3657,6 +3663,10 @@ installPrintShim();
   // window), `:` and `y` were all bound for a while with no line here, and the float mode read
   // as removed. Rows without bindings are keys handled elsewhere — chords after `g`/`z`, the
   // pickers' own keys, and the ones the engine intercepts before the page sees them.
+  // The normal-mode keys and their help, one table. The rule is Vimium's: a key Vimium binds does
+  // what Vimium does with it (or tweb's nearest equivalent), and a tweb-only action lives only on a
+  // key Vimium leaves free — so years of Vimium muscle memory are never surprised here.
+  // `VIMIUM_NORMAL_KEYS` in vimium-keys.test.cjs is the list this is held to.
   const shortcutHelpSections = [
     ["Motion", [
       ["h · j · k · l", "scroll left · down · up · right", {
@@ -3678,37 +3688,65 @@ installPrintShim();
         L: () => send("history-forward"),
       }],
       ["Alt-← · Alt-→ · Backspace", "history back · forward — the Chrome keys"],
+      ["gu · gU", "up one level of the URL · to its root"],
+      ["gi", "focus the first input"],
     ]],
-    ["Opening and tabs", [
+    ["Tabs", [
+      ["J · K · gT · gt", "previous · next tab", { J: () => send("previous-tab"), K: () => send("next-tab") }],
+      ["g0 · g$", "first · last tab"],
+      ["^", "the tab you were on before", { "^": () => send("previous-visited-tab") }],
+      ["T", "search open tabs — j/k, Enter, x closes, 1-9 jumps", { T: () => showTabList() }],
+      ["t", "new tab (with the omnibox)", { t: () => showPrompt(true) }],
+      ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
+      ["r · R", "reload · reload bypassing the cache", { r: () => send("reload"), R: () => send("reload-hard") }],
+      ["Ctrl-Tab / PgUp / PgDn · Ctrl-W", "switch browser tab · close it — the Chrome keys"],
+    ]],
+    ["Opening", [
       ["f · F", "open via hint · open in new tab — a hint on a video/audio itself holds it for the media keys", { f: () => startHints(false), F: () => startHints(true) }],
-      ["o · O / t", "omnibox in current tab · new tab", {
+      ["o · O", "omnibox in current tab · new tab", {
         o: () => showPrompt(false),
         O: () => showPrompt(true),
-        t: () => showPrompt(true),
       }],
-      ["b", "list open tabs", { b: () => showTabList() }],
-      ["gh · gd", "history page · downloads — search, copy the path, open"],
-      ["gr · gR", "record for the agent · record a flow for it to learn (again to stop and send)"],
-      ["J · K", "previous · next tab", { J: () => send("previous-tab"), K: () => send("next-tab") }],
-      ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
-      ["r · gi", "reload · focus first input", { r: () => send("reload") }],
-    ]],
-    ["Search and selection", [
+      ["ge · gE", "edit the current URL here · in a new tab"],
+      ["p · P", "with a field focused, paste into it · open the clipboard URL here · in a new tab", {
+        p: () => pasteOrOpen(false),
+        P: () => pasteOrOpen(true),
+      }],
       ["/ · n · N", "search · next · previous match", {
         "/": () => showSearch(),
         n: () => { if (!lastSearch) return false; stepSearch(true); },
         N: () => { if (!lastSearch) return false; stepSearch(false); },
       }],
+    ]],
+    // `y` is a menu, not a copy: the second key names what to copy, and the menu shows what
+    // each would copy right now. The combo rows bind nothing here — the menu
+    // (`handleCopyMenuKey`) owns the second key — so only `y` is bound. `yy`, `yt` and `yf`
+    // are Vimium's; the rest sit on second keys Vimium leaves free.
+    ["Copy and paste", [
+      ["y", "copy menu — each row shows what it would copy right now; Esc closes it", { y: () => startCopyMenu() }],
+      ["yy", "the page URL · on a v pick the image, link URL or text"],
+      ["yt", "duplicate this tab"],
+      ["yf", "link URL · labels to pick one"],
+      ["yw", "text: the selection · the picked block (never a password field)"],
+      ["yu", "URL: the page · the picked link or image"],
+      ["yl", "markdown link: [title](url) of the page · the picked link"],
+      ["yi", "image itself (the original file, else the pixels shown) · labels to pick one"],
+      ["ys", "image URL · labels to pick one"],
+      ["yc", "code block · labels to pick one"],
+    ]],
+    ["Visual", [
       ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k, the arrows and PageUp/PageDown to scroll (Esc returns to the page) · orange video/audio, held for the media keys · Enter clicks the pick · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
+      ["o", "swap the ends of the selection"],
       ["c · v", "drop to caret to move the anchor · select from there"],
-      ["y… · Y · u", "copy menu (see Copy and paste) · text · image/link URL"],
-      ["D · o/O · p · d", "image download · open target · paste · inspect"],
-      ["I", "inspect picker — then y/h/t copy, a sends it to the agent pane", { I: () => startInspect() }],
+      ["y · Y", "copy the selected text (on a pick with no text selected, the copy menu) · the text"],
+      ["u · D", "image/link URL copy · image download"],
+      ["t · T · Enter", "open the picked link or image here · in a new tab · click it"],
+      ["I", "inspect the pick"],
     ]],
     // Its own section rather than one dense row under selection: the keys are the page's
-    // ordinary ones (j/k scroll, m takes audio back) until a video is held, and a reader
-    // scanning for "volume" did not find them packed into a single line.
+    // ordinary ones (j/k scroll) until a video is held, and a reader scanning for "volume" did
+    // not find them packed into a single line.
     ["Media (a video or audio held with f or v)", [
       ["f · v", "pick a video or audio to hold it — v labels it orange; the status shows volume · speed · time"],
       ["j · k", "volume −10% · +10% (raising from muted unmutes)"],
@@ -3717,54 +3755,55 @@ installPrintShim();
       ["H · L", "seek −30s · +30s"],
       ["m", "mute · unmute"],
       ["< · >", "speed −0.25 · +0.25 (0.25x–4x)"],
-      ["Esc", "let it go — j/k scroll and m takes audio back again"],
+      ["Esc", "let it go — j/k scroll again"],
     ]],
-    // `y` is a menu, not a copy: the second key names what to copy, and the menu shows what
-    // each would copy right now. The combo rows bind nothing here — the menu
-    // (`handleCopyMenuKey`) owns the second key — so only `y`, `p` and `P` are bound.
-    ["Copy and paste", [
-      ["y", "copy menu — each row shows what it would copy right now; Esc closes it", { y: () => startCopyMenu() }],
-      ["yy", "smart: the selection, else the page URL · on a v pick the image, link URL or text"],
-      ["yt", "text: the selection · the picked block (never a password field)"],
-      ["yu", "URL: the page · the picked link or image"],
-      ["yl", "markdown link: [title](url) of the page · the picked link"],
-      ["yi", "image itself (the original file, else the pixels shown) · labels to pick one"],
-      ["ys", "image URL · labels to pick one"],
-      ["yc", "code block · labels to pick one"],
-      ["yf", "link URL · labels to pick one"],
-      ["p · P", "with a field focused, paste into it · open the clipboard URL here · in a new tab", {
-        p: () => pasteOrOpen(false),
-        P: () => pasteOrOpen(true),
-      }],
-    ]],
-    ["Browser and modes", [
+    ["tweb", [
+      ["gh · gd", "history page · downloads — search, copy the path, open"],
+      ["gr · gR", "record for the agent · record a flow for it to learn (again to stop and send)"],
+      ["ga", "take audio back — only one pane plays at a time"],
+      ["I", "inspect picker — then y/h/t copy, a sends it to the agent pane", { I: () => startInspect() }],
       ["zi · zo · zz", "zoom in · out · reset", {
         z: () => { pendingZ = true; pendingZTimer = setTimeout(resetPendingZ, 800); setMode("normal", "z"); },
       }],
       ["Ctrl + / - / 0", "browser zoom"],
-      ["Ctrl-Tab / PgUp / PgDn", "switch browser tab"],
-      ["Ctrl-W", "close current browser tab"],
       ["Ctrl-P", "save the page as a PDF in ~/Downloads (a terminal cannot draw a print dialog)"],
       ["gp", "save the PDF, then send it to the printer with lpr"],
       ["Ctrl-D", "cancel the running download"],
-      // Shift-W raises the floating window without changing whether it exists — `w` still
-      // toggles. Same finger, and the pair reads as "float" / "go to the float".
-      ["w · W", "float the page into a desktop window (again to return) · raise it", {
+      // `W` is Vimium's "move tab to new window", and floating is tweb's version of that: the page
+      // leaves the pane for a desktop window. `w` (free in Vimium) does the same, because `w` is
+      // also the key the floating window itself takes to come back; `:window` raises the float.
+      ["W · w", "float the page into a desktop window (again to return) — :window raises it", {
+        W: () => send("toggle-float"),
         w: () => send("toggle-float"),
-        W: () => send("focus-float"),
       }],
       ["c", "command palette", { c: () => startCommandPalette() }],
       // The command line. Normal mode only — DESIGN.md 16.3 keeps a colon a character the page
       // is entitled to receive in insert mode, and this table only runs in normal mode.
-      [":", "command line", { ":": () => startCommandLine() }],
+      [":", "command line — every command is listed under Commands below", { ":": () => startCommandLine() }],
       ["i", "insert mode — page's own shortcuts, Esc returns", { i: () => enterInsertMode() }],
-      ["m", "take audio back — only one pane plays at a time", { m: () => { send("reclaim-audio"); flash("audio"); } }],
       ["?", "this help", { "?": () => showHelp() }],
       ["Ctrl-;", "Edit mode: every key to the page while this pane has focus"],
       ["Ctrl-C", "quit TWeb from Shortcuts mode"],
       ["Esc", "clear current mode · fullscreen · input focus"],
     ]],
   ];
+
+  // `?` lists the commands `:` and the palette (`c`) run, built from the tables they run from
+  // (`commandsByName`, `commandPaletteEntries`), so a command added there shows up here and one
+  // cannot be reachable but missing from the help.
+  function commandHelpSection() {
+    const palette = new Set(commandPaletteEntries.map((entry) => entry));
+    const rows = [...commandsByName.values()].map((entry) => [
+      `:${entry.name}${entry.argument ? ` <${entry.argument}>` : ""}`,
+      `${entry.label || entry.help || ""}${palette.has(entry) ? " · also in c" : ""}`,
+    ]);
+    rows.push([`:${SCRIPT_PREFIXES[0]} <expression> · :!<expression>`, "run JavaScript in the page and show the result"]);
+    return ["Commands (: and the c palette)", rows];
+  }
+
+  function helpSections() {
+    return [...shortcutHelpSections, commandHelpSection()];
+  }
 
   const normalKeyActions = new Map(shortcutHelpSections.flatMap(([, entries]) =>
     entries.flatMap(([, , bindings]) => Object.entries(bindings || {}))));
@@ -3826,7 +3865,7 @@ installPrintShim();
     noMatch.style.cssText = "display:none;padding:11px;color:#9aa0a6";
     const rows = [];
     const groups = [];
-    for (const [title, entries] of shortcutHelpSections) {
+    for (const [title, entries] of helpSections()) {
       const group = document.createElement("section");
       group.style.cssText = "padding:11px;border:1px solid #ffffff18;border-radius:7px;background:#ffffff08";
       const name = document.createElement("strong");
@@ -3980,7 +4019,9 @@ installPrintShim();
     return score - haystack.length * 0.01;
   }
 
-  function showPrompt(newTab) {
+  // `editUrl` is Vimium's `ge` / `gE`: the address already in the box with the caret at its end,
+  // to be edited rather than replaced.
+  function showPrompt(newTab, editUrl = false) {
     cancelTransient(false);
     const host = document.createElement("div");
     host.id = "__tweb_omnibox__";
@@ -4134,8 +4175,9 @@ installPrintShim();
     ipcRenderer.once("tweb-omnibox", (_event, nextModel) => {
       if (promptHost !== host) return;
       model = nextModel || model;
-      input.value = newTab ? "" : model.current || "";
-      if (!newTab) input.select();
+      input.value = newTab && !editUrl ? "" : model.current || "";
+      if (editUrl) input.setSelectionRange(input.value.length, input.value.length);
+      else if (!newTab) input.select();
       render();
     });
     send("omnibox-model");
@@ -4503,6 +4545,30 @@ installPrintShim();
     if (!item) return;
     tabListRefresh = true;
     send("close-tab", item.tab.index);
+  }
+
+  // Vimium's `gu` / `gU`: up one level of the URL, or to its root. The query and fragment belong
+  // to the page being left, so they go first; a trailing slash is not a level.
+  function upUrl(href, root) {
+    let url;
+    try { url = new URL(href); } catch (_) { return null; }
+    if (!/^https?:$|^file:$/.test(url.protocol)) return null;
+    const base = `${url.origin === "null" ? `${url.protocol}//` : url.origin}`;
+    if (root) return `${base}/`;
+    const parts = url.pathname.replace(/\/+$/, "").split("/");
+    if (parts.length <= 1 && !url.search && !url.hash) return null;
+    if (url.search || url.hash) return `${base}${url.pathname}`;
+    parts.pop();
+    return `${base}${parts.join("/") || ""}/`;
+  }
+
+  function goUpUrl(root) {
+    const target = upUrl(location.href, root);
+    if (!target || target === location.href) {
+      flash(root ? "already at the root" : "no level above");
+      return;
+    }
+    send("navigate", target);
   }
 
   function showTabList() {
@@ -5461,8 +5527,8 @@ installPrintShim();
     const elementRectAtPick = item.element?.getBoundingClientRect?.() || null;
     visualState = { ...item, outline, selectionMade, elementRectAtPick };
     if (selectionMade) updateVisualSelection();
-    else if (item.kind === "image") setMode("visual", "image ⏎·y…·Y·u·D·o");
-    else setMode("visual", `${item.kind} ⏎·y…·Y·u·o·p`);
+    else if (item.kind === "image") setMode("visual", "image ⏎·y…·Y·u·D·t·I");
+    else setMode("visual", `${item.kind} ⏎·y…·Y·u·t·p·I`);
   }
 
   function startVisual() {
@@ -5610,8 +5676,10 @@ installPrintShim();
     };
   }
 
+  // `yy` (page URL), `yt` (duplicate tab) and `yf` (link URL by hints) are Vimium's and mean what
+  // they mean there. Text is `yw`: Vimium leaves it free, and vim's `yw` yanks words.
   const COPY_MENU_KINDS = {
-    y: "smart", t: "text", u: "URL", l: "markdown", i: "image", s: "image URL", c: "code", f: "link",
+    y: "smart", w: "text", u: "URL", l: "markdown", i: "image", s: "image URL", c: "code", f: "link", t: "tab",
   };
 
   // Rows in the order the menu shows them. A row with `action` copies; one without carries the
@@ -5624,7 +5692,7 @@ installPrintShim();
     const rows = {};
 
     const text = picked ? (picked.secret ? "" : picked.text) : ctx.selection;
-    rows.t = text
+    rows.w = text
       ? { preview: quoted(text), action: { type: "text", text, flash: `text ${text.length} chars` } }
       : { reason: picked?.secret ? "password field" : picked ? "no text here" : "no selection" };
 
@@ -5668,18 +5736,20 @@ installPrintShim();
       ? { preview: labels(counts.link, "link"), action: { type: "pick", target: "link" } }
       : { reason: "no links" };
 
-    // `yy` is whichever of the others fits what you are on: in a caret, always the text (a caret
-    // is a text cursor); on a picked image the bitmap, on a link its address, else the text; with
-    // nothing picked the selection, else the page URL.
+    rows.t = { preview: `duplicate this tab · ${clipText(page.url, 48)}`, action: { type: "duplicate-tab" } };
+
+    // `yy` with nothing picked is Vimium's: the page URL, selection or not (`yw` copies the
+    // selection). On a `v` pick it is whichever row fits the pick: in a caret the text (a caret is
+    // a text cursor), on an image the bitmap, on a link its address, else the text.
     const smart = picked
-      ? (picked.caret ? "t" : picked.kind === "image" && picked.image ? "i" : picked.href ? "u" : "t")
-      : (ctx.selection ? "t" : "u");
+      ? (picked.caret ? "w" : picked.kind === "image" && picked.image ? "i" : picked.href ? "u" : "w")
+      : "u";
     const resolved = rows[smart];
     rows.y = resolved.action
       ? { preview: `= y${smart} · ${resolved.preview}`, action: resolved.action, resolves: smart }
       : { reason: `= y${smart} · ${resolved.reason}`, resolves: smart };
 
-    return ["y", "t", "u", "l", "i", "s", "c", "f"].map((key) => ({
+    return ["y", "w", "u", "l", "i", "s", "c", "f", "t"].map((key) => ({
       key, kind: COPY_MENU_KINDS[key], available: Boolean(rows[key].action), ...rows[key],
     }));
   }
@@ -5714,6 +5784,9 @@ installPrintShim();
     } else if (action.type === "page-url") {
       send("copy-url");
       flash("URL");
+    } else if (action.type === "duplicate-tab") {
+      send("duplicate-tab");
+      flash("duplicated");
     } else if (action.type === "page-markdown") {
       send("copy-page-markdown");
       flash("markdown link");
@@ -5899,9 +5972,13 @@ installPrintShim();
     else if (key === "c" && !visualState.caret) enterCaret();
     else if (key === "v" && visualState.caret) selectFromCaret();
     else if (key === "Enter" && !visualState.caret && !visualState.pageSelection) clickVisual();
-    // `y` opens the copy menu (`startCopyMenu`), which then owns the next key.
+    // Vimium's visual `y`: with text selected, yank it and leave. On a pick with no text selected
+    // (an image, a link block) there is nothing to yank, so `y` opens the copy menu instead.
+    else if (key === "y" && visualTextSelected()) copyVisualText();
     else if (key === "y") startCopyMenu();
     else if (key === "Y") copyVisualText();
+    // Vimium's visual `o`: the other end of the selection becomes the moving one.
+    else if (key === "o") reverseVisualSelection();
     else if (key === "u") {
       const url = visualState.kind === "image" ? visualState.imageURL : visualState.link?.href;
       if (url) {
@@ -5913,25 +5990,44 @@ installPrintShim();
       send("download", visualState.imageURL);
       cancelVisual(false);
       flash("download");
-    } else if (key === "o" || key === "O") {
+    // Open the pick: `t` / `T`, which Vimium's visual mode leaves free (`o` is its swap-ends).
+    } else if (key === "t" || key === "T") {
       const url = visualState.kind === "image"
         ? visualState.imageURL || visualState.link?.href
         : visualState.link?.href;
       if (url) {
         cancelVisual();
-        send(key === "O" ? "new-tab" : "navigate", url);
+        send(key === "T" ? "new-tab" : "navigate", url);
       }
     } else if (key === "p" && visualState.kind === "editable") {
       visualState.element.focus();
       send("paste");
       cancelVisual(false);
       flash("pasted");
-    } else if (key === "d") {
+    // `I`, the same key that starts the inspect picker from normal mode. It was `d`, which is
+    // half-a-page-down everywhere else.
+    } else if (key === "I") {
       const item = visualState;
       cancelVisual(false);
       enterInspect(item);
     }
     return true;
+  }
+
+  // A real, non-empty text selection — what Vimium's visual keys act on — as opposed to a pick of
+  // an image or link block, or a collapsed caret.
+  function visualTextSelected() {
+    if (!visualState?.selectionMade) return false;
+    const selection = visualSelection();
+    return Boolean(selection?.rangeCount && !selection.isCollapsed);
+  }
+
+  function reverseVisualSelection() {
+    if (!visualTextSelected()) return;
+    const selection = visualSelection();
+    const { anchorNode, anchorOffset, focusNode, focusOffset } = selection;
+    selection.setBaseAndExtent(focusNode, focusOffset, anchorNode, anchorOffset);
+    updateVisualSelection();
   }
 
   function cssSelector(element) {
@@ -6820,6 +6916,15 @@ installPrintShim();
       // Record a flow for the agent to learn; the stop asks it to write the site's playbook.
       else if (key === "R") send("learn-toggle");
       else if (key === "i") document.querySelector("input:not([type=hidden]):not(:disabled),textarea:not(:disabled),[contenteditable=true]")?.focus();
+      // Vimium's tab and URL keys.
+      else if (key === "t") send("next-tab");
+      else if (key === "T") send("previous-tab");
+      else if (key === "0") send("first-tab");
+      else if (key === "$") send("last-tab");
+      else if (key === "u" || key === "U") goUpUrl(key === "U");
+      else if (key === "e" || key === "E") showPrompt(key === "E", true);
+      // tweb's own: `m` is Vimium's set-mark, so taking audio back moved here.
+      else if (key === "a") { send("reclaim-audio"); flash("audio"); }
       else return;
       event.preventDefault();
       event.stopImmediatePropagation();
