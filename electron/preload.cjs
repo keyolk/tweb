@@ -111,6 +111,10 @@ installPrintShim();
   let passThroughEscapeTimer = null;
   let scrollTarget = null;
   let panTarget = null;
+  // The video or audio element picked with `f` or `v`: while it is held, the media keys
+  // (`handleMediaKey`) act on it, and Esc lets it go. See `holdMedia`.
+  let mediaTarget = null;
+  let mediaTargetWatch = null;
   let tabListRefresh = false;
   let pendingG = false;
   let pendingGTimer = null;
@@ -347,6 +351,7 @@ installPrintShim();
     hint: "H",
     search: "/",
     visual: "V",
+    media: "♪",
     inspect: "I",
     tabs: "T",
     history: "≡",
@@ -1243,6 +1248,7 @@ installPrintShim();
     // of `E`, hiding the one thing the mode was there to say.
     if (insertMode) setMode("insert", "Esc");
     else if (isEditable(activeElement())) setMode("insert");
+    else if (mediaSurface()) setMode("media", mediaStatus(mediaTarget));
     else if (panSurface()) setMode("normal", "↔ pan · Esc");
     else setMode("normal", scrollSurface() ? "⇅ inner · Esc" : "");
     // Every other caret trigger is an event on the focused field, and a field can leave
@@ -1764,7 +1770,17 @@ installPrintShim();
         [Math.max(114, rect.width - 26), "menu"],
       ]
       : [[24, "play"], [Math.max(54, rect.width - 28), "mute"]];
-    return controls.map(([offset, mediaControl]) => ({
+    // The element itself as well, at its centre: picking it holds the media for the media
+    // keys (`holdMedia`), which the per-button targets around it cannot do.
+    const whole = {
+      element: media,
+      rect: { left: rect.left + rect.width / 2 - 8, top: rect.top + rect.height / 2 - 8,
+              right: rect.left + rect.width / 2 + 8, bottom: rect.top + rect.height / 2 + 8,
+              width: 16, height: 16 },
+      mediaRect: rect,
+      nativePoint: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+    };
+    return [whole, ...controls.map(([offset, mediaControl]) => ({
       element: media,
       rect: {
         left: rect.left + offset - 8,
@@ -1777,7 +1793,7 @@ installPrintShim();
       mediaRect: rect,
       nativePoint: { x: rect.left + offset, y },
       mediaControl,
-    }));
+    }))];
   }
 
   // An ad's dismiss control is a pointer-styled div of ~18px with no semantic
@@ -1921,7 +1937,7 @@ installPrintShim();
 
   function visualTargets() {
     const selector = [
-      "a[href]", "img", "picture", "canvas", "svg", "video", "p", "li", "pre", "code", "blockquote",
+      "a[href]", "img", "picture", "canvas", "svg", "video", "audio", "p", "li", "pre", "code", "blockquote",
       "h1", "h2", "h3", "h4", "h5", "h6", "figcaption", "article", "[role=article]", "[role=img]",
       "input:not([type=hidden])", "textarea", "[contenteditable=true]",
     ].join(",");
@@ -1931,7 +1947,9 @@ installPrintShim();
         ? element.querySelector?.("img,canvas,svg,video") || element
         : link?.querySelector?.("img,picture,canvas,svg,video,[role=img]") || null;
       return {
-        kind: isEditable(element) ? "editable" : image ? "image" : link ? "link" : "text",
+        // A video or audio is picked to be controlled, not saved: `holdMedia`.
+        kind: isEditable(element) ? "editable" : isMediaElement(element) ? "media"
+          : image ? "image" : link ? "link" : "text",
         link,
         image,
         imageURL: imageSource(image),
@@ -2237,6 +2255,113 @@ installPrintShim();
     normalMode();
   }
 
+  function isMediaElement(element) {
+    return isTag(element, "video", "audio");
+  }
+
+  // Hold a video or audio picked from `f` or `v`: until Esc, the media keys act on it. One
+  // implementation for both pickers, so the keys are the same whichever way it was picked.
+  //
+  // The element is driven directly (volume, currentTime, playbackRate) rather than through the
+  // site's own shortcuts: those differ per site, and only work while the player has focus.
+  function holdMedia(item) {
+    releaseMedia(false);
+    mediaTarget = item.element;
+    const refresh = () => {
+      if (mediaTarget && document.documentElement?.dataset.twebMode === "media") normalMode();
+    };
+    const events = ["volumechange", "ratechange", "play", "pause", "durationchange"];
+    let lastSecond = -1;
+    // timeupdate fires several times a second; the clock only shows whole seconds.
+    const tick = () => {
+      const second = Math.floor(mediaTarget?.currentTime || 0);
+      if (second !== lastSecond) {
+        lastSecond = second;
+        refresh();
+      }
+    };
+    for (const type of events) mediaTarget.addEventListener(type, refresh);
+    mediaTarget.addEventListener("timeupdate", tick);
+    mediaTargetWatch = { element: mediaTarget, events, refresh, tick };
+    // A site's own control bar is hover-gated; showing it lets its slider follow the keys.
+    const rect = visibleRect(mediaTarget);
+    if (rect) {
+      send("native-hover", topViewportPoint({
+        x: rect.left + rect.width / 2, y: rect.bottom - Math.min(40, rect.height * 0.1),
+      }));
+    }
+    normalMode();
+  }
+
+  function releaseMedia(restoreMode = true) {
+    const watch = mediaTargetWatch;
+    mediaTargetWatch = null;
+    mediaTarget = null;
+    if (watch) {
+      for (const type of watch.events) watch.element.removeEventListener(type, watch.refresh);
+      watch.element.removeEventListener("timeupdate", watch.tick);
+    }
+    if (restoreMode) normalMode();
+  }
+
+  function mediaSurface() {
+    if (mediaTarget?.isConnected) return mediaTarget;
+    if (mediaTarget) releaseMedia(false);
+    return null;
+  }
+
+  function mediaClock(seconds) {
+    if (!Number.isFinite(seconds)) return "live";
+    const whole = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(whole / 3600);
+    const m = Math.floor(whole / 60) % 60;
+    const s = String(whole % 60).padStart(2, "0");
+    return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${String(m).padStart(2, "0")}:${s}`;
+  }
+
+  // What the indicator shows while media is held: `🔊 60% · 1.25x · 03:12/10:40`.
+  function mediaStatus(media) {
+    const silent = media.muted || media.volume === 0;
+    const state = media.paused ? "⏸ " : "";
+    return `${state}${silent ? "🔇" : "🔊"} ${Math.round(media.volume * 100)}% · ${media.playbackRate}x · `
+      + `${mediaClock(media.currentTime)}/${mediaClock(media.duration)} · Esc`;
+  }
+
+  // The media keys, only while a video or audio is held. False otherwise, so j/k/h/l/space/m go
+  // on to scroll the page and to their usual shortcuts. Claimed before the single-key shortcuts.
+  function handleMediaKey(event, key) {
+    const media = mediaSurface();
+    if (!media) return false;
+    const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+    if (key === "Escape") {
+      releaseMedia();
+    } else if (key === "j" || key === "k") {
+      const up = key === "k";
+      // Raising from silence has to be heard: a muted element at 70% stays silent otherwise.
+      if (up && (media.muted || media.volume === 0)) media.muted = false;
+      media.volume = clamp(Math.round((media.volume + (up ? 0.1 : -0.1)) * 10) / 10, 0, 1);
+    } else if (key === " ") {
+      if (media.paused) void media.play()?.catch?.(() => {});
+      else media.pause();
+    } else if (key === "h" || key === "l" || key === "H" || key === "L") {
+      const step = (key === "H" || key === "L" ? 30 : 5) * (key.toLowerCase() === "l" ? 1 : -1);
+      const end = Number.isFinite(media.duration) ? media.duration : Infinity;
+      media.currentTime = clamp(media.currentTime + step, 0, end);
+    } else if (key === "m") {
+      media.muted = !media.muted;
+    } else if (key === "<" || key === ">") {
+      media.playbackRate = clamp(media.playbackRate + (key === ">" ? 0.25 : -0.25), 0.25, 4);
+    } else {
+      return false;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    // Refreshed here too, not only by the element's events: a step that changes nothing (volume
+    // already at 100%) fires none.
+    if (mediaTarget) normalMode();
+    return true;
+  }
+
   function inspectTargets() {
     const excluded = new Set(["html", "head", "body", "style", "script", "link", "meta"]);
     const elements = collectRoots()
@@ -2385,13 +2510,15 @@ installPrintShim();
   // A `v` badge's colour says what picking it will do, before the label is typed: text is
   // selected (yellow), a link is followed or copied (blue), an image is saved or copied (pink),
   // an editable takes the caret (green, the insert-mode colour of the mode label), and an area
-  // takes the scroll keys (teal). `f` badges have no kind and stay yellow.
+  // takes the scroll keys (teal), and a video or audio takes the media keys (orange). `f` badges
+  // have no kind and stay yellow.
   const BADGE_COLORS = {
     text: { fill: "#ffd75f", border: "#9b6b00" },
     link: { fill: "#8ab4f8", border: "#1a5fb4" },
     image: { fill: "#f6aed1", border: "#a3386c" },
     editable: { fill: "#81c995", border: "#1e7a3a" },
     scroll: { fill: "#64ffda", border: "#00796b" },
+    media: { fill: "#fcad70", border: "#b45309" },
   };
   function badgeColors(target) {
     return BADGE_COLORS[target.kind] || BADGE_COLORS.text;
@@ -2401,7 +2528,7 @@ installPrintShim();
   // closed while the badges are up. So a `v` round carries its own key, in the corner across
   // from the mode label, for as long as the badges are on screen.
   const BADGE_LEGEND = [["text", "text"], ["link", "link"], ["image", "image"],
-    ["editable", "edit"], ["scroll", "scroll area"]];
+    ["editable", "edit"], ["scroll", "scroll area"], ["media", "media"]];
   function badgeLegend() {
     const legend = document.createElement("div");
     legend.style.cssText = [
@@ -3221,7 +3348,12 @@ installPrintShim();
       // "hint" is the shared picker's mode either way: it is what routes typed labels through
       // the engine to every frame. Only the targets and what a pick does differ.
       const targets = counted ? counted.filter((target) => target.element.isConnected) : visualTargets();
+      // Show the players' own control bars while the labels are up, as `f` does. Never
+      // re-collected: the targets are the ones this frame reported for the shared round.
+      const players = mediaHoverPoints();
+      if (players.length) nudgeMediaPointer(players);
       startPicker(targets, "hint", pickVisualTarget, space, "visual");
+      startMediaHoverLoop(players);
       return;
     }
     const points = mediaHoverPoints();
@@ -3229,6 +3361,12 @@ installPrintShim();
       const link = item.element.closest("a[href]");
       if (newTab && link?.href) send("new-tab", link.href);
       else if (performMediaControl(item)) {}
+      // The element itself, not one of its buttons: hold it for the media keys, as `v` does.
+      else if (!item.mediaControl && isMediaElement(item.element)) {
+        send("hint-done");
+        holdMedia(item);
+        return;
+      }
       else send("native-click", hintClickPoint(item));
       send("hint-done");
       normalMode();
@@ -3561,7 +3699,7 @@ installPrintShim();
       ["Alt-← · Alt-→ · Backspace", "history back · forward — the Chrome keys"],
     ]],
     ["Opening and tabs", [
-      ["f · F", "open via hint · open in new tab", { f: () => startHints(false), F: () => startHints(true) }],
+      ["f · F", "open via hint · open in new tab — a hint on a video/audio itself holds it for the media keys", { f: () => startHints(false), F: () => startHints(true) }],
       ["o · O / t", "omnibox in current tab · new tab", {
         o: () => showPrompt(false),
         O: () => showPrompt(true),
@@ -3581,9 +3719,10 @@ installPrintShim();
         n: () => { if (!lastSearch) return false; stepSearch(true); },
         N: () => { if (!lastSearch) return false; stepSearch(false); },
       }],
-      ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k, the arrows and PageUp/PageDown to scroll (Esc returns to the page) · Enter clicks the pick · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
+      ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k, the arrows and PageUp/PageDown to scroll (Esc returns to the page) · orange video/audio, held for the media keys · Enter clicks the pick · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
+      ["j/k · ␣ · h/l · H/L · m · </>", "held video/audio (picked with f or v): volume ∓10% · play/pause · seek ∓5s · ∓30s · mute · speed ∓0.25 — Esc lets it go"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
       ["D · o/O · p · d", "image download · open target · paste · inspect"],
       ["I", "inspect picker — then y/h/t copy, a sends it to the agent pane", { I: () => startInspect() }],
@@ -5289,6 +5428,10 @@ installPrintShim();
       holdScrollArea(item);
       return;
     }
+    if (item.kind === "media") {
+      holdMedia(item);
+      return;
+    }
     const outline = makeOutline(item.rect, "#fdd663");
     let selectionMade = false;
     if (item.kind === "text") {
@@ -6308,6 +6451,8 @@ installPrintShim();
     // left them alone; an app that binds the arrows itself (a list, a dashboard, a feed) took
     // them and moved its own main view, so in one picked area PageDown scrolled it and ArrowDown
     // scrolled the page around it. Claimed here, before the page sees them.
+    // Held media takes its keys first: j/k are volume, not scroll, while it is held.
+    if (handleMediaKey(event, key)) return;
     if (scrollHeldSurface(key, event.shiftKey)) {
       event.preventDefault();
       event.stopImmediatePropagation();
