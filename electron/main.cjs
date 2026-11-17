@@ -4496,6 +4496,9 @@ function tabListModel() {
       index,
       title: tabTitle(candidate),
       url: tabDisplayUrl(candidate),
+      // Tabs in one pane can sit on different engines (a Chrome tab for Okta beside Electron
+      // ones), and the list is where the user picks one — so it says which.
+      engine: candidate.isDestroyed() ? null : tabEngine(candidate),
     })),
   };
 }
