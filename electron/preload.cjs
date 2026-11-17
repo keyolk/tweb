@@ -4496,7 +4496,7 @@ installPrintShim();
     const items = model.tabs.map((tab, index) => {
       const row = document.createElement("button");
       row.type = "button";
-      row.style.cssText = "display:grid;grid-template-columns:3ch minmax(0,1fr);gap:8px;width:100%;padding:7px;border:0;border-radius:5px;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer";
+      row.style.cssText = "display:grid;grid-template-columns:3ch minmax(0,1fr) auto;align-items:center;gap:8px;width:100%;padding:7px;border:0;border-radius:5px;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer";
       const number = document.createElement("span");
       number.textContent = index < 9 ? String(index + 1) : "·";
       number.style.cssText = "color:#8ab4f8;text-align:right";
@@ -4508,7 +4508,13 @@ installPrintShim();
       url.textContent = tab.url || "about:blank";
       url.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6";
       text.append(tabTitle, url);
-      row.append(number, text);
+      // The engine the tab runs on, in the corner badge's outlined style: a Chrome tab for an
+      // Okta site and an Electron one look alike otherwise, and they hold different sign-ins.
+      const engine = document.createElement("span");
+      engine.textContent = tab.engine || "";
+      engine.style.cssText = `padding:1px 6px;border:1px solid ${ENGINE_TONES.plain}66;border-radius:4px;color:${ENGINE_TONES.plain};font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace`;
+      if (!tab.engine) engine.style.visibility = "hidden";
+      row.append(number, text, engine);
       row.onmouseenter = () => selectTabListIndex(index);
       row.onclick = () => { selectTabListIndex(index); activateSelectedTab(); };
       panel.append(row);

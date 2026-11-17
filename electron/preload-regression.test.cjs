@@ -3371,3 +3371,15 @@ test("the help lists every held-media key in its own section", () => {
     assert.ok(handler.includes(key), `handleMediaKey handles ${key} that the help lists`);
   }
 });
+
+// The `b` tab list says which engine each tab runs on: tabs in one pane can be on Electron and
+// Chrome at once, and they hold different sign-ins.
+test("the tab list carries and shows each tab's engine", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const model = main.slice(main.indexOf("function tabListModel"), main.indexOf("function tabStateModel"));
+  assert.match(model, /engine: candidate\.isDestroyed\(\) \? null : tabEngine\(candidate\)/);
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const render = preload.slice(preload.indexOf("function renderTabList"), preload.indexOf("function handleTabListKey"));
+  assert.match(render, /engine\.textContent = tab\.engine/);
+  assert.match(render, /row\.append\(number, text, engine\)/);
+});
