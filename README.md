@@ -754,13 +754,18 @@ composition area and the terminal cursor are removed with it.
 
 ### Shortcuts mode keys
 
+The keys follow [Vimium](https://github.com/philc/vimium)'s defaults: a key Vimium binds does what
+Vimium does with it, or nothing; tweb's own actions sit on keys Vimium leaves free.
+`electron/vimium-keys.test.cjs` holds the table this is checked against. `?` lists every key, and
+every `:` command with its arguments.
+
 | Key | Action |
 | --- | --- |
 | `?` | Open the supported-shortcut help (`?` or `Esc` closes it) |
 | `f` / `F` | Hint the clickable elements on screen / open the link in a new tab |
 | `/`, `n`, `N` | Find in page (`Enter` confirms) / next / previous match — **broken, see [Status](#status): the bar opens and accepts typing but matches nothing** |
 | `v` / `V` | Pick a target with the visual picker / open the whole page's text as a Visual selection (inside visual, `c` enters caret mode; from caret, `v` selects from that point). Teal labels in `v` are inner scroll or drag-pan areas: picking one points `h`/`j`/`k`/`l` at it — the mode indicator gains a `⇅` — and `Esc` hands them back to the page |
-| `b` | The open browser tab list (`j`/`k`, `1`–`9`, `Enter`, `x` closes, `Esc`) |
+| `T` | Search the open tabs (`j`/`k`, `1`–`9`, `Enter`, `x` closes, `Esc`) |
 | `I` | inspect picker: check element info and selectors; `a` on a pick sends it to the agent pane |
 | `h` / `l` | Scroll left / right |
 | `j` / `k` | Scroll down / up |
@@ -768,17 +773,22 @@ composition area and the terminal cursor are removed with it.
 | `gg` / `G` | Top / bottom of the page |
 | `gi` | Focus the first input element |
 | `H` / `L` | History back / forward |
-| `J` / `K` | Previous / next browser tab |
+| `J` / `K`, `gT` / `gt` | Previous / next browser tab |
+| `g0` / `g$` / `^` | First / last tab / the tab you were on before |
 | `t`, `O` | Open the new-tab fuzzy omnibox (open tabs plus the full visit history) |
 | `o` | Open the current-tab fuzzy omnibox (prefilled with the current URL) |
+| `ge` / `gE` | Edit the current URL here / in a new tab |
+| `gu` / `gU` | Up one level of the URL / to its root |
+| `p` / `P` | Paste into the focused field, else open the clipboard URL here / in a new tab |
 | `x` / `X` | Close the current tab / restore the most recently closed tab |
-| `y` | Copy the current page URL |
-| `r` | Reload |
+| `y` | Copy menu: `yy` page URL, `yt` duplicate tab, `yf` link URL by hints, `yw` selected text, `yu`/`yl`/`yi`/`ys`/`yc` URL, markdown link, image, image URL, code block — each row previews what it would copy |
+| `r` / `R` | Reload / reload bypassing the cache |
 | `gr` | Record for the agent; `gr` again stops and pastes the timeline into the agent pane |
 | `gR` | Record a flow for the agent to learn; `gR` again stops, pastes the timeline and asks for the site's playbook |
 | `zi` / `zo` / `zz` | Zoom in / out / reset |
 | `i` | insert mode: use the page's own shortcuts (`Esc` returns) |
-| `m` | Take audio back for this pane (only one TWeb pane is audible at a time) |
+| `ga` | Take audio back for this pane (only one TWeb pane is audible at a time) |
+| `W`, `w` | Float the page into a desktop window, or bring it back |
 | `Esc` | Cancel hint/search/visual/inspect/omnibox · clear input focus · leave fullscreen |
 | `Esc` (normal) | Close site autocomplete and popups as an outside click |
 
@@ -792,7 +802,7 @@ pane title in the tmux status line.
 Only one TWeb pane is audible at a time. When a page starts making noise, that pane claims the
 speakers and every other pane mutes — muted, not paused, so a video keeps playing and keeps its
 position. A muted pane shows a `🔇 %<pane>` badge next to its mode indicator naming the pane that
-owns audio; `m` takes it back, which mutes the previous owner instead.
+owns audio; `ga` takes it back, which mutes the previous owner instead.
 
 Ownership is a claim file in the runtime directory (`audio-owner.json`), refreshed by the owner and
 re-read by every pane a few times a second. A pane that is killed rather than closed therefore does
@@ -802,11 +812,12 @@ pane to notice clears it. `tweb diag --json` reports the whole state under `audi
 After picking a text target in Visual, or selecting the whole page's text with `V` from normal mode,
 `h`/`l` adjust the active edge by character, `b`/`w`/`e` by word, `k`/`j` by line, `0`/`$` by line
 boundary and `{`/`}` by paragraph, while `o` switches which selection endpoint is being adjusted. Over
-that adjusted range, `y`/`Y` copy the selected text. On an image target, `y` copies the displayed
-bitmap, `Y` the alt text, `u` the image URL actually being displayed (`currentSrc`), `D` downloads the
-image and `o`/`O` open it in the current/a new tab. On link/editable targets, `y` smart-copies the link
-URL or the text/value, `u` gives the link URL, `o`/`O` open the link and `p` pastes the clipboard.
-`d` inspects the target.
+that adjusted range, `y`/`Y` copy the selected text — Vimium's visual keys. On an image target (no
+text selected), `y` opens the copy menu (`yy` the displayed bitmap), `Y` copies the alt text, `u` the
+image URL actually being displayed (`currentSrc`), `D` downloads the image and `t`/`T` open it in the
+current/a new tab. On link/editable targets, `y` opens the copy menu (`yy` the link URL or the
+text/value), `u` gives the link URL, `t`/`T` open the link and `p` pastes the clipboard. `I` inspects
+the target.
 
 To move the selection's **start**, drop into caret mode with `c`. The selection collapses to a single
 caret and the motions above move the caret instead of extending a selection, so pressing `v` at the
@@ -1111,7 +1122,7 @@ Not consolation prizes — these are things Chrome cannot do because it owns its
   rest of the terminal. Chrome's window management is Chrome's; here it is yours.
 - **Exclusive audio across panes.** Exactly one TWeb pane holds the speakers. Takeover is automatic,
   the loser is told *why* (`mutedByOther` distinguishes "I muted this" from "something took it"), and
-  `m` takes it back with one keystroke. And an autoplaying ad **cannot** steal your audio — a page
+  `ga` takes it back with one chord. And an autoplaying ad **cannot** steal your audio — a page
   starting playback is not treated as consent. Chrome gives you N tabs shouting at once and a small
   speaker icon to hunt for.
 - **History as a keyboard overlay.** `gh` opens a searchable overlay on the page you are already on,

@@ -757,7 +757,7 @@ test("the tab badge list closes a tab in place", () => {
 
 test("the shortcut help lists the float window and the command palette", () => {
   // `w` existed with no entry in `?`, so the float mode looked like it had been removed.
-  assert.match(electron, /\["w · W", "float the page into a desktop window/);
+  assert.match(electron, /\["W · w", "float the page into a desktop window/);
   assert.match(electron, /\["c", "command palette", \{ c: /);
   assert.match(electron, /w: \(\) => send\("toggle-float"\),/);
 });
@@ -828,7 +828,7 @@ test("c reaches a caret from a target that carries no text", () => {
   assert.doesNotMatch(electron,
     /key === "c" && visualState\.selectionMade/);
   // In caret mode `yy` means the text, not the bitmap or the href (copy-menu.test.cjs runs it).
-  assert.match(electron, /picked\.caret \? "t" : picked\.kind === "image" && picked\.image \? "i" : picked\.href \? "u" : "t"/);
+  assert.match(electron, /picked\.caret \? "w" : picked\.kind === "image" && picked\.image \? "i" : picked\.href \? "u" : "w"/);
 });
 
 // Chromium paints nothing until a page commits. On google.com that was 5.5s of a
@@ -3183,7 +3183,8 @@ test("gr toggles recording and leaves the other g chords alone", () => {
   }
   assert.equal((chord.match(/key === "r"/g) || []).length, 1);
   // A bare `r` is still reload; only the chord records.
-  assert.match(electron, /\["r · gi", "reload · focus first input", \{ r: \(\) => send\("reload"\) \}\]/);
+  assert.match(electron, /\["r · R", "reload · reload bypassing the cache", \{ r: \(\) => send\("reload"\), R: \(\) => send\("reload-hard"\) \}\]/);
+  assert.match(electron, /\["gi", "focus the first input"\]/);
   // The palette row and `:record` reach the same action.
   assert.match(electron, /\{ name: "record", label: "Record for agent \(start \/ stop\)", action: \(\) => send\("record-toggle"\) \}/);
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");

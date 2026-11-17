@@ -4207,6 +4207,8 @@ function activateTab(index) {
     pageKeyTabs.delete(leaving);
     if (inputState().bypass) setCmdBypassEnabled(false);
   }
+  // Vimium's `^` goes back to the tab you came from, so the one being left is remembered.
+  if (leaving && leaving !== currentWindows().tabs[normalized]) currentWindows().previousTab = leaving;
   currentWindows().activeTabIndex = normalized;
   currentWindows().win = currentWindows().tabs[normalized];
   inputTrace.mark("tab", { index: normalized });
@@ -5002,6 +5004,24 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       break;
     case "previous-tab": cycleTab(-1); break;
     case "next-tab": cycleTab(1); break;
+    // Vimium's g0 / g$ / ^ / yt / R.
+    case "first-tab": if (currentWindows().tabs.length) activateTab(0); break;
+    case "last-tab": if (currentWindows().tabs.length) activateTab(currentWindows().tabs.length - 1); break;
+    case "previous-visited-tab": {
+      const index = currentWindows().tabs.indexOf(currentWindows().previousTab);
+      if (index >= 0 && !currentWindows().previousTab.isDestroyed()) activateTab(index);
+      break;
+    }
+    case "duplicate-tab": {
+      const url = contents.getURL();
+      if (url) openTabRouted(tab, url, true);
+      break;
+    }
+    // The WebKit engine has no cache-bypassing reload; a plain one is the closest it has.
+    case "reload-hard":
+      if (typeof contents.reloadIgnoringCache === "function") contents.reloadIgnoringCache();
+      else contents.reload();
+      break;
     case "list-tabs":
       sendToTabFrames(tab, "tweb-tabs", tabListModel());
       break;
@@ -5061,7 +5081,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       closeTab(Number.isInteger(value) ? value : currentWindows().activeTabIndex);
       break;
     // The × in the tab badge's popover. Separate from `close-tab` because that one sets
-    // `refreshTabListAfterClose`, which pushes the full `b` list model and would pop the big list
+    // `refreshTabListAfterClose`, which pushes the full `T` list model and would pop the big list
     // open over the popover. The popover redraws from the ordinary tab state instead.
     case "restore-tab": restoreClosedTab(); break;
     case "reload": contents.reload(); break;

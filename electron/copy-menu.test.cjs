@@ -105,10 +105,12 @@ const row = (rows, key) => rows.find((candidate) => candidate.key === key);
 test("with nothing picked or selected, yy is the page URL and the label rows count their targets", () => {
   const h = harness({ counts: { image: 7, link: 52 } });
   const rows = h.rows();
-  assert.deepEqual(rows.map((r) => r.key), ["y", "t", "u", "l", "i", "s", "c", "f"]);
+  assert.deepEqual(rows.map((r) => r.key), ["y", "w", "u", "l", "i", "s", "c", "f", "t"]);
   assert.equal(row(rows, "y").resolves, "u");
   assert.match(row(rows, "y").preview, /^= yu · https:\/\/example\.com\/a\(1\) · page$/);
-  assert.deepEqual(row(rows, "t"), { key: "t", kind: "text", available: false, reason: "no selection" });
+  assert.deepEqual(row(rows, "w"), { key: "w", kind: "text", available: false, reason: "no selection" });
+  // `yt` is Vimium's duplicate tab.
+  assert.deepEqual(row(rows, "t").action, { type: "duplicate-tab" });
   assert.deepEqual(row(rows, "u").action, { type: "page-url" });
   assert.deepEqual(row(rows, "l").action, { type: "page-markdown" });
   assert.match(row(rows, "l").preview, /^\[Example \\\[docs\\\]\]\(https:\/\/example\.com\/a%281%29\) · page$/);
@@ -119,12 +121,13 @@ test("with nothing picked or selected, yy is the page URL and the label rows cou
   assert.equal(row(rows, "f").preview, "pick with labels · 52 links");
 });
 
-test("with text selected, yy and yt are that text, previewed and counted", () => {
+// Vimium's `yy` copies the page URL whether or not text is selected; the selection is `yw`.
+test("with text selected, yy is still the page URL and yw is that text, previewed and counted", () => {
   const h = harness({ selection: "The quick brown fox" });
   const rows = h.rows();
-  assert.equal(row(rows, "y").resolves, "t");
-  assert.equal(row(rows, "t").preview, '"The quick brown fox" · 19 chars');
-  assert.deepEqual(row(rows, "t").action, { type: "text", text: "The quick brown fox", flash: "text 19 chars" });
+  assert.equal(row(rows, "y").resolves, "u");
+  assert.equal(row(rows, "w").preview, '"The quick brown fox" · 19 chars');
+  assert.deepEqual(row(rows, "w").action, { type: "text", text: "The quick brown fox", flash: "text 19 chars" });
 });
 
 test("on a v pick, yy is the image, the link address, or the text — and the text in a caret", () => {
@@ -143,7 +146,7 @@ test("on a v pick, yy is the image, the link address, or the text — and the te
   assert.deepEqual(row(onLink, "l").action, { type: "text", text: "[Read more](https://a.test/x)", flash: "markdown link" });
 
   const caret = harness({ visual: { kind: "link", caret: true, element, link } }).rows();
-  assert.equal(row(caret, "y").resolves, "t", "a caret is a text cursor");
+  assert.equal(row(caret, "y").resolves, "w", "a caret is a text cursor");
 
   const pre = { localName: "pre", innerText: "a\nb\nc\n" };
   const code = { localName: "code", innerText: "a\nb\nc\n", getAttribute: () => null, closest: (s) => (s === "pre" ? pre : null) };
@@ -156,20 +159,20 @@ test("a password field is never previewed or copied", () => {
   const field = { localName: "input", type: "password", value: "hunter2", getAttribute: () => null };
   const h = harness({ visual: { kind: "editable", element: field } });
   const rows = h.rows();
-  assert.equal(row(rows, "t").available, false);
-  assert.equal(row(rows, "t").reason, "password field");
+  assert.equal(row(rows, "w").available, false);
+  assert.equal(row(rows, "w").reason, "password field");
   assert.equal(row(rows, "y").available, false);
   assert.ok(!JSON.stringify(rows).includes("hunter2"), "the value must not appear in any row");
   h.open();
   h.key("y");
   h.open();
-  h.key("t");
+  h.key("w");
   assert.ok(!JSON.stringify(h.env.sent).includes("hunter2"));
 
   const otp = { localName: "input", type: "text", value: "123456", getAttribute: (name) => (name === "autocomplete" ? "one-time-code" : null) };
-  assert.equal(row(harness({ visual: { kind: "editable", element: otp } }).rows(), "t").available, false);
+  assert.equal(row(harness({ visual: { kind: "editable", element: otp } }).rows(), "w").available, false);
   // A secret field focused in normal mode: its selection is not offered either.
-  assert.equal(row(harness({ selection: "hunter2", active: field }).rows(), "t").available, false);
+  assert.equal(row(harness({ selection: "hunter2", active: field }).rows(), "w").available, false);
 });
 
 test("y alone copies nothing; the second key copies", () => {
@@ -178,12 +181,12 @@ test("y alone copies nothing; the second key copies", () => {
   assert.ok(h.isOpen());
   assert.deepEqual(h.env.sent, [], "y opens a menu and copies nothing");
   assert.deepEqual(h.env.modes.at(-1), ["normal", "y…"]);
-  assert.deepEqual(h.key("t"), { handled: true, prevented: true });
+  assert.deepEqual(h.key("w"), { handled: true, prevented: true });
   assert.deepEqual(h.env.sent, [["copy-text", "hello"]]);
   assert.deepEqual(h.env.flashes, ["text 5 chars"]);
   assert.equal(h.isOpen(), false);
 
-  for (const [key, expected] of [["u", [["copy-url"]]], ["l", [["copy-page-markdown"]]], ["y", [["copy-text", "hello"]]]]) {
+  for (const [key, expected] of [["u", [["copy-url"]]], ["l", [["copy-page-markdown"]]], ["y", [["copy-url"]]], ["t", [["duplicate-tab"]]]]) {
     const each = harness({ selection: key === "y" ? "hello" : "" });
     each.open();
     each.key(key);
@@ -329,18 +332,21 @@ test("only a lone address on the clipboard counts as a URL", () => {
   }
 });
 
-test("the help lists every copy combo and binds only y, p and P", () => {
+test("the help lists every copy combo and binds only y there; p and P open the clipboard", () => {
   const start = preload.indexOf("  const shortcutHelpSections = [");
   const end = preload.indexOf("  const normalKeyActions");
   const sections = new Function(`${preload.slice(start, end)}\nreturn shortcutHelpSections;`)();
   const copy = sections.find(([title]) => title === "Copy and paste");
   assert.ok(copy, "a Copy and paste section");
   const keys = copy[1].map(([key]) => key);
-  for (const key of ["y", "yy", "yt", "yu", "yl", "yi", "ys", "yc", "yf", "p · P"]) {
+  for (const key of ["y", "yy", "yt", "yw", "yu", "yl", "yi", "ys", "yc", "yf"]) {
     assert.ok(keys.includes(key), `help row for ${key}`);
   }
   const bound = copy[1].flatMap(([, , bindings]) => Object.keys(bindings || {}));
-  assert.deepEqual(bound.sort(), ["P", "p", "y"]);
+  assert.deepEqual(bound, ["y"]);
+  // Vimium's p / P (open the clipboard here / in a new tab) sit with the other ways to open.
+  const opening = sections.find(([title]) => title === "Opening");
+  assert.deepEqual(Object.keys(opening[1].find(([key]) => key === "p · P")[2]).sort(), ["P", "p"]);
   assert.ok(!preload.includes('["y", "copy the page URL"'), "y no longer copies the URL at once");
   // Every menu row the help names exists in the menu.
   const menuKeys = new Function(`${menuSource.slice(menuSource.indexOf("  const COPY_MENU_KINDS"), menuSource.indexOf("  // Rows in the order"))}\nreturn COPY_MENU_KINDS;`)();
