@@ -387,8 +387,8 @@ test("a remote frame that cannot be an edit alternates", () => {
 test("placeholder cells are written whole only when the grid does not already hold them", () => {
   const frames = context(100);
   frames.cells = { cols: 200, rows: 50 };
-  assert.deepEqual(wholeFrameCells(frames, { now: 1000 }), { full: true, rects: [] });
-  assert.deepEqual(wholeFrameCells(frames, { now: 1100 }), { full: false, rects: [] });
+  assert.deepEqual(wholeFrameCells(frames, { now: 1000 }), { full: true, rects: [], restore: [] });
+  assert.deepEqual(wholeFrameCells(frames, { now: 1100 }), { full: false, rects: [], restore: [] });
   frames.cells = { cols: 200, rows: 40 };
   assert.equal(wholeFrameCells(frames, { now: 1200 }).full, true, "a resize rewrites them");
   takeWholeFrameBase(frames);
@@ -407,8 +407,8 @@ test("a whole frame rewrites just the blocks of the patches it retires", () => {
   notePatchCells(frames, 101, { row: 3, col: 4, rows: 2, cols: 5 });
   notePatchCells(frames, 102, { row: 9, col: 9, rows: 1, cols: 1 });
   assert.deepEqual(wholeFrameCells(frames, { now: 1100, retired: [101] }),
-    { full: false, rects: [{ row: 3, col: 4, rows: 2, cols: 5 }] });
-  assert.deepEqual(wholeFrameCells(frames, { now: 1200, retired: [101] }), { full: false, rects: [] });
+    { full: false, rects: [{ row: 3, col: 4, rows: 2, cols: 5 }], restore: [] });
+  assert.deepEqual(wholeFrameCells(frames, { now: 1200, retired: [101] }), { full: false, rects: [], restore: [] });
   assert.equal(frames.patchCells.has(102), true);
 });
 
@@ -419,4 +419,59 @@ test("placeholder cells are rewritten whole once the refresh interval has passed
   noteCellsWritten(frames, 1000);
   assert.equal(wholeFrameCells(frames, { now: 1000 + PLACEHOLDER_CELLS_REFRESH_MS - 1 }).full, false);
   assert.equal(wholeFrameCells(frames, { now: 1000 + PLACEHOLDER_CELLS_REFRESH_MS }).full, true);
+});
+
+// The command palette, one row down while a whole frame is in flight, on a placeholder pane. The
+// patch before the frame covered rows 3-4 (the row left, the row moved to), the one sent during
+// it rows 4-5. When the frame lands, the retired block is written back with the frame's cells and
+// row 4 shows the frame's highlight again, beside the real one on row 5 — unless the surviving
+// patch's cells are written again after it.
+test("a placeholder patch newer than the frame is written again over the retired block", () => {
+  const frames = context(100);
+  frames.cells = { cols: 200, rows: 50 };
+  noteCellsWritten(frames, 1000);
+  const left = nextPatchId(frames);
+  const leftPlace = { row: 3, col: 10, rows: 2, cols: 40 };
+  notePatch(frames, left, { x: 0, y: 0, width: 1, height: 1 }, leftPlace);
+  notePatchCells(frames, left, leftPlace);
+  const seq = retirePatchesOnPlace(frames);
+  const moved = nextPatchId(frames);
+  const movedPlace = { row: 4, col: 10, rows: 2, cols: 40 };
+  notePatch(frames, moved, { x: 0, y: 0, width: 1, height: 1 }, movedPlace);
+  notePatchCells(frames, moved, movedPlace);
+
+  const retired = takePatchesToRetire(frames, seq);
+  assert.deepEqual(retired, [left]);
+  assert.deepEqual(wholeFrameCells(frames, { now: 1100, retired }), {
+    full: false,
+    rects: [leftPlace],
+    restore: [{ id: moved, ...movedPlace }],
+  });
+  // Still its block to write back when the frame that contains it lands.
+  assert.deepEqual(frames.patchCells.get(moved), movedPlace);
+});
+
+test("a full rewrite of the base's cells writes every surviving patch again, oldest first", () => {
+  const frames = context(100);
+  frames.cells = { cols: 200, rows: 50 };
+  const seq = retirePatchesOnPlace(frames);
+  const a = nextPatchId(frames);
+  notePatch(frames, a, { x: 0, y: 0, width: 1, height: 1 }, { row: 1, col: 1, rows: 1, cols: 1 });
+  notePatchCells(frames, a, { row: 1, col: 1, rows: 1, cols: 1 });
+  const b = nextPatchId(frames);
+  notePatch(frames, b, { x: 0, y: 0, width: 1, height: 1 }, { row: 1, col: 1, rows: 2, cols: 2 });
+  notePatchCells(frames, b, { row: 1, col: 1, rows: 2, cols: 2 });
+  const plan = wholeFrameCells(frames, { now: 1000, retired: takePatchesToRetire(frames, seq) });
+  assert.equal(plan.full, true);
+  assert.deepEqual(plan.restore.map((patch) => patch.id), [a, b]);
+  assert.equal(frames.patchCells.has(a) && frames.patchCells.has(b), true);
+});
+
+test("a frame that writes no cells rewrites no patch either", () => {
+  const frames = context(100);
+  frames.cells = { cols: 200, rows: 50 };
+  noteCellsWritten(frames, 1000);
+  const live = nextPatchId(frames);
+  notePatch(frames, live, { x: 0, y: 0, width: 1, height: 1 }, { row: 1, col: 1, rows: 1, cols: 1 });
+  assert.deepEqual(wholeFrameCells(frames, { now: 1100, retired: [] }), { full: false, rects: [], restore: [] });
 });

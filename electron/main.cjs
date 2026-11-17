@@ -1834,11 +1834,17 @@ function handleGfxWorkerReady(commands, frames = currentFrames()) {
       // grid does not already hold (`wholeFrameCells`): all of them after a flip or a resize, else
       // just the blocks of the retired patches, which still name the patch ids.
       const plan = wholeFrameCells(frames, { now: Date.now(), retired: retiredPatches });
-      const cells = plan.full
+      // Then the surviving patches' own cells, oldest first: they are newer than this frame, and
+      // the base's cells just written may cover them (`wholeFrameCells`). Counted from 0 like any
+      // patch's, as `patchPlacementSequence` wrote them.
+      const cells = (plan.full
         ? basePlaceholderCells(frames)
         : plan.rects.map((rect) => placeholderBlock(frames.shownBase, {
           rows: rect.rows, cols: rect.cols, top: rect.row + 1, left: rect.col + 1,
           rowOffset: rect.row, colOffset: rect.col,
+        })).join(""))
+        + plan.restore.map((patch) => placeholderBlock(patch.id, {
+          rows: patch.rows, cols: patch.cols, top: patch.row + 1, left: patch.col + 1,
         })).join("");
       cellBytes = Buffer.byteLength(cells);
       writeGfxCommands(commands, { after: cells, retire });

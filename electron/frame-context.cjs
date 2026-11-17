@@ -227,17 +227,33 @@ function notePatchCells(context, id, place) {
  * flip to the other base) or the refresh interval has passed. Otherwise only the blocks of the
  * patches being retired, which still name their patch ids: written back with the base's cells,
  * the page shows through where the patch was.
+ *
+ * `restore` is the patches that stay on screen, oldest first, whose own cells are written again
+ * AFTER the base's. They were sent while this frame was in flight, so they are newer than it. A
+ * placeholder patch is nothing but its cells, and the base's cells written over them (all of them
+ * on a full write, or a retired block that overlaps them) replaced it with the older frame. The
+ * command palette moving one row while a frame was in flight is exactly that: the retired patch
+ * covered the row it left and the row it moved to, the surviving one the next two, and the row
+ * they share came back highlighted from the frame, beside the row the selection was really on.
+ * All of them, in order, whenever any base cells go out: one rewritten alone could cover a newer
+ * one drawn over it.
  */
 function wholeFrameCells(context, { now, retired = [] }) {
   const { rows, cols } = context.cells;
   const key = `${context.shownBase}:${rows}x${cols}`;
   const rects = retired.map((id) => context.patchCells.get(id)).filter(Boolean);
   for (const id of retired) context.patchCells.delete(id);
+  const survivors = survivingPatches(context).filter((patch) => !retired.includes(patch.id));
+  const restore = survivors.map(({ id, place }) => ({
+    id, row: place.row, col: place.col, rows: place.rows, cols: place.cols,
+  }));
   if (context.cellsKey !== key || now - context.cellsWrittenAt >= PLACEHOLDER_CELLS_REFRESH_MS) {
     noteCellsWritten(context, now);
-    return { full: true, rects: [] };
+    // The full write cleared every patch's block; the survivors' are written again just after.
+    for (const { id, place } of survivors) notePatchCells(context, id, place);
+    return { full: true, rects: [], restore };
   }
-  return { full: false, rects };
+  return { full: false, rects, restore: rects.length > 0 ? restore : [] };
 }
 
 /** Records that the grid now holds the base's cells at the current size, all of them. */
