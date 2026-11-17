@@ -1723,8 +1723,11 @@ test("undeliverable shortcuts repair themselves", () => {
   // works, and a live preload answering re-registers itself.
   assert.match(repair, /frame\.send\("tweb-are-you-there"\)/);
   // A page mid-load has not had its chance to register yet; reloading would cancel the very
-  // navigation about to fix things.
-  assert.match(repair, /contents\.isLoading\(\)/);
+  // navigation about to fix things. Only the reload waits for the load: the ping goes out first,
+  // because a streaming page (YouTube) never stops loading and its keys were dropped for good.
+  const loadingCheck = repair.indexOf("tab.webContents.isLoading()");
+  assert.ok(loadingCheck > repair.indexOf('frame.send("tweb-are-you-there")'), "ping before the loading check");
+  assert.ok(loadingCheck < repair.indexOf("tab.webContents.reload()"), "loading check guards the reload");
   // Silence means no preload is there, so the page needs reloading to get one...
   assert.match(repair, /tab\.webContents\.reload\(\)/);
   // ...but not forever: a page that crashes on load would otherwise reload in a loop.
