@@ -5739,10 +5739,12 @@ installPrintShim();
     const panel = document.createElement("div");
     // Bottom-right above the mode badge, where the command palette opens: a menu in a corner,
     // not a dialog over the page the previews describe.
+    // Opaque, like the tab list: the rows are previews of page text, and a see-through panel laid
+    // them over the page's own text so neither could be read (observed on YouTube).
     panel.style.cssText = [
       "position:fixed", "right:8px", "bottom:24px", "box-sizing:border-box",
       "width:min(560px,calc(100vw - 16px))", "padding:4px 0", "border:1px solid #5f6368",
-      "border-radius:6px", "background:#111e", "box-shadow:0 4px 16px #000a", "color:#e8eaed",
+      "border-radius:6px", "background:#202124", "box-shadow:0 4px 16px #000a", "color:#e8eaed",
       "font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace",
     ].join(";");
     const title = document.createElement("div");
