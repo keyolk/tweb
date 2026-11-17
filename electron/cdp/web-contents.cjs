@@ -518,6 +518,10 @@ class CdpWebContents extends EventEmitter {
     this.keyFlushQueued = false;
     this.capture = { inFlight: 0, dirty: false, lastAt: 0, timer: null, screencast: false };
     this.findState = null;
+    // The drag Chrome handed back instead of starting one natively: `Input.dragIntercepted`'s
+    // data, kept until the button is released. See `dragInput`.
+    this.interceptedDrag = null;
+    this.interceptedDragEntered = false;
   }
 
   // --- lifecycle -------------------------------------------------------------------------
@@ -549,6 +553,10 @@ class CdpWebContents extends EventEmitter {
     session.on("Runtime.exceptionThrown", (params) => this.onException(params));
     session.on("Target.attachedToTarget", (params) => this.onChildAttached(params, session.id));
     session.on("Target.detachedFromTarget", (params) => this.onChildDetached(params, session.id));
+    session.on("Input.dragIntercepted", (params) => {
+      this.interceptedDrag = params.data || null;
+      this.interceptedDragEntered = false;
+    });
     session.on("Inspector.targetCrashed", () => this.emit("render-process-gone", {}, { reason: "crashed", exitCode: -1 }));
     session.on("Network.requestWillBeSent", (params) => this.engine.onRequest(this, params));
     session.on("Network.responseReceived", (params) => this.engine.onResponse(this, params));
@@ -609,6 +617,18 @@ class CdpWebContents extends EventEmitter {
         session.send("Page.setLifecycleEventsEnabled", { enabled: true }),
         // A pane is never "hidden" in Chrome's sense, even though no Chrome window is on screen.
         session.send("Emulation.setFocusEmulationEnabled", { enabled: true }),
+        // A drag of a link, an image or a selection starts the OS drag session in Chrome's
+        // browser process, headless or not, and macOS puts the drag image in a window of its own at
+        // the dragging level (500) over every app. A release that arrives over CDP rather than from
+        // the OS does not end that session, so the image stayed on screen above the terminal —
+        // observed: the engine Chrome holding a level-500 window spanning both displays, with a
+        // Platform Portal link's title and URL in it, after a left-button drag on that tab. Nothing
+        // tweb redraws reaches it: not a reload, a tab switch, or the pane's frames, which are
+        // terminal images under it. `Input.cancelDragging` afterwards was accepted and did not
+        // remove it. Intercepted, Chrome starts no OS drag and hands the data back instead
+        // (`Input.dragIntercepted`); the drag is then finished on the page with
+        // `Input.dispatchDragEvent` (see `dragInput`), so drag-and-drop on the page still works.
+        session.send("Input.setInterceptDrags", { enabled: true }),
         session.send("Browser.setDownloadBehavior", {
           behavior: "allowAndName", downloadPath: this.engine.downloadDirectory(), eventsEnabled: true,
         }).catch(() => {}),
@@ -730,6 +750,8 @@ class CdpWebContents extends EventEmitter {
       // clicked. The moves of a drag keep the press's value (see `pointerHeld`).
       const scale = await this.inputScaleReady(params.type === "mousePressed");
       const sent = { ...params, x: params.x * scale, y: params.y * scale };
+      const drag = this.dragInput(sent);
+      if (drag) return [this.session.send("Input.dispatchDragEvent", drag)];
       // Wheel distance is in DIPs on Electron, where zoom is the browser's own and Chromium turns
       // DIPs into CSS pixels itself. Here zoom is an emulated scale with no such step, so a notch
       // scrolled a fifth less at the default 0.8 — measured 300px against Electron's 375 for three.
@@ -744,6 +766,31 @@ class CdpWebContents extends EventEmitter {
     const written = (this.inputQueue || Promise.resolve()).then(send, send);
     this.inputQueue = written.catch(() => {});
     return written.then(([answer]) => answer);
+  }
+
+  // The drag event a mouse event stands for while an intercepted drag is live, or null to send the
+  // mouse event as it is. A held move is `dragOver`, the release is `drop`, and a move with no
+  // button (the release was lost) is `dragCancel`; each of the last two ends the drag. Read
+  // after scaling, so the point is the one the mouse event would have used.
+  dragInput(params) {
+    const data = this.interceptedDrag;
+    if (!data) return null;
+    const point = { x: params.x, y: params.y, modifiers: params.modifiers || 0, data };
+    if (params.type === "mouseMoved" && params.buttons) {
+      // The page sees the drag arrive before it moves, as with a real one.
+      const type = this.interceptedDragEntered ? "dragOver" : "dragEnter";
+      this.interceptedDragEntered = true;
+      return { type, ...point };
+    }
+    if (params.type === "mouseReleased") {
+      this.interceptedDrag = null;
+      return { type: "drop", ...point };
+    }
+    if (params.type === "mouseMoved" || params.type === "mousePressed") {
+      this.interceptedDrag = null;
+      return { type: "dragCancel", ...point };
+    }
+    return null;
   }
 
   destroy() {
