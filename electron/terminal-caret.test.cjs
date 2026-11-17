@@ -39,3 +39,12 @@ test("the engine never shows the pane's terminal cursor", () => {
     assert.doesNotMatch(source, /\?25h/);
   }
 });
+
+// One caret in a focused field, the page's own. tweb once forced every caret cyan and drew a
+// second steady cyan bar over it; with the page caret no longer made transparent (#264) both
+// showed at once, one blinking and one not.
+test("the engine draws no caret of its own over the page's", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.doesNotMatch(main, /__twebCaretInstalled/);
+  assert.doesNotMatch(main, /caret-color\s*:/);
+});

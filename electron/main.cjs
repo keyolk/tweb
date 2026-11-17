@@ -3558,8 +3558,12 @@ function installPageEnhancements(tab = currentWindows().win) {
       // muted tone that reads on both light and dark pages. scrollbar-width:thin
       // is the standards path; the webkit-* rules cover Chromium, which is
       // what this engine is.
+      //
+      // No caret rules. The page's own caret is the one shown (#264): it blinks, sits on the
+      // exact pixel and has the page's colour. tweb used to force it cyan and draw a second
+      // steady cyan bar (__tweb_caret__) over it, which was only hidden while the page caret
+      // was made transparent — with that gone the two showed side by side.
       style.textContent = [
-        'input,textarea,[contenteditable]:focus{caret-color:#00e5ff!important}',
         '::-webkit-scrollbar{width:8px;height:8px;background:transparent}',
         '::-webkit-scrollbar-track{background:transparent}',
         '::-webkit-scrollbar-thumb{background:rgba(130,130,140,.4);border-radius:4px;border:2px solid transparent;background-clip:padding-box}',
@@ -3570,72 +3574,6 @@ function installPageEnhancements(tab = currentWindows().win) {
       (document.head || document.documentElement).append(style);
     }
 
-    if (!window.__twebCaretInstalled) {
-      window.__twebCaretInstalled = true;
-      const caret = document.createElement('div');
-      caret.id = '__tweb_caret__';
-      caret.style.cssText = 'display:none;position:fixed;z-index:2147483646;width:2px;pointer-events:none;background:#00e5ff;box-shadow:0 0 3px #001bff,0 0 1px #fff';
-      document.documentElement.append(caret);
-      const canvas = document.createElement('canvas');
-      const context = canvas.getContext('2d');
-      const textInput = (element) => element instanceof HTMLInputElement && !['checkbox','radio','button','submit','reset','file','range','color'].includes(element.type);
-      const updateCaret = () => {
-        const element = document.activeElement;
-        if (!element || (!textInput(element) && !(element instanceof HTMLTextAreaElement) && !element.isContentEditable)) {
-          caret.style.display = 'none';
-          return;
-        }
-        const box = element.getBoundingClientRect();
-        const computed = getComputedStyle(element);
-        let x = box.left + parseFloat(computed.paddingLeft || 0) + 1;
-        let y = box.top + parseFloat(computed.paddingTop || 0) + 1;
-        let height = Math.max(12, parseFloat(computed.lineHeight) || parseFloat(computed.fontSize) * 1.25 || 16);
-        if (textInput(element)) {
-          context.font = computed.font;
-          const before = element.value.slice(0, element.selectionStart ?? element.value.length);
-          x += context.measureText(before).width - element.scrollLeft;
-          y = box.top + Math.max(1, (box.height - height) / 2);
-        } else if (element instanceof HTMLTextAreaElement) {
-          const mirror = document.createElement('div');
-          const properties = ['font','letterSpacing','lineHeight','padding','border','boxSizing','whiteSpace','wordBreak','overflowWrap','width'];
-          mirror.style.cssText = 'position:fixed;visibility:hidden;white-space:pre-wrap;word-wrap:break-word;top:' + box.top + 'px;left:' + box.left + 'px';
-          for (const property of properties) mirror.style[property] = computed[property];
-          mirror.textContent = element.value.slice(0, element.selectionStart ?? 0);
-          const marker = document.createElement('span');
-          marker.textContent = '\\u200b';
-          mirror.append(marker);
-          document.documentElement.append(mirror);
-          const markerBox = marker.getBoundingClientRect();
-          x = markerBox.left - element.scrollLeft;
-          y = markerBox.top - element.scrollTop;
-          mirror.remove();
-        } else {
-          const selection = getSelection();
-          if (selection && selection.rangeCount) {
-            const range = selection.getRangeAt(0).cloneRange();
-            range.collapse(true);
-            const rangeBox = range.getBoundingClientRect();
-            if (rangeBox.left || rangeBox.top) {
-              x = rangeBox.left;
-              y = rangeBox.top;
-              height = rangeBox.height || height;
-            }
-          }
-        }
-        caret.style.cssText += '';
-        caret.style.display = 'block';
-        caret.style.left = Math.max(0, x) + 'px';
-        caret.style.top = Math.max(0, y) + 'px';
-        caret.style.height = Math.min(box.height || height, height) + 'px';
-      };
-      for (const event of ['focusin','focusout','input','keyup','click','selectionchange']) {
-        document.addEventListener(event, updateCaret, true);
-      }
-      document.addEventListener('scroll', updateCaret, true);
-      window.addEventListener('resize', updateCaret);
-      window.setInterval(updateCaret, 500);
-      updateCaret();
-    }
   })()`, true).catch((error) => {
     if (debugLogging) console.error(`tweb: page enhancements failed: ${error.message}`);
   });
