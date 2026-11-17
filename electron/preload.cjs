@@ -3686,10 +3686,22 @@ installPrintShim();
       ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k, the arrows and PageUp/PageDown to scroll (Esc returns to the page) · orange video/audio, held for the media keys · Enter clicks the pick · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
-      ["j/k · ␣ · h/l · H/L · m · </>", "held video/audio (picked with f or v): volume ∓10% · play/pause · seek ∓5s · ∓30s · mute · speed ∓0.25 — Esc lets it go"],
       ["y · Y · u", "smart copy · text copy · image/link URL copy"],
       ["D · o/O · p · d", "image download · open target · paste · inspect"],
       ["I", "inspect picker — then y/h/t copy, a sends it to the agent pane", { I: () => startInspect() }],
+    ]],
+    // Its own section rather than one dense row under selection: the keys are the page's
+    // ordinary ones (j/k scroll, m takes audio back) until a video is held, and a reader
+    // scanning for "volume" did not find them packed into a single line.
+    ["Media (a video or audio held with f or v)", [
+      ["f · v", "pick a video or audio to hold it — v labels it orange; the status shows volume · speed · time"],
+      ["j · k", "volume −10% · +10% (raising from muted unmutes)"],
+      ["␣", "play · pause"],
+      ["h · l", "seek −5s · +5s"],
+      ["H · L", "seek −30s · +30s"],
+      ["m", "mute · unmute"],
+      ["< · >", "speed −0.25 · +0.25 (0.25x–4x)"],
+      ["Esc", "let it go — j/k scroll and m takes audio back again"],
     ]],
     ["Browser and modes", [
       ["zi · zo · zz", "zoom in · out · reset", {

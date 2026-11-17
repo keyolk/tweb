@@ -3350,3 +3350,24 @@ test("placeholder cells reach the pane writer as UTF-8", () => {
   assert.match(main, /Buffer\.from\(cells, "utf8"\)/);
   assert.match(main, /write\(Buffer\.from\(basePlaceholderCells\(frames\), "utf8"\)\)/);
 });
+
+// `?` lists the media keys in a section of their own, one key per row, and binds none of them:
+// they act only while a video is held (handleMediaKey), and a binding here would make `j`, `k`
+// or `m` media keys on every page.
+test("the help lists every held-media key in its own section", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  const start = preload.indexOf("  const shortcutHelpSections = [");
+  const end = preload.indexOf("  const normalKeyActions");
+  const sections = new Function(`const showPrompt=()=>{},send=()=>{},flash=()=>{};${preload.slice(start, end)}\nreturn shortcutHelpSections;`)();
+  const media = sections.find(([title]) => /^Media/.test(title));
+  assert.ok(media, "a Media section in the help");
+  const keys = media[1].map(([key]) => key);
+  for (const key of ["j · k", "␣", "h · l", "H · L", "m", "< · >", "Esc"]) {
+    assert.ok(keys.includes(key), `media help row for ${key}`);
+  }
+  assert.ok(media[1].every(([, , bindings]) => !bindings), "media rows bind no normal-mode key");
+  const handler = preload.slice(preload.indexOf("function handleMediaKey"), preload.indexOf("function inspectTargets"));
+  for (const key of ['"j"', '"k"', '" "', '"h"', '"L"', '"m"', '"<"', '">"', '"Escape"']) {
+    assert.ok(handler.includes(key), `handleMediaKey handles ${key} that the help lists`);
+  }
+});
