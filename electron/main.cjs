@@ -5057,6 +5057,20 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       void copyImageToClipboard(tab, contents, value);
       break;
     // `yl` with nothing picked: the tab's own title and address, which a subframe cannot read.
+    // `y` in a subframe holding nothing the user pointed at: the top frame opens the menu.
+    case "copy-menu-top": {
+      const mainFrame = contents.mainFrame;
+      if (mainFrame && !mainFrame.isDestroyed() && !mainFrame.detached) mainFrame.send("tweb-copy-menu");
+      break;
+    }
+    case "copy-menu-owner":
+      noteCopyMenuOwner(tab, sourceFrame, Boolean(value));
+      break;
+    // `yi`/`ys`/`yc`/`yf`: a label round across every frame, opened the way `f` opens one.
+    case "copy-round":
+      startHintRound(tab);
+      sendToTabFrames(tab, "tweb-copy-round", String(value?.target || ""));
+      break;
     case "copy-page-markdown":
       clipboard.writeText(markdownLink(contents.getTitle() || contents.getURL(), contents.getURL()));
       break;
@@ -5302,6 +5316,31 @@ ipcMain.on("tweb-shortcut", bindPane(
 //
 // A round is per tab, and there is at most one: a new `f` replaces whatever was open.
 const hintRounds = new WeakMap();
+
+// The frame whose copy menu is up, per tab, by frame key. Keys normally go to the focused frame,
+// but the menu is opened in the top frame when `y` came from a subframe holding nothing (preload
+// `copyMenuBelongsHere`) — on YouTube, an ad iframe that had focus. The second key has to reach
+// the menu, so while one is up keys go to its frame. Kept by key, not by frame object: a
+// navigation gives the frame a new token, and a menu that went with its document must not keep
+// pulling keys away from the focused frame.
+const copyMenuOwners = new WeakMap();
+
+function noteCopyMenuOwner(tab, frame, open) {
+  if (!tab || !frame) return;
+  if (open) copyMenuOwners.set(tab, { frame, key: frameKey(frame) });
+  else if (copyMenuOwners.get(tab)?.key === frameKey(frame)) copyMenuOwners.delete(tab);
+}
+
+function copyMenuOwnerFrame(tab) {
+  const owner = tab && copyMenuOwners.get(tab);
+  if (!owner) return null;
+  const { frame, key } = owner;
+  if (frame.isDestroyed() || frame.detached || frameKey(frame) !== key) {
+    copyMenuOwners.delete(tab);
+    return null;
+  }
+  return frame;
+}
 
 // How long to wait for the frames to answer. A SUBFRAME that has not replied by then is left
 // out of the round rather than holding the hints back — the common case for a slow one is an ad
@@ -10055,7 +10094,7 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
     cycleTab(key === "J" ? -1 : 1);
     return;
   }
-  sendToFocusedTabFrame(currentWindows().win, "tweb-terminal-key", {
+  const payload = {
     key,
     code: "",
     event: eventKind === 3 ? "keyup" : "keydown",
@@ -10065,7 +10104,14 @@ function dispatchNamedKey(key, modifierMask = 1, eventKind = 1, textCodepoints =
     ctrlKey: control,
     metaKey: modifiers.includes("meta"),
     synthesizeKeyUp: eventKind === 1,
-  });
+  };
+  // An open copy menu takes the key, wherever focus is (see `copyMenuOwners`).
+  const menuFrame = copyMenuOwnerFrame(currentWindows().win);
+  if (menuFrame) {
+    menuFrame.send("tweb-terminal-key", payload);
+    return;
+  }
+  sendToFocusedTabFrame(currentWindows().win, "tweb-terminal-key", payload);
 }
 
 function dispatchKey(codepoint, modifierMask = 1, eventKind = 1, textCodepoints = []) {
