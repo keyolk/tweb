@@ -36,15 +36,21 @@ function fakeNode(tag = "div") {
 }
 
 // counts: how many targets each picking row would label.
-function harness({ visual = null, selection = "", active = null, counts = {} } = {}) {
+function harness({ visual = null, selection = "", active = null, counts = {}, top = true } = {}) {
   const sent = [];
   const flashes = [];
   const modes = [];
   const picks = [];
-  const env = { visual, selection, active, counts, sent, flashes, modes, picks, appended: [] };
+  const env = { visual, selection, active, counts, top, sent, flashes, modes, picks, owner: [], appended: [] };
   const api = new Function("env", `
     let visualState = env.visual;
     let copyMenuState = null;
+    const topFrame = env.top;
+    const noteCopyMenuOwner = (open) => env.owner.push(open);
+    let pendingRoundKind = "hints";
+    let pendingHintTargets = null;
+    let pendingCopyTarget = null;
+    const requestFrameOffset = () => {};
     let indicatorMode = "normal";
     let indicatorDetail = "";
     const location = { href: "https://example.com/a(1)" };
@@ -66,7 +72,7 @@ function harness({ visual = null, selection = "", active = null, counts = {} } =
     const setMode = (mode, detail) => { indicatorMode = mode; indicatorDetail = detail; env.modes.push([mode, detail]); };
     const paintNow = () => {};
     const cancelVisual = () => { visualState = null; env.visual = null; };
-    const startPicker = (targets, mode, onPick) => env.picks.push({ targets, mode, onPick });
+    const startPicker = (targets, mode, onPick, space, shown) => env.picks.push({ targets, mode, onPick, space, shown });
     ${menuSource}
     // The DOM-reading half, replaced by the counts this test asks for.
     copyPickTargets = (kind) => Array.from({ length: env.counts[kind] || 0 }, (_, i) => ({
@@ -85,6 +91,9 @@ function harness({ visual = null, selection = "", active = null, counts = {} } =
       isOpen: () => Boolean(copyMenuState),
       visual: () => visualState,
       paste: (newTab) => pasteOrOpen(newTab),
+      // The engine's half of a copy round, played by the test: ask, then hand out the space.
+      round: (target) => { startCopyRound(target); return pendingRoundKind; },
+      draw: (space) => { const counted = space ? pendingHintTargets : null; pendingHintTargets = null; pendingRoundKind = "hints"; drawCopyHints(space, counted); },
       markdownLink,
     };
   `)(env);
@@ -182,7 +191,9 @@ test("y alone copies nothing; the second key copies", () => {
   }
 });
 
-test("the label rows start a copy picker, and each pick copies its own thing", () => {
+// A label row opens a round shared by every frame (the engine's `copy-round`), not a picker in
+// the frame that showed the menu: labels in embedded documents, typed from any frame.
+test("the label rows open a shared copy round, and each pick copies its own thing", () => {
   for (const [key, target, expected] of [
     ["i", "image", (sent) => assert.equal(sent[0][0], "copy-image")],
     ["s", "image-src", (sent) => assert.deepEqual(sent, [["copy-text", "https://example.com/i0.png"]])],
@@ -192,12 +203,59 @@ test("the label rows start a copy picker, and each pick copies its own thing", (
     const h = harness({ counts: { image: 2, "image-src": 2, code: 1, link: 3 } });
     h.open();
     h.key(key);
-    assert.equal(h.env.picks.length, 1, `y${key} starts a picker`);
-    assert.equal(h.env.picks[0].mode, "copy");
-    assert.ok(h.env.picks[0].targets.length > 0, target);
+    assert.deepEqual(h.env.sent, [["copy-round", { target }]], `y${key} asks the engine for a round`);
+    assert.equal(h.env.picks.length, 0, `y${key} draws no local picker`);
+    h.env.sent.length = 0;
+    assert.equal(h.round(target), "copy");
+    assert.equal(h.env.sent[0][0], "hint-round");
+    assert.ok(h.env.sent[0][1].count > 0, `${target} counted`);
+    h.env.sent.length = 0;
+    h.draw({ offset: 0, count: 1, total: 1, round: 1 });
+    assert.equal(h.env.picks.length, 1);
+    assert.equal(h.env.picks[0].mode, "hint", "the shared picker mode routes labels through the engine");
+    assert.equal(h.env.picks[0].shown, "copy");
     h.env.picks[0].onPick(h.env.picks[0].targets[0]);
-    expected(h.env.sent);
+    assert.deepEqual(h.env.sent[0], ["hint-done"]);
+    expected(h.env.sent.slice(1));
   }
+});
+
+// `y` in a subframe holding nothing the user pointed at — focus in a YouTube ad iframe, observed —
+// hands the menu to the top frame, which builds it from the page the user sees.
+test("y in a subframe with nothing selected or picked defers to the top frame", () => {
+  const sub = harness({ top: false, counts: { image: 0, link: 1 } });
+  sub.open();
+  assert.deepEqual(sub.env.sent, [["copy-menu-top"]]);
+  assert.equal(sub.isOpen(), false, "the subframe draws no menu");
+  assert.deepEqual(sub.env.owner, [], "and claims no keys");
+
+  const selected = harness({ top: false, selection: "ad text the user chose" });
+  selected.open();
+  assert.equal(selected.isOpen(), true, "a selection in the subframe keeps the menu there");
+  assert.deepEqual(selected.env.sent, []);
+
+  const picked = harness({ top: false, visual: { kind: "text", element: { innerText: "x" } } });
+  picked.open();
+  assert.equal(picked.isOpen(), true, "so does a v pick");
+
+  const secret = harness({ top: false, selection: "hunter2", active: { localName: "input", type: "password", getAttribute: () => "" } });
+  secret.open();
+  assert.deepEqual(secret.env.sent, [["copy-menu-top"]], "a selection in a password field does not count");
+});
+
+test("the frame showing the menu claims the keys until it closes", () => {
+  const h = harness({ counts: { link: 1 } });
+  h.open();
+  assert.deepEqual(h.env.owner, [true]);
+  h.key("Escape");
+  assert.deepEqual(h.env.owner, [true, false]);
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const dispatch = main.slice(main.indexOf("const menuFrame = copyMenuOwnerFrame("), main.indexOf("function dispatchKey("));
+  assert.match(dispatch, /menuFrame\.send\("tweb-terminal-key", payload\)/);
+  assert.ok(dispatch.indexOf("menuFrame.send") < dispatch.indexOf("sendToFocusedTabFrame"),
+    "the menu's frame is asked before the focused frame");
+  assert.match(main, /case "copy-menu-top": \{[\s\S]{0,200}mainFrame\.send\("tweb-copy-menu"\)/);
+  assert.match(main, /case "copy-round":\s*startHintRound\(tab\);\s*sendToTabFrames\(tab, "tweb-copy-round"/);
 });
 
 test("a picked image is copied with its URL so main can fetch the original", () => {

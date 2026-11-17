@@ -366,6 +366,13 @@ installPrintShim();
   function send(action, value) {
     ipcRenderer.send("tweb-shortcut", { action, value });
   }
+  // The copy menu's owner, told to the engine. Keys go to the FOCUSED frame, and the menu may be
+  // up in another one — the top frame, opened there because `y` was pressed inside an ad iframe
+  // (see `copyMenuBelongsHere`). While it is up the engine sends keys to the frame that owns it.
+  function noteCopyMenuOwner(open) {
+    send("copy-menu-owner", Boolean(open));
+  }
+
 
   // Overlays are only worth drawing if they reach the terminal promptly; the
   // frame clock alone can hold them back by a whole idle interval.
@@ -3239,6 +3246,8 @@ installPrintShim();
   let pendingHintTargets = null;
   // What the shared round is picking: links and controls (`f`), or content and areas (`v`).
   let pendingRoundKind = "hints";
+  // The kind a copy round picks (`startCopyRound`): image, image-src, code or link.
+  let pendingCopyTarget = null;
 
   function startHints(newTab) {
     // Refresh where we are before any of these badges can be picked. The badges
@@ -3310,6 +3319,11 @@ installPrintShim();
     const newTab = pendingHintNewTab;
     const counted = space ? pendingHintTargets : null;
     pendingHintTargets = null;
+    if (pendingRoundKind === "copy") {
+      pendingRoundKind = "hints";
+      drawCopyHints(space, counted);
+      return;
+    }
     if (pendingRoundKind === "visual") {
       pendingRoundKind = "hints";
       // "hint" is the shared picker's mode either way: it is what routes typed labels through
@@ -5690,7 +5704,7 @@ installPrintShim();
 
   function runCopyAction(action, ctx) {
     if (action.type === "pick") {
-      startCopyPick(action.target, ctx.targets?.[action.target]);
+      send("copy-round", { target: action.target });
       return;
     }
     if (visualState) cancelVisual(false);
@@ -5708,28 +5722,65 @@ installPrintShim();
     }
   }
 
-  function startCopyPick(target, targets) {
-    const list = (targets || copyPickTargets(target)).filter((item) => item.element.isConnected);
-    startPicker(list, "copy", (item) => {
-      if (target === "image") {
-        copyImage(item.image || item.element, item.imageURL);
-      } else if (target === "image-src") {
-        send("copy-text", item.imageURL);
-        flash("image URL");
-      } else if (target === "code") {
-        const code = item.element.innerText || item.element.textContent || "";
-        const lines = lineCount(code);
-        send("copy-text", code);
-        flash(`code ${lines} line${lines === 1 ? "" : "s"}`);
-      } else {
-        send("copy-text", item.element.href);
-        flash("URL");
-      }
-    });
+  // What a label pick from `yi`/`ys`/`yc`/`yf` copies.
+  function copyPickedTarget(target, item) {
+    if (target === "image") {
+      copyImage(item.image || item.element, item.imageURL);
+    } else if (target === "image-src") {
+      send("copy-text", item.imageURL);
+      flash("image URL");
+    } else if (target === "code") {
+      const code = item.element.innerText || item.element.textContent || "";
+      const lines = lineCount(code);
+      send("copy-text", code);
+      flash(`code ${lines} line${lines === 1 ? "" : "s"}`);
+    } else {
+      send("copy-text", item.element.href);
+      flash("URL");
+    }
+  }
+
+  // The label rows pick in a round shared by every frame, the one `f` and `v` use: the engine
+  // opens it and asks each frame (`tweb-copy-round`) for its targets of that kind, so an image in
+  // an embedded document gets a label too, and a label typed while focus is in some other frame
+  // still reaches the frame that drew it. A picker local to the frame that opened the menu could
+  // do neither.
+  function startCopyRound(target) {
+    requestFrameOffset();
+    pendingRoundKind = "copy";
+    pendingCopyTarget = target;
+    pendingHintTargets = copyPickTargets(target);
+    send("hint-round", { count: pendingHintTargets.length });
+  }
+
+  // This frame's share of a copy round (from `drawHints`).
+  function drawCopyHints(space, counted) {
+    const target = pendingCopyTarget;
+    pendingCopyTarget = null;
+    const targets = (counted || copyPickTargets(target)).filter((item) => item.element.isConnected);
+    startPicker(targets, "hint", (item) => {
+      send("hint-done");
+      copyPickedTarget(target, item);
+    }, space, "copy");
+  }
+
+  // `y` is read by whichever frame has focus, and on a page with ads that is often an ad's
+  // cross-origin iframe the user never meant to be in. On YouTube the menu said "no images ·
+  // 1 link", built from the ad's own DOM, while the page had 91 links and 64 images (observed).
+  // So a subframe keeps the menu only when it holds what the user is pointing at — a `v` pick, a
+  // caret, or a text selection; otherwise the top frame opens it, for the page the user sees.
+  function copyMenuBelongsHere() {
+    if (topFrame || visualState) return true;
+    const selection = window.getSelection?.()?.toString() || "";
+    return Boolean(selection) && !isSecretField(activeElement());
   }
 
   function startCopyMenu() {
     cancelCopyMenu(false);
+    if (!copyMenuBelongsHere()) {
+      send("copy-menu-top");
+      return;
+    }
     const ctx = copyMenuContext();
     const rows = copyMenuRows(ctx);
     const host = document.createElement("div");
@@ -5770,6 +5821,7 @@ installPrintShim();
     document.documentElement.append(host);
     paintNow();
     copyMenuState = { host, rows, ctx, mode: indicatorMode, detail: indicatorDetail };
+    noteCopyMenuOwner(true);
     setMode(visualState ? "visual" : "normal", "y…");
   }
 
@@ -5778,6 +5830,7 @@ installPrintShim();
     const { host, mode, detail } = copyMenuState;
     copyMenuState = null;
     host.remove();
+    noteCopyMenuOwner(false);
     if (restoreMode) setMode(mode || "normal", detail || "");
   }
 
@@ -6821,6 +6874,16 @@ installPrintShim();
       event.stopImmediatePropagation();
     }
   }
+
+  // A subframe passed `y` to the top frame (`copyMenuBelongsHere`).
+  ipcRenderer.on("tweb-copy-menu", () => {
+    if (topFrame) startCopyMenu();
+  });
+
+  // The engine opened a copy round; this frame answers with its targets.
+  ipcRenderer.on("tweb-copy-round", (_event, target) => {
+    if (["image", "image-src", "code", "link"].includes(target)) startCopyRound(target);
+  });
 
   // This frame's share of a hint round the engine has just divided up.
   ipcRenderer.on("tweb-hint-space", (_event, space) => {
