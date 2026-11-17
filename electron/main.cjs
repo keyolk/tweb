@@ -77,7 +77,7 @@ const { passthroughRuns } = require("./tmux-passthrough.cjs");
 const { parkSequence, unparkSequence } = require("./terminal-caret.cjs");
 const { markdownLink, clipboardUrl } = require("./copy-format.cjs");
 const {
-  shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
+  shmFramesDecision, paneShmMedium, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
   SHM_RING, SHM_PATCH_RING,
 } = require("./shm-frames.cjs");
 const { mouseEventParams, pointerTarget, nextCapture } = require("./oopif-input.cjs");
@@ -1652,13 +1652,21 @@ function markShmPane(frames) {
 }
 
 // Shared memory is one reader's medium: the terminal unlinks the object once it has read it, so a
-// second client tmux forwards the same command to finds nothing. Under the overlay that cost a
-// patch the second client never drew, with the base still showing underneath. Under placeholders
-// there is nothing underneath — measured with two clients on one pane, the patched box was blank
-// in a quarter of captures on both. So a placeholder pane takes the file medium, which any number
-// of terminals can read.
+// second client tmux forwards the same command to finds nothing. A placeholder pane therefore takes
+// shm only while exactly one client shows it — see `paneShmMedium` for the measurements. The client
+// set is the pane's own (its record), not the ambient pane's: a host serves panes in different
+// windows watched by different clients.
+function paneShmMediumFor(frames) {
+  const record = frames.record;
+  return paneShmMedium({
+    shmEnabled: shmFramesEnabled,
+    placeholders: usesPlaceholders(record),
+    clientCount: record?.visibility?.clientTtys?.size,
+  });
+}
+
 function shmUsableFor(frames) {
-  return shmFramesEnabled && !usesPlaceholders(frames.record);
+  return paneShmMediumFor(frames).shm;
 }
 
 function nextShmFrameName(frames) {
@@ -5742,7 +5750,11 @@ function agentDiagnostics() {
       wholeCompressed: currentFrames().compressedWholeFrames,
       // Whether whole frames go through shared memory (`t=s`), why or why not, and how many of
       // `whole` did. See shm-frames.cjs.
-      wholeMedium: shmFramesEnabled ? "shm" : frameTransport,
+      // What this pane uses NOW, not what the engine may use: a placeholder pane takes shm only
+      // while one client shows it, and the engine-wide answer read "shm" on a pane that had sent
+      // 0 of 6053 frames through it.
+      wholeMedium: paneShmMediumFor(currentFrames()).shm ? "shm" : frameTransport,
+      wholeMediumReason: paneShmMediumFor(currentFrames()).reason,
       shmReason: shmDecision.reason,
       shmError: lastShmFrameError,
       wholeShm: currentFrames().shmWholeFrames,
