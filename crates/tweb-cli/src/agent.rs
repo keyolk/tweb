@@ -590,8 +590,8 @@ pub fn render(method: &str, result: &Value) -> String {
                         .get("memoryMb")
                         .and_then(Value::as_u64)
                         .map(|mb| {
-                            let shared = tab.get("sharedRenderer").and_then(Value::as_bool)
-                                == Some(true);
+                            let shared =
+                                tab.get("sharedRenderer").and_then(Value::as_bool) == Some(true);
                             format!(" {mb}MB{}", if shared { " shared" } else { "" })
                         })
                         .unwrap_or_default();
@@ -661,7 +661,30 @@ pub fn stale_engine_notice(engine_app: &str, own_tag: &str) -> Option<String> {
 
 /// Run one command and print it.
 pub fn run(pane: Option<&str>, method: &str, params: Value, as_json: bool) -> Result<()> {
-    let result = request(pane, method, params)?;
+    let mut result = request(pane, method, params)?;
+    // What no engine can see: the other engines on this profile. A pane's own engine beside the
+    // daemon's splits the profile's storage locks (see doctor `profile engines`).
+    if method == "diag" {
+        let engines = crate::doctor::engine::ProfileEngines::observe();
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "profileEngines".to_string(),
+                json!({
+                    "hosts": engines.hosts,
+                    "standalone": engines.standalone.iter()
+                        .map(|(pid, pane)| json!({ "pid": pid, "pane": pane }))
+                        .collect::<Vec<_>>(),
+                    "shared": engines.shared(),
+                }),
+            );
+        }
+        if engines.shared() {
+            eprintln!(
+                "tweb: {} — they share one profile; reopen those panes so the daemon hosts them",
+                engines.describe()
+            );
+        }
+    }
     if as_json {
         println!("{}", render_json(method, &result));
     } else {
@@ -828,8 +851,9 @@ mod tests {
 
     #[test]
     fn an_engine_running_another_installed_app_is_named() {
-        let notice = super::stale_engine_notice("/h/.cache/tweb/app-f5ef21bd4d732295", "4a9cfd33ca61c8f8")
-            .expect("a different cache app is stale");
+        let notice =
+            super::stale_engine_notice("/h/.cache/tweb/app-f5ef21bd4d732295", "4a9cfd33ca61c8f8")
+                .expect("a different cache app is stale");
         assert!(notice.contains("app-f5ef21bd4d732295"), "{notice}");
         assert!(notice.contains("app-4a9cfd33ca61c8f8"), "{notice}");
         assert!(notice.contains("tweb daemon restart"), "{notice}");
@@ -837,7 +861,10 @@ mod tests {
 
     #[test]
     fn the_same_app_and_development_checkouts_are_not_warned_about() {
-        assert_eq!(super::stale_engine_notice("/h/.cache/tweb/app-aa", "aa"), None);
+        assert_eq!(
+            super::stale_engine_notice("/h/.cache/tweb/app-aa", "aa"),
+            None
+        );
         // A development binary runs its workspace's electron/, which is never an installed tag.
         assert_eq!(super::stale_engine_notice("/w/tweb/electron", "aa"), None);
         assert_eq!(super::stale_engine_notice("", "aa"), None);

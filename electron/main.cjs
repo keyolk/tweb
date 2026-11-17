@@ -9082,6 +9082,8 @@ const paneInputStates = new Map();
 // rather than pane key because the key includes a generation the SESSION line does not carry — it
 // is written immediately before the attach it belongs to and consumed by it.
 const pendingSessionIdentities = new Map();
+// A pane's first-tab engine between its `ENGINE` line and the `ATTACH` that follows; see above.
+const pendingFirstTabEngines = new Map();
 
 function inputState() {
   const record = currentPane();
@@ -10702,7 +10704,14 @@ function handleAttach(command) {
   // registers resolves back here from that entry, including `paint`.
   withPaneScope(record, () => {
     if (command.viewport) applyViewport(command.viewport, command.origin ?? null, frames, record);
-    createWindow(url, frames, { explicit: explicitUrl });
+    const firstTab = createWindow(url, frames, { explicit: explicitUrl });
+    const engine = pendingFirstTabEngines.get(command.paneId);
+    pendingFirstTabEngines.delete(command.paneId);
+    // The same move the engine badge makes: the tab opens on the host's engine and moves once the
+    // requested one has started, which is also how a restored Chrome tab comes back.
+    if (engine && engine !== pageBackend.kind && firstTab && !firstTab.isDestroyed?.()) {
+      void switchTabEngine(firstTab, engine);
+    }
     markInteractionActivity();
   });
 
@@ -10833,6 +10842,13 @@ function handleControlLine(line) {
   // yet. It is held until the attach claims a slot with it.
   if (command.kind === "session") {
     pendingSessionIdentities.set(command.paneId, command.identity);
+    return;
+  }
+  // Held the same way: the ATTACH that follows opens its first tab on this engine. A Chrome- or
+  // WebKit-first pane is hosted like any other instead of starting an engine of its own on this
+  // profile (tweb-pane `first_tab_engine`).
+  if (command.kind === "engine") {
+    pendingFirstTabEngines.set(command.paneId, command.engine);
     return;
   }
 

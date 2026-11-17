@@ -53,6 +53,8 @@ pub struct HostRequest<'a> {
     /// silently resolve a different engine app.
     pub engine_executable: String,
     pub engine_app_dir: String,
+    /// The engine the first tab opens on when it is not the host's own; see `Request::Host`.
+    pub engine: Option<&'static str>,
 }
 
 /// Opens the connection and asks the daemon to host this pane.
@@ -82,6 +84,7 @@ pub fn connect_and_host(
         adaptive_frame_rate: request.adaptive_frame_rate,
         restore_session: request.restore_session,
         session_identity: request.session_identity.clone(),
+        engine: request.engine.map(str::to_string),
     });
     writer
         .write_all(line.as_bytes())

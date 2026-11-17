@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
-mod engine;
+pub(crate) mod engine;
 
 const GHOSTTY_BEGIN: &str = "# >>> tweb doctor managed passthrough >>>";
 const GHOSTTY_END: &str = "# <<< tweb doctor managed passthrough <<<";
@@ -348,6 +348,7 @@ pub async fn run(fix: bool) -> Result<()> {
     ]);
     checks.extend(engine::linux_checks());
     checks.push(check_chrome_engine());
+    checks.push(engine::check_profile_engines());
 
     // Output.
     for check in &checks {

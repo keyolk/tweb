@@ -198,6 +198,12 @@ pub enum Request {
         /// every `Request` on this wire — a keystroke's `Control` included — would carry that size.
         #[serde(default)]
         session_identity: Option<Box<TmuxWindowIdentity>>,
+        /// The engine the pane's first tab opens on (`chrome`, `webkit`), or `None` for the host's
+        /// own (Electron). A Chrome- or WebKit-first pane used to skip the daemon and start an
+        /// Electron engine of its own on the shared profile, which split the profile's storage
+        /// locks with the daemon's engine. Defaulted, so an older frontend still decodes.
+        #[serde(default)]
+        engine: Option<String>,
     },
     /// One control line for an already-hosted pane — `RESIZE …`, `VIS …`, `INPUT …`, verbatim in
     /// the grammar the single-pane engine already parses.
@@ -431,6 +437,7 @@ mod tests {
                 adaptive_frame_rate: true,
                 restore_session: false,
                 session_identity: None,
+                engine: None,
             },
             Request::Control {
                 pane: pane_ref("%3", "srv"),
@@ -493,6 +500,7 @@ mod tests {
             adaptive_frame_rate: false,
             restore_session: true,
             session_identity: None,
+            engine: None,
         });
         let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(value["kind"], "host");
