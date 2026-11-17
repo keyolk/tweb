@@ -827,9 +827,8 @@ test("c reaches a caret from a target that carries no text", () => {
   assert.match(reach, /caretRangeFromPoint/);
   assert.doesNotMatch(electron,
     /key === "c" && visualState\.selectionMade/);
-  // In caret mode `y` means the text, not the bitmap or the href.
-  assert.match(electron, /smart && !item\.caret && item\.kind === "image"/);
-  assert.match(electron, /smart && !item\.caret && item\.kind === "link"/);
+  // In caret mode `yy` means the text, not the bitmap or the href (copy-menu.test.cjs runs it).
+  assert.match(electron, /picked\.caret \? "t" : picked\.kind === "image" && picked\.image \? "i" : picked\.href \? "u" : "t"/);
 });
 
 // Chromium paints nothing until a page commits. On google.com that was 5.5s of a

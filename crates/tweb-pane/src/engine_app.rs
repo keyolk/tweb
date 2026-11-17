@@ -272,6 +272,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../electron/terminal-caret.cjs"),
     ),
     (
+        "copy-format.cjs",
+        include_str!("../../../electron/copy-format.cjs"),
+    ),
+    (
         "hangul-keys.cjs",
         include_str!("../../../electron/hangul-keys.cjs"),
     ),

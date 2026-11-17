@@ -117,6 +117,8 @@ installPrintShim();
   let mediaTargetWatch = null;
   let tabListRefresh = false;
   let pendingG = false;
+  // The `y` copy menu while it is open (startCopyMenu).
+  let copyMenuState = null;
   let pendingGTimer = null;
   let pendingZ = false;
   let pendingZTimer = null;
@@ -2500,6 +2502,7 @@ installPrintShim();
     hint: "no clickable target",
     visual: "no text·link·image·scroll area",
     inspect: "no target",
+    copy: "nothing to copy",
     command: "no command to run",
   };
 
@@ -3675,7 +3678,6 @@ installPrintShim();
       ["J · K", "previous · next tab", { J: () => send("previous-tab"), K: () => send("next-tab") }],
       ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
       ["r · gi", "reload · focus first input", { r: () => send("reload") }],
-      ["y", "copy the page URL", { y: () => { send("copy-url"); flash("URL"); } }],
     ]],
     ["Search and selection", [
       ["/ · n · N", "search · next · previous match", {
@@ -3686,7 +3688,7 @@ installPrintShim();
       ["v · V", "visual picker — label colour is the kind, keyed in the bottom-left corner while the labels are up: yellow text · blue link · pink image · green editable (puts the caret there) · teal area for j/k, the arrows and PageUp/PageDown to scroll (Esc returns to the page) · orange video/audio, held for the media keys · Enter clicks the pick · select whole page", { v: () => startVisualRound(), V: () => selectPageText() }],
       ["h/l · b/w/e · j/k · 0/$ · {/}", "adjust visual selection (beyond the block too)"],
       ["c · v", "drop to caret to move the anchor · select from there"],
-      ["y · Y · u", "smart copy · text copy · image/link URL copy"],
+      ["y… · Y · u", "copy menu (see Copy and paste) · text · image/link URL"],
       ["D · o/O · p · d", "image download · open target · paste · inspect"],
       ["I", "inspect picker — then y/h/t copy, a sends it to the agent pane", { I: () => startInspect() }],
     ]],
@@ -3702,6 +3704,24 @@ installPrintShim();
       ["m", "mute · unmute"],
       ["< · >", "speed −0.25 · +0.25 (0.25x–4x)"],
       ["Esc", "let it go — j/k scroll and m takes audio back again"],
+    ]],
+    // `y` is a menu, not a copy: the second key names what to copy, and the menu shows what
+    // each would copy right now. The combo rows bind nothing here — the menu
+    // (`handleCopyMenuKey`) owns the second key — so only `y`, `p` and `P` are bound.
+    ["Copy and paste", [
+      ["y", "copy menu — each row shows what it would copy right now; Esc closes it", { y: () => startCopyMenu() }],
+      ["yy", "smart: the selection, else the page URL · on a v pick the image, link URL or text"],
+      ["yt", "text: the selection · the picked block (never a password field)"],
+      ["yu", "URL: the page · the picked link or image"],
+      ["yl", "markdown link: [title](url) of the page · the picked link"],
+      ["yi", "image itself (the original file, else the pixels shown) · labels to pick one"],
+      ["ys", "image URL · labels to pick one"],
+      ["yc", "code block · labels to pick one"],
+      ["yf", "link URL · labels to pick one"],
+      ["p · P", "with a field focused, paste into it · open the clipboard URL here · in a new tab", {
+        p: () => pasteOrOpen(false),
+        P: () => pasteOrOpen(true),
+      }],
     ]],
     ["Browser and modes", [
       ["zi · zo · zz", "zoom in · out · reset", {
@@ -5427,8 +5447,8 @@ installPrintShim();
     const elementRectAtPick = item.element?.getBoundingClientRect?.() || null;
     visualState = { ...item, outline, selectionMade, elementRectAtPick };
     if (selectionMade) updateVisualSelection();
-    else if (item.kind === "image") setMode("visual", "image ⏎·y·Y·u·D·o");
-    else setMode("visual", `${item.kind} ⏎·y·Y·u·o·p`);
+    else if (item.kind === "image") setMode("visual", "image ⏎·y…·Y·u·D·o");
+    else setMode("visual", `${item.kind} ⏎·y…·Y·u·o·p`);
   }
 
   function startVisual() {
@@ -5450,31 +5470,359 @@ installPrintShim();
     });
   }
 
-  function copyVisual(smart = true) {
-    if (!visualState) return;
-    const item = visualState;
-    // A caret is a text cursor: `y` there means the text, never the image bitmap
-    // or the link URL that a smart copy would reach for.
-    if (smart && !item.caret && item.kind === "image") {
-      send("copy-image", {
-        x: Math.max(0, Math.floor(item.rect.left)),
-        y: Math.max(0, Math.floor(item.rect.top)),
-        width: Math.max(1, Math.ceil(item.rect.width)),
-        height: Math.max(1, Math.ceil(item.rect.height)),
-      });
-    } else if (smart && !item.caret && item.kind === "link" && item.link?.href) {
-      send("copy-text", item.link.href);
+  // --- copy menu (`y`) ---
+  //
+  // `y` used to copy at once, and what it copied depended on where you were: the page URL in
+  // normal mode even with text selected, the bitmap, href or text of a `v` pick. Nothing on screen
+  // said which. Now `y` opens a menu and the second key names the thing — and every row shows
+  // what it would put on the clipboard right now, so the choice is made by reading, not by
+  // remembering. A row that cannot apply here stays visible, dimmed, with the reason.
+  //
+  // `copyMenuRows` is pure (a context in, rows out) so the routing is testable without a page;
+  // `copyMenuContext` is the only part that reads the DOM.
+
+  // A field whose value tweb must never preview or copy: a password, or anything the page marks
+  // as a credential or card secret.
+  const SECRET_AUTOCOMPLETE = /\b(current-password|new-password|one-time-code|cc-number|cc-csc)\b/i;
+  function isSecretField(element) {
+    if (!element || typeof element.getAttribute !== "function") return false;
+    if (element.localName === "input" && String(element.type || "").toLowerCase() === "password") return true;
+    return SECRET_AUTOCOMPLETE.test(String(element.getAttribute("autocomplete") || ""));
+  }
+
+  function clipText(text, max) {
+    const flat = String(text || "").replace(/\s+/g, " ").trim();
+    return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+  }
+
+  // Same rule as copy-format.cjs `markdownLink`, which main uses for the page's own link; a
+  // sandboxed preload cannot require it, so the rule is stated in both (and a test compares them).
+  function markdownLink(text, url) {
+    const label = String(text || url || "").replace(/\s+/g, " ").trim().replace(/[[\]\\]/g, (c) => `\\${c}`);
+    return `[${label}](${String(url || "").replace(/[()\s]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)})`;
+  }
+
+  function lineCount(text) {
+    const trimmed = String(text || "").replace(/\n+$/, "");
+    return trimmed ? trimmed.split("\n").length : 0;
+  }
+
+  // The text a `v` pick stands for: the selection made inside it, else the block, a field's value
+  // (never a secret one), or an image's alt.
+  function pickedText(item) {
+    if (isSecretField(item.element)) return "";
+    // A caret selects nothing, so its text is the block it sits in — the same thing `v` then
+    // `y` has always copied.
+    const selectedText = item.selectionMade ? visualSelection()?.toString() || "" : "";
+    return selectedText || (typeof item.element.value === "string" ? item.element.value
+      : item.element.innerText?.trim() || item.image?.getAttribute?.("alt")
+        || item.element.getAttribute?.("alt") || item.element.getAttribute?.("aria-label") || "");
+  }
+
+  function imageSize(image, rect) {
+    const natural = isTag(image, "img") ? [image.naturalWidth, image.naturalHeight]
+      : isTag(image, "video") ? [image.videoWidth, image.videoHeight]
+        : isTag(image, "canvas") ? [image.width, image.height] : [0, 0];
+    if (natural[0] > 0 && natural[1] > 0) return { width: natural[0], height: natural[1] };
+    const box = rect || image?.getBoundingClientRect?.();
+    return box ? { width: Math.round(box.width), height: Math.round(box.height) } : null;
+  }
+
+  function codeBlockOf(element) {
+    return element?.closest?.("pre") || element?.closest?.("code") || null;
+  }
+
+  // What the label-picking rows (`yi` `ys` `yc` `yf` with nothing picked) put badges on.
+  function copyPickTargets(kind) {
+    const roots = collectRoots();
+    const all = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
+    let targets;
+    if (kind === "link") {
+      targets = uniqueVisibleTargets(all("a[href]").filter((link) => link.href), () => ({ kind: "link" }));
+    } else if (kind === "code") {
+      targets = uniqueVisibleTargets(all("pre,code")
+        .filter((element) => !(isTag(element, "code") && element.closest("pre")) && element.textContent?.trim()),
+      () => ({ kind: "text" }));
     } else {
-      // A caret selects nothing, so `y` there copies the block it sits in — the
-      // same thing `v` then `y` has always done.
-      const selectedText = item.selectionMade ? visualSelection()?.toString() || "" : "";
-      const text = selectedText || (typeof item.element.value === "string" ? item.element.value
-        : item.element.innerText?.trim() || item.image?.getAttribute("alt")
-          || item.element.getAttribute("alt") || item.element.getAttribute("aria-label") || "");
-      if (text) send("copy-text", text);
+      // Icons are images too, and a page is full of them; an svg counts only at picture size.
+      targets = uniqueVisibleTargets(all("img,picture,canvas,video,svg,[role=img]").filter((element) => {
+        if (!isTag(element, "svg")) return true;
+        const box = element.getBoundingClientRect();
+        return box.width >= 32 && box.height >= 32;
+      }), (element) => {
+        const image = isTag(element, "picture") || element.getAttribute?.("role") === "img"
+          ? element.querySelector?.("img,canvas,svg,video") || element : element;
+        return { kind: "image", image, imageURL: imageSource(image) };
+      });
+      if (kind === "image-src") targets = targets.filter((target) => target.imageURL);
     }
+    return targets.sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
+  }
+
+  function copyMenuContext() {
+    const page = { url: location.href, title: document.title || "" };
+    const targets = {
+      image: copyPickTargets("image"),
+      link: copyPickTargets("link"),
+      code: copyPickTargets("code"),
+    };
+    targets["image-src"] = targets.image.filter((target) => target.imageURL);
+    const counts = Object.fromEntries(Object.entries(targets).map(([kind, list]) => [kind, list.length]));
+    const item = visualState;
+    if (!item) {
+      const selection = window.getSelection?.();
+      // A selection inside a password field never reaches toString, but one that merely starts in
+      // a field the page marks secret is left out too.
+      const secret = isSecretField(activeElement());
+      return { picked: null, selection: secret ? "" : selection?.toString() || "", page, counts, targets };
+    }
+    const image = item.kind === "image" ? item.image || item.element : item.image || null;
+    const code = codeBlockOf(item.element);
+    return {
+      picked: {
+        kind: item.kind,
+        caret: Boolean(item.caret),
+        secret: isSecretField(item.element),
+        text: pickedText(item),
+        href: item.link?.href || "",
+        linkText: item.link?.innerText?.trim() || item.link?.textContent?.trim() || "",
+        image: image ? { element: image, url: item.imageURL || imageSource(image), size: imageSize(image) } : null,
+        code: code ? code.innerText || code.textContent || "" : "",
+      },
+      selection: "",
+      page,
+      counts,
+      targets,
+    };
+  }
+
+  const COPY_MENU_KINDS = {
+    y: "smart", t: "text", u: "URL", l: "markdown", i: "image", s: "image URL", c: "code", f: "link",
+  };
+
+  // Rows in the order the menu shows them. A row with `action` copies; one without carries the
+  // `reason` it cannot, shown dimmed.
+  function copyMenuRows(ctx) {
+    const { picked, page } = ctx;
+    const counts = ctx.counts || {};
+    const quoted = (text) => `"${clipText(text, 44)}" · ${String(text).length} chars`;
+    const labels = (count, noun) => `pick with labels · ${count} ${noun}${count === 1 ? "" : "s"}`;
+    const rows = {};
+
+    const text = picked ? (picked.secret ? "" : picked.text) : ctx.selection;
+    rows.t = text
+      ? { preview: quoted(text), action: { type: "text", text, flash: `text ${text.length} chars` } }
+      : { reason: picked?.secret ? "password field" : picked ? "no text here" : "no selection" };
+
+    const url = picked ? picked.href || (picked.kind === "image" ? picked.image?.url : "") || "" : "";
+    rows.u = url
+      ? { preview: clipText(url, 64), action: { type: "text", text: url, flash: "URL" } }
+      : { preview: `${clipText(page.url, 56)} · page`, action: { type: "page-url" } };
+
+    rows.l = picked?.href
+      ? (() => {
+        const link = markdownLink(picked.linkText || picked.text, picked.href);
+        return { preview: clipText(link, 64), action: { type: "text", text: link, flash: "markdown link" } };
+      })()
+      : { preview: `${clipText(markdownLink(page.title || page.url, page.url), 56)} · page`, action: { type: "page-markdown" } };
+
+    const size = picked?.image?.size;
+    const sizeText = size && size.width && size.height ? `${size.width}×${size.height} · ` : "";
+    rows.i = picked?.image
+      ? { preview: `${sizeText}the picked image`, action: { type: "image" } }
+      : counts.image ? { preview: labels(counts.image, "image"), action: { type: "pick", target: "image" } }
+        : { reason: "no images" };
+
+    rows.s = picked?.image?.url
+      ? { preview: clipText(picked.image.url, 64), action: { type: "text", text: picked.image.url, flash: "image URL" } }
+      : picked?.image ? { reason: "the picked image has no URL" }
+        : counts["image-src"] ? { preview: labels(counts["image-src"], "image"), action: { type: "pick", target: "image-src" } }
+          : { reason: "no image URLs" };
+
+    const code = picked?.code || "";
+    rows.c = code
+      ? (() => {
+        const lines = lineCount(code);
+        const flash = `code ${lines} line${lines === 1 ? "" : "s"}`;
+        return { preview: `${clipText(code.split("\n")[0], 40)} · ${lines} line${lines === 1 ? "" : "s"}`,
+          action: { type: "text", text: code, flash } };
+      })()
+      : counts.code ? { preview: labels(counts.code, "block"), action: { type: "pick", target: "code" } }
+        : { reason: "no code blocks" };
+
+    rows.f = counts.link
+      ? { preview: labels(counts.link, "link"), action: { type: "pick", target: "link" } }
+      : { reason: "no links" };
+
+    // `yy` is whichever of the others fits what you are on: in a caret, always the text (a caret
+    // is a text cursor); on a picked image the bitmap, on a link its address, else the text; with
+    // nothing picked the selection, else the page URL.
+    const smart = picked
+      ? (picked.caret ? "t" : picked.kind === "image" && picked.image ? "i" : picked.href ? "u" : "t")
+      : (ctx.selection ? "t" : "u");
+    const resolved = rows[smart];
+    rows.y = resolved.action
+      ? { preview: `= y${smart} · ${resolved.preview}`, action: resolved.action, resolves: smart }
+      : { reason: `= y${smart} · ${resolved.reason}`, resolves: smart };
+
+    return ["y", "t", "u", "l", "i", "s", "c", "f"].map((key) => ({
+      key, kind: COPY_MENU_KINDS[key], available: Boolean(rows[key].action), ...rows[key],
+    }));
+  }
+
+  function copyImageRect(element) {
+    const box = element?.getBoundingClientRect?.();
+    if (!box) return null;
+    return {
+      x: Math.max(0, Math.floor(box.left)),
+      y: Math.max(0, Math.floor(box.top)),
+      width: Math.max(1, Math.ceil(box.width)),
+      height: Math.max(1, Math.ceil(box.height)),
+    };
+  }
+
+  // Main fetches the original through the tab's session and falls back to the pixels on screen
+  // (a canvas, a video frame, a format the clipboard cannot decode); it says which when done.
+  function copyImage(element, src) {
+    send("copy-image", { ...(copyImageRect(element) || {}), src: src || "" });
+    setMode("normal", "copying image…");
+  }
+
+  function runCopyAction(action, ctx) {
+    if (action.type === "pick") {
+      startCopyPick(action.target, ctx.targets?.[action.target]);
+      return;
+    }
+    if (visualState) cancelVisual(false);
+    if (action.type === "text") {
+      send("copy-text", action.text);
+      flash(action.flash || "copied");
+    } else if (action.type === "page-url") {
+      send("copy-url");
+      flash("URL");
+    } else if (action.type === "page-markdown") {
+      send("copy-page-markdown");
+      flash("markdown link");
+    } else if (action.type === "image") {
+      copyImage(ctx.picked.image.element, ctx.picked.image.url);
+    }
+  }
+
+  function startCopyPick(target, targets) {
+    const list = (targets || copyPickTargets(target)).filter((item) => item.element.isConnected);
+    startPicker(list, "copy", (item) => {
+      if (target === "image") {
+        copyImage(item.image || item.element, item.imageURL);
+      } else if (target === "image-src") {
+        send("copy-text", item.imageURL);
+        flash("image URL");
+      } else if (target === "code") {
+        const code = item.element.innerText || item.element.textContent || "";
+        const lines = lineCount(code);
+        send("copy-text", code);
+        flash(`code ${lines} line${lines === 1 ? "" : "s"}`);
+      } else {
+        send("copy-text", item.element.href);
+        flash("URL");
+      }
+    });
+  }
+
+  function startCopyMenu() {
+    cancelCopyMenu(false);
+    const ctx = copyMenuContext();
+    const rows = copyMenuRows(ctx);
+    const host = document.createElement("div");
+    host.id = "__tweb_copy_menu__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "open" });
+    const panel = document.createElement("div");
+    // Bottom-right above the mode badge, where the command palette opens: a menu in a corner,
+    // not a dialog over the page the previews describe.
+    panel.style.cssText = [
+      "position:fixed", "right:8px", "bottom:24px", "box-sizing:border-box",
+      "width:min(560px,calc(100vw - 16px))", "padding:4px 0", "border:1px solid #5f6368",
+      "border-radius:6px", "background:#111e", "box-shadow:0 4px 16px #000a", "color:#e8eaed",
+      "font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace",
+    ].join(";");
+    const title = document.createElement("div");
+    title.textContent = `copy${visualState ? (visualState.caret ? " · caret" : ` · picked ${visualState.kind}`) : ""} — press a key · Esc`;
+    title.style.cssText = "padding:2px 10px 4px;color:#9aa0a6;font:11px/1.4 system-ui,sans-serif";
+    panel.append(title);
+    for (const row of rows) {
+      const line = document.createElement("div");
+      line.style.cssText = `display:grid;grid-template-columns:3ch 9ch minmax(0,1fr);gap:8px;padding:2px 10px;${row.available ? "" : "opacity:.45"}`;
+      const key = document.createElement("span");
+      key.textContent = `y${row.key}`;
+      key.style.cssText = `color:${row.available ? "#fdd663" : "#9aa0a6"};font-weight:700`;
+      const kind = document.createElement("span");
+      kind.textContent = row.kind;
+      kind.style.cssText = "color:#8ab4f8";
+      const preview = document.createElement("span");
+      preview.textContent = row.available ? row.preview : row.reason;
+      preview.style.cssText = `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${row.available ? "" : "font-style:italic"}`;
+      line.append(key, kind, preview);
+      panel.append(line);
+    }
+    shadow.append(panel);
+    document.documentElement.append(host);
+    paintNow();
+    copyMenuState = { host, rows, ctx, mode: indicatorMode, detail: indicatorDetail };
+    setMode(visualState ? "visual" : "normal", "y…");
+  }
+
+  function cancelCopyMenu(restoreMode = true) {
+    if (!copyMenuState) return;
+    const { host, mode, detail } = copyMenuState;
+    copyMenuState = null;
+    host.remove();
+    if (restoreMode) setMode(mode || "normal", detail || "");
+  }
+
+  // Runs before every other key handler while the menu is open, so the second key is the menu's
+  // even inside a `v` pick. A key the menu does not know closes it and goes on as usual — no
+  // timeout, but no trap either.
+  function handleCopyMenuKey(event, key) {
+    if (!copyMenuState) return false;
+    if (["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(key)) return true;
+    const row = copyMenuState.rows.find((candidate) => candidate.key === key);
+    if (key !== "Escape" && !row) {
+      cancelCopyMenu(true);
+      return false;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const { ctx } = copyMenuState;
+    cancelCopyMenu(key === "Escape" || !row.available);
+    if (key === "Escape") return true;
+    if (!row.available) {
+      flash(row.reason, 1200);
+      return true;
+    }
+    runCopyAction(row.action, ctx);
+    return true;
+  }
+
+  // Visual mode's `Y`: the text, whatever the pick is.
+  function copyVisualText() {
+    if (!visualState) return;
+    const text = pickedText(visualState);
     cancelVisual(false);
-    flash("copied");
+    if (text) send("copy-text", text);
+    flash(text ? `text ${text.length} chars` : "no text here");
+  }
+
+  // Normal mode's `p` / `P`. A focused field takes the paste; otherwise the clipboard is a URL to
+  // open (main checks it is one, and says so when it is not).
+  function pasteOrOpen(newTab) {
+    const field = activeElement();
+    if (!newTab && isEditable(field) && !isSecretField(field)) {
+      field.focus();
+      send("paste");
+      flash("pasted");
+      return;
+    }
+    send("open-clipboard-url", { newTab });
   }
 
   // Enter on a `v` pick clicks it, as picking the same thing with `f` would have. Before, Enter
@@ -5496,8 +5844,9 @@ installPrintShim();
     else if (key === "c" && !visualState.caret) enterCaret();
     else if (key === "v" && visualState.caret) selectFromCaret();
     else if (key === "Enter" && !visualState.caret && !visualState.pageSelection) clickVisual();
-    else if (key === "y") copyVisual(true);
-    else if (key === "Y") copyVisual(false);
+    // `y` opens the copy menu (`startCopyMenu`), which then owns the next key.
+    else if (key === "y") startCopyMenu();
+    else if (key === "Y") copyVisualText();
     else if (key === "u") {
       const url = visualState.kind === "image" ? visualState.imageURL : visualState.link?.href;
       if (url) {
@@ -6206,6 +6555,7 @@ installPrintShim();
   }
 
   function cancelTransient(restoreMode = true) {
+    cancelCopyMenu(false);
     cancelPicker(false);
     cancelCommandPalette(false);
     cancelCommandLine(false);
@@ -6259,7 +6609,7 @@ installPrintShim();
   }
 
   function hasTransientMode() {
-    return Boolean(pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || downloadsState || fileChooserState || helpHost || selectListState || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
+    return Boolean(copyMenuState || pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || downloadsState || fileChooserState || helpHost || selectListState || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
 
   // Spends one allowance for this key, if the engine announced it recently.
@@ -6301,6 +6651,10 @@ installPrintShim();
       }, 0);
       return;
     }
+
+    // The copy menu's second key, before anything else can claim it — including Escape, which
+    // closes only the menu and leaves a `v` pick where it was.
+    if (handleCopyMenuKey(event, key)) return;
 
     // Escape is handled before defaultPrevented/isComposing/editable checks so one
     // physical press always cancels the current TWeb mode.
