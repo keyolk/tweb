@@ -74,6 +74,7 @@ const {
 } = require("./placeholder-cells.cjs");
 const { createPatchBudget } = require("./patch-budget.cjs");
 const { passthroughRuns } = require("./tmux-passthrough.cjs");
+const { parkSequence, unparkSequence } = require("./terminal-caret.cjs");
 const {
   shmFramesDecision, shmPatchName, paneShmNames, shmFrameName, shmMarkerName, abandonedShmFrames,
   SHM_RING, SHM_PATCH_RING,
@@ -1991,12 +1992,11 @@ function writeGfxChunked(header, payload, prefix = "", suffix = "", cells = "") 
 
 function terminalSetup() {
   // The image shows up in the pane on its own, but the cursor does not: the pane inherits
-  // whatever the shell left behind, which is a visible block in the top-left corner. There
-  // is nothing for it to mean until a caret is parked on one — and sitting in the corner it
-  // reads as the caret having started there. Hide it until something parks it.
+  // whatever the shell left behind, which is a visible block in the top-left corner. Nothing
+  // in tweb ever shows it again — a parked caret stays hidden (terminal-caret.cjs).
   inputState().caretHidden = true;
   try {
-    paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`);
+    paneWrite(unparkSequence());
   } catch (error) {
     void error;
   }
@@ -2047,7 +2047,7 @@ function terminalCleanup(record = currentPane()) {
       writeGfx(`a=d,d=I,i=${id}`, "");
     }
   } catch (e) {}
-  // Caret parking leaves the cursor shape as a bar, so restore the terminal default.
+  // An engine from before terminal-caret.cjs left the cursor shape as a bar; restore the default.
   try {
     paneWrite(CSI("0 q"));
   } catch (e) {}
@@ -6979,16 +6979,12 @@ async function dispatchAgentCommand(method, params) {
 // IME composition is the terminal emulator's job, and it paints the pending
 // syllable at the terminal cursor. That cursor sits wherever we last left it —
 // the pane origin — so Korean input composes off in a corner instead of at the
-// field. Park the cursor on the cell holding the web caret and show it only
-// while a field is focused.
+// field. Park the cursor on the cell holding the web caret while a field is focused.
 // Per-pane, on the input state: the coordinates are written to the pane's own terminal through
 // `paneWrite`, so a shared cell parked every pane's cursor at whichever pane last reported a caret —
 // and a hidden flag shared means one pane's blur leaves another pane's cursor showing.
-// A block cursor covers the cell it sits on, so the parked cursor hid the page's
-// own caret and the character next to it. Ask for a steady bar (DECSCUSR 6): it
-// draws on the cell's left edge, which is where a text caret belongs anyway.
-const CARET_BAR = CSI("6 q");
-const CARET_SHAPE_RESET = CSI("0 q");
+// Parked HIDDEN: the terminal still composes there and places the candidate window from it, and
+// the page draws its own caret. Why, with the sources it was read in: terminal-caret.cjs.
 // Where a fixed-width font puts its baseline inside the cell. The terminal paints
 // preedit on that baseline, so the row has to be picked by baseline — matching
 // cell *centres* floated a composing syllable a row above tall page text.
@@ -7000,10 +6996,11 @@ function unparkTerminalCaret() {
   const input = inputState();
   input.caretCell = null;
   input.caretPoint = null;
-  // Reported on every frame with no caret, so it writes only on the transition.
+  // Reported on every frame with no caret, so it writes only on the transition. `caretHidden`
+  // now means "not parked": the cursor is hidden either way.
   if (input.caretHidden) return;
   input.caretHidden = true;
-  try { paneWrite(`${CSI("?25l")}${CARET_SHAPE_RESET}`); } catch (error) { void error; }
+  try { paneWrite(unparkSequence()); } catch (error) { void error; }
 }
 
 // The page draws the IME composition surface on the cell grid, which only main can measure: the
@@ -7063,7 +7060,7 @@ function moveTerminalCaret(point) {
 function writeTerminalCaret(row, col) {
   inputState().caretHidden = false;
   try {
-    paneWrite(`${CSI(`${row};${col}H`)}${CARET_BAR}${CSI("?25h")}`);
+    paneWrite(parkSequence(row, col));
   } catch (error) {
     void error;
   }

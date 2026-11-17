@@ -996,11 +996,11 @@ test("the terminal caret follows the focused field for IME composition", () => {
   assert.match(main, /imageZ === 0 \? "" : `,z=\$\{imageZ\}`/);
   // No caret to follow means no cursor on top of the page, and the shape we
   // borrowed goes back — otherwise the shell inherits a bar cursor.
-  assert.match(main, /function unparkTerminalCaret\(\)[\s\S]*?CSI\("\?25l"\)\}\$\{CARET_SHAPE_RESET\}/);
+  assert.match(main, /function unparkTerminalCaret\(\)[\s\S]*?paneWrite\(unparkSequence\(\)\)/);
   assert.match(main, /function terminalCleanup\(record = currentPane\(\)\)[\s\S]*?paneWrite\(CSI\("0 q"\)\)/);
-  // A block cursor sits on the character and hides the page's own caret.
-  assert.match(main, /const CARET_BAR = CSI\("6 q"\);/);
-  assert.match(main, /\$\{CARET_BAR\}/);
+  // Parked hidden: the shape no longer matters, and nothing borrows a bar any more.
+  assert.match(main, /paneWrite\(parkSequence\(row, col\)\)/);
+  assert.doesNotMatch(main, /CARET_BAR/);
   // Preedit is painted on the cell's text baseline, so the row is chosen by
   // baseline; picking the cell that contains the caret's centre put a composing
   // syllable a line above page text taller than one cell.
@@ -1429,7 +1429,7 @@ test("the terminal cursor is hidden until a caret is parked on it", () => {
   // Startup hides it rather than leaving whatever the shell had.
   const setup = main.slice(main.indexOf("function terminalSetup()"),
     main.indexOf("function requestTrackedKeyboardModeRestore()"));
-  assert.match(setup, /CSI\("\?25l"\)/);
+  assert.match(setup, /paneWrite\(unparkSequence\(\)\)/);
   assert.match(setup, /inputState\(\)\.caretHidden = true;/);
 
   // And a report with no caret hides it unconditionally — a frame's cursor anchoring can
@@ -1685,25 +1685,14 @@ test("an invisible or offscreen field reports no caret", () => {
   assert.match(gate, /box\.width < 2 \|\| box\.height < 2/);
 });
 
-// Two carets a few pixels apart read as a rendering fault, not as two systems agreeing.
-// The terminal's is the one that matters: it is the anchor composition lands on.
-test("the page caret is hidden while the terminal draws one", () => {
-  assert.match(electron, /function hidePageCaret\(element\)/);
-  assert.match(electron, /element\.style\.caretColor = "transparent"/);
-  // Restored when the slot goes away, or a field keeps an invisible caret after this pane
-  // stops driving it.
-  assert.match(electron, /function restorePageCaret\(\)/);
-  // Keyed off the parked terminal cursor rather than off the IME slot, which is now
-  // withheld mid-text — see "the IME slot is withheld when the caret is not at the end".
-  // Tying it to the slot would leave the page's caret drawn beside the terminal's in
-  // exactly the case the slot is skipped.
+// One caret, and it is the page's: the terminal cursor parked for composition is hidden
+// (terminal-caret.cjs), so the field keeps its own caret at the exact pixel and in its own colour.
+test("the page keeps its own caret while a field is focused", () => {
+  assert.doesNotMatch(electron, /caretColor = "transparent"/);
+  assert.doesNotMatch(electron, /function hidePageCaret/);
   const report = electron.slice(electron.indexOf("  function reportCaret()"),
     electron.indexOf("  function dismissPageOverlay()"));
-  assert.match(report, /hidePageCaret\(activeElement\(\)\)/);
-  assert.match(report, /else restorePageCaret\(\);/);
-  // An inline style rather than a stylesheet: caret-color inherits, and a page-wide rule
-  // would blank the caret in fields this pane is not driving.
-  assert.match(electron, /caretColorBefore = element\.style\.caretColor \|\| ""/);
+  assert.doesNotMatch(report, /caret-?[cC]olor/);
 });
 
 // The slot is up whenever a field has focus — composition is never signalled to the
@@ -1839,16 +1828,6 @@ test("the IME slot is withheld when the caret is not at the end", () => {
   // contentEditable has no value, so the range from the caret to the end of the host is it.
   assert.match(helper, /after\.setEndAfter\(element\)/);
 
-  // Suppressing the page caret must follow the parked terminal cursor, not the slot —
-  // otherwise withholding the slot brings back the two carets a few pixels apart.
-  const report = electron.slice(electron.indexOf("  function reportCaret()"),
-    electron.indexOf("  function dismissPageOverlay()"));
-  assert.match(report, /if \(point && isEditable\(activeElement\(\)\)\) hidePageCaret\(activeElement\(\)\);/);
-  assert.match(report, /else restorePageCaret\(\);/);
-  const slot = electron.slice(electron.indexOf("  function updateImeSlot(rect)"),
-    electron.indexOf("  function ensureImeSlot()"));
-  assert.doesNotMatch(slot, /hidePageCaret/);
-  assert.doesNotMatch(slot, /restorePageCaret/);
 });
 
 // Composition is never signalled to this preload — preedit happens in the terminal and only

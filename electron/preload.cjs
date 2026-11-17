@@ -2778,7 +2778,7 @@ installPrintShim();
   // the cell grid, the page draws text in its font at arbitrary offsets, and we
   // never learn the preedit text (it is not sent over the pty) so we cannot draw it
   // ourselves. Give it a place of its own instead — a surface snapped to the cell grid
-  // just past the caret, with the terminal cursor parked on its first cell. The
+  // just past the caret, with the (hidden) terminal cursor parked on its first cell. The
   // composition then lands inside the surface, never on top of page glyphs, and reads
   // as the terminal surface it is.
   let lastCaretReport = "";
@@ -2870,39 +2870,6 @@ installPrintShim();
     const lineBottom = wrapped ? top + cell.height
       : Math.max(top + cell.height, caret.y + (caret.height || cell.height));
     return { left, top, width, height: cell.height, lineTop, lineBottom };
-  }
-
-  // While the terminal draws a cursor for this pane, the page must not draw one too.
-  //
-  // Both are honest: the page paints its own caret because a field has focus, and the
-  // terminal paints one because that is where composition will land. Together they are two
-  // bars a few pixels apart, which reads as a rendering fault rather than as two systems
-  // agreeing. The terminal's is the one to keep — it is the anchor the terminal composes
-  // against, and it blinks with the rest of the terminal.
-  //
-  // An inline style on the focused element, restored when focus leaves, rather than a
-  // stylesheet: `caret-color` inherits, and a page-wide rule would hide the caret in every
-  // field including ones this pane is not driving.
-  let caretHiddenElement = null;
-  let caretColorBefore = "";
-
-  function hidePageCaret(element) {
-    if (caretHiddenElement === element) return;
-    restorePageCaret();
-    if (!isElement(element) || !element.style) return;
-    caretHiddenElement = element;
-    caretColorBefore = element.style.caretColor || "";
-    element.style.caretColor = "transparent";
-  }
-
-  function restorePageCaret() {
-    if (!caretHiddenElement) return;
-    try {
-      if (caretColorBefore) caretHiddenElement.style.caretColor = caretColorBefore;
-      else caretHiddenElement.style.removeProperty("caret-color");
-    } catch (_) { /* the element may be gone with its document */ }
-    caretHiddenElement = null;
-    caretColorBefore = "";
   }
 
   function updateImeSlot(rect) {
@@ -3217,12 +3184,9 @@ installPrintShim();
     } else {
       updateImeSlot(null);
     }
-    // Tied to the parked terminal cursor rather than to the slot. The page's caret is
-    // suppressed because the terminal draws one on the same spot, and that stays true in
-    // every case the slot is withheld — otherwise withholding it above would bring back
-    // the two-carets-a-few-pixels-apart this was written to fix.
-    if (point && isEditable(activeElement())) hidePageCaret(activeElement());
-    else restorePageCaret();
+    // The page keeps its own caret. The terminal cursor parked here is hidden
+    // (terminal-caret.cjs), so there is one caret — the field's, at the exact pixel and in its
+    // own colour — and the terminal draws only a composition in progress.
     const report = point ? `${Math.round(point.x)},${Math.round(point.y)},${Math.round(height)}` : "";
     if (report === lastCaretReport) return;
     lastCaretReport = report;
