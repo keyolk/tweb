@@ -117,3 +117,30 @@ test("releaseAll lets go of everything now", () => {
   assert.strictEqual(log.filter((l) => l.endsWith("up")).length, 2);
   assert.strictEqual(keys.isHeld("a"), false);
 });
+
+test("with a native release, every press of a held key is a repeat however it is spaced", () => {
+  const { c, keys, log } = rig();
+  const press = () => keys.press("ArrowRight", (rep) => log.push(`${c.now()} down${rep ? "*" : ""}`), () => log.push(`${c.now()} up`), { native: true });
+  press();
+  c.advance(100); // sooner than the repeat delay: the timer path would call this a second press
+  assert.strictEqual(press(), "repeat");
+  c.advance(800);
+  press();
+  keys.release("ArrowRight");
+  assert.deepStrictEqual(log, ["0 down", "100 down*", "900 down*", "900 up"]);
+});
+
+test("a native hold still lets go if the release report never comes", () => {
+  const { c, keys, log } = rig();
+  keys.press("x", () => log.push(`${c.now()} down`), () => log.push(`${c.now()} up`), { native: true });
+  c.advance(5000);
+  assert.deepStrictEqual(log, ["0 down", "1500 up"]);
+});
+
+test("macKeyCode maps arrows and letters, either case, and nothing else", () => {
+  const { macKeyCode } = require("./held-keys.cjs");
+  assert.strictEqual(macKeyCode("ArrowRight"), 124);
+  assert.strictEqual(macKeyCode("x"), 7);
+  assert.strictEqual(macKeyCode("X"), 7);
+  assert.strictEqual(macKeyCode("F5"), undefined);
+});

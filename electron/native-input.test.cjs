@@ -352,3 +352,41 @@ test("a grid that really moved takes over once its own reports locate it", () =>
   assert.ok(Math.abs(estimate.origin().y - moved.y) < 0.5, `y ${estimate.origin().y}`);
   assert.ok(Math.abs(estimate.origin().x - moved.x) < 0.5, `x ${estimate.origin().x}`);
 });
+
+test("key watches go to the helper only once it reports key access", () => {
+  const { native, line, written } = harness();
+  const ups = [];
+  native.on("keyup", (code) => ups.push(code));
+  // Started, but no ready line yet: the caller must keep its own timing.
+  assert.strictEqual(native.watchKey(124), false);
+  line({ ev: "ready", pid: 1, keys: true });
+  assert.strictEqual(native.watchKey(124), true);
+  assert.ok(written.includes("key 124\n"));
+  line({ ev: "ku", k: 124 });
+  assert.deepStrictEqual(ups, [124]);
+});
+
+test("a helper without Input Monitoring is never asked to watch keys", () => {
+  const { native, line, written } = harness();
+  native.watchKey(7);
+  line({ ev: "ready", pid: 1, keys: false });
+  assert.strictEqual(native.watchKey(7), false);
+  assert.ok(!written.some((l) => l.startsWith("key ")));
+});
+
+test("the helper exiting drops key access and says so", () => {
+  const { native, line, spawned } = harness();
+  let lost = 0;
+  native.on("keys-lost", () => { lost += 1; });
+  native.watchKey(7);
+  line({ ev: "ready", pid: 1, keys: true });
+  spawned[0].child.emit("exit", 1, null);
+  assert.strictEqual(native.keyAccess, null);
+  assert.strictEqual(lost, 1);
+});
+
+test("ku and ready lines parse", () => {
+  assert.deepStrictEqual(parseHelperLine('{"ev":"ku","k":124}'), { ev: "ku", code: 124 });
+  assert.strictEqual(parseHelperLine('{"ev":"ku","k":"x"}'), null);
+  assert.deepStrictEqual(parseHelperLine('{"ev":"ready","pid":3,"keys":true}'), { ev: "ready", keys: true });
+});
