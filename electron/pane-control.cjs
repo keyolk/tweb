@@ -50,6 +50,8 @@ const DETACH = /^DETACH$/;
 // line, so nothing can be appended after it. Hex because a session name and a socket path can hold
 // anything, including the tab this grammar splits on.
 const SESSION = /^SESSION\s+([0-9a-f]*)$/i;
+// The engine a hosted pane's first tab opens on, sent before its ATTACH like SESSION.
+const ENGINE = /^ENGINE\s+(chrome|webkit)$/;
 // Fourteen fields, the last taken verbatim. `-?\d+` on the origin because `-1 -1` is its
 // "unknown" sentinel, and the tty is any non-space run so a path is not split on.
 const ATTACH = new RegExp(
@@ -143,6 +145,9 @@ function parseControlLine(rawLine) {
   }
 
   if (DETACH.test(rest)) return { kind: "detach", paneId };
+
+  const engine = ENGINE.exec(rest);
+  if (engine) return { kind: "engine", paneId, engine: engine[1] };
 
   const session = SESSION.exec(rest);
   if (session && session[1].length % 2 === 0) {

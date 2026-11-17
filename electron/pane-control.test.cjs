@@ -186,3 +186,17 @@ test("outbound lines mirror the same optional-address rule", () => {
   assert.equal(formatOutbound("DETACHED", "%3"), "@%3 DETACHED\n");
   assert.equal(formatOutbound("DETACHED", null), "DETACHED\n");
 });
+
+// A Chrome- or WebKit-first pane is hosted: its first tab's engine comes on an ENGINE line before
+// the ATTACH. Anything but a known engine name is ignored, so an unknown value never reaches a tab.
+test("ENGINE names the engine a hosted pane's first tab opens on", () => {
+  assert.deepEqual(parseControlLine("@%7 ENGINE chrome"), { kind: "engine", paneId: "%7", engine: "chrome" });
+  assert.deepEqual(parseControlLine("@%7 ENGINE webkit"), { kind: "engine", paneId: "%7", engine: "webkit" });
+  assert.equal(parseControlLine("@%7 ENGINE firefox"), null);
+});
+
+test("the host moves the first tab of an ENGINE pane to that engine", () => {
+  const main = require("node:fs").readFileSync(require("node:path").join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /pendingFirstTabEngines\.set\(command\.paneId, command\.engine\)/);
+  assert.match(main, /void switchTabEngine\(firstTab, engine\)/);
+});

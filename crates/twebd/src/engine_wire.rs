@@ -63,6 +63,9 @@ pub struct OpenRequest<'a> {
     /// Not another ATTACH field: that line ends in a url which takes the rest of it, so nothing can
     /// be appended after it without making the url unparseable.
     pub session_identity: Option<&'a crate::protocol::TmuxWindowIdentity>,
+    /// The engine the pane's first tab opens on, sent on its own `ENGINE` line before the
+    /// `ATTACH` for the same reason as the session identity. `None` (or `electron`) sends nothing.
+    pub engine: Option<&'a str>,
 }
 
 /// What an absent optional field looks like on the wire.
@@ -106,6 +109,19 @@ pub fn session_line(request: &OpenRequest<'_>) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     control_line(request.pane, &format!("SESSION {hex}"))
+}
+
+/// The `ENGINE` line for a pane whose first tab opens on Chrome or WebKit, or empty.
+///
+/// Only a known engine name goes on the wire: the engine reads the rest of the line as the name,
+/// and anything else is better left to the host's own engine than passed through.
+pub fn engine_line(request: &OpenRequest<'_>) -> String {
+    match request.engine {
+        Some(engine @ ("chrome" | "webkit")) => {
+            control_line(request.pane, &format!("ENGINE {engine}"))
+        }
+        _ => String::new(),
+    }
 }
 
 pub fn open_line(request: &OpenRequest<'_>) -> String {
@@ -269,6 +285,7 @@ mod tests {
             tty: Some("/dev/ttys004"),
             url: "https://example.com",
             session_identity: None,
+            engine: None,
         }
     }
 
@@ -312,6 +329,27 @@ mod tests {
 
     // No identity means no line at all, rather than an empty one: a pane outside tmux, or a frontend
     // built before this, simply has no window session — which is what every hosted pane had before.
+    #[test]
+    fn a_chrome_or_webkit_first_pane_sends_an_engine_line_before_its_attach() {
+        let chrome = OpenRequest {
+            engine: Some("chrome"),
+            ..open_request()
+        };
+        assert_eq!(engine_line(&chrome), "@%3 ENGINE chrome\n");
+        let webkit = OpenRequest {
+            engine: Some("webkit"),
+            ..open_request()
+        };
+        assert_eq!(engine_line(&webkit), "@%3 ENGINE webkit\n");
+        // The host's own engine, and anything unknown, send nothing.
+        assert_eq!(engine_line(&open_request()), "");
+        let other = OpenRequest {
+            engine: Some("firefox"),
+            ..open_request()
+        };
+        assert_eq!(engine_line(&other), "");
+    }
+
     #[test]
     fn a_pane_without_a_tmux_identity_sends_no_session_line() {
         assert_eq!(session_line(&open_request()), "");
@@ -357,6 +395,7 @@ mod tests {
             tty: Some("/dev/ttys004"),
             url: "https://example.com/a b",
             session_identity: None,
+            engine: None,
         });
         assert_eq!(
             line,
@@ -384,6 +423,7 @@ mod tests {
             tty: None,
             url: "https://example.com",
             session_identity: None,
+            engine: None,
         });
         assert_eq!(
             line,
@@ -414,6 +454,7 @@ mod tests {
             tty: Some(""),
             url: "https://example.com/a b c",
             session_identity: None,
+            engine: None,
         });
         let body = line
             .trim_end()

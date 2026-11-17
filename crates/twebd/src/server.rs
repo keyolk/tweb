@@ -55,9 +55,14 @@ impl Supervisor {
 
     /// A supervisor whose engine is the given one whatever the panes name. Only an engine app that
     /// looks like one is pinned, so a bad pin falls back to the panes' rather than refusing all.
-    pub fn with_pinned_engine(mut self, executable: Option<String>, app_dir: Option<String>) -> Self {
+    pub fn with_pinned_engine(
+        mut self,
+        executable: Option<String>,
+        app_dir: Option<String>,
+    ) -> Self {
         if let (Some(executable), Some(app_dir)) = (executable, app_dir) {
-            if Path::new(&executable).exists() && app_dir_looks_like_an_engine(Path::new(&app_dir)) {
+            if Path::new(&executable).exists() && app_dir_looks_like_an_engine(Path::new(&app_dir))
+            {
                 self.pinned_engine = Some((executable, app_dir));
             }
         }
@@ -193,6 +198,7 @@ pub async fn dispatch(
             adaptive_frame_rate,
             restore_session,
             session_identity,
+            engine: first_tab_engine,
         } => {
             if let Some(reason) = protocol_refusal(protocol) {
                 return refused(
@@ -238,6 +244,7 @@ pub async fn dispatch(
                         tty: tty.as_deref(),
                         url: &url,
                         session_identity: session_identity.as_deref(),
+                        engine: first_tab_engine.as_deref(),
                     },
                     now_ms,
                 )
@@ -737,6 +744,7 @@ mod tests {
             adaptive_frame_rate: true,
             restore_session: false,
             session_identity: None,
+            engine: None,
         }
     }
 
@@ -1166,7 +1174,8 @@ mod tests {
     }
 
     fn engine_app(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("twebd-pin-test-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("twebd-pin-test-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         std::fs::write(dir.join("main.cjs"), "").unwrap();
         std::fs::write(dir.join("package.json"), "{}").unwrap();
@@ -1184,7 +1193,10 @@ mod tests {
         let engine = supervisor.engine_for(&executable, "/nonexistent/old-app");
         let state = engine.state().to_string();
         assert!(!state.contains("old-app"), "{state}");
-        if !matches!(engine.state(), crate::engine_host::EngineState::Unavailable { .. }) {
+        if !matches!(
+            engine.state(),
+            crate::engine_host::EngineState::Unavailable { .. }
+        ) {
             assert_eq!(engine.app_dir(), pinned.as_path());
         }
         let _ = std::fs::remove_dir_all(&pinned);
@@ -1193,8 +1205,8 @@ mod tests {
     #[test]
     fn a_pin_that_is_not_an_engine_app_is_ignored() {
         let executable = std::env::current_exe().unwrap().display().to_string();
-        let supervisor = supervisor()
-            .with_pinned_engine(Some(executable), Some("/nonexistent/app".to_string()));
+        let supervisor =
+            supervisor().with_pinned_engine(Some(executable), Some("/nonexistent/app".to_string()));
         assert!(supervisor.pinned_engine.is_none());
     }
 }

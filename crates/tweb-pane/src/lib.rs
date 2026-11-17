@@ -953,6 +953,78 @@ fn pane_tty() -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `ENGINE` a hosted pane's first tab opens on, or `None` for the host's own (Electron).
+fn first_tab_engine(engine: BrowserEngine) -> Option<&'static str> {
+    match engine {
+        BrowserEngine::Electron => None,
+        BrowserEngine::Chrome => Some("chrome"),
+        BrowserEngine::Webkit => Some("webkit"),
+    }
+}
+
+/// What a pane does after its retry budget, given why it is still not hosted.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterBudget {
+    /// Start an engine of its own.
+    Spawn,
+    /// Keep waiting for the daemon, `delay` before the next try, with a message in the pane.
+    Wait(std::time::Duration),
+}
+
+/// How long a pane waits between tries once its budget is spent on [`EngineUnavailable`], by how
+/// many waits it has done: doubling from 2s, capped at 30s.
+///
+/// EngineUnavailable means a daemon is running and its engine cannot host — on 2026-11-17 a build
+/// missing a module, so the daemon's engine died on start. Falling back then is the one move that
+/// cannot be undone: every pane started an Electron engine of its own on the shared profile, they
+/// kept its storage locks after the daemon was fixed and restarted twice, and every hosted pane
+/// opened afterwards could not open its service worker or CacheStorage (YouTube icons blank) until
+/// those engines were killed by hand. A pane that waits, says so, and attaches the moment the
+/// daemon can host costs a blank pane for as long as the daemon is broken; a fallback cost every
+/// hosted pane its storage for as long as the fallback engines lived. `TWEB_DAEMON=0` still opts a
+/// pane out of the daemon entirely.
+///
+/// [`EngineUnavailable`]: twebd::protocol::RefusalReason::EngineUnavailable
+fn after_budget(reason: &attach::SpawnReason, waits: u32) -> AfterBudget {
+    match reason {
+        attach::SpawnReason::Refused(twebd::protocol::RefusalReason::EngineUnavailable, _) => {
+            let seconds = 2u64.saturating_mul(1u64 << waits.min(4)).min(30);
+            AfterBudget::Wait(std::time::Duration::from_secs(seconds))
+        }
+        // Once a pane is waiting, the daemon was alive a moment ago: a restart in between answers
+        // `ConnectFailed` or ends a session, and is a reason to keep waiting, not to fall back.
+        attach::SpawnReason::ConnectFailed(_)
+        | attach::SpawnReason::DaemonStartFailed(_)
+        | attach::SpawnReason::HostedSessionLost(_)
+            if waits > 0 =>
+        {
+            AfterBudget::Wait(std::time::Duration::from_secs(2))
+        }
+        _ => AfterBudget::Spawn,
+    }
+}
+
+/// Shows why the pane is blank while it waits for the daemon. Written by this process, which is
+/// the pane's only writer; erased before the next try so a hosted page does not paint over it.
+fn show_waiting(reason: &attach::SpawnReason, delay: std::time::Duration) {
+    use std::io::Write as _;
+    let text = format!(
+        "\x1b[2J\x1b[H tweb: the daemon's engine cannot host this pane yet.\r\n\r\n \
+         {reason}\r\n\r\n Trying again in {}s. Not starting an engine of its own: it would share \
+         the profile with the daemon's and break storage in every hosted pane.\r\n Check \
+         `tweb doctor` / `twebd status`, or close this pane.\r\n",
+        delay.as_secs()
+    );
+    let mut out = std::io::stdout();
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
+fn clear_waiting() {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[2J\x1b[H").and_then(|()| out.flush());
+}
+
 /// What a hosted attempt produced.
 enum HostedOutcome {
     /// The pane ran hosted and has ended. The caller returns.
@@ -1029,6 +1101,23 @@ async fn host_until_settled(
         tokio::time::sleep(REATTACH_DELAY).await;
         outcome = try_hosted(url, again.clone(), pane, image_id).await;
     }
+    // The budget is spent. A daemon whose engine cannot host is waited out rather than fallen back
+    // from; see `after_budget`.
+    let mut waits = 0;
+    while let HostedOutcome::Spawn(reason) = &outcome {
+        let AfterBudget::Wait(delay) = after_budget(reason, waits) else {
+            break;
+        };
+        if matches!(reason, attach::SpawnReason::HostedSessionLost(_)) {
+            again.restore_session = true;
+        }
+        tracing::warn!(%reason, waits, ?delay, "daemon engine cannot host; waiting instead of spawning");
+        show_waiting(reason, delay);
+        tokio::time::sleep(delay).await;
+        clear_waiting();
+        waits = waits.saturating_add(1);
+        outcome = try_hosted(url, again.clone(), pane, image_id).await;
+    }
     outcome
 }
 
@@ -1042,11 +1131,11 @@ async fn host_until_settled(
 async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) -> HostedOutcome {
     let socket = twebd::paths::socket_path_in(&twebd::paths::runtime_dir());
     let flag = std::env::var(attach::DAEMON_FLAG).ok();
-    // A Chrome pane drives a browser that is already shared across panes, and a WebKit pane its
-    // own page host; the supervisor hosts Electron pages only, so it is not consulted.
-    if options.engine != BrowserEngine::Electron {
-        return HostedOutcome::Spawn(attach::SpawnReason::FlagOff);
-    }
+    // A Chrome- or WebKit-first pane is hosted too, with its first tab moved to that engine by the
+    // host (`ENGINE` line). It used to skip the daemon and start an engine of its own — an Electron
+    // process on the same profile directory as the daemon's — which split the profile's storage
+    // locks between the two: measured 2026-11-18, a `tweb split --engine chrome` pane held the
+    // service-worker and Local Storage locks, and YouTube icons went blank in every hosted pane.
     // The host's ATTACH has no field for it, and a hosted engine reads `page.transparent` from
     // config.toml for every pane anyway. Only the per-pane flag needs a per-pane engine.
     if options.transparent {
@@ -1103,6 +1192,7 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
         tty: pane_tty(),
         engine_executable: executable.display().to_string(),
         engine_app_dir: app_dir.display().to_string(),
+        engine: first_tab_engine(options.engine),
     };
     let (stream, generation) = match hosted::connect_and_host(&socket, &request, std::process::id())
     {
@@ -1547,6 +1637,59 @@ mod tests {
 
     // A daemon restart ends hosting; the pane's own engine then restores the tabs the hosted one
     // saved. Never hosted (no daemon, flag off, inline frames): the URL it was opened with.
+    #[test]
+    fn a_daemon_whose_engine_cannot_host_is_waited_out_never_fallen_back_from() {
+        use super::{after_budget, AfterBudget};
+        use crate::attach::SpawnReason;
+        use std::time::Duration;
+        let unavailable = SpawnReason::Refused(
+            twebd::protocol::RefusalReason::EngineUnavailable,
+            "engine did not declare itself a pane host within 10000ms".into(),
+        );
+        // However long it lasts: a fallback engine would share the profile with the daemon's.
+        for waits in [0, 1, 5, 50] {
+            assert!(
+                matches!(after_budget(&unavailable, waits), AfterBudget::Wait(_)),
+                "{waits}"
+            );
+        }
+        assert_eq!(
+            after_budget(&unavailable, 0),
+            AfterBudget::Wait(Duration::from_secs(2))
+        );
+        assert_eq!(
+            after_budget(&unavailable, 50),
+            AfterBudget::Wait(Duration::from_secs(30))
+        );
+        // A daemon restart while waiting is still the daemon, not a reason to spawn.
+        assert!(matches!(
+            after_budget(&SpawnReason::ConnectFailed("refused".into()), 3),
+            AfterBudget::Wait(_)
+        ));
+        // Before any wait, a daemon that never answered keeps today's fallback.
+        assert_eq!(
+            after_budget(&SpawnReason::ConnectFailed("refused".into()), 0),
+            AfterBudget::Spawn
+        );
+        assert_eq!(after_budget(&SpawnReason::FlagOff, 0), AfterBudget::Spawn);
+    }
+
+    #[test]
+    fn a_chrome_or_webkit_first_pane_is_hosted_with_its_first_tab_engine() {
+        use super::{first_tab_engine, BrowserEngine};
+        assert_eq!(first_tab_engine(BrowserEngine::Electron), None);
+        assert_eq!(first_tab_engine(BrowserEngine::Chrome), Some("chrome"));
+        assert_eq!(first_tab_engine(BrowserEngine::Webkit), Some("webkit"));
+        // And `try_hosted` no longer sends them away before asking the daemon.
+        let source = include_str!("lib.rs");
+        let body = &source[source.find("async fn try_hosted").unwrap()..];
+        let body = &body[..body.find("daemon_autostart::ensure_running").unwrap()];
+        assert!(
+            !body.contains("options.engine != BrowserEngine::Electron"),
+            "{body}"
+        );
+    }
+
     #[test]
     fn only_a_lost_hosted_session_restores_the_window_tabs() {
         use crate::attach::SpawnReason;

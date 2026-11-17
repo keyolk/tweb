@@ -200,3 +200,135 @@ mod tests {
         );
     }
 }
+
+/// Which tweb engines are running on this machine's profile, by process title.
+///
+/// The engine names itself: `tweb host` is a daemon's engine, `tweb %N` is a pane's own
+/// (electron/main.cjs `process.title`). Both open the same profile directory, and Chromium's
+/// storage is one process at a time, so a pane's own engine beside a host — or two of them —
+/// split the profile's locks. On 2026-11-17 eleven such engines, left from a fallback, kept the
+/// service-worker and Local Storage locks for hours and every hosted pane lost CacheStorage.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProfileEngines {
+    pub hosts: Vec<u32>,
+    /// (pid, pane id)
+    pub standalone: Vec<(u32, String)>,
+}
+
+impl ProfileEngines {
+    /// From `ps -axo pid=,command=` output. Only main processes count: helpers carry `--type=`.
+    pub(crate) fn from_ps(output: &str) -> Self {
+        let mut found = Self::default();
+        for line in output.lines() {
+            let line = line.trim_start();
+            let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            let command = command.trim();
+            if command.contains("--type=") {
+                continue;
+            }
+            if command == "tweb host" || command.starts_with("tweb host ") {
+                found.hosts.push(pid);
+            } else if let Some(rest) = command.strip_prefix("tweb %") {
+                let pane = rest.split_whitespace().next().unwrap_or_default();
+                if !pane.is_empty() && pane.chars().all(|c| c.is_ascii_digit()) {
+                    found.standalone.push((pid, format!("%{pane}")));
+                }
+            }
+        }
+        found
+    }
+
+    pub(crate) fn observe() -> Self {
+        Command::new("ps")
+            .args(["-axo", "pid=,command="])
+            .output()
+            .ok()
+            .map(|out| Self::from_ps(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_default()
+    }
+
+    /// Whether more than one engine shares the profile.
+    pub(crate) fn shared(&self) -> bool {
+        self.hosts.len() + self.standalone.len() > 1 && !self.standalone.is_empty()
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        let standalone = self
+            .standalone
+            .iter()
+            .map(|(pid, pane)| format!("{pane} pid {pid}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{} host engine(s) {:?}; pane-own engine(s): {}",
+            self.hosts.len(),
+            self.hosts,
+            if standalone.is_empty() {
+                "none".to_string()
+            } else {
+                standalone
+            }
+        )
+    }
+}
+
+/// Doctor: warns when a pane's own engine shares the profile with another engine.
+pub(super) fn check_profile_engines() -> Check {
+    profile_engines_check(&ProfileEngines::observe())
+}
+
+fn profile_engines_check(engines: &ProfileEngines) -> Check {
+    let shared = engines.shared();
+    Check {
+        name: "profile engines",
+        status: if shared {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Ok
+        },
+        detail: if shared {
+            format!(
+                "{} — they share one profile and split its storage locks (blank YouTube icons, \
+                 stalled IndexedDB). Close those panes and reopen them so the daemon hosts them.",
+                engines.describe()
+            )
+        } else {
+            engines.describe()
+        },
+    }
+}
+
+#[cfg(test)]
+mod profile_engine_tests {
+    use super::*;
+
+    #[test]
+    fn a_panes_own_engine_beside_a_host_is_reported_with_its_pid() {
+        let ps = "  101 tweb host\n  102 /Applications/x/Electron Helper --type=renderer tweb\n\
+                  87551 tweb %119\n 87536 tweb %125   \n 300 /usr/bin/vim\n";
+        let engines = ProfileEngines::from_ps(ps);
+        assert_eq!(engines.hosts, vec![101]);
+        assert_eq!(
+            engines.standalone,
+            vec![(87551, "%119".to_string()), (87536, "%125".to_string())]
+        );
+        let check = profile_engines_check(&engines);
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert!(check.detail.contains("%119 pid 87551"), "{}", check.detail);
+    }
+
+    #[test]
+    fn one_host_alone_is_fine() {
+        let engines = ProfileEngines::from_ps(" 101 tweb host\n");
+        assert!(!engines.shared());
+        assert!(matches!(
+            profile_engines_check(&engines).status,
+            CheckStatus::Ok
+        ));
+    }
+}

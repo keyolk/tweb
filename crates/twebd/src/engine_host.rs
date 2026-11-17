@@ -290,8 +290,9 @@ impl EngineHost {
         // separated by another pane's traffic: the engine holds the identity by pane id until the
         // attach consumes it, and an attach that arrived first would claim no slot at all.
         let line = format!(
-            "{}{}",
+            "{}{}{}",
             engine_wire::session_line(open),
+            engine_wire::engine_line(open),
             engine_wire::open_line(open)
         );
         // Waited on by every pane that arrives during a start; the first one through starts the
@@ -749,6 +750,7 @@ mod tests {
                     tty: None,
                     url: "https://example.com",
                     session_identity: None,
+                    engine: None,
                 },
                 0,
             )
@@ -866,6 +868,7 @@ mod tests {
             tty: Some("/dev/ttys004"),
             url: "https://example.com",
             session_identity: None,
+            engine: None,
         }
     }
 
