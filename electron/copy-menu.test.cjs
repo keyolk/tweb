@@ -312,3 +312,14 @@ test("main copies the original image through the tab's session, else what is sho
   assert.match(main, /case "copy-page-markdown":\s+clipboard\.writeText\(markdownLink\(/);
   assert.match(main, /case "open-clipboard-url": \{\s+const text = clipboard\.readText\(\);\s+const url = clipboardUrl\(text\);/);
 });
+
+// The rows preview page text, so the panel must hide the page under it: a translucent
+// background let YouTube's titles show through the previews.
+test("the copy menu panel is opaque", () => {
+  const preload = require("node:fs").readFileSync(require("node:path").join(__dirname, "preload.cjs"), "utf8");
+  const at = preload.indexOf('host.id = "__tweb_copy_menu__";');
+  const block = preload.slice(at, at + 1500);
+  const bg = block.match(/"background:(#[0-9a-fA-F]+)"/);
+  assert.ok(bg, "panel background");
+  assert.ok(bg[1].length === 7 || bg[1].length === 4, `opaque colour, got ${bg[1]}`);
+});
