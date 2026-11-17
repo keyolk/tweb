@@ -746,3 +746,88 @@ test("a short frame with nothing to fill from, or one off by more than two, is r
   // A CSS-pixel frame at half the pane's size is not a rounding error, and stays a signal only.
   assert.equal(fitNearFrame(grid(10, 5, 7), { width: 10, height: 5 }, grid(20, 10, 1), { width: 20, height: 10 }), null);
 });
+
+// A link drag on the Chrome engine started the OS drag session in Chrome's browser process, and
+// macOS kept its drag image — the link's title and URL — in a window at the dragging level over
+// every app, after the release that arrived over CDP. Observed on a live engine: a level-500 window
+// spanning both displays, untouched by reload, tab switch or the pane's frames, and still there
+// after `Input.cancelDragging`. Intercepting the drag stops Chrome starting the OS session.
+test("the top-level session intercepts drags rather than letting Chrome start an OS drag", async () => {
+  const { created } = contents();
+  created.engine.downloadDirectory = () => "/tmp";
+  const sent = [];
+  const handlers = {};
+  const session = {
+    id: "S",
+    on(event, handler) { handlers[event] = handler; },
+    send: async (method, params) => { sent.push([method, params]); return {}; },
+  };
+  await created.prepareSession(session, true);
+  assert.deepStrictEqual(sent.find(([method]) => method === "Input.setInterceptDrags"),
+    ["Input.setInterceptDrags", { enabled: true }]);
+});
+
+function dragContents() {
+  const { created } = contents();
+  created.measureInputScale = async () => 1;
+  const sent = [];
+  created.session.send = async (method, params) => { sent.push([method, params]); return {}; };
+  return { created, sent };
+}
+
+const DRAG_DATA = { items: [{ mimeType: "text/uri-list", data: "https://portal.test/templates" }], dragOperationsMask: 1 };
+
+test("an intercepted drag is finished on the page: enter, over, then drop at the release", async () => {
+  const { created, sent } = dragContents();
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mousePressed", x: 10, y: 10, button: "left", buttons: 1 });
+  // Chrome's answer to the press turning into a drag (recorded by `initialize`'s listener, below).
+  created.interceptedDrag = DRAG_DATA;
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", x: 20, y: 12, button: "left", buttons: 1 });
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", x: 30, y: 14, button: "left", buttons: 1 });
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseReleased", x: 40, y: 16, button: "left", buttons: 0 });
+  assert.deepStrictEqual(sent.map(([method, params]) => [method, params.type]), [
+    ["Input.dispatchMouseEvent", "mousePressed"],
+    ["Input.dispatchDragEvent", "dragEnter"],
+    ["Input.dispatchDragEvent", "dragOver"],
+    ["Input.dispatchDragEvent", "drop"],
+  ]);
+  assert.deepStrictEqual(sent[3][1], { type: "drop", x: 40, y: 16, modifiers: 0, data: DRAG_DATA });
+  // The drag is over: the next move is a mouse move again.
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", x: 50, y: 16, buttons: 0 });
+  assert.deepStrictEqual(sent.at(-1)[0], "Input.dispatchMouseEvent");
+});
+
+test("the real event listener records the intercepted drag", async () => {
+  const handlers = {};
+  const engine = { connection: { send: async () => ({}) }, windowFor: () => null, debug: false, downloadDirectory: () => "/tmp" };
+  const session = { id: "S", on(event, handler) { handlers[event] = handler; }, send: async () => ({ frameTree: { frame: { id: "MAIN", url: "about:blank" } } }) };
+  const created = new CdpWebContents(engine, "MAIN", session);
+  created.applyMetrics = async () => {};
+  created.startScreencast = async () => {};
+  await created.initialize("MAIN");
+  assert.ok(handlers["Input.dragIntercepted"], "initialize listens for Input.dragIntercepted");
+  handlers["Input.dragIntercepted"]({ data: DRAG_DATA });
+  assert.deepStrictEqual(created.interceptedDrag, DRAG_DATA);
+});
+
+test("a move with no button held cancels an intercepted drag whose release was lost", async () => {
+  const { created, sent } = dragContents();
+  created.interceptedDrag = DRAG_DATA;
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", x: 5, y: 5, buttons: 0 });
+  assert.deepStrictEqual(sent.map(([method, params]) => [method, params.type]), [["Input.dispatchDragEvent", "dragCancel"]]);
+  assert.strictEqual(created.interceptedDrag, null);
+});
+
+// Ownership: with no drag intercepted, clicks, text-selection drags and plain moves go out exactly
+// as they did — a selection drag is not drag-and-drop, and Chrome never reports one as a drag.
+test("with no drag intercepted, mouse input is sent unchanged", async () => {
+  const { created, sent } = dragContents();
+  const events = [
+    { type: "mousePressed", x: 1, y: 2, button: "left", buttons: 1, clickCount: 1 },
+    { type: "mouseMoved", x: 3, y: 4, button: "left", buttons: 1 },
+    { type: "mouseReleased", x: 5, y: 6, button: "left", buttons: 0, clickCount: 1 },
+    { type: "mouseMoved", x: 7, y: 8, button: "none", buttons: 0 },
+  ];
+  for (const event of events) await created.sendInput("Input.dispatchMouseEvent", event);
+  assert.deepStrictEqual(sent, events.map((event) => ["Input.dispatchMouseEvent", event]));
+});
