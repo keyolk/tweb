@@ -3957,17 +3957,35 @@ function shortcutRecoveryState(tab) {
   return state;
 }
 
+// Asks the main frame's preload to register again when the bookkeeping has lost it. Harmless
+// when nothing was lost: the check skips a registered frame, and a ping with no preload
+// listening goes nowhere.
+function reregisterMainFrame(tab) {
+  if (!tab || tab.isDestroyed()) return;
+  const frame = tab.webContents.mainFrame;
+  if (!frame || frame.isDestroyed() || frame.detached) return;
+  if (readyFrameKeys(tab).has(frameKey(frame))) return;
+  try {
+    frame.send("tweb-are-you-there");
+  } catch (error) {
+    if (debugLogging) console.error(`tweb: re-register ping failed: ${error.message}`);
+  }
+}
+
 // Called from the drop path, so a dropped key is what starts the repair.
 function repairShortcutDelivery(tab) {
   const state = shortcutRecoveryState(tab);
   if (state.pinging) return;
   const contents = tab.webContents;
-  // A page that is still loading has not had the chance to register yet, and its
-  // `tweb-preload-ready` is on the way. Reloading it here would cancel the very navigation
-  // that is about to fix things.
-  if (contents.isLoading()) return;
   const frame = contents.mainFrame;
   if (!frame || frame.isDestroyed() || frame.detached) return;
+  // The ping goes out even while the page is loading. It used to wait for the load to end, on
+  // the theory that the page's own registration was on the way — but a page like YouTube is
+  // "loading" for as long as it streams, and a main frame that had lost its registration (a
+  // navigation that started, pruned the frame, and never committed) dropped every key for the
+  // whole session: observed with `shortcut frames=1 ready=1`, the one ready frame a hidden
+  // iframe, mouse working and no shortcut at all until a full reload. A ping costs nothing and
+  // only a live preload answers it; what loading still rules out is the reload below.
   state.pinging = true;
   try {
     frame.send("tweb-are-you-there");
@@ -3982,6 +4000,10 @@ function repairShortcutDelivery(tab) {
       state.reloads = 0;
       return;
     }
+    // A page that is still loading has not had the chance to register yet, and its
+    // `tweb-preload-ready` is on the way. Reloading it here would cancel the very navigation
+    // that is about to fix things; the next dropped key pings again.
+    if (tab.webContents.isLoading()) return;
     if (state.reloads >= MAX_SHORTCUT_RELOADS) {
       console.error("tweb: shortcuts still undeliverable after"
         + ` ${state.reloads} reload(s); not reloading again`);
@@ -8686,6 +8708,12 @@ function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
   // ordinary end, a stop, and a failure alike — a bar left behind by an error page would be
   // the most annoying form of this feature.
   onContents("did-stop-loading", () => sendLoadingProgress(tab, null));
+  // A navigation that starts prunes the main frame from the ready set (`did-start-navigation`),
+  // and the new document registers when its preload runs. One that never commits — aborted,
+  // replaced, turned into a download or a 204 — leaves the old document in place, alive and
+  // unregistered, so every key to it is dropped. When loading ends, ask it to register again;
+  // a frame that is already ready is left alone.
+  onContents("did-stop-loading", () => reregisterMainFrame(tab));
   // A recorded navigation's keyframe is the page it loaded, not the blank one it left.
   onContents("did-stop-loading", () => settleNavigationKeyframe(tab));
 
