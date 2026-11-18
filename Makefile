@@ -121,6 +121,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/placeholder-cells.cjs
 	node --check electron/patch-budget.cjs
 	node --check electron/terminal-caret.cjs
+	node --check electron/bookmarks.cjs
 	node --check electron/copy-format.cjs
 	node --check electron/float-preload.cjs
 	node --check electron/hangul-keys.cjs

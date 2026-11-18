@@ -144,6 +144,9 @@ const {
   compactLines,
 } = require("./history-view.cjs");
 const {
+  foldBookmarkLines, bookmarkLine, tombstoneLine, parseChromeBookmarks, mergeBookmarks, filterBookmarks,
+} = require("./bookmarks.cjs");
+const {
   extensionsDir,
   loadExtensions,
   watchServiceWorkers,
@@ -4524,9 +4527,96 @@ function compactHistory() {
   }
 }
 
+// Bookmarks (`b` / `B`, `:bookmark`). tweb's own live in bookmarks.jsonl beside history.jsonl and
+// take the same lock, for the same reason: every pane appends from its own process. The user's
+// Chrome bookmarks are read as a second, read-only source (bookmarks.cjs has the why).
+function bookmarksPath() {
+  return path.join(app.getPath("userData"), "bookmarks.jsonl");
+}
+
+// Chrome's own profile file. Overridable so a test or a non-Default profile can point elsewhere.
+function chromeBookmarksPath() {
+  return process.env.TWEB_CHROME_BOOKMARKS
+    || path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome", "Default", "Bookmarks");
+}
+
+function readTwebBookmarks() {
+  try {
+    return foldBookmarkLines(readFileSync(bookmarksPath(), "utf8").split("\n"));
+  } catch (error) {
+    if (error.code !== "ENOENT" && debugLogging) console.error(`tweb: bookmarks read failed: ${error.message}`);
+    return [];
+  }
+}
+
+// `{entries, note}`: `note` says why Chrome's rows are missing, so an empty Chrome half is never
+// mistaken for "you have no Chrome bookmarks". Missing file → no note (no Chrome, nothing to say).
+function readChromeBookmarks() {
+  let text;
+  try {
+    text = readFileSync(chromeBookmarksPath(), "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return { entries: [], note: "" };
+    return { entries: [], note: `Chrome bookmarks unreadable (${error.code || error.message})` };
+  }
+  const entries = parseChromeBookmarks(text);
+  return entries ? { entries, note: "" } : { entries: [], note: "Chrome bookmarks file is not in the expected format" };
+}
+
+function appendBookmarkLine(line) {
+  mkdirSync(path.dirname(bookmarksPath()), { recursive: true });
+  withHistoryLock(`${bookmarksPath()}.lock`, () => {
+    appendFileSync(bookmarksPath(), line, { encoding: "utf8", mode: 0o600 });
+  });
+}
+
+function bookmarksModel(query = "") {
+  const tweb = readTwebBookmarks();
+  const chrome = readChromeBookmarks();
+  const all = mergeBookmarks(tweb, chrome.entries);
+  const rows = filterBookmarks(all, query);
+  return {
+    query: String(query || ""),
+    rows: rows.map((entry) => ({ url: entry.url, name: entry.name, folder: entry.folder || "", source: entry.source })),
+    total: all.length,
+    tweb: tweb.length,
+    chrome: chrome.entries.length,
+    note: chrome.note,
+  };
+}
+
+// `:bookmark [name]`: this page, named as given or by its title. A URL already bookmarked is
+// renamed rather than listed twice — the fold keeps the last line per URL.
+function addBookmark(tab, name) {
+  const url = tabUrl(tab);
+  if (!url || isStartPage(url) || !isRestorableUrl(url)) return { ok: false, message: "nothing to bookmark on this page" };
+  const existed = readTwebBookmarks().some((entry) => entry.url === url);
+  const label = String(name || "").trim() || tabTitle(tab) || url;
+  try {
+    appendBookmarkLine(bookmarkLine(url, label));
+  } catch (error) {
+    return { ok: false, message: `bookmark failed: ${error.message}` };
+  }
+  return { ok: true, message: `${existed ? "renamed" : "bookmarked"}: ${label}` };
+}
+
+// Only tweb's own rows delete; a Chrome row is read-only and the model says so per row.
+function deleteBookmark(url, query = "") {
+  const target = String(url || "").trim();
+  if (target && readTwebBookmarks().some((entry) => entry.url === target)) {
+    try {
+      appendBookmarkLine(tombstoneLine(target));
+    } catch (error) {
+      if (debugLogging) console.error(`tweb: bookmark delete failed: ${error.message}`);
+    }
+  }
+  return bookmarksModel(query);
+}
+
 function omniboxModel() {
   const history = readGlobalHistory();
   // Open soleWindows.tabs always outrank history entries.
+  const bookmarkCount = mergeBookmarks(readTwebBookmarks(), readChromeBookmarks().entries).length;
   const base = history.length;
   const tabEntries = currentWindows().tabs.flatMap((candidate, index) => {
     const url = tabUrl(candidate);
@@ -4537,14 +4627,23 @@ function omniboxModel() {
       index,
       url,
       title: tabTitle(candidate),
-      recency: base + currentWindows().tabs.length - index,
+      recency: base + bookmarkCount + currentWindows().tabs.length - index,
     }];
   });
+  // Bookmarks rank above history and below open tabs: something kept on purpose is a likelier
+  // destination than something merely visited. Above history by recency when nothing is typed; once
+  // something is, the fuzzy score decides, as it does for every row.
+  const bookmarks = mergeBookmarks(readTwebBookmarks(), readChromeBookmarks().entries);
+  // History rows sit at recency 1..base; bookmarks go above them, open tabs above both.
+  const bookmarkEntries = bookmarks.map((entry, index) => ({
+    kind: "bookmark", url: entry.url, title: entry.name, recency: base + bookmarks.length - index,
+  }));
   return {
     // Empty on a start page, so `o` there opens on a blank line rather than a data: URL.
     current: isStartPage(tabUrl(currentWindows().win)) ? "" : tabUrl(currentWindows().win),
     entries: [
       ...tabEntries,
+      ...bookmarkEntries,
       ...history.map((entry, index) => ({ ...entry, kind: "history", recency: base - index })),
       // Below history when nothing is typed (recency 0), matched like any row once something is:
       // `3000` finds the dev server without `localhost:`.
@@ -5041,6 +5140,15 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
     }
     // The page re-asks on every keystroke so the filter runs over the whole file rather
     // than over a slice the renderer happens to be holding.
+    case "bookmarks-model":
+      sendToFocusedTabFrame(tab, "tweb-bookmarks", bookmarksModel(value?.query));
+      break;
+    case "bookmark-delete":
+      sendToFocusedTabFrame(tab, "tweb-bookmarks", deleteBookmark(value?.url, value?.query));
+      break;
+    case "bookmark-add":
+      sendToMainTabFrame(tab, "tweb-flash", addBookmark(tab, value).message);
+      break;
     case "history-model":
       sendToFocusedTabFrame(tab, "tweb-history", historyPageModel(value?.query));
       break;
