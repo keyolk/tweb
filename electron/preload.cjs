@@ -160,6 +160,9 @@ installPrintShim();
     // one of them on a busy desktop is the case these exist for.
     { name: "terminal", label: "Focus terminal", action: () => send("focus-terminal") },
     { name: "window", label: "Focus float window", action: () => send("focus-float") },
+    // Vimium has no key for adding a bookmark, so tweb gives it none either: a named command and a
+    // palette row. `:bookmark name` names it; alone it takes the page title. Same URL → renamed.
+    { name: "bookmark", label: "Bookmark this page", argumentOptional: "name", action: (value) => send("bookmark-add", value || "") },
   ];
   // Commands with no palette row. These are the ones that already have a key — listing them in
   // the palette would duplicate the key (DESIGN.md 15.3), but `:` is reached by name and a name
@@ -170,6 +173,7 @@ installPrintShim();
     { name: "back", help: "history back (H)", action: () => send("history-back") },
     { name: "forward", help: "history forward (L)", action: () => send("history-forward") },
     { name: "tabs", help: "search open tabs (T)", action: () => showTabList() },
+    { name: "bookmarks", help: "search bookmarks (b · B for a new tab)", action: () => showBookmarks(false) },
     // In-page overlays, not shortcut sends — `gh`/`gd` reach these same functions.
     { name: "history", help: "history page (gh)", action: () => showHistory() },
     { name: "downloads", help: "downloads (gd)", action: () => showDownloads() },
@@ -305,6 +309,8 @@ installPrintShim();
   let lastInspectElement = null;
   let tabListState = null;
   let historyState = null;
+  // The `b` / `B` bookmark list while it is open (showBookmarks).
+  let bookmarksState = null;
   let helpHost = null;
   let helpScroller = null;
   let helpRuntimeInfo = null;
@@ -357,6 +363,7 @@ installPrintShim();
     inspect: "I",
     tabs: "T",
     history: "≡",
+    bookmarks: "★",
     downloads: "⇣",
     chooser: "⇡",
     omnibox: "O",
@@ -3696,6 +3703,7 @@ installPrintShim();
       ["g0 · g$", "first · last tab"],
       ["^", "the tab you were on before", { "^": () => send("previous-visited-tab") }],
       ["T", "search open tabs — j/k, Enter, x closes, 1-9 jumps", { T: () => showTabList() }],
+      ["b · B", "search bookmarks (tweb's and Chrome's) · open the pick in a new tab — :bookmark adds this page", { b: () => showBookmarks(false), B: () => showBookmarks(true) }],
       ["t", "new tab (with the omnibox)", { t: () => showPrompt(true) }],
       ["x · X", "close tab · restore recent tab", { x: () => send("close-tab"), X: () => send("restore-tab") }],
       ["r · R", "reload · reload bypassing the cache", { r: () => send("reload"), R: () => send("reload-hard") }],
@@ -3794,7 +3802,7 @@ installPrintShim();
   function commandHelpSection() {
     const palette = new Set(commandPaletteEntries.map((entry) => entry));
     const rows = [...commandsByName.values()].map((entry) => [
-      `:${entry.name}${entry.argument ? ` <${entry.argument}>` : ""}`,
+      `:${entry.name}${entry.argument ? ` <${entry.argument}>` : entry.argumentOptional ? ` [${entry.argumentOptional}]` : ""}`,
       `${entry.label || entry.help || ""}${palette.has(entry) ? " · also in c" : ""}`,
     ]);
     rows.push([`:${SCRIPT_PREFIXES[0]} <expression> · :!<expression>`, "run JavaScript in the page and show the result"]);
@@ -4119,7 +4127,7 @@ installPrintShim();
         title.textContent = entry.title || entry.url;
         title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:13px/1.35 system-ui,-apple-system,sans-serif";
         const detail = document.createElement("div");
-        const tag = { tab: "TAB  ", search: "SEARCH  ", keyword: "KEYWORD  ", port: "LISTENING  " }[entry.kind] || "";
+        const tag = { tab: "TAB  ", bookmark: "BOOKMARK  ", search: "SEARCH  ", keyword: "KEYWORD  ", port: "LISTENING  " }[entry.kind] || "";
         detail.textContent = `${tag}${entry.url}`;
         detail.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6;font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace";
         row.append(title, detail);
@@ -4818,6 +4826,168 @@ installPrintShim();
     setMode("history", "…");
     requestHistoryModel();
     requestAnimationFrame(() => input.focus());
+  }
+
+  // --- bookmarks (`b` / `B`) ---
+  //
+  // Vimium's "search bookmarks": the same filter-as-you-type list as history, over tweb's own
+  // bookmarks (`:bookmark` adds) and the user's Chrome bookmarks, read only. Main owns both sources
+  // (bookmarks.cjs); this is the view. `B` opens the pick in a new tab, as Vimium's does.
+  //
+  // The list's own keys are the history page's: the input holds the focus so letters filter, which
+  // is why moving is ↑/↓ or Ctrl-J/K and deleting is Ctrl-D rather than bare j/k/x.
+
+  function cancelBookmarks(restoreMode = true) {
+    bookmarksState?.host.remove();
+    bookmarksState = null;
+    if (restoreMode) normalMode();
+  }
+
+  function selectBookmarkIndex(index) {
+    const rows = bookmarksState?.rows || [];
+    if (!bookmarksState || rows.length === 0) {
+      setMode("bookmarks", bookmarksState ? "0" : "");
+      return;
+    }
+    const count = rows.length;
+    bookmarksState.selected = ((index % count) + count) % count;
+    for (const [rowIndex, entry] of rows.entries()) {
+      const selected = rowIndex === bookmarksState.selected;
+      entry.row.style.background = selected ? "#3c4043" : "transparent";
+      entry.row.style.outline = selected ? "1px solid #8ab4f8" : "none";
+    }
+    rows[bookmarksState.selected].row.scrollIntoView?.({ block: "nearest" });
+    setMode("bookmarks", `${bookmarksState.selected + 1}/${count}`);
+  }
+
+  function openSelectedBookmark(newTab) {
+    const entry = bookmarksState?.rows[bookmarksState.selected];
+    if (!entry) return;
+    const inNewTab = newTab || bookmarksState.newTab;
+    cancelBookmarks(false);
+    send(inNewTab ? "new-tab" : "navigate", entry.url);
+  }
+
+  function deleteSelectedBookmark() {
+    const entry = bookmarksState?.rows[bookmarksState.selected];
+    if (!entry) return;
+    // A Chrome row is read only: tweb never writes Chrome's file.
+    if (entry.source !== "tweb") {
+      flash("Chrome bookmark · read only");
+      return;
+    }
+    bookmarksState.keepSelection = bookmarksState.selected;
+    send("bookmark-delete", { url: entry.url, query: bookmarksState.input.value });
+  }
+
+  function renderBookmarksModel(model) {
+    if (!bookmarksState || !model) return;
+    // The list re-asks on every keystroke; a reply to a query already moved past is dropped.
+    if (String(model.query || "") !== bookmarksState.input.value) return;
+    const { list } = bookmarksState;
+    const rows = [];
+    list.replaceChildren();
+    for (const entry of model.rows || []) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;width:100%;padding:6px 7px;border:0;border-radius:5px;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer";
+      const text = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = entry.name || entry.url;
+      title.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500";
+      const url = document.createElement("small");
+      url.textContent = entry.folder ? `${entry.folder} · ${entry.url}` : entry.url;
+      url.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9aa0a6";
+      text.append(title, url);
+      // Which source the row came from: only `tweb` rows delete.
+      const source = document.createElement("span");
+      source.textContent = entry.source === "chrome" ? "Chrome" : "tweb";
+      source.style.cssText = `padding:1px 6px;border:1px solid #9aa0a666;border-radius:4px;color:${entry.source === "chrome" ? "#9aa0a6" : "#8ab4f8"};font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace`;
+      row.append(text, source);
+      const index = rows.length;
+      row.onmouseenter = () => selectBookmarkIndex(index);
+      row.onclick = () => { selectBookmarkIndex(index); openSelectedBookmark(false); };
+      list.append(row);
+      rows.push({ url: entry.url, source: entry.source, row });
+    }
+    if (rows.length === 0) {
+      const empty = document.createElement("div");
+      empty.textContent = model.query ? `No bookmarks match ${model.query}` : "No bookmarks yet · :bookmark adds this page";
+      empty.style.cssText = "padding:14px 7px;color:#9aa0a6";
+      list.append(empty);
+    }
+    bookmarksState.rows = rows;
+    bookmarksState.count.textContent = `${model.tweb || 0} tweb · ${model.chrome || 0} Chrome`;
+    // Why Chrome's half is missing, when it is: an empty half must not read as "no bookmarks".
+    bookmarksState.footer.textContent = model.note || "";
+    bookmarksState.footer.style.display = model.note ? "block" : "none";
+    const resume = bookmarksState.keepSelection;
+    bookmarksState.keepSelection = null;
+    selectBookmarkIndex(resume === null || resume === undefined ? 0 : Math.min(resume, rows.length - 1));
+  }
+
+  function showBookmarks(newTab = false) {
+    cancelTransient(false);
+    const host = document.createElement("div");
+    host.id = "__tweb_bookmarks__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483646;display:flex;align-items:flex-start;justify-content:center;padding-top:6vh;background:#0007;pointer-events:auto";
+    const shadow = host.attachShadow({ mode: "open" });
+    const panel = document.createElement("div");
+    panel.style.cssText = "box-sizing:border-box;display:flex;flex-direction:column;width:min(860px,calc(100vw - 32px));max-height:82vh;padding:8px;border:1px solid #5f6368;border-radius:8px;background:#202124;color:#e8eaed;box-shadow:0 12px 36px #000b;font:13px/1.4 system-ui,-apple-system,sans-serif";
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;gap:8px;padding:2px 4px 8px";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = newTab ? "Search bookmarks · opens in a new tab" : "Search bookmarks";
+    input.style.cssText = "flex:1;box-sizing:border-box;min-width:0;padding:7px 9px;border:1px solid #5f6368;border-radius:6px;outline:0;background:#303134;color:#f8f9fa;font:14px/1.3 system-ui,-apple-system,sans-serif";
+    const count = document.createElement("span");
+    count.style.cssText = "color:#bdc1c6;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap";
+    header.append(input, count);
+    const hint = document.createElement("div");
+    hint.textContent = "↑/↓ or Ctrl-J/K move · Enter open · Shift-Enter new tab · Ctrl-D delete (tweb only) · Esc close";
+    hint.style.cssText = "padding:0 5px 7px;color:#9aa0a6;font-size:11px";
+    const list = document.createElement("div");
+    list.setAttribute("role", "listbox");
+    list.style.cssText = "flex:1;min-height:0;overflow:auto;padding:0 2px 4px";
+    const footer = document.createElement("div");
+    footer.style.cssText = "display:none;padding:6px 5px 0;color:#fdd663;font-size:11px";
+    input.addEventListener("input", () => send("bookmarks-model", { query: input.value }));
+    input.addEventListener("keydown", (event) => handleBookmarksKey(event));
+    panel.append(header, hint, list, footer);
+    shadow.append(panel);
+    document.documentElement.append(host);
+    paintNow();
+    bookmarksState = { host, input, list, count, footer, rows: [], selected: 0, keepSelection: null, newTab };
+    setMode("bookmarks", "…");
+    send("bookmarks-model", { query: "" });
+    requestAnimationFrame(() => input.focus());
+  }
+
+  // The list owns every key while it is open; none reaches the page or the normal-mode table.
+  function handleBookmarksKey(event) {
+    if (!bookmarksState) return false;
+    event.stopPropagation();
+    const key = String(event.key || "");
+    const rows = bookmarksState.rows;
+    if (event.code === "Escape" || key === "Escape") {
+      event.preventDefault();
+      cancelBookmarks();
+    } else if (event.code === "ArrowDown" || (event.ctrlKey && key.toLowerCase() === "j")) {
+      event.preventDefault();
+      if (rows.length) selectBookmarkIndex(bookmarksState.selected + 1);
+    } else if (event.code === "ArrowUp" || (event.ctrlKey && key.toLowerCase() === "k")) {
+      event.preventDefault();
+      if (rows.length) selectBookmarkIndex(bookmarksState.selected - 1);
+    } else if (event.code === "Enter" || key === "Enter") {
+      event.preventDefault();
+      openSelectedBookmark(event.shiftKey);
+    } else if (event.ctrlKey && key.toLowerCase() === "d") {
+      event.preventDefault();
+      deleteSelectedBookmark();
+    }
+    return true;
   }
 
   // --- downloads page ---
@@ -6716,6 +6886,7 @@ installPrintShim();
     cancelInspect(false);
     cancelTabList(false);
     cancelHistory(false);
+    cancelBookmarks(false);
     cancelDownloads(false);
     cancelFileChooser();
     cancelHelp(false);
@@ -6760,7 +6931,7 @@ installPrintShim();
   }
 
   function hasTransientMode() {
-    return Boolean(copyMenuState || pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || downloadsState || fileChooserState || helpHost || selectListState || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
+    return Boolean(copyMenuState || pickerState || promptHost || searchState || visualState || inspectState || tabListState || historyState || bookmarksState || downloadsState || fileChooserState || helpHost || selectListState || pendingG || pendingZ || document.getElementById("__tweb_context_menu__"));
   }
 
   // Spends one allowance for this key, if the engine announced it recently.
@@ -6847,7 +7018,7 @@ installPrintShim();
     if (handleTabListKey(event, key)) return;
     if (handleSearchKey(event, key)) return;
     if (commandPaletteState) return;
-    if (searchState || promptHost || historyState || downloadsState || fileChooserState) return;
+    if (searchState || promptHost || historyState || bookmarksState || downloadsState || fileChooserState) return;
 
     // A key an agent sent on purpose belongs to the page, whatever it would mean as a TWeb command.
     // Placed after the overlays above so a help, picker or palette that is open still takes its keys.
@@ -7199,6 +7370,10 @@ installPrintShim();
 
   ipcRenderer.on("tweb-history", (_event, model) => {
     renderHistoryModel(model);
+  });
+
+  ipcRenderer.on("tweb-bookmarks", (_event, model) => {
+    renderBookmarksModel(model);
   });
 
   ipcRenderer.on("tweb-downloads", (_event, model) => {

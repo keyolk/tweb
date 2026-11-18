@@ -43,8 +43,8 @@ const VIMIUM_NORMAL_KEYS = {
   o: /showPrompt\(false\)/, // Vomnibar.activate
   O: /showPrompt\(true\)/, // Vomnibar.activateInNewTab
   T: /showTabList\(\)/, // Vomnibar.activateTabSelection
-  b: null, // Vomnibar.activateBookmarks — tweb has no bookmarks
-  B: null, // Vomnibar.activateBookmarksInNewTab
+  b: /showBookmarks\(false\)/, // Vomnibar.activateBookmarks
+  B: /showBookmarks\(true\)/, // Vomnibar.activateBookmarksInNewTab
   m: null, // Marks.activateCreateMode — no marks
   "`": null, // Marks.activateGotoMode
   H: /send\("history-back"\)/, // goBack
@@ -206,13 +206,14 @@ test("the help lists every command the command line and the palette accept", () 
   assert.match(title, /^Commands/);
   const keys = rows.map(([key]) => key);
   for (const [name, entry] of commandsByName) {
-    const row = rows.find(([key]) => key === `:${name}` || key.startsWith(`:${name} <`));
+    const row = rows.find(([key]) => key === `:${name}` || key.startsWith(`:${name} <`) || key.startsWith(`:${name} [`));
     assert.ok(row, `:${name} is missing from the help`);
     if (entry.argument) assert.ok(row[0].includes(`<${entry.argument}>`), `:${name} shows its argument`);
+    if (entry.argumentOptional) assert.ok(row[0].includes(`[${entry.argumentOptional}]`), `:${name} shows its optional argument`);
     assert.ok(row[1].trim(), `:${name} has a description`);
   }
   for (const entry of commandPaletteEntries) {
-    assert.match(rows.find(([key]) => key === `:${entry.name}`)[1], /also in c$/, `${entry.name} is marked as a palette row`);
+    assert.match(rows.find(([key]) => key === `:${entry.name}` || key.startsWith(`:${entry.name} [`))[1], /also in c$/, `${entry.name} is marked as a palette row`);
   }
   assert.ok(keys.some((key) => key.includes(`:${SCRIPT_PREFIXES[0]} `)), "the script form is listed");
   // The help renders this list, not only the shortcut table.
