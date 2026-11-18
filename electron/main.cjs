@@ -70,7 +70,7 @@ const {
 const { deflateFramesAllowed } = require("./deflate-policy.cjs");
 const { relativePatchesDecision } = require("./relative-placement.cjs");
 const {
-  placeholderBlock, placeholdersDecision, MAX_ROWS: PLACEHOLDER_MAX_ROWS,
+  placeholderBlock, placeholdersDecision, MAX_ROWS: PLACEHOLDER_MAX_ROWS, graphicsWithCells,
 } = require("./placeholder-cells.cjs");
 const { createPatchBudget } = require("./patch-budget.cjs");
 const { passthroughRuns } = require("./tmux-passthrough.cjs");
@@ -948,16 +948,6 @@ function basePlaceholderCells(frames, id = frames.shownBase) {
   return placeholderBlock(id, { rows: frames.cells.rows, cols: frames.cells.cols });
 }
 
-// Graphics strings and cell text as one buffer for the pane writer. The writer takes a string as
-// latin1 ("binary"), which is right for escape sequences and base64 and destroys anything past
-// U+00FF: the placeholder cells arrived as their low bytes and the page was never drawn. So the
-// cells are encoded as UTF-8 here and the graphics as the bytes they already are.
-function graphicsWithCells(graphics, cells, tail = "") {
-  if (!cells) return graphics + tail;
-  return Buffer.concat([
-    Buffer.from(graphics, "latin1"), Buffer.from(cells, "utf8"), Buffer.from(tail, "latin1"),
-  ]);
-}
 const deflateFrames = deflateFramesAllowed({
   clientTermname,
   term: process.env.TERM,
@@ -2236,7 +2226,8 @@ function replacePlacement(frames = currentFrames()) {
     // A virtual placement at the new size and the cells for it. The cells of the old size that
     // fall outside the new one are tmux's to drop: they were in the grid, and the grid was resized.
     writeGfx(`a=p,U=1,i=${frames.shownBase},p=${PLACEMENT_ID},c=${frames.cells.cols},r=${frames.cells.rows},q=2`, "");
-    writerFor(frames.record).write(Buffer.from(basePlaceholderCells(frames), "utf8"));
+    // Every row of the pane: one synchronized update, like a whole frame's (`graphicsWithCells`).
+    writerFor(frames.record).write(graphicsWithCells("", basePlaceholderCells(frames)));
     noteCellsWritten(frames, Date.now());
     return;
   }
