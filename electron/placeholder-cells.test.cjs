@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   DIACRITICS, PLACEHOLDER, MAX_ROWS, placeholderBlock, virtualPlacement, placeholdersDecision,
+  graphicsWithCells, SYNC_BEGIN, SYNC_END,
 } = require("./placeholder-cells.cjs");
 
 const strip = (text) => text.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b[78]/g, "");
@@ -98,4 +99,24 @@ test("TWEB_PLACEHOLDERS forces it, but never outside tmux", () => {
   assert.equal(placeholdersDecision({ inTmux: true, clientTermtype: "ghostty 1.4.0", override: "0" }).allowed, false);
   assert.equal(placeholdersDecision({ inTmux: true, clientTermtype: "kitty", override: "1" }).allowed, true);
   assert.equal(placeholdersDecision({ inTmux: false, override: "1" }).allowed, false);
+});
+
+// A full cell rewrite is every row of the pane. Unbracketed, tmux and Ghostty drew it as it
+// arrived, and a playing video flickered the whole pane every PLACEHOLDER_CELLS_REFRESH_MS.
+test("a write that carries cells is one synchronized update, with the brackets outside passthrough", () => {
+  const graphics = "\x1bPtmux;\x1b\x1b_Ga=T,i=1;AAAA\x1b\x1b\\\x1b\\";
+  const cells = placeholderBlock(0x20000110, { rows: 2, cols: 2 });
+  const tail = "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=2,q=2\x1b\x1b\\\x1b\\";
+  const out = graphicsWithCells(graphics, cells, tail);
+  assert.ok(Buffer.isBuffer(out));
+  const text = out.toString("utf8");
+  assert.equal(SYNC_BEGIN, "\x1b[?2026h");
+  assert.equal(SYNC_END, "\x1b[?2026l");
+  assert.ok(text.startsWith(SYNC_BEGIN + graphics), "begin precedes the graphics, plain");
+  assert.ok(text.endsWith(tail + SYNC_END), "end follows the retire deletes");
+  assert.ok(text.includes(cells), "cells stay UTF-8");
+});
+
+test("graphics alone are not bracketed: nothing in the grid changes", () => {
+  assert.equal(graphicsWithCells("\x1b_Ga=d\x1b\\", "", "x"), "\x1b_Ga=d\x1b\\x");
 });

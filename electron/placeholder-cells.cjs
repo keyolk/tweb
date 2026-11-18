@@ -126,8 +126,32 @@ function virtualPlacement(id, { rows, cols }) {
   return `a=p,U=1,i=${id},c=${cols},r=${rows},q=2`;
 }
 
+// DEC 2026 synchronized output: the terminal holds what it shows until the end mark, so one
+// update lands as one picture. Plain, not passthrough: tmux (3.7+) has to read these itself, both
+// to hold its own redraw of the pane and to forward the bracket to a client that has `sync`.
+const SYNC_BEGIN = "\x1b[?2026h";
+const SYNC_END = "\x1b[?2026l";
+
+// Graphics strings and cell text as one buffer for the pane writer. The writer takes a string as
+// latin1 ("binary"), which is right for escape sequences and base64 and destroys anything past
+// U+00FF: the placeholder cells arrived as their low bytes and the page was never drawn. So the
+// cells are encoded as UTF-8 here and the graphics as the bytes they already are.
+//
+// A write that carries cells is bracketed as one synchronized update. A full rewrite is every row
+// of the pane (~280KB at 254x96) and goes out every PLACEHOLDER_CELLS_REFRESH_MS while a page
+// animates; unbracketed, tmux and the terminal drew it as it arrived, rows of the new frame over
+// rows of the old, and the whole pane flickered every two seconds during a video.
+function graphicsWithCells(graphics, cells, tail = "") {
+  if (!cells) return graphics + tail;
+  return Buffer.concat([
+    Buffer.from(SYNC_BEGIN + graphics, "latin1"), Buffer.from(cells, "utf8"),
+    Buffer.from(tail + SYNC_END, "latin1"),
+  ]);
+}
+
 module.exports = {
   DIACRITICS, PLACEHOLDER, MAX_ROWS, placeholderBlock, virtualPlacement, idColour, highByteMark,
+  graphicsWithCells, SYNC_BEGIN, SYNC_END,
 };
 
 // Whether a pane draws through placeholders. Decided like relative patches (relative-placement.cjs)

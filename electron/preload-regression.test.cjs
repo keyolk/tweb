@@ -3350,8 +3350,10 @@ test("a pane taller than the placeholder table keeps the overlay", () => {
 // low bytes and the page was never drawn; they go out as UTF-8 buffers.
 test("placeholder cells reach the pane writer as UTF-8", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /Buffer\.from\(cells, "utf8"\)/);
-  assert.match(main, /write\(Buffer\.from\(basePlaceholderCells\(frames\), "utf8"\)\)/);
+  const cells = fs.readFileSync(path.join(__dirname, "placeholder-cells.cjs"), "utf8");
+  assert.match(cells, /Buffer\.from\(cells, "utf8"\)/);
+  // The resize re-place goes through the same encoder, so it is UTF-8 and synchronized too.
+  assert.match(main, /write\(graphicsWithCells\("", basePlaceholderCells\(frames\)\)\)/);
 });
 
 // `?` lists the media keys in a section of their own, one key per row, and binds none of them:
