@@ -513,6 +513,13 @@ class CdpWebContents extends EventEmitter {
     this.defaultUserAgent = null;
     this.windowOpenHandler = null;
     this.debugger = new CdpDebugger(this);
+    // Chrome's input router hit-tests a root-session `Input.dispatchMouseEvent` across the whole
+    // frame tree, out-of-process frames and whatever the parent draws over them included, and moves
+    // focus with it — measured: a root click over the claude.ai artifact iframe opened a `<details>`
+    // inside it and left `hasFocus()` true there. So main.cjs sends every pointer event to the root
+    // and does none of the box routing Electron needs. That routing, applied here, sent each click on
+    // the artifact page's share menu into the iframe underneath it.
+    this.hitTestsFrames = true;
     this.navigationHistory = new CdpNavigationHistory(this);
     this.keys = new KeySequencer((params) => this.dispatchKey(params));
     this.keyFlushQueued = false;

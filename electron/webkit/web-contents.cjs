@@ -128,6 +128,9 @@ class WebKitWebContents extends EventEmitter {
     this.windowOpenHandler = null;
     this.pendingLoad = null;
     this.debugger = new WebKitDebugger();
+    // Native NSEvents: WebKit routes them into frames itself (see the header). Declared for the
+    // pointer router, which never reaches this engine today because the debugger cannot attach.
+    this.hitTestsFrames = true;
     this.navigationHistory = new WebKitNavigationHistory(this);
     this.keys = new KeySequencer((params) => this.dispatchKey(params));
     this.keyFlushQueued = false;
