@@ -83,6 +83,7 @@ const {
 const {
   mouseEventParams, pointerTarget, nextCapture, routingCapture, outermostSession, reusableVerdict,
 } = require("./oopif-input.cjs");
+const { capability } = require("./engine-capabilities.cjs");
 const { interpolatePoints } = require("./pointer-interpolation.cjs");
 const { NativeInput, createPaneNative, paneGeometry } = require("./native-input.cjs");
 const { shareLabels } = require("./hint-labels.cjs");
@@ -3143,9 +3144,9 @@ function updatePaintingState() {
 // `isPainting` is Electron 43 API, but the engine also runs against whatever the user
 // has cached, so an older runtime must degrade to the unconditional call rather than
 // throw inside the watchdog.
-// Only the Chrome engine pays for a collapsed surface on the way back; see `surfacePlan`.
+// Only an engine that pays for a collapsed surface on the way back (Chrome); see `surfacePlan`.
 function keepsSizeInStandby(tab) {
-  return tabEngine(tab) === "chrome";
+  return capability(tab.webContents, "keepsSizeInStandby");
 }
 
 function readIsPainting(contents) {
@@ -3871,9 +3872,9 @@ function noticePinnedNavigation(tab, url) {
 // said on the page, because the CLI's own error would go nowhere the user can see.
 function openDevToolsPane(tab) {
   const paneId = currentPane()?.paneId;
-  const engine = tabEngine(tab);
+  const inspector = capability(tab.webContents, "inspectorName");
   const say = (text) => sendToMainTabFrame(tab, "tweb-flash", text);
-  if (engine === "electron") {
+  if (!inspector) {
     say("DevTools needs a Chrome or WebKit tab: engine badge → Chrome, then try again");
     return;
   }
@@ -3882,7 +3883,7 @@ function openDevToolsPane(tab) {
     return;
   }
   const tweb = process.env.TWEB_BIN || path.join(os.homedir(), ".local", "bin", "tweb");
-  say(engine === "webkit" ? "Opening Safari's Web Inspector…" : "Opening DevTools beside this pane…");
+  say(`Opening ${inspector}…`);
   execFile(tweb, ["devtools", "--pane", paneId], {
     stdio: "ignore", env: { ...process.env, TMUX_PANE: paneId },
   }, (error) => {
@@ -5299,7 +5300,7 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       // from a frame with focus (the preload checks `document.hasFocus()`), and a frame giving
       // up focus clears the cursor only if it still owns it. The WebKit engine has no focused
       // frame to ask either, so it takes the same rule.
-      if (tabEngine(tab) !== "electron") {
+      if (capability(contents, "focusedFrameIsMainOnly")) {
         const key = sourceFrame ? frameKey(sourceFrame) : null;
         if (!value && key && caretOwners.get(tab) && caretOwners.get(tab) !== key) break;
         caretOwners.set(tab, value ? key : null);
@@ -6128,9 +6129,9 @@ function agentTabList() {
 }
 
 // Every renderer process a tab uses: its main frame's first, then each out-of-process iframe's.
-// Empty for a tab on another engine, which has no Electron frames.
+// Empty for a tab on another engine: its frames carry no `osProcessId`.
 function tabRendererPids(tab) {
-  if (!tab || tab.isDestroyed() || tabEngine(tab) !== "electron") return [];
+  if (!tab || tab.isDestroyed()) return [];
   const mainFrame = tab.webContents.mainFrame;
   if (!mainFrame) return [];
   const pids = [];
@@ -7078,7 +7079,7 @@ async function dispatchAgentCommand(method, params) {
       // only as "Script failed to execute", and the exception is the answer (see agent-eval.cjs).
       const tab = agentTab();
       const contents = tab.webContents;
-      const debuggerSend = tabEngine(tab) !== "chrome" && ensureDebugger(tab)
+      const debuggerSend = !capability(contents, "reportsScriptExceptions") && ensureDebugger(tab)
         ? (method, commandParams) => contents.debugger.sendCommand(method, commandParams)
         : null;
       return evaluate(params.script, {
@@ -7683,8 +7684,8 @@ function sendPointerEvent(tab, event) {
       const applied = routingCapture(captured, params.type);
       let target = null;
       // An engine whose root session hit-tests across frames itself (Chrome) gets every event on
-      // the root, which is what a real mouse does there. See `hitTestsFrames` in cdp/web-contents.
-      if (!contents.hitTestsFrames) {
+      // the root, which is what a real mouse does there. See `hitTestsFrames` in engine-capabilities.
+      if (!capability(contents, "hitTestsFrames")) {
         target = pointerTarget(oopifSessions(tab), point, applied);
         // The box says the point is inside a frame, not that the frame is what shows there. A
         // popover the parent draws over the frame is inside the same box, and a click on it went
@@ -8108,7 +8109,7 @@ function refusePermissionPrompts(tab) {
 // Headless Chrome refuses every request itself, so a Chrome tab gets what the user granted before
 // the page asks: on each navigation, its origin's remembered decisions go to `Browser.setPermission`.
 function applyChromeSitePermissions(tab, url) {
-  if (tab.isDestroyed() || tabEngine(tab) !== "chrome") return;
+  if (tab.isDestroyed() || !capability(tab.webContents, "grantsPermissionsAhead")) return;
   const origin = sitePermissionRules.originOf(url);
   if (!origin || origin === "file://") return;
   const contents = tab.webContents;
@@ -8229,7 +8230,7 @@ function handleSitePermissionCommand(tab, value) {
   const allowed = op === "permit";
   sitePermissions().set(origin, [kind], allowed);
   applyChromeSitePermissions(tab, url);
-  say(`${sitePermissionRules.LABELS[kind]} ${allowed ? "allowed" : "blocked"} for ${origin}${tabEngine(tab) === "chrome" ? " — reload to use it" : ""}`);
+  say(`${sitePermissionRules.LABELS[kind]} ${allowed ? "allowed" : "blocked"} for ${origin}${capability(tab.webContents, "grantsPermissionsAhead") ? " — reload to use it" : ""}`);
 }
 
 function configureDownloads() {
@@ -8939,7 +8940,7 @@ function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
     applyChromeSitePermissions(tab, url);
     // The Chrome engine cannot sign in to Google (see cdp/sign-in-block.cjs); replace the refusal,
     // whose only button fails the same way, with what to do instead.
-    if (tabEngine(tab) === "chrome" && isGoogleSignInRejection(url)) {
+    if (capability(contents, "blocksGoogleSignIn") && isGoogleSignInRejection(url)) {
       console.error("tweb: google sign-in refused in the chrome engine; pointing at `tweb chrome login`");
       void contents.loadURL(signInNoticePage(url));
       return;
@@ -10222,7 +10223,7 @@ function dispatchNativeKey(contents, key, text, modifiers, eventKind) {
 function dispatchEditKey(tab, key, text, modifiers, eventKind) {
   if (!tab || tab.isDestroyed()) return;
   const contents = tab.webContents;
-  if (tabEngine(tab) === "chrome" || !ensureDebugger(tab)) {
+  if (capability(contents, "keyEventsRunEditCommands") || !ensureDebugger(tab)) {
     dispatchNativeKey(contents, key, text, modifiers, eventKind);
     return;
   }
