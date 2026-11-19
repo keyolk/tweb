@@ -317,9 +317,11 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// Read an element's text.
+    /// Read an element's text. Without REF, the whole page's text (`document.body.innerText`),
+    /// line breaks kept.
     Text {
-        r#ref: String,
+        /// The ref a snapshot assigned. Omitted, the page body.
+        r#ref: Option<String>,
         #[command(flatten)]
         agent: AgentOptions,
     },
@@ -384,12 +386,12 @@ pub enum Command {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// List tabs.
+    /// List tabs. `tweb tab list` is the same command.
     Tabs {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// Switch, create and close tabs.
+    /// List, switch, create and close tabs.
     Tab {
         #[command(subcommand)]
         action: TabAction,
@@ -655,6 +657,12 @@ pub enum SkillAction {
 
 #[derive(Subcommand, Debug)]
 pub enum TabAction {
+    /// List tabs, the same as `tweb tabs`.
+    #[command(visible_alias = "ls")]
+    List {
+        #[command(flatten)]
+        agent: AgentOptions,
+    },
     /// Switch to a tab by index.
     Switch {
         index: usize,
@@ -1141,6 +1149,7 @@ pub async fn run() -> Result<()> {
         },
         Command::Tab { action } => {
             let (method, params, agent) = match action {
+                TabAction::List { agent } => ("tabs", json!({}), agent),
                 TabAction::Switch { index, agent } => ("tab", json!({ "index": index }), agent),
                 TabAction::New { url, agent } => {
                     let url = url.map(|value| resolve_url_argument(&value, &working_directory));
@@ -1160,6 +1169,26 @@ pub async fn run() -> Result<()> {
                 ),
             };
             agent::run(agent.pane.as_deref(), method, params, agent.json)?;
+        }
+        // Without a ref there is no snapshot element to read, so the page's text comes from
+        // `eval`, which every engine answers; it is printed the way `text <ref>` prints, so a
+        // caller reading `--json` gets `{"text": …}` either way.
+        Command::Text { r#ref: None, agent } => {
+            let result = agent::request(
+                agent.pane.as_deref(),
+                "eval",
+                json!({ "script": PAGE_TEXT_SCRIPT }),
+            )?;
+            let text = result
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let result = json!({ "text": text });
+            if agent.json {
+                println!("{}", agent::render_json("act", &result));
+            } else {
+                print!("{}", agent::render("act", &result));
+            }
         }
         // A value from stdin is a secret by contract: the page's reply carries the field's value
         // back for anything but a password input (a username field, a token box), and `run`
@@ -1237,6 +1266,11 @@ fn read_fill_value(mut input: impl std::io::Read) -> Result<String> {
     Ok(value)
 }
 
+/// `tweb text` without a ref. `innerText` keeps the page's line breaks, which an element's text
+/// (collapsed to one line) does not; the document element covers a page without a body.
+const PAGE_TEXT_SCRIPT: &str =
+    "String((document.body || document.documentElement)?.innerText ?? '').trim()";
+
 /// Map a page-driving subcommand onto its JSON-RPC method and params.
 fn agent_call(
     command: Command,
@@ -1289,7 +1323,10 @@ fn agent_call(
         } => ("act", act(r#ref, "select", Some(value)), agent),
         Command::Check { r#ref, agent } => ("act", act(r#ref, "check", None), agent),
         Command::Uncheck { r#ref, agent } => ("act", act(r#ref, "uncheck", None), agent),
-        Command::Text { r#ref, agent } => ("act", act(r#ref, "text", None), agent),
+        Command::Text {
+            r#ref: Some(r#ref),
+            agent,
+        } => ("act", act(r#ref, "text", None), agent),
         Command::Html { r#ref, agent } => ("act", act(r#ref, "html", None), agent),
         Command::Type { text, agent } => ("type", json!({ "text": text }), agent),
         Command::Press {
@@ -1665,6 +1702,37 @@ mod tests {
         }
         // Nested subcommands and a trailing `--` keep working.
         parse(&["tweb", "--pane", "%7", "tab", "new", "about:blank"]).expect("nested");
+    }
+
+    /// Agents reach for `tab list`; it has to be `tabs`, `--json` and `--pane` included.
+    #[test]
+    fn tab_list_and_ls_are_tabs() {
+        use super::TabAction;
+        for word in ["list", "ls"] {
+            let cli = Cli::try_parse_from(["tweb", "tab", word, "--pane", "%476", "--json"])
+                .unwrap_or_else(|e| panic!("tab {word}: {e}"));
+            let Command::Tab {
+                action: TabAction::List { agent },
+            } = cli.command
+            else {
+                panic!("tab {word} parsed as {:?}", cli.command);
+            };
+            assert_eq!(agent.pane.as_deref(), Some("%476"));
+            assert!(agent.json);
+        }
+    }
+
+    /// `tweb text` alone reads the page; with a ref it still reads that element.
+    #[test]
+    fn text_ref_is_optional() {
+        let cli = Cli::try_parse_from(["tweb", "text", "--pane", "%3"]).expect("parse");
+        assert!(matches!(cli.command, Command::Text { r#ref: None, .. }));
+        let cli = Cli::try_parse_from(["tweb", "text", "a"]).expect("parse");
+        let (method, params, _) =
+            super::agent_call(cli.command, Path::new("/")).expect("element text");
+        assert_eq!(method, "act");
+        assert_eq!(params["ref"], "a");
+        assert_eq!(params["action"], "text");
     }
 
     #[test]

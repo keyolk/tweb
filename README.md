@@ -432,6 +432,7 @@ the very element that carried the `a` badge get pressed, and a human looking at 
 ```bash
 tweb panes                       # browser panes available to drive
 tweb snapshot                    # interactive elements + refs (--text for a reading snapshot)
+tweb text                        # the whole page's text (`tweb text a` for one element)
 tweb click a                     # trusted native click (isTrusted=true)
 tweb fill s "agent@example.com"  # framework-safe value assignment
 pass show web/site | head -1 | tweb fill s --stdin  # a secret: not in argv, not printed back
@@ -441,6 +442,7 @@ tweb wait --selector "#result" --timeout 5000
 tweb errors                      # console errors only
 tweb network --limit 40          # requests the page made, with status
 tweb eval "location.pathname"
+tweb tabs                        # the tabs (`tweb tab list` is the same)
 tweb tab new https://localhost:5173
 tweb diag                        # pane geometry, zoom, frame and input state
 tweb engine-log --limit 40       # engine debug lines (resize and frame accounting)
