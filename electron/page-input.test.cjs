@@ -526,3 +526,13 @@ test("a patch over the immediate budget is handed to the paced path", () => {
   assert.ok(check < write, "the size check must come before the write, or the write has already blocked");
   assert.ok(note > write, "a written patch has to be counted, or a stream is never held back");
 });
+
+// A page that changes its own hash (the briefs index's tag buttons set `#t=`) left Electron
+// reporting a zoom of 1 while it rendered at the pane's 80%. Every click tweb places converts a
+// page point with that factor, so from the second `f` pick on each click landed a quarter past its
+// target. The factor is put back after every same-document navigation of the main frame.
+test("the pane's zoom is put back after a same-document navigation", () => {
+  const handler = body('onContents("did-navigate-in-page"', "let initialZoomApplied");
+  assert.match(handler, /if \(!isMainFrame\) return;/);
+  assert.match(handler, /const zoomFactor = effectiveZoomFactor\(tab\);\s*\n\s*if \(contents\.getZoomFactor\(\) !== zoomFactor\) contents\.setZoomFactor\(zoomFactor\);/);
+});
