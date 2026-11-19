@@ -536,3 +536,21 @@ test("the pane's zoom is put back after a same-document navigation", () => {
   assert.match(handler, /if \(!isMainFrame\) return;/);
   assert.match(handler, /const zoomFactor = effectiveZoomFactor\(tab\);\s*\n\s*if \(contents\.getZoomFactor\(\) !== zoomFactor\) contents\.setZoomFactor\(zoomFactor\);/);
 });
+
+// A host's own TMUX_PANE is the daemon's, so `ownTmuxPane` is null there, and every passthrough
+// path used to return on it: in a hosted pane Ctrl-; switched the engine to edit mode but never set
+// `@tweb_edit` or put the client on the passthrough table, so tmux kept the prefix and its own root
+// bindings. The pane being served is asked instead, and each pane restores only the clients it armed.
+test("edit mode reaches tmux in a pane a host serves", () => {
+  const resolver = body("function tmuxPaneId()", "function switchTmuxClientTable(");
+  assert.match(resolver, /if \(ownTmuxPane\) return ownTmuxPane;/);
+  assert.match(resolver, /currentPane\(\)\?\.paneId/);
+  const reconcile = body("function reconcileTmuxPassthrough(", "// `@tweb_edit` on this pane");
+  assert.match(reconcile, /const paneId = tmuxPaneId\(\);\s*\n\s*if \(!paneId\) return;/);
+  assert.match(reconcile, /setPaneEditOption\(paneId, inputState\(\)\.bypass\);/);
+  assert.match(reconcile, /if \(entry\.paneId !== paneId\) continue;/);
+  assert.match(reconcile, /passthroughClientTables\.set\(tty, \{ paneId, table: originalTable \|\| "root" \}\);/);
+  assert.doesNotMatch(reconcile, /ownTmuxPane/);
+  const close = body("function closePaneOnce(record, reason)", "settleWindowSession();");
+  assert.match(close, /restoreTmuxPassthroughClients\(record\.paneId\);/);
+});

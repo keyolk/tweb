@@ -1183,7 +1183,7 @@ function configureTmuxRootBindings() {
 }
 
 function ensureTmuxPassthroughTable() {
-  if (!ownTmuxPane) return;
+  if (!tmuxPaneId()) return;
   configureTmuxRootBindings();
   const zoomUserKeys = [
     [113, "User113", 5002],
@@ -1269,7 +1269,7 @@ function ensureTmuxPassthroughTable() {
 }
 
 function listTmuxClientStates() {
-  if (!ownTmuxPane) return new Map();
+  if (!tmuxPaneId()) return new Map();
   try {
     const output = execFileSync(
       "tmux",
@@ -1285,6 +1285,19 @@ function listTmuxClientStates() {
   } catch (error) {
     return new Map();
   }
+}
+
+// The tmux pane whose keys this engine owns right now: its own pane, or in a host the pane being
+// served. A host's `ownTmuxPane` is null (its TMUX_PANE is the daemon's), and every passthrough
+// path below used to return on that null — so in a hosted pane Ctrl-; flipped the engine's mode
+// but never set `@tweb_edit` or moved the client to the passthrough table, and tmux kept Escape,
+// the prefix and the rest for itself. Reported from a web terminal on the Chrome engine: Ctrl-;
+// logged "bypass ON" and Escape still did not reach the page.
+function tmuxPaneId() {
+  if (ownTmuxPane) return ownTmuxPane;
+  if (!hostedRuntime) return null;
+  const paneId = String(currentPane()?.paneId || "");
+  return /^%\d+$/.test(paneId) ? paneId : null;
 }
 
 function switchTmuxClientTable(tty, table) {
@@ -1306,15 +1319,24 @@ function switchTmuxClientTable(tty, table) {
 // and with vimium on the normal-mode keys have to work, so the table stays off.
 // That is what makes "bypass on + vimium on" give both vimium and Cmd.
 function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
-  if (!ownTmuxPane) return;
-  const paneId = ownTmuxPane;
+  const paneId = tmuxPaneId();
+  if (!paneId) return;
+  // A host serves several panes; the bindings are global and installed once, idempotently.
+  if (hostedRuntime) ensureTmuxPassthroughTableOnce();
   const passthroughArmed = !inputState().vimium || inputState().bypass;
   setPaneEditOption(paneId, inputState().bypass);
 
-  for (const [tty, originalTable] of [...passthroughClientTables]) {
+  for (const [tty, entry] of [...passthroughClientTables]) {
+    // Each pane restores only the clients it armed: in a host, another pane's reconcile must not
+    // switch a client that is on that other pane now.
+    if (entry.paneId !== paneId) continue;
+    const originalTable = entry.table;
     const state = states.get(tty);
     if (!passthroughArmed || !state || state.paneId !== paneId) {
-      if (state) switchTmuxClientTable(tty, originalTable);
+      // A client that moved to another pane armed by this engine is that pane's now.
+      const movedToArmedPane = state && [...passthroughClientTables.values()]
+        .some((other) => other !== entry && other.paneId === state.paneId);
+      if (state && !movedToArmedPane) switchTmuxClientTable(tty, originalTable);
       passthroughClientTables.delete(tty);
       if (debugLogging) {
         console.error(`tweb: passthrough client restore ${tty} ${state?.paneId || "detached"} -> ${originalTable}`);
@@ -1324,10 +1346,10 @@ function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
 
   if (!passthroughArmed) return;
   for (const [tty, state] of states) {
-    if (state.paneId !== paneId || passthroughClientTables.has(tty)) continue;
+    if (state.paneId !== paneId || passthroughClientTables.get(tty)?.paneId === paneId) continue;
     const originalTable = state.keyTable === passthroughTable ? "root" : state.keyTable;
     if (switchTmuxClientTable(tty, passthroughTable)) {
-      passthroughClientTables.set(tty, originalTable || "root");
+      passthroughClientTables.set(tty, { paneId, table: originalTable || "root" });
       if (debugLogging) {
         console.error(`tweb: passthrough client arm ${tty} ${state.paneId} from ${originalTable || "root"}`);
       }
@@ -1338,7 +1360,8 @@ function reconcileTmuxPassthrough(states = listTmuxClientStates()) {
 // `@tweb_edit` on this pane is what the tmux focus hooks read (see `ensureTmuxPassthroughTable`):
 // the hooks run inside tmux the moment focus moves, so they can switch a client's key table back
 // before the next key is read — the engine only learns of a focus change at its next tick.
-let paneEditOption = null;
+// Last value written per pane, so a reconcile that changes nothing runs no tmux command.
+const paneEditOptions = new Map();
 
 // The pane process (crates/tweb-pane) is the only side that sees a typed Ctrl-C: raw mode turns
 // it into a byte, and that process ends the pane on it before the engine hears anything. In edit
@@ -1364,11 +1387,11 @@ function setEditFlagFile(on) {
 }
 
 function setPaneEditOption(paneId, on) {
-  if (!paneId || paneEditOption === on) return;
+  if (!paneId || paneEditOptions.get(paneId) === on) return;
   try {
     execFileSync("tmux", ["set-option", "-p", "-t", paneId, "@tweb_edit", on ? "1" : "0"],
       { timeout: 1000, stdio: "ignore" });
-    paneEditOption = on;
+    paneEditOptions.set(paneId, on);
   } catch (error) {
     if (debugLogging) console.error(`tweb: @tweb_edit failed: ${error.message}`);
   }
@@ -1409,11 +1432,19 @@ function syncInputSource(record = currentPane()) {
   });
 }
 
-function restoreTmuxPassthroughClients() {
-  for (const [tty, originalTable] of [...passthroughClientTables]) {
-    switchTmuxClientTable(tty, originalTable);
+function restoreTmuxPassthroughClients(paneId = null) {
+  for (const [tty, entry] of [...passthroughClientTables]) {
+    if (paneId && entry.paneId !== paneId) continue;
+    switchTmuxClientTable(tty, entry.table);
     passthroughClientTables.delete(tty);
   }
+}
+
+let tmuxPassthroughTableReady = false;
+function ensureTmuxPassthroughTableOnce() {
+  if (tmuxPassthroughTableReady) return;
+  tmuxPassthroughTableReady = true;
+  ensureTmuxPassthroughTable();
 }
 
 function initializeTmuxVisibility() {
@@ -10991,6 +11022,11 @@ function closePaneOnce(record, reason) {
   // image id — 19 pane resolutions fell back to the first pane, and `%12` stopped painting
   // altogether. Destroying the windows is what stops all three.
   withPaneScope(record, () => {
+    // The clients this pane put on the passthrough table go back to theirs; the pane process
+    // clears the pane's `@tweb_edit` itself (crates/tweb-pane). Only this pane's: a host serves
+    // others that keep theirs.
+    restoreTmuxPassthroughClients(record.paneId);
+    paneEditOptions.delete(record.paneId);
     // Before the tabs go: with none left there is nothing to save.
     try {
       settleWindowSession();
@@ -11661,7 +11697,7 @@ app.on("before-quit", () => {
         }],
       ]);
     })],
-    ["tmux passthrough", restoreTmuxPassthroughClients],
+    ["tmux passthrough", () => restoreTmuxPassthroughClients()],
     ["edit flag", () => setEditFlagFile(false)],
     ["pane title", restorePaneTitle],
   ]);
