@@ -21,6 +21,7 @@
 
 const { EventEmitter } = require("node:events");
 const { KeySequencer, modifierMask } = require("../cdp/input.cjs");
+const { declareCapabilities } = require("../engine-capabilities.cjs");
 
 let nativeImage = null;
 function setNativeImage(impl) {
@@ -128,9 +129,15 @@ class WebKitWebContents extends EventEmitter {
     this.windowOpenHandler = null;
     this.pendingLoad = null;
     this.debugger = new WebKitDebugger();
-    // Native NSEvents: WebKit routes them into frames itself (see the header). Declared for the
-    // pointer router, which never reaches this engine today because the debugger cannot attach.
-    this.hitTestsFrames = true;
+    // How this engine departs from Electron; each name is explained in engine-capabilities.cjs.
+    this.capabilities = declareCapabilities({
+      // Native NSEvents: WebKit routes them into frames itself (see the header). Declared for the
+      // pointer router, which never reaches this engine today because the debugger cannot attach.
+      hitTestsFrames: true,
+      // The host reports no focused frame; `focusedFrame` below is the main frame.
+      focusedFrameIsMainOnly: true,
+      inspectorName: "Safari's Web Inspector",
+    });
     this.navigationHistory = new WebKitNavigationHistory(this);
     this.keys = new KeySequencer((params) => this.dispatchKey(params));
     this.keyFlushQueued = false;

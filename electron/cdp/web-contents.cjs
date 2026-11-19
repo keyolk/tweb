@@ -27,6 +27,7 @@
 const { EventEmitter } = require("node:events");
 const { dirtyRect } = require("./damage.cjs");
 const { KeySequencer, toCdpMouse } = require("./input.cjs");
+const { declareCapabilities } = require("../engine-capabilities.cjs");
 const { BINDING_NAME, WORLD_NAME, preloadScript } = require("./preload-bridge.cjs");
 
 // The box covering both, either of which may be null.
@@ -513,13 +514,26 @@ class CdpWebContents extends EventEmitter {
     this.defaultUserAgent = null;
     this.windowOpenHandler = null;
     this.debugger = new CdpDebugger(this);
-    // Chrome's input router hit-tests a root-session `Input.dispatchMouseEvent` across the whole
-    // frame tree, out-of-process frames and whatever the parent draws over them included, and moves
-    // focus with it — measured: a root click over the claude.ai artifact iframe opened a `<details>`
-    // inside it and left `hasFocus()` true there. So main.cjs sends every pointer event to the root
-    // and does none of the box routing Electron needs. That routing, applied here, sent each click on
-    // the artifact page's share menu into the iframe underneath it.
-    this.hitTestsFrames = true;
+    // How this engine departs from Electron; each name is explained in engine-capabilities.cjs.
+    this.capabilities = declareCapabilities({
+      // Chrome's input router hit-tests a root-session `Input.dispatchMouseEvent` across the whole
+      // frame tree, out-of-process frames and whatever the parent draws over them included, and
+      // moves focus with it — measured: a root click over the claude.ai artifact iframe opened a
+      // `<details>` inside it and left `hasFocus()` true there. Electron's box routing, applied
+      // here, sent each click on the artifact page's share menu into the iframe underneath it.
+      hitTestsFrames: true,
+      keepsSizeInStandby: true,
+      // CDP has no synchronous "focused frame"; `focusedFrame` below is the main frame.
+      focusedFrameIsMainOnly: true,
+      // `evaluateIn` throws the page's exception description.
+      reportsScriptExceptions: true,
+      // input.cjs sends each key as `Input.dispatchKeyEvent` with its commands.
+      keyEventsRunEditCommands: true,
+      grantsPermissionsAhead: true,
+      // cdp/sign-in-block.cjs
+      blocksGoogleSignIn: true,
+      inspectorName: "DevTools",
+    });
     this.navigationHistory = new CdpNavigationHistory(this);
     this.keys = new KeySequencer((params) => this.dispatchKey(params));
     this.keyFlushQueued = false;
