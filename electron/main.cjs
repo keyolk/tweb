@@ -8953,7 +8953,18 @@ function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
     recordTabNavigation(tab, url, false);
   });
   onContents("did-navigate-in-page", (_event, url, isMainFrame) => {
-    if (isMainFrame) { recordNavigation(url); updatePaneTitle(); recordTabNavigation(tab, url, true); }
+    if (!isMainFrame) return;
+    recordNavigation(url);
+    updatePaneTitle();
+    recordTabNavigation(tab, url, true);
+    // A same-document navigation (a hash or pushState change) puts the factor Electron reports
+    // back to 1 while the page goes on rendering at the pane's zoom. Every click tweb places
+    // reads that factor to turn a page point into a window point, so after a page changed its
+    // own hash each `f` pick landed 1/zoom too far right and down — at 80%, a quarter past the
+    // target, on nothing. Measured on the briefs index, whose tag buttons set `#t=`: the first
+    // pick toggled its tag; from then on getZoomFactor() read 1 and every pick missed.
+    const zoomFactor = effectiveZoomFactor(tab);
+    if (contents.getZoomFactor() !== zoomFactor) contents.setZoomFactor(zoomFactor);
   });
 
   let initialZoomApplied = false;
