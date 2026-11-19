@@ -34,6 +34,7 @@ shipping configuration, which does not set that switch.
 | `gate-harness.py` | Whether the DESIGN.md 6.5/7.7 release gates hold, per pane state — see [GATES.md](GATES.md) |
 | `idle-paint.cjs` | Whether `startPainting()`/`setFrameRate()` provoke a paint on a page that is not changing |
 | `scroll-pacing.cjs` | How many frames Chromium's own offscreen producer delivers under a continuous scroll |
+| `parity.py` | Whether the same mouse input gets the same verdict on Electron, Chrome and WebKit: a popover over a cross-site frame, a click and a drag in the frame, a drag on the page. Run it with each engine-specific input or frame fix (`--engine all`; `TWEB_ELECTRON_DIR=$PWD/electron` for this checkout's app code) |
 
 `gfxprobe.py` is the odd one out: it talks to a terminal, not to Electron, and **must run on a bare
 tty**. Graphics responses do not come back through tmux DCS passthrough — which is why the shipping

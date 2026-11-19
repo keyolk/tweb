@@ -1,0 +1,24 @@
+<!doctype html><meta charset=utf-8><title>frame-overlay</title>
+<!-- bench/parity.py: a cross-site iframe with a popover drawn over it, the shape of claude.ai's
+     artifact page with its share menu open (#278). The parent is served on localhost and the
+     frame on 127.0.0.1, so the frame is another site and runs out of process. -->
+<style>body{margin:0;font:16px system-ui}header{height:50px;display:flex;align-items:center;gap:12px;padding:0 12px;background:#eee}
+iframe{position:absolute;top:50px;left:0;width:100%;height:calc(100vh - 50px);border:0}
+#pop{position:fixed;top:60px;right:20px;width:300px;height:200px;background:#fff;border:2px solid #333;z-index:10;display:none;padding:12px}
+#pop button{display:block;margin:12px 0;padding:10px 20px;font-size:16px}</style>
+<header><button id=share>Share</button><span id=status>closed</span></header>
+<iframe id=frame></iframe>
+<div id=pop><button id=inside>inside popover</button></div>
+<script>
+frame.src = `http://127.0.0.1:${location.port}/frame-overlay-child.html`;
+window.__log = [];
+share.onclick = () => { pop.style.display = "block"; status.textContent = "open"; };
+inside.onclick = () => __log.push("inside");
+addEventListener("message", (e) => { if (typeof e.data === "string") __log.push("child:" + e.data); });
+// The same report for the parent's own document, so a drag can be judged with no frame involved.
+let moves = 0;
+const own = (e) => !e.target.closest("#pop");
+addEventListener("pointerdown", (e) => { if (own(e)) { moves = 0; __log.push(`pointerdown ${e.clientX | 0},${e.clientY | 0}`); } });
+addEventListener("pointermove", (e) => { if (e.buttons) moves++; });
+addEventListener("pointerup", (e) => { if (own(e)) __log.push(`pointerup moves=${moves} at ${e.clientX | 0},${e.clientY | 0}`); });
+</script>

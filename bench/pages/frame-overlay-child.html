@@ -1,0 +1,14 @@
+<!doctype html><meta charset=utf-8>
+<!-- The frame in frame-overlay.html: reports each pointer event to the parent. -->
+<style>body{margin:0;background:#cdf;height:100vh}</style>
+<p style="padding:20px">frame</p>
+<script>
+let moves = 0;
+const say = (text) => parent.postMessage(text, "*");
+addEventListener("pointerdown", (e) => { moves = 0; say(`pointerdown ${e.clientX | 0},${e.clientY | 0}`); });
+addEventListener("pointermove", (e) => { if (e.buttons) moves++; });
+addEventListener("pointerup", (e) => say(`pointerup moves=${moves} at ${e.clientX | 0},${e.clientY | 0}`));
+addEventListener("mousedown", () => say("mousedown"));
+addEventListener("click", () => say("click"));
+addEventListener("focus", () => say("focus"));
+</script>
