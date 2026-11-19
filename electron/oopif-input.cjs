@@ -95,6 +95,7 @@ function sessionsUnderPoint(sessions, point) {
  * @returns {{sessionId: string, x: number, y: number}|null} null means the root
  */
 function pointerTarget(sessions, point, captured) {
+  if (captured === ROOT_CAPTURE) return null;
   if (captured) {
     const rect = sessions.get(captured)?.rect;
     if (rect && Number.isFinite(rect.x) && Number.isFinite(rect.y)) {
@@ -113,9 +114,59 @@ function pointerTarget(sessions, point, captured) {
  * @param {{sessionId: string}|null} target where the event went
  */
 function nextCapture(captured, type, target) {
-  if (type === "mousePressed") return target ? target.sessionId : null;
+  if (type === "mousePressed") return target ? target.sessionId : ROOT_CAPTURE;
   if (type === "mouseReleased") return null;
   return captured;
+}
+
+// The capture a press held by the ROOT document. A root press has to keep its moves and its release
+// as much as a frame's does: a text selection dragged in the page over an embedded frame, or a
+// popover button pressed where a frame sits underneath, must not hand the rest of the gesture to the
+// frame because the pointer is now inside its box. A session id never has this spelling.
+const ROOT_CAPTURE = "root";
+
+/**
+ * The capture that applies to routing this event.
+ *
+ * A press starts a gesture, so it is hit-tested whatever an earlier one left behind: a release that
+ * never arrived would otherwise send every later click to wherever that press went, and the frame
+ * the user is now clicking would never be reached again.
+ */
+function routingCapture(captured, type) {
+  return type === "mousePressed" ? null : captured;
+}
+
+/**
+ * The out-of-process frame at the top of `sessionId`'s chain: the one whose `<iframe>` sits in a
+ * document the ROOT session can hit-test. Only that owner can be checked against what the root
+ * finds at a point; the frames below it are inside it.
+ */
+function outermostSession(sessions, sessionId) {
+  let at = sessionId;
+  for (let depth = 0; depth < 16; depth += 1) {
+    const parent = sessions.get(at)?.parent;
+    if (!parent || !sessions.has(parent)) return at;
+    at = parent;
+  }
+  return at;
+}
+
+// How long one "is the frame on top here" answer is reused for moves and wheel at the same point. A
+// wheel turned at a still pointer sends a stream of events at one point, and checking each would put
+// a round trip into the page in front of every notch. A press always asks again: that is where an
+// overlay that has just opened decides where the click goes.
+const HIT_VERDICT_TTL_MS = 300;
+
+/**
+ * A recent answer for this frame and point, or null when the root has to be asked again.
+ *
+ * @param {{sessionId: string, x: number, y: number, at: number, onTop: boolean}|null} cache
+ */
+function reusableVerdict(cache, sessionId, point, type, now) {
+  if (!cache || type === "mousePressed") return null;
+  if (cache.sessionId !== sessionId || cache.x !== point.x || cache.y !== point.y) return null;
+  if (now - cache.at > HIT_VERDICT_TTL_MS) return null;
+  return cache.onTop;
 }
 
 /** CDP's button names, and the bitmask `buttons` it wants alongside them. */
@@ -202,4 +253,7 @@ function mouseEventParams(event) {
   return params;
 }
 
-module.exports = { mouseEventParams, modifierMask, sessionsUnderPoint, pointerTarget, nextCapture, CDP_TYPES, BUTTONS };
+module.exports = {
+  mouseEventParams, modifierMask, sessionsUnderPoint, pointerTarget, nextCapture, routingCapture,
+  outermostSession, reusableVerdict, ROOT_CAPTURE, HIT_VERDICT_TTL_MS, CDP_TYPES, BUTTONS,
+};

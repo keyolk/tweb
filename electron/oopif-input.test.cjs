@@ -163,7 +163,9 @@ test("a capture on a frame that has gone falls back to hit-testing", () => {
 
 test("a press takes the capture for its target and a release gives it back", () => {
   assert.equal(nextCapture(null, "mousePressed", { sessionId: "inner" }), "inner");
-  assert.equal(nextCapture(null, "mousePressed", null), null);
+  // A press the root took holds its gesture too.
+  assert.equal(nextCapture(null, "mousePressed", null), ROOT_CAPTURE);
+  assert.equal(nextCapture(ROOT_CAPTURE, "mouseReleased", null), null);
   assert.equal(nextCapture("inner", "mouseMoved", { sessionId: "outer" }), "inner");
   assert.equal(nextCapture("inner", "mouseReleased", { sessionId: "inner" }), null);
 });
@@ -176,4 +178,49 @@ test("a held button carries the pressure a real mouse reports", () => {
   assert.equal(mouseEventParams({ type: "mouseDown", x: 1, y: 1, button: "left", held: true }).force, 0.5);
   assert.equal(mouseEventParams({ type: "mouseUp", x: 1, y: 1, button: "left" }).force, 0);
   assert.equal(mouseEventParams({ type: "mouseMove", x: 1, y: 1 }).force, 0);
+});
+
+// --- the root's own gestures, and the check that a frame is really what shows ---
+
+const {
+  ROOT_CAPTURE, routingCapture, outermostSession, reusableVerdict, HIT_VERDICT_TTL_MS,
+} = require("./oopif-input.cjs");
+
+test("a gesture the root pressed stays with the root over a frame", () => {
+  // A popover button over an iframe, or a text selection dragged across one: the moves and the
+  // release must not leave for the frame just because the pointer is inside its box.
+  assert.equal(pointerTarget(PANEL, { x: 200, y: 220 }, ROOT_CAPTURE), null);
+});
+
+test("a press ignores a capture a lost release left behind", () => {
+  // Otherwise every later click would go where that press went, and the frame under the pointer
+  // would never be reached again.
+  assert.equal(routingCapture("inner", "mousePressed"), null);
+  assert.equal(routingCapture(ROOT_CAPTURE, "mousePressed"), null);
+  assert.equal(routingCapture("inner", "mouseMoved"), "inner");
+  assert.equal(routingCapture(ROOT_CAPTURE, "mouseReleased"), ROOT_CAPTURE);
+});
+
+test("the outermost frame of a nested chain is the one the root can see", () => {
+  const nested = new Map([
+    ["outer", { parent: "" }],
+    ["inner", { parent: "outer" }],
+    ["deeper", { parent: "inner" }],
+  ]);
+  assert.equal(outermostSession(nested, "deeper"), "outer");
+  assert.equal(outermostSession(nested, "outer"), "outer");
+  // A parent that has gone ends the walk where it is.
+  assert.equal(outermostSession(new Map([["orphan", { parent: "gone" }]]), "orphan"), "orphan");
+});
+
+test("a frame-on-top answer is reused only for the same frame, point and a short while", () => {
+  const cache = { sessionId: "inner", x: 10, y: 20, at: 1000, onTop: false };
+  assert.equal(reusableVerdict(cache, "inner", { x: 10, y: 20 }, "mouseWheel", 1100), false);
+  assert.equal(reusableVerdict(cache, "inner", { x: 10, y: 20 }, "mouseMoved", 1000 + HIT_VERDICT_TTL_MS), false);
+  assert.equal(reusableVerdict(cache, "inner", { x: 10, y: 20 }, "mouseMoved", 1001 + HIT_VERDICT_TTL_MS), null);
+  assert.equal(reusableVerdict(cache, "inner", { x: 11, y: 20 }, "mouseMoved", 1100), null);
+  assert.equal(reusableVerdict(cache, "outer", { x: 10, y: 20 }, "mouseMoved", 1100), null);
+  // A press always asks again: an overlay that just opened decides where it goes.
+  assert.equal(reusableVerdict(cache, "inner", { x: 10, y: 20 }, "mousePressed", 1001), null);
+  assert.equal(reusableVerdict(null, "inner", { x: 10, y: 20 }, "mouseMoved", 1001), null);
 });

@@ -100,12 +100,40 @@ test("CDP gets CSS pixels, not the window DIPs the direct path takes", () => {
 // pointerdown, and Excalidraw abandoned the stroke in progress each time.
 test("an event over a frame goes to that frame alone, not to the root as well", () => {
   const router = body("function sendPointerEvent(tab, event)", "// The pre-CDP path");
-  assert.match(router, /const target = pointerTarget\(oopifSessions\(tab\), \{ x: params\.x, y: params\.y \}, captured\);/);
+  assert.match(router, /target = pointerTarget\(oopifSessions\(tab\), point, applied\);/);
   // The root only when no frame takes it.
   assert.match(router, /if \(!target\) \{[^]*?sendCommand\("Input\.dispatchMouseEvent", params\)[^]*?return;\s*\n\s*\}/);
   assert.match(router, /\{ \.\.\.params, x: target\.x, y: target\.y \},\s*\n\s*target\.sessionId,/);
   // And the drag stays with the frame that took the press.
   assert.match(router, /pointerCaptures\.set\(tab, nextCapture\(captured, params\.type, target\)\);/);
+});
+
+// Chrome hit-tests a root-session event across the frame tree itself, overlays included. Routing
+// by the frame's box sent every click on claude.ai's share popover — drawn over the artifact
+// iframe — into the artifact instead.
+test("an engine that hit-tests frames itself gets every pointer event on the root", () => {
+  const router = body("function sendPointerEvent(tab, event)", "// The pre-CDP path");
+  assert.match(router, /let target = null;\s*\n(\s*\/\/.*\n)*\s*if \(!contents\.hitTestsFrames\) \{/);
+  // The boxes are still read: a hint clicked inside a frame is placed with them.
+  assert.match(router, /if \(params\.type === "mouseMoved"\) scheduleOopifRectRefresh\(tab\);/);
+  const cdp = fs.readFileSync(path.join(__dirname, "cdp", "web-contents.cjs"), "utf8");
+  assert.match(cdp, /this\.hitTestsFrames = true;/);
+});
+
+// The same bug on Electron: a frame's box contains the popover drawn over it. The parent is asked
+// what is really at the point before a frame gets the event.
+test("a frame only takes an event when the parent shows that frame at the point", () => {
+  const router = body("function sendPointerEvent(tab, event)", "// The pre-CDP path");
+  assert.match(router, /if \(target && !applied && !\(await frameOnTop\(tab, target\.sessionId, point, params\.type\)\)\) \{\s*\n\s*target = null;/);
+  const check = body("async function frameOnTop(tab, sessionId, point, type)", "function dispatchPointer");
+  assert.match(check, /sendCommand\("DOM\.getNodeForLocation", \{/);
+  assert.match(check, /ignorePointerEventsNone: false/);
+  assert.match(check, /const onTop = hit\?\.backendNodeId === ownerNode;/);
+  // No owner read yet, or no answer in time: the box decides, as before.
+  assert.match(check, /if \(!ownerNode\) return true;/);
+  assert.match(check, /catch \(error\) \{[^]*?return true;/);
+  // In order: a check must not let a later event overtake an earlier one.
+  assert.match(router, /const chain = \(pointerChains\.get\(tab\) \|\| Promise\.resolve\(\)\)\.then\(step, step\);/);
 });
 
 test("sessions are flattened onto this connection, with the DOM domain they need", () => {
@@ -179,7 +207,7 @@ test("a frame's URL is re-read once it has one", () => {
   assert.match(refresh, /expression: "location\.href", returnByValue: true,/);
   // Re-read from the live entry rather than the one captured before the awaits: a refresh is
   // asynchronous and an attach may have landed in between.
-  assert.match(refresh, /sessions\.set\(sessionId, \{ \.\.\.sessions\.get\(sessionId\), url, rect \}\)/);
+  assert.match(refresh, /sessions\.set\(sessionId, \{ \.\.\.sessions\.get\(sessionId\), url, rect, ownerNode: ownerNodes\.get\(sessionId\) \}\)/);
 });
 
 // A frame nested inside ANOTHER out-of-process frame — which is the shape a Google Meet add-on
