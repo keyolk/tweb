@@ -113,11 +113,9 @@ test("an event over a frame goes to that frame alone, not to the root as well", 
 // iframe — into the artifact instead.
 test("an engine that hit-tests frames itself gets every pointer event on the root", () => {
   const router = body("function sendPointerEvent(tab, event)", "// The pre-CDP path");
-  assert.match(router, /let target = null;\s*\n(\s*\/\/.*\n)*\s*if \(!contents\.hitTestsFrames\) \{/);
+  assert.match(router, /let target = null;\s*\n(\s*\/\/.*\n)*\s*if \(!capability\(contents, "hitTestsFrames"\)\) \{/);
   // The boxes are still read: a hint clicked inside a frame is placed with them.
   assert.match(router, /if \(params\.type === "mouseMoved"\) scheduleOopifRectRefresh\(tab\);/);
-  const cdp = fs.readFileSync(path.join(__dirname, "cdp", "web-contents.cjs"), "utf8");
-  assert.match(cdp, /this\.hitTestsFrames = true;/);
 });
 
 // The same bug on Electron: a frame's box contains the popover drawn over it. The parent is asked

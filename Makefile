@@ -52,6 +52,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/cdp/web-contents.cjs
 	node --check electron/chrome-sites.cjs
 	node --check electron/engine-routing.cjs
+	node --check electron/engine-capabilities.cjs
 	node --check electron/agent-handoff.cjs
 	node --check electron/agent-presence.cjs
 	node --check electron/recorder.cjs

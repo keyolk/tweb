@@ -3035,8 +3035,8 @@ test("on the Chrome and WebKit engines the caret owner is the frame that last re
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const branch = main.slice(main.indexOf('case "caret": {'), main.indexOf('case "insert-mode":'));
   // Neither has a synchronous focused frame; only Electron's own webContents does. Asked of the
-  // tab, since one pane can hold tabs on several engines.
-  assert.match(branch, /if \(tabEngine\(tab\) !== "electron"\) \{/);
+  // tab's contents, since one pane can hold tabs on several engines.
+  assert.match(branch, /if \(capability\(contents, "focusedFrameIsMainOnly"\)\) \{/);
   // A null from a frame that no longer owns the cursor must not hide the owner's cursor.
   assert.match(branch, /if \(!value && key && caretOwners\.get\(tab\) && caretOwners\.get\(tab\) !== key\) break;/);
   assert.match(branch, /caretOwners\.set\(tab, value \? key : null\);/);
@@ -3271,7 +3271,8 @@ test("DevTools opens from the palette through the CLI", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const open = main.slice(main.indexOf("function openDevToolsPane(tab)"), main.indexOf("function openInChromePane("));
   assert.match(open, /execFile\(tweb, \["devtools", "--pane", paneId\]/);
-  assert.match(open, /if \(engine === "electron"\) \{\s+say\(/);
+  assert.match(open, /const inspector = capability\(tab\.webContents, "inspectorName"\);/);
+  assert.match(open, /if \(!inspector\) \{\s+say\(/);
   const gate = main.indexOf("if (!inputState().vimium || tab !== currentWindows().win || tab.isDestroyed()) return;");
   assert.ok(main.indexOf('if (action === "open-devtools")') < gate);
 });
