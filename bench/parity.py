@@ -42,13 +42,7 @@ SIZE = (160, 50, 1280, 800)
 
 # A failure that is already understood and tracked, reported as "known" instead of failing the run.
 # Each entry says what happens, so the day it changes is noticed too.
-KNOWN_GAPS = {
-    # Measured 2026-11-19, the installed app and this checkout alike: the press and the release
-    # arrive, at the right points, but no pointermove with a button held in between, in a frame or
-    # not. The host turns a held move into LeftMouseDragged (crates/tweb-engine/webkit/src/input.rs).
-    ("webkit", "frame-drag"): "WebKit: a drag reaches the page as press and release only, no held moves",
-    ("webkit", "page-drag"): "WebKit: a drag reaches the page as press and release only, no held moves",
-}
+KNOWN_GAPS = {}
 
 
 class Page:
