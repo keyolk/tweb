@@ -42,6 +42,7 @@ tweb select d Green                   # pick an <option>
 tweb check c / tweb uncheck c
 tweb hover h
 tweb text a / tweb html a             # read one element
+tweb text                             # the whole page's text, line breaks kept
 tweb navigate https://example.com     # exits non-zero when the page fails to load
 tweb back / tweb forward / tweb reload
 tweb wait --selector "#result"        # or --text "Saved", --url /done, --load, --ms 500
@@ -104,7 +105,7 @@ did not, check in this order:
 ## Tabs, devices, files
 
 ```sh
-tweb tabs                             # indexes start at 0
+tweb tabs                             # indexes start at 0 (`tweb tab list` is the same)
 tweb tab new http://localhost:3000
 tweb tab switch 0
 tweb tab close                        # the active tab; or give an index
@@ -189,6 +190,8 @@ Every command takes `--pane %N`. Both positions work: `tweb status --pane %N` an
 - If there are several, tweb uses the browser pane in **your** tmux window. Browser panes in other
   windows are never chosen.
 - If your window has more than one browser pane, pass `--pane`. Get the ids from `tweb panes`.
+- A `--pane` id that names no running pane fails and lists the panes that are running. Take the id
+  from that list; do not guess another one.
 
 Add `--json` to any command for machine-readable output.
 

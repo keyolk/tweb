@@ -97,10 +97,9 @@ pub fn resolve_socket(pane: Option<&str>) -> Result<PathBuf> {
             .map_or(pane.to_string(), |rest| format!("%{rest}"));
         let path = runtime_dir().join(format!("agent-{name}.sock"));
         if !path.exists() {
-            bail!(
-                "no browser pane at {name} (socket {} missing)",
-                path.display()
-            );
+            // A stale id (a pane closed since the caller looked it up) left the caller guessing
+            // the next id; naming the panes that are up turns the retry into a lookup.
+            bail!("{}", missing_pane_message(&name, &path, &live_panes()));
         }
         return Ok(path);
     }
@@ -138,6 +137,68 @@ pub fn resolve_socket(pane: Option<&str>) -> Result<PathBuf> {
             bail!("multiple browser panes are running ({listed}); pass --pane")
         }
     }
+}
+
+/// A browser pane that answers on its socket, as `tweb panes` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivePane {
+    pub pane: String,
+    pub title: String,
+    pub url: String,
+}
+
+/// How long a pane named in an error may take to say what it shows. The error is the answer the
+/// caller is waiting for; one wedged page must not hold it for the full read timeout.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Every pane with a live socket, those in the caller's tmux window first. A pane that does not
+/// answer `status` in time is still listed, without a title or URL.
+pub fn live_panes() -> Vec<LivePane> {
+    let nearby = panes_in_our_window();
+    let mut panes: Vec<LivePane> = discover_sockets()
+        .iter()
+        .filter_map(|socket| {
+            let pane = socket
+                .file_stem()?
+                .to_str()?
+                .trim_start_matches("agent-")
+                .to_string();
+            let status = call_with_timeout(socket, "status", json!({}), LISTING_TIMEOUT)
+                .unwrap_or(Value::Null);
+            let active = active_tab(&status);
+            Some(LivePane {
+                pane,
+                title: text_field(&active, "title"),
+                url: text_field(&active, "url"),
+            })
+        })
+        .collect();
+    panes.sort_by_key(|pane| !nearby.contains(&pane.pane));
+    panes
+}
+
+/// The error for `--pane` naming no running pane: what is up instead, in at most six lines.
+pub fn missing_pane_message(name: &str, socket: &Path, live: &[LivePane]) -> String {
+    let mut lines = vec![format!(
+        "no browser pane at {name} (socket {} missing)",
+        socket.display()
+    )];
+    if live.is_empty() {
+        lines.push("no browser pane is running; open one with `tweb split <url>`".to_string());
+        return lines.join("\n");
+    }
+    lines.push("running browser panes:".to_string());
+    // Three rows fit; past that, two and a count, so the message stays at six lines.
+    let shown = if live.len() > 3 { 2 } else { live.len() };
+    for pane in &live[..shown] {
+        let row = format!("  {} {} {}", pane.pane, pane.title, pane.url);
+        lines.push(row.trim_end().to_string());
+    }
+    if live.len() > shown {
+        lines.push(format!("  … and {} more", live.len() - shown));
+    }
+    lines.push("pass one of them with --pane; `tweb panes` lists them all".to_string());
+    lines.join("\n")
 }
 
 /// How long to wait for a pane to answer before giving up.
@@ -179,9 +240,19 @@ pub fn render_json(method: &str, result: &Value) -> String {
 
 /// One request/response round trip.
 pub fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
+    let timeout = read_timeout(method, &params);
+    call_with_timeout(socket, method, params, timeout)
+}
+
+/// [`call`] with the caller's own read timeout.
+fn call_with_timeout(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("cannot reach browser pane at {}", socket.display()))?;
-    let timeout = read_timeout(method, &params);
     stream.set_read_timeout(Some(timeout))?;
     let mut writer = stream.try_clone()?;
     let request = json!({ "id": 1, "method": method, "params": params });
@@ -722,6 +793,19 @@ pub fn render_for_agent(method: &str, result: &Value) -> String {
     crate::playbook::annotate_snapshot(rendered, &url, playbook.as_deref())
 }
 
+/// The active tab in a `status` reply, or null.
+fn active_tab(status: &Value) -> Value {
+    status
+        .pointer("/tabs/tabs")
+        .and_then(Value::as_array)
+        .and_then(|tabs| {
+            tabs.iter()
+                .find(|tab| tab.get("active").and_then(Value::as_bool) == Some(true))
+        })
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 /// A browser pane `tweb devtools` can inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectTarget {
@@ -753,15 +837,7 @@ pub fn inspect_targets() -> Vec<InspectTarget> {
 }
 
 fn inspect_target(pane: String, status: &Value, nearby: &[String]) -> Option<InspectTarget> {
-    let active = status
-        .pointer("/tabs/tabs")
-        .and_then(Value::as_array)
-        .and_then(|tabs| {
-            tabs.iter()
-                .find(|tab| tab.get("active").and_then(Value::as_bool) == Some(true))
-        })
-        .cloned()
-        .unwrap_or(Value::Null);
+    let active = active_tab(status);
     // The active tab's engine, not the pane's: a tab moved with the engine badge is on Chrome in a
     // pane started on Electron, and the engine answers `devtools` by the tab. `browser` is the
     // fallback for an engine that predates per-tab engines.
@@ -825,15 +901,7 @@ pub fn list_panes(as_json: bool) -> Result<()> {
         return Ok(());
     }
     for entry in &entries {
-        let active = entry
-            .pointer("/status/tabs/tabs")
-            .and_then(Value::as_array)
-            .and_then(|tabs| {
-                tabs.iter()
-                    .find(|tab| tab.get("active").and_then(Value::as_bool) == Some(true))
-            })
-            .cloned()
-            .unwrap_or(Value::Null);
+        let active = active_tab(entry.get("status").unwrap_or(&Value::Null));
         println!(
             "{}{} {} {}",
             text_field(entry, "pane"),
@@ -868,6 +936,59 @@ mod tests {
         // A development binary runs its workspace's electron/, which is never an installed tag.
         assert_eq!(super::stale_engine_notice("/w/tweb/electron", "aa"), None);
         assert_eq!(super::stale_engine_notice("", "aa"), None);
+    }
+
+    fn live(pane: &str, title: &str, url: &str) -> super::LivePane {
+        super::LivePane {
+            pane: pane.into(),
+            title: title.into(),
+            url: url.into(),
+        }
+    }
+
+    #[test]
+    fn a_missing_pane_names_the_panes_that_are_up() {
+        let socket = std::path::Path::new("/run/tweb/agent-%99999.sock");
+        let message = super::missing_pane_message(
+            "%99999",
+            socket,
+            &[
+                live("%476", "Report", "file:///r.html"),
+                live("%12", "", ""),
+            ],
+        );
+        assert_eq!(
+            message,
+            "no browser pane at %99999 (socket /run/tweb/agent-%99999.sock missing)\n\
+             running browser panes:\n  \
+             %476 Report file:///r.html\n  \
+             %12\n\
+             pass one of them with --pane; `tweb panes` lists them all"
+        );
+    }
+
+    #[test]
+    fn a_missing_pane_with_none_running_says_so() {
+        let socket = std::path::Path::new("/run/tweb/agent-%3.sock");
+        let message = super::missing_pane_message("%3", socket, &[]);
+        assert_eq!(message.lines().count(), 2, "{message}");
+        assert!(message.contains("no browser pane is running"), "{message}");
+        assert!(message.contains("tweb split"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_pane_message_stays_at_six_lines() {
+        let socket = std::path::Path::new("/run/tweb/agent-%3.sock");
+        let panes: Vec<_> = (0..9)
+            .map(|n| live(&format!("%{n}"), "t", "about:blank"))
+            .collect();
+        for count in 1..=panes.len() {
+            let message = super::missing_pane_message("%3", socket, &panes[..count]);
+            assert!(message.lines().count() <= 6, "{count} panes:\n{message}");
+            assert!(message.contains("tweb panes"), "{message}");
+        }
+        let message = super::missing_pane_message("%3", socket, &panes);
+        assert!(message.contains("… and 7 more"), "{message}");
     }
 
     #[test]
