@@ -137,6 +137,7 @@ pub fn run() {
     let app = NSApplication::sharedApplication(mtm);
     // No Dock icon, no menu bar, and never active: the terminal keeps focus.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    input::report_synthetic_buttons();
     with_state(|state| {
         state.shared = Some(Shared {
             handler: ScriptHandler::new(mtm),

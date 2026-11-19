@@ -10,12 +10,13 @@
 // `sendInputEvent`, since the view is as large as the pane's window in DIPs and page zoom is
 // WebKit's own (`pageZoom`), which maps view points to CSS pixels itself.
 
-use objc2::MainThreadMarker;
+use objc2::runtime::{AnyClass, Imp, Sel};
+use objc2::{sel, ClassType, MainThreadMarker};
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType, NSScreen};
 use objc2_core_graphics::{CGEvent, CGEventField, CGScrollEventUnit};
 use objc2_foundation::{NSPoint, NSString};
 use objc2_web_kit::WKWebView;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -115,6 +116,66 @@ pub fn cg_momentum_phase(momentum: u64) -> i64 {
     }
 }
 
+/// The buttons this host's own events hold down, as `+[NSEvent pressedMouseButtons]` spells them.
+///
+/// WebKit does not take `MouseEvent.buttons` from the event it is handed: it asks
+/// `+[NSEvent pressedMouseButtons]`, which reads the hardware. A drag this host builds holds no
+/// real button, so every move of it reached the page as `buttons: 0` — measured with
+/// bench/parity.py: press and release at the right points, and between them only moves that said
+/// nothing was held, so a slider or a canvas that checks `buttons` saw no drag at all.
+static SYNTHETIC_BUTTONS: AtomicUsize = AtomicUsize::new(0);
+static PRESSED_MOUSE_BUTTONS: OnceLock<Imp> = OnceLock::new();
+
+/// `pressedMouseButtons` as AppKit's mask has it: left 1, right 2, the middle button 4.
+fn button_mask(button: u32) -> usize {
+    match button {
+        1 => 1 << 2,
+        2 => 1 << 1,
+        _ => 1,
+    }
+}
+
+/// What `pressedMouseButtons` answers after an event of `kind` with `held` before it: the press
+/// adds its button, the release clears it, a move keeps what was held.
+fn buttons_after(kind: &str, button: u32, held: Option<u32>) -> usize {
+    match kind {
+        "down" => button_mask(button),
+        "up" => 0,
+        _ => held.map_or(0, button_mask),
+    }
+}
+
+unsafe extern "C-unwind" fn pressed_mouse_buttons(class: &AnyClass, cmd: Sel) -> usize {
+    let real = PRESSED_MOUSE_BUTTONS.get().map_or(0, |imp| {
+        // SAFETY: the IMP this replaced, with the signature it was registered under.
+        let original: unsafe extern "C-unwind" fn(&AnyClass, Sel) -> usize =
+            unsafe { std::mem::transmute(*imp) };
+        unsafe { original(class, cmd) }
+    });
+    real | SYNTHETIC_BUTTONS.load(Ordering::Relaxed)
+}
+
+/// Makes `+[NSEvent pressedMouseButtons]` include the buttons this host's events hold, as well as
+/// the real ones. Once, at startup, before any view takes input. Only this process is affected,
+/// and the only events it handles are the ones it builds.
+pub fn report_synthetic_buttons() {
+    if PRESSED_MOUSE_BUTTONS.get().is_some() {
+        return;
+    }
+    let Some(method) = NSEvent::class().class_method(sel!(pressedMouseButtons)) else {
+        eprintln!("tweb-webkit: +[NSEvent pressedMouseButtons] not found; drags report no buttons");
+        return;
+    };
+    // SAFETY: the replacement has the method's signature (class, selector) -> NSUInteger, and
+    // returns what the original does with more bits set, which no caller can be harmed by.
+    let replacement: Imp = unsafe {
+        std::mem::transmute::<unsafe extern "C-unwind" fn(&AnyClass, Sel) -> usize, Imp>(
+            pressed_mouse_buttons,
+        )
+    };
+    let _ = PRESSED_MOUSE_BUTTONS.set(unsafe { method.set_implementation(replacement) });
+}
+
 pub fn mouse(webview: &WKWebView, input: Mouse) {
     if input.kind == "wheel" {
         wheel(webview, &input);
@@ -123,6 +184,11 @@ pub fn mouse(webview: &WKWebView, input: Mouse) {
     let Some(window) = webview.window() else {
         return;
     };
+    // Before the event is built: WebKit reads the buttons while it handles it.
+    SYNTHETIC_BUTTONS.store(
+        buttons_after(input.kind, input.button, input.held),
+        Ordering::Relaxed,
+    );
     // WKWebView is flipped, so a top-down point converts as it is.
     let location = webview.convertPoint_toView(NSPoint::new(input.x, input.y), None);
     let (event_type, clicks, pressure) = match input.kind {
@@ -487,6 +553,18 @@ pub fn virtual_key(code: &str, key: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A drag must read as held to the page from the press to the release, and as nothing after.
+    #[test]
+    fn synthetic_buttons_follow_the_press() {
+        assert_eq!(buttons_after("down", 0, None), 1);
+        assert_eq!(buttons_after("move", 0, Some(0)), 1);
+        assert_eq!(buttons_after("up", 0, Some(0)), 0);
+        assert_eq!(buttons_after("move", 0, None), 0);
+        // AppKit's order, not the host's: right is bit 1, the middle button bit 2.
+        assert_eq!(buttons_after("down", 2, None), 2);
+        assert_eq!(buttons_after("move", 1, Some(1)), 4);
+    }
 
     fn key_input<'a>(key: &'a str, text: &'a str, modifiers: u32) -> Key<'a> {
         Key {
