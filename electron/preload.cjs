@@ -1903,6 +1903,74 @@ installPrintShim();
     return composedSelfOrAncestor(hit, element) || element.contains(hit);
   }
 
+  // Click targets a surface draws itself and so has no element for: the nodes of a graph on a
+  // `<canvas>`, the cells of a map. No selector, cursor or hit test can see them, so the page is
+  // asked. The contract, in both directions through the DOM because this script runs in an
+  // isolated world and shares nothing else with the page:
+  //
+  //   1. A `tweb:targets` event (bubbles) is dispatched on every `<canvas>` and every element
+  //      carrying `data-tweb-targets`, at the start of a hint round.
+  //   2. The page answers, inside its handler (dispatch is synchronous), by writing
+  //      `data-tweb-targets` on that element: a JSON array of
+  //      `{ "x", "y", "w", "h", "label"?, "action"?: "dblclick" }`, the box of each target in CSS
+  //      pixels relative to the element's own box. A page whose targets never move may write the
+  //      attribute once and not listen at all.
+  //   3. Each box that is on screen becomes a hint, picked by a real click at its centre, so the
+  //      page's own hit test decides what was clicked, exactly as for a mouse. The element's own
+  //      single hint is dropped when it declared any.
+  //
+  // An element that never answers keeps its one hint, as before this existed. Read in full every
+  // round: the boxes move with the page (a force layout, a pan), and the page is asked again.
+  const DECLARED_TARGETS_MAX = 300;
+  const DECLARED_TARGETS_SELECTOR = "canvas,[data-tweb-targets]";
+
+  function declaredTargets(element) {
+    try {
+      element.dispatchEvent(new (ownerView(element).CustomEvent)("tweb:targets", { bubbles: true }));
+    } catch (_) {}
+    const raw = element.getAttribute("data-tweb-targets");
+    if (!raw) return null;
+    let list;
+    try { list = JSON.parse(raw); } catch (_) { return null; }
+    if (!Array.isArray(list)) return null;
+    const box = visibleRect(element);
+    if (!box) return [];
+    const targets = [];
+    for (const entry of list.slice(0, DECLARED_TARGETS_MAX)) {
+      const [x, y, w, h] = [entry?.x, entry?.y, entry?.w, entry?.h].map(Number);
+      if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) continue;
+      const left = box.left + x;
+      const top = box.top + y;
+      const point = { x: left + w / 2, y: top + h / 2 };
+      // Only what can be clicked where it is: inside the element's box and inside the viewport.
+      if (point.x < box.left || point.x > box.right || point.y < box.top || point.y > box.bottom) continue;
+      if (point.x < 0 || point.y < 0 || point.x >= innerWidth || point.y >= innerHeight) continue;
+      targets.push({
+        element,
+        rect: { left, top, right: left + w, bottom: top + h, width: w, height: h, x: left, y: top },
+        nativePoint: point,
+        declared: true,
+        label: typeof entry.label === "string" ? entry.label.slice(0, 200) : "",
+        doubleClick: entry.action === "dblclick",
+      });
+    }
+    return targets;
+  }
+
+  // Every declared target in the roots, keyed by the element that declared them; an element that
+  // declared none is left out, so it keeps its ordinary hint.
+  function declaredTargetsByElement(roots) {
+    const byElement = new Map();
+    for (const root of roots) {
+      for (const element of root.querySelectorAll(DECLARED_TARGETS_SELECTOR)) {
+        if (ownId(element).startsWith("__tweb_")) continue;
+        const targets = declaredTargets(element);
+        if (targets?.length) byElement.set(element, targets);
+      }
+    }
+    return byElement;
+  }
+
   function interactiveTargets() {
     forgetDeclaredCursors();
     const roots = collectRoots();
@@ -1919,7 +1987,9 @@ installPrintShim();
     }), opaqueFrames).filter((item) => !item.element.matches("video,audio")
       && (!item.element.matches("iframe,frame") || opaqueFrames.has(item.element))
       && reachableAt(item));
-    return [...targets, ...media.flatMap(mediaControlTargets)]
+    const declared = declaredTargetsByElement(roots);
+    const drawn = [...declared.values()].flat().filter(reachableAt);
+    return [...targets.filter((item) => !declared.has(item.element)), ...drawn, ...media.flatMap(mediaControlTargets)]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
@@ -2760,7 +2830,7 @@ installPrintShim();
   }
 
   function hintClickPoint(item) {
-    if (item.mediaControl && item.nativePoint) return topViewportPoint(item.nativePoint);
+    if ((item.mediaControl || item.declared) && item.nativePoint) return topViewportPoint(item.nativePoint);
     const rect = visibleRect(item.element) || item.rect;
     return topViewportPoint(reachablePoint(item.element, rect));
   }
@@ -3361,7 +3431,7 @@ installPrintShim();
         holdMedia(item);
         return;
       }
-      else send("native-click", hintClickPoint(item));
+      else send("native-click", item.doubleClick ? { ...hintClickPoint(item), count: 2 } : hintClickPoint(item));
       send("hint-done");
       normalMode();
     };
@@ -3404,6 +3474,8 @@ installPrintShim();
 
   function agentRole(element, item) {
     if (item?.mediaControl) return `media-${item.mediaControl}`;
+    // A target a surface declared (`declaredTargets`) is something to press, not the surface.
+    if (item?.declared) return "button";
     const explicit = element.getAttribute?.("role");
     if (explicit) return explicit;
     switch (element.localName) {
@@ -3421,6 +3493,7 @@ installPrintShim();
 
   function agentName(element, item) {
     if (item?.mediaControl) return mediaControlPresentation[item.mediaControl]?.label || item.mediaControl;
+    if (item?.declared && item.label) return item.label;
     const labelledBy = (element.getAttribute?.("aria-labelledby") || "")
       .split(/\s+/).filter(Boolean)
       .map((id) => document.getElementById(id)?.innerText || "")

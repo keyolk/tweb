@@ -1,0 +1,34 @@
+<!doctype html><meta charset=utf-8><title>canvas-targets</title>
+<!-- bench/parity.py: three nodes drawn on one <canvas>, the shape of the briefs index's Graph tab.
+     The page answers tweb's `tweb:targets` event with each node's box in `data-tweb-targets`, and
+     finds the node a click hit by its own hit test, as a canvas app does. Node c asks for a double
+     click, the graph's "open". -->
+<style>body{margin:0;font:16px system-ui}header{height:50px;background:#eee}canvas{display:block;margin:30px 40px;border:1px solid #888}</style>
+<header></header>
+<canvas id=cv width=600 height=360></canvas>
+<script>
+window.__log = [];
+const nodes = [
+  { name: "a", x: 80, y: 80, r: 18 },
+  { name: "b", x: 320, y: 200, r: 18 },
+  { name: "c", x: 520, y: 300, r: 18, action: "dblclick" },
+];
+const ctx = cv.getContext("2d");
+for (const n of nodes) {
+  ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, 7); ctx.fillStyle = "#1971c2"; ctx.fill();
+  ctx.fillStyle = "#000"; ctx.fillText(n.name, n.x - 3, n.y - n.r - 4);
+}
+const pick = (e) => {
+  const r = cv.getBoundingClientRect();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  return nodes.find((n) => Math.hypot(n.x - x, n.y - y) <= n.r);
+};
+cv.addEventListener("tweb:targets", () => {
+  window.__asked = (window.__asked || 0) + 1;
+  cv.setAttribute("data-tweb-targets", JSON.stringify(nodes.map((n) => ({
+    x: n.x - n.r, y: n.y - n.r, w: 2 * n.r, h: 2 * n.r, label: "node " + n.name, ...(n.action ? { action: n.action } : {}),
+  }))));
+});
+cv.addEventListener("click", (e) => { const n = pick(e); __log.push("click:" + (n ? n.name : "none")); });
+cv.addEventListener("dblclick", (e) => { const n = pick(e); __log.push("dblclick:" + (n ? n.name : "none")); });
+</script>

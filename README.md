@@ -921,6 +921,28 @@ cursors and delegated click areas, and interactive elements in open shadow DOM. 
 a brief outline/ripple feedback. Cross-origin iframes and ad frames are not made hint targets as outer
 frames themselves, to avoid focus getting stuck.
 
+A page that draws its own click targets — graph nodes on a `<canvas>`, cells of a map — can give each
+one a hint. At the start of a hint round tweb dispatches a `tweb:targets` event (it bubbles) on every
+`<canvas>` and every element with a `data-tweb-targets` attribute. The page answers inside its handler
+by writing `data-tweb-targets` on that element: a JSON array of boxes in CSS pixels relative to the
+element's own box. A page whose targets never move can set the attribute once without listening.
+
+```js
+canvas.addEventListener("tweb:targets", () => {
+  canvas.setAttribute("data-tweb-targets", JSON.stringify(nodes.map((n) => ({
+    x: n.x - n.r, y: n.y - n.r, w: 2 * n.r, h: 2 * n.r,
+    label: n.title,          // optional: the name `tweb snapshot` reports
+    // action: "dblclick",   // optional: picking it double-clicks
+  }))));
+});
+```
+
+Each box on screen gets a badge, and picking it sends a real click at its centre, so the page's own
+hit test decides what was clicked. An element that declares any box loses its own single badge; one
+that never answers keeps it. The answer goes through a DOM attribute, not the event's `detail`,
+because tweb's script runs in an isolated world and the DOM is all it shares with the page. Up to 300
+boxes are read per element.
+
 A video's control bar is hidden behind hover, so before collecting hints the pointer is moved over the
 largest video to bring up **the controls the site draws itself**, and the hints attach to those real
 buttons. On a site with its own controls, like YouTube, the hints point at the same positions and

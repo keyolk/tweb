@@ -22,6 +22,9 @@ is no substitute: it targets an element, so it never asks which frame is under a
                 and the button took each click. Chrome read mouse coordinates at its own scale or
                 the zoomed tab's from one event to the next, so a release could land at 1/1.44 of
                 the press and no click happened (`zoomLayout` in electron/cdp/engine.cjs)
+  canvas-hints  `f` on canvas-targets.html, three nodes drawn on one <canvas> that answers tweb's
+                `tweb:targets` event. ok = the page was asked, a badge sits on each node, typing
+                node b's label clicks node b and node c's double-clicks node c
 
 A pane runs in a private tmux server with a pixel-sized client attached (feel.py's `Pane`), so it
 is visible and its input takes the shipping path. A new scenario is a function in SCENARIOS that
@@ -196,8 +199,54 @@ def zoomed_click(steps):
     return scenario
 
 
+def badges(page):
+    """The labels of the `f` round now on screen, each with its top-left: the picker is an open shadow root."""
+    return page.eval("(() => { const h = document.getElementById('__tweb_picker__');"
+                     " if (!h || !h.shadowRoot) return [];"
+                     " return [...h.shadowRoot.children].map((b) => [b.textContent,"
+                     " parseFloat(b.style.left), parseFloat(b.style.top)]); })()")
+
+
+def type_keys(page, text):
+    subprocess.run(["tmux", "-L", page.pane.tmux, "send-keys", "-t", "feel", "-l", text], check=True)
+
+
+def canvas_hints(page):
+    """Each node a badge, and a pick reaching the node: page-declared targets on a canvas."""
+    page.eval("(() => { window.__asked = 0; return 1; })()")
+    canvas_box = page.rect("#cv")
+    nodes = page.eval("nodes.map((n) => [n.name, n.x - n.r, n.y - n.r])")
+    detail = {}
+    for name, want in (("b", "click:b"), ("c", "dblclick:c")):
+        page.eval("(() => { __log.length = 0; return 1; })()")
+        type_keys(page, "f")
+        deadline = time.time() + 3
+        shown = []
+        while time.time() < deadline and not shown:
+            time.sleep(0.2)
+            shown = badges(page)
+        # The badge drawn at a node's box corner is that node's.
+        corners = {n: (canvas_box[0] + x, canvas_box[1] + y) for n, x, y in nodes}
+        on_node = {n: next((label for label, left, top in shown
+                            if abs(left - cx) <= 2 and abs(top - cy) <= 2), None)
+                   for n, (cx, cy) in corners.items()}
+        detail[name] = {"badges": len(shown), "on_node": on_node}
+        if not on_node.get(name):
+            type_keys(page, "\x1b")
+            return False, detail
+        type_keys(page, on_node[name])
+        log = page.settle(lambda log: want in log)
+        detail[name]["log"] = log
+        if want not in log or not all(on_node.values()):
+            return False, detail
+    detail["asked"] = page.eval("window.__asked")
+    return detail["asked"] >= 2, detail
+
+
 SCENARIOS = {"popover": popover, "frame-click": frame_click, "frame-drag": frame_drag, "page-drag": page_drag,
-             "zoom-out-click": zoomed_click(2), "zoom-in-click": zoomed_click(-2)}
+             "zoom-out-click": zoomed_click(2), "zoom-in-click": zoomed_click(-2), "canvas-hints": canvas_hints}
+# The fixture each scenario runs on, when not the frame overlay.
+FIXTURES = {"canvas-hints": "canvas-targets.html"}
 
 
 def prepare(page):
@@ -232,10 +281,20 @@ def main():
                 failed = True
                 continue
             page = Page(pane)
+            at = "frame-overlay.html"
             for name in args.scenario:
+                fixture = FIXTURES.get(name, "frame-overlay.html")
+                if fixture != at:
+                    code, _, err = pane.agent("navigate", base.replace("127.0.0.1", "localhost") + "/" + fixture,
+                                              timeout=20)
+                    if code != 0:
+                        raise RuntimeError(f"navigate to {fixture} failed: {err}")
+                    time.sleep(1.0)
+                    at = fixture
                 passes, last_failure = 0, None
                 for _ in range(args.runs):
-                    prepare(page)
+                    if fixture == "frame-overlay.html":
+                        prepare(page)
                     ok, log = SCENARIOS[name](page)
                     passes += ok
                     if not ok:
