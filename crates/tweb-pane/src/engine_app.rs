@@ -554,6 +554,117 @@ fn with_agent_key(text: &str) -> Option<String> {
     ))
 }
 
+/// Electron's fuse wire: a sentinel, a version byte, a length byte, then one byte per fuse —
+/// `'1'` enabled, `'0'` disabled, `'r'` removed. The order is Electron's `FuseV1Options`.
+const FUSE_SENTINEL: &[u8] = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
+const FUSE_GRANT_FILE_PROTOCOL_EXTRA_PRIVILEGES: usize = 7;
+
+/// What [`deny_file_protocol_privileges`] found or did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FileFuse {
+    /// The fuse was enabled and is now disabled.
+    Disabled,
+    /// It was already off (or removed from this build).
+    AlreadyOff,
+    /// No fuse wire in the binary: a build that predates fuses.
+    NoWire,
+}
+
+/// `bytes` with Electron's `GrantFileProtocolExtraPrivileges` fuse turned off, or what stopped it.
+///
+/// Pure, for the test: the caller does the reading, the signing and the swap.
+fn without_file_privileges(bytes: &mut [u8]) -> FileFuse {
+    let Some(at) = bytes
+        .windows(FUSE_SENTINEL.len())
+        .position(|window| window == FUSE_SENTINEL)
+    else {
+        return FileFuse::NoWire;
+    };
+    let wire = at + FUSE_SENTINEL.len();
+    let (Some(&version), Some(&length)) = (bytes.get(wire), bytes.get(wire + 1)) else {
+        return FileFuse::NoWire;
+    };
+    if version != 1 || usize::from(length) <= FUSE_GRANT_FILE_PROTOCOL_EXTRA_PRIVILEGES {
+        return FileFuse::NoWire;
+    }
+    let fuse = wire + 2 + FUSE_GRANT_FILE_PROTOCOL_EXTRA_PRIVILEGES;
+    match bytes.get(fuse) {
+        Some(b'1') => {
+            bytes[fuse] = b'0';
+            FileFuse::Disabled
+        }
+        Some(_) => FileFuse::AlreadyOff,
+        None => FileFuse::NoWire,
+    }
+}
+
+/// The file that carries the fuse wire: the framework on macOS, the executable elsewhere.
+fn fuse_carrier(executable: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        if let Some(contents) = executable.parent().and_then(Path::parent) {
+            let framework = contents
+                .join("Frameworks/Electron Framework.framework/Versions/A/Electron Framework");
+            if framework.is_file() {
+                return framework;
+            }
+        }
+    }
+    executable.to_path_buf()
+}
+
+/// Turns off Electron's `GrantFileProtocolExtraPrivileges` fuse in the runtime about to run.
+///
+/// WHY. With it on — Electron's default — a `file://` page reads any other file on the disk:
+/// `fetch` and XHR of a sibling file and of `file:///etc/hosts` answered 200 with the content, and
+/// the DOM of a same-folder `<iframe>` was readable. Measured in a tweb pane on Electron 43. A brief
+/// is a `file://` page, and briefs include Artifacts other people wrote, so one of them could read
+/// `~/.aws` or `~/.ssh` and send it out. Chrome treats every file URL as its own opaque origin and
+/// refuses all three; with the fuse off Electron does exactly the same, while a relative `<img>` or
+/// stylesheet still loads. There is no webPreferences switch for this: the fuse is a byte in the
+/// binary, read before any app code runs.
+///
+/// Never written in place: an engine already running maps this file, and overwriting the pages
+/// of a running executable gets it killed. The patched copy is signed (macOS kills an arm64 binary
+/// whose pages no longer match its signature) and renamed over the original, which leaves the
+/// running engine on the old inode. A marker records the carrier's size and mtime so later
+/// starts skip the 200MB read.
+pub fn deny_file_protocol_privileges(executable: &Path) -> Result<FileFuse> {
+    let carrier = fuse_carrier(executable);
+    let metadata = std::fs::metadata(&carrier)
+        .with_context(|| format!("cannot read {}", carrier.display()))?;
+    let stamp = format!("{} {:?}\n", metadata.len(), metadata.modified().ok());
+    let marker = carrier.with_extension("tweb-file-fuse");
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(stamp.as_str()) {
+        return Ok(FileFuse::AlreadyOff);
+    }
+    let mut bytes =
+        std::fs::read(&carrier).with_context(|| format!("cannot read {}", carrier.display()))?;
+    let outcome = without_file_privileges(&mut bytes);
+    if outcome == FileFuse::Disabled {
+        let staging = carrier.with_extension(format!("tweb-fuse-{}", std::process::id()));
+        std::fs::write(&staging, &bytes)
+            .with_context(|| format!("cannot write {}", staging.display()))?;
+        std::fs::set_permissions(&staging, metadata.permissions()).ok();
+        #[cfg(target_os = "macos")]
+        if let Err(err) = run(
+            "codesign",
+            &["--force", "--sign", "-", &staging.to_string_lossy()],
+        ) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(err.context("cannot sign the patched Electron"));
+        }
+        std::fs::rename(&staging, &carrier).with_context(|| {
+            let _ = std::fs::remove_file(&staging);
+            format!("cannot replace {}", carrier.display())
+        })?;
+    }
+    if let Ok(after) = std::fs::metadata(&carrier) {
+        let stamp = format!("{} {:?}\n", after.len(), after.modified().ok());
+        let _ = std::fs::write(&marker, stamp);
+    }
+    Ok(outcome)
+}
+
 /// The directory a one-shot install puts the runtime in.
 pub fn runtime_dir() -> PathBuf {
     let version = electron_version().unwrap_or_else(|_| "unknown".to_string());
@@ -690,7 +801,11 @@ mod tests {
     // and fails at startup. held-keys.cjs shipped this way in the first build of #234.
     #[test]
     fn every_local_module_main_requires_is_embedded() {
-        let main = FILES.iter().find(|(name, _)| *name == "main.cjs").map(|(_, body)| *body).unwrap();
+        let main = FILES
+            .iter()
+            .find(|(name, _)| *name == "main.cjs")
+            .map(|(_, body)| *body)
+            .unwrap();
         let embedded: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
         let missing: Vec<String> = main
             .split("require(\"./")
@@ -699,7 +814,10 @@ mod tests {
             .filter(|path| !embedded.contains(path))
             .map(str::to_string)
             .collect();
-        assert!(missing.is_empty(), "required by main.cjs but not embedded: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "required by main.cjs but not embedded: {missing:?}"
+        );
     }
 
     #[test]
@@ -791,6 +909,40 @@ mod tests {
         assert!(marked.contains("<string>Electron</string>"));
         assert_eq!(super::with_agent_key(&marked), None);
         assert_eq!(super::with_agent_key("not a plist"), None);
+    }
+
+    /// The fuse wire as Electron 43 ships it: `GrantFileProtocolExtraPrivileges` is byte 7, on.
+    #[test]
+    fn the_file_protocol_fuse_is_turned_off_and_only_that_byte() {
+        let mut binary = b"....dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX\x01\x09101100011....".to_vec();
+        let before = binary.clone();
+        assert_eq!(
+            super::without_file_privileges(&mut binary),
+            super::FileFuse::Disabled
+        );
+        let changed: Vec<usize> = (0..binary.len())
+            .filter(|&i| binary[i] != before[i])
+            .collect();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(&binary[changed[0]..=changed[0]], b"0");
+        assert!(binary.windows(9).any(|w| w == b"101100001"));
+        // Idempotent.
+        assert_eq!(
+            super::without_file_privileges(&mut binary),
+            super::FileFuse::AlreadyOff
+        );
+        // A build without the wire, or one too short to have this fuse, is left alone.
+        assert_eq!(
+            super::without_file_privileges(&mut b"no fuses here".to_vec()),
+            super::FileFuse::NoWire
+        );
+        let mut short = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX\x01\x05101100".to_vec();
+        let kept = short.clone();
+        assert_eq!(
+            super::without_file_privileges(&mut short),
+            super::FileFuse::NoWire
+        );
+        assert_eq!(short, kept);
     }
 
     #[test]
