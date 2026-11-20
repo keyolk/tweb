@@ -5947,6 +5947,11 @@ function agentDiagnostics() {
       defaultZoomFactor: defaultZoomFactor(),
       // A popup's real size, which no resize changes; null for an ordinary tab.
       popupSize: tab ? popupWindowSizes.get(tab) || null : null,
+      // Chrome only (null elsewhere): the scale captures are taken at to reach the pane's size, and
+      // how many times a mouse skew was measured and corrected. Anything above 0 means the emulated
+      // and browser scales came apart; see `zoomLayout` in cdp/engine.cjs.
+      captureScale: tab?.webContents.captureScale ?? null,
+      inputSkews: typeof tab?.webContents.measureInputScale === "function" ? tab.webContents.inputSkews || 0 : null,
       visible: tab ? tab.isVisible() : null,
     },
     // What config.toml resolved to and where each value came from (env / file / default).

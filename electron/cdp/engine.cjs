@@ -27,6 +27,44 @@ function isForeignTab(info) {
     && /^https?:\/\//i.test(String(info.url || ""));
 }
 
+// How a Chrome tab shows a pane at a zoom: the CSS viewport, the emulated device scale, and the
+// scale its captures are taken at.
+//
+// THE INVARIANT: the emulated scale is always the browser's own (`--force-device-scale-factor`,
+// see `chromeArgs`), whatever the zoom. Chrome keeps two ideas of the device scale — the
+// window's, which that flag sets, and the tab's emulated one — and when they differ it reads
+// `Input.dispatchMouseEvent` coordinates at one or the other from one event to the next. Measured:
+// zoomed out twice (0.556, emulated 1.11 under a forced 1.6) a press landed on a button and its
+// release at 1/1.44 of the point, so no click happened — 2 of 6 clicks on a large button; zoomed in
+// twice half the events landed at 1/1.44. Mouse input on that tab looked dead while `f` hints,
+// which aim at an element, still worked. #231 made the two agree at the default zoom only; this
+// makes them agree at every zoom.
+//
+// Zoom is therefore only the CSS viewport — the content size divided by the zoom, as Electron's
+// page zoom lays out — and the capture's `clip.scale`, which brings the picture back to the
+// pane's pixel size. Chrome re-renders at that scale rather than resampling a bitmap (text was
+// measured identically sharp both ways at zoom 1.15). What the page reports as
+// `devicePixelRatio` stays at the browser scale.
+//
+// The viewport is rounded UP, so the capture is never smaller than the frame and is cropped back
+// to it: at zoom 0.8 a 450-DIP pane is 562.5 CSS px, which rounds to a 901px frame against the
+// 900 the pane expects — measured, and dropped as the wrong size.
+function zoomLayout({ contentSize, scaleFactor, zoom, browserScale }) {
+  const deviceScaleFactor = browserScale > 0 ? browserScale : scaleFactor * zoom;
+  return {
+    viewport: {
+      width: Math.max(1, Math.ceil(contentSize.width / zoom)),
+      height: Math.max(1, Math.ceil(contentSize.height / zoom)),
+    },
+    deviceScaleFactor,
+    captureScale: (scaleFactor * zoom) / deviceScaleFactor,
+    frameSize: {
+      width: Math.max(1, Math.round(contentSize.width * scaleFactor)),
+      height: Math.max(1, Math.round(contentSize.height * scaleFactor)),
+    },
+  };
+}
+
 class CdpBrowserWindow extends EventEmitter {
   constructor(engine, options = {}) {
     super();
@@ -57,26 +95,20 @@ class CdpBrowserWindow extends EventEmitter {
     this.emit("closed");
   }
 
-  // The CSS viewport is the content size divided by the zoom; the device scale is the render
-  // scale multiplied by it. The product — the screenshot size — never moves, which is what
-  // Electron's page zoom does to an offscreen window's paint.
+  // See `zoomLayout`. The frame Electron would paint is the content size at the render scale,
+  // whatever the zoom, and the capture is scaled to it.
   relayout() {
     const contents = this.webContents;
     if (!contents || contents.isDestroyed() || contents.deviceEmulation) return;
-    const zoom = contents.getZoomFactor() || 1;
-    // The frame Electron would paint is the content size at the render scale, whatever the zoom.
-    // The CSS viewport is rounded UP, so the screenshot is never smaller than that frame, and the
-    // capture is cropped back to it: at zoom 0.8 a 450-DIP pane is 562.5 CSS px, which rounds to a
-    // 901px frame against the 900 the pane expects — measured, and dropped as the wrong size.
-    contents.frameSize = {
-      width: Math.max(1, Math.round(this.contentSize.width * this.scaleFactor)),
-      height: Math.max(1, Math.round(this.contentSize.height * this.scaleFactor)),
-    };
-    contents.setViewport(
-      Math.max(1, Math.ceil(this.contentSize.width / zoom)),
-      Math.max(1, Math.ceil(this.contentSize.height / zoom)),
-      this.scaleFactor * zoom,
-    );
+    const layout = zoomLayout({
+      contentSize: this.contentSize,
+      scaleFactor: this.scaleFactor,
+      zoom: contents.getZoomFactor() || 1,
+      browserScale: this.engine.browserScale,
+    });
+    contents.frameSize = layout.frameSize;
+    contents.captureScale = layout.captureScale;
+    contents.setViewport(layout.viewport.width, layout.viewport.height, layout.deviceScaleFactor);
   }
 
   isDestroyed() { return this.destroyed; }
@@ -282,7 +314,9 @@ class CdpEngine extends EventEmitter {
     const contents = new CdpWebContents(this, targetId, null, {
       width: window.contentSize.width,
       height: window.contentSize.height,
-      deviceScaleFactor: window.scaleFactor,
+      // The browser's scale from the first override on, never another one even briefly; see
+      // `zoomLayout`. `relayout` sets the viewport for the tab's zoom once the target is attached.
+      deviceScaleFactor: this.browserScale || window.scaleFactor,
     });
     window.attach(contents);
     return contents;
@@ -646,4 +680,4 @@ class CdpDownloadItem extends EventEmitter {
   }
 }
 
-module.exports = { CdpBrowserWindow, CdpEngine, CdpIpcMain, browserUserAgent, isForeignTab };
+module.exports = { CdpBrowserWindow, CdpEngine, CdpIpcMain, browserUserAgent, isForeignTab, zoomLayout };
