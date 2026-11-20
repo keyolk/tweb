@@ -91,7 +91,8 @@ function assertPreload(source) {
   assert.match(source, /function commandKey\(value, shiftKey = false\)/);
   assert.match(source, /return commandKey\(keys\[event\.code\] \|\| event\.key, event\.shiftKey\)/);
   assert.match(source, /commandKey\(payload\.key, Boolean\(payload\.shiftKey\)\)/);
-  assert.match(source, /else send\("native-click", hintClickPoint\(item\)\)/);
+  // A page-declared target may ask for a double click (`count: 2`); it is still the native path.
+  assert.match(source, /else send\("native-click", item\.doubleClick \? \{ \.\.\.hintClickPoint\(item\), count: 2 \} : hintClickPoint\(item\)\)/);
   assert.match(source, /const rect = visibleRect\(item\.element\) \|\| item\.rect/);
   assert.doesNotMatch(source, /item\.element\.click\(\)/);
 

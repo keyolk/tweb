@@ -5491,8 +5491,13 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       if ([value?.x, value?.y].every(Number.isFinite)) {
         const { x, y } = pageToWindowPoint(contents, frameViewportPoint(tab, sourceFrame, value));
         sendPointerEvent(tab, { type: "mouseMove", x, y });
-        sendPointerEvent(tab, { type: "mouseDown", x, y, button: "left", clickCount: 1, held: true });
-        sendPointerEvent(tab, { type: "mouseUp", x, y, button: "left", clickCount: 1 });
+        // `count: 2` is a double click, which a target a page declared can ask for (its graph
+        // opens a node on dblclick): the second press carries clickCount 2, as a mouse's does.
+        const count = value.count === 2 ? 2 : 1;
+        for (let clickCount = 1; clickCount <= count; clickCount += 1) {
+          sendPointerEvent(tab, { type: "mouseDown", x, y, button: "left", clickCount, held: true });
+          sendPointerEvent(tab, { type: "mouseUp", x, y, button: "left", clickCount });
+        }
       }
       break;
     case "native-drag": {
