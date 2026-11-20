@@ -537,6 +537,24 @@ console.error = (...args) => {
   writeError(...args);
 };
 
+// An exception nothing caught in this process is logged, not shown. Electron's default shows a modal
+// "Uncaught Exception" dialog per throw. A hosted engine serves every pane of every tmux window, and
+// a throw on an input path repeats on every mouse report: measured, a pane whose active tab had been
+// destroyed raised a dialog for each pointer move, over whatever the person was doing in any app.
+// Logged with the pane it happened in and counted in `tweb diag` (`engine.uncaught`), so a new one
+// is still found — and the engine keeps serving the other panes.
+let uncaughtErrors = 0;
+let lastUncaught = null;
+function noteUncaught(kind, error) {
+  uncaughtErrors += 1;
+  let pane = null;
+  try { pane = paneScope.getStore()?.paneId || null; } catch (_) { /* scope not set up yet */ }
+  lastUncaught = { at: Date.now(), kind, pane, message: String(error?.message || error) };
+  console.error(`tweb: uncaught ${kind}${pane ? ` in ${pane}` : ""}: ${error?.stack || error}`);
+}
+process.on("uncaughtException", (error) => noteUncaught("exception", error));
+process.on("unhandledRejection", (reason) => noteUncaught("rejection", reason));
+
 const configuredImageId = Number.parseInt(process.env.TWEB_IMAGE_ID || "", 10);
 const configuredPaneImageId = Number.isSafeInteger(configuredImageId) && configuredImageId > 0
   ? configuredImageId
@@ -4220,6 +4238,41 @@ function applyPageKeys(tab) {
   }
 }
 
+/// Drops this pane's tabs that are already destroyed, and moves `win` off one.
+///
+/// A destroyed tab left in a pane is a trap for every input path: `win.webContents` on it throws
+/// "Object has been destroyed". It happened: a pane kept a destroyed active tab, and each mouse
+/// report on that pane threw in `dispatchMouse`. The `closed` handler is what normally removes a
+/// tab, but it finds the tab's pane through `tabPanes`, and a tab whose pane it does not find there
+/// stays in that pane's list. So the pane checks for itself: on every input, and every pane when
+/// any tab closes. Returns whether anything was dropped.
+function reconcileDestroyedTabs() {
+  const windows = currentWindows();
+  const alive = windows.tabs.filter((tab) => !tab.isDestroyed());
+  const winGone = Boolean(windows.win) && windows.win.isDestroyed();
+  if (alive.length === windows.tabs.length && !winGone) return false;
+  const dropped = windows.tabs.length - alive.length;
+  console.error(`tweb: dropped ${dropped} destroyed tab(s)${winGone ? ", the active one among them" : ""}`);
+  const wasActive = windows.activeTabIndex;
+  windows.tabs.splice(0, windows.tabs.length, ...alive);
+  if (windows.previousTab?.isDestroyed()) windows.previousTab = null;
+  if (alive.length === 0) {
+    windows.win = null;
+    windows.activeTabIndex = -1;
+    return true;
+  }
+  if (winGone || !alive.includes(windows.win)) {
+    // Cleared first: `activateTab` treats the tab it leaves as alive (it asks its webContents
+    // whether it keeps its size) and would remember it as the tab to go back to.
+    windows.win = null;
+    activateTab(Math.min(Math.max(0, wasActive), alive.length - 1));
+  } else {
+    windows.activeTabIndex = alive.indexOf(windows.win);
+    sendTabState();
+  }
+  return true;
+}
+
 function activateTab(index) {
   if (currentWindows().tabs.length === 0) {
     currentWindows().win = null;
@@ -5886,6 +5939,8 @@ function agentDiagnostics() {
       logical: currentFrames().viewport ? logicalContentSize(currentFrames().viewport) : null,
       scaleFactor: renderScaleFactor(),
     },
+    // Exceptions nothing caught in this engine, all panes; see `noteUncaught`.
+    engine: { uncaught: uncaughtErrors, lastUncaught },
     window: {
       contentSize: size ? { width: size[0], height: size[1] } : null,
       zoomFactor: tab ? tab.webContents.getZoomFactor() : null,
@@ -9090,7 +9145,12 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = paneZoomFactor(
     floatingTabs.delete(tab);
     closeDisplayWindow(tab);
     const closedIndex = currentWindows().tabs.indexOf(tab);
-    if (closedIndex < 0) return;
+    if (closedIndex < 0) {
+      // Not in the pane `tabPanes` named. Whichever pane does hold it must not keep it — least
+      // of all as its active tab (see `reconcileDestroyedTabs`).
+      forEachPane(() => reconcileDestroyedTabs());
+      return;
+    }
     const wasActive = tab === currentWindows().win;
     tabFrames.delete(tab);
     tabZoomFactors.delete(tab);
@@ -9489,7 +9549,7 @@ function hasZoomModifier(modifiers) {
 }
 
 function dispatchMouse(cb, rawX, rawY, release) {
-  if (!currentWindows().win) return;
+  if (!currentWindows().win || currentWindows().win.isDestroyed()) return;
   const contents = currentWindows().win.webContents;
   // Inside tmux the report is a cell. Where the native pointer agrees with it, the point is the
   // pointer's real one instead — see native-input.cjs. Outside tmux the report is already pixels.
@@ -11191,6 +11251,7 @@ function handleTargetedCommand(command, target) {
   }
 
   if (command.kind === "input") {
+    reconcileDestroyedTabs();
     inputTrace.mark("in", { hex: command.hex });
     markInteractionActivity();
     const input = inputState();
