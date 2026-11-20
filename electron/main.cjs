@@ -48,6 +48,7 @@ const { createInputTrace } = require("./input-trace.cjs");
 const { runtimeInfoRows } = require("./runtime-info.cjs");
 const { StringDecoder } = require("node:string_decoder");
 const { MouseClickState } = require("./mouse-click-state.cjs");
+const { tabShowingPage } = require("./tab-dedupe.cjs");
 const os = require("node:os");
 const settings = require("./settings.cjs");
 const { ENGINE_LABELS, engineBadgeModel, pinLists, pinTable, routeNavigation } = require("./engine-routing.cjs");
@@ -6139,6 +6140,24 @@ function agentDiagnostics() {
   };
 }
 
+/// For a page asked for by URL (`tweb navigate`, `tweb tab new`): the tab of this pane that
+/// already shows that page, activated, or null. See tab-dedupe.cjs for why — `brief side` sent the
+/// active tab to a page another tab already had, and the pane collected copies.
+///
+/// `navigate` leaves the active tab out: loading there is what it does anyway. `tab new` counts it,
+/// since a new tab for the page already in front is the copy being avoided.
+function activateTabShowing(url, { countActive = false } = {}) {
+  const windows = currentWindows();
+  const urls = windows.tabs.map((tab) => (tab.isDestroyed() ? "" : tabSessionUrls.get(tab) || tab.webContents.getURL()));
+  const index = tabShowingPage(urls, url, countActive
+    ? { active: windows.activeTabIndex }
+    : { except: windows.activeTabIndex });
+  if (index < 0) return null;
+  activateTab(index);
+  if (debugLogging) console.error(`tweb: ${url} is already open in tab ${index + 1}; using it`);
+  return windows.win;
+}
+
 function agentTab() {
   if (!currentWindows().win || currentWindows().win.isDestroyed()) throw new Error("no active tab");
   return currentWindows().win;
@@ -7138,6 +7157,9 @@ async function dispatchAgentCommand(method, params) {
       // `tweb back` exists, but `tweb navigate back` used to load https://back.
       const word = historyWord(params.url);
       if (word) return dispatchAgentCommand(word, {});
+      // Loaded in the tab that already shows this page, when another one does; it is still
+      // loaded, so the page is fresh — a brief regenerated since is the new one.
+      activateTabShowing(normalizeUrl(String(params.url || "")));
       const tab = agentTab();
       const contents = tab.webContents;
       return agentNavigateTab(normalizeUrl(String(params.url || "")), {
@@ -7199,7 +7221,13 @@ async function dispatchAgentCommand(method, params) {
       activateTab(Number(params.index));
       return agentTabList();
     case "tab-new":
-      if (params.url) openTabRouted(currentWindows().win, normalizeUrl(String(params.url)), true);
+      if (params.url) {
+        const url = normalizeUrl(String(params.url));
+        // An open copy of the page is shown and loaded again instead of a second one being made.
+        const existing = activateTabShowing(url, { countActive: true });
+        if (existing) void existing.webContents.loadURL(url).catch(() => {});
+        else openTabRouted(currentWindows().win, url, true);
+      }
       else refreshStartPage(createTab(newTabPage(), true));
       return agentTabList();
     // A tab moved to another page engine in place, as the engine badge does. Answers once the new

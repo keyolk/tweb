@@ -559,8 +559,12 @@ applies.
 
 
 Every engine persists the open tab URLs, the active tab and each tab's zoom per tmux window.
-Omitting the URL — plain `tweb open` — restores the last state, while naming a URL ignores the stored
-state, starts fresh on that single URL and updates the stored state to match. Electron does not store
+Omitting the URL — plain `tweb open` — restores the last state. Naming a URL restores it too and shows
+that URL among the tabs: the tab already on that page (any `#fragment` of it), or a new last tab.
+A pane keeps one tab per page. `tweb navigate` and `tweb tab new` go to the tab that already shows the
+page and load it there instead of making a second copy, and a stored session keeps each URL once, so
+copies saved before this are dropped on the next restore. Following a link inside a page is left as
+the page does it. Electron does not store
 `about:blank` or its internal loading/notice pages, so a valid previous session is never overwritten.
 With no URL to restore it shows an address prompt rather than a black screen. The Electron persistence
 key uses the tmux socket, the session name and the window index, so the same slot is restored across a
