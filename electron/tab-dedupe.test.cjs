@@ -58,12 +58,22 @@ test("a pane opened with a URL uses the saved tab showing that page at another f
   assert.deepEqual(sessionWithOpenedUrl(session, "file:///b/index.html"), { tabs: session.tabs, activeIndex: 0 });
 });
 
-test("navigate goes to the tab already showing the page; tab new does too, the active one included", () => {
+test("navigate switches to the tab already showing the page and does not load it again", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const navigate = main.slice(main.indexOf('case "navigate": {\n      // `tweb back`'), main.indexOf('case "back": {'));
-  assert.match(navigate, /activateTabShowing\(normalizeUrl\(String\(params\.url \|\| ""\)\)\);\n      const tab = agentTab\(\);/);
+  // `new` first: a tab of its own regardless.
+  assert.match(navigate, /if \(params\.new\) \{\n        openTabRouted\(currentWindows\(\)\.win, url, true\);/);
+  // The tab already on the page, the active one included, is switched to and returned untouched.
+  assert.match(navigate, /const showing = activateTabShowing\(url, \{ countActive: true \}\);\n      if \(showing && !params\.reload\) \{\n        return \{[^}]*reused: true \};/);
+  // Only `reload` goes on to load it.
+  assert.match(navigate, /return showing \? \{ \.\.\.navigated, reused: true, reloaded: true \} : navigated;/);
+});
+
+test("tab new follows the same rule: switch, load only with reload, a second tab only with new", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
   const tabNew = main.slice(main.indexOf('case "tab-new":'), main.indexOf('case "tab-engine":'));
-  assert.match(tabNew, /activateTabShowing\(url, \{ countActive: true \}\)/);
-  assert.match(tabNew, /existing\.webContents\.loadURL\(url\)/);
-  assert.match(tabNew, /else openTabRouted\(currentWindows\(\)\.win, url, true\);/);
+  assert.match(tabNew, /const existing = params\.new \? null : activateTabShowing\(url, \{ countActive: true \}\);/);
+  assert.match(tabNew, /if \(existing && params\.reload\) void existing\.webContents\.loadURL\(url\)/);
+  assert.match(tabNew, /else if \(!existing\) openTabRouted\(currentWindows\(\)\.win, url, true\);/);
+  assert.match(tabNew, /reused: true, reloaded: Boolean\(params\.reload\)/);
 });

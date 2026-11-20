@@ -351,6 +351,18 @@ pub fn render_snapshot(result: &Value) -> String {
 
 /// Human-facing rendering per method; falls back to pretty JSON.
 pub fn render(method: &str, result: &Value) -> String {
+    // Said first, on its own line: the page was already open, so nothing was loaded. A caller
+    // that expected a fresh load reads `--reload` from this.
+    let reused = result.get("reused").and_then(Value::as_bool) == Some(true)
+        && result.get("reloaded").and_then(Value::as_bool) != Some(true);
+    if reused && (method == "navigate" || method == "tab-new") {
+        let rest = render_inner(method, result);
+        return format!("switched to the tab already showing this page (not reloaded; --reload to load it again)\n{rest}");
+    }
+    render_inner(method, result)
+}
+
+fn render_inner(method: &str, result: &Value) -> String {
     match method {
         "snapshot" => render_snapshot(result),
         // Strings bare, as before, so `$(tweb eval 'location.href')` stays a plain string.

@@ -7157,12 +7157,23 @@ async function dispatchAgentCommand(method, params) {
       // `tweb back` exists, but `tweb navigate back` used to load https://back.
       const word = historyWord(params.url);
       if (word) return dispatchAgentCommand(word, {});
-      // Loaded in the tab that already shows this page, when another one does; it is still
-      // loaded, so the page is fresh — a brief regenerated since is the new one.
-      activateTabShowing(normalizeUrl(String(params.url || "")));
+      // The tab that already shows this page, when one does, is switched to and left as it is: a
+      // form half filled or a scroll position is the reason the tab was kept, and loading it again
+      // threw that away. `reload` loads it there anyway (a brief regenerated since); `new` opens
+      // the page in a tab of its own even so. See tab-dedupe.cjs for why a copy is avoided at all.
+      const url = normalizeUrl(String(params.url || ""));
+      if (params.new) {
+        openTabRouted(currentWindows().win, url, true);
+        await settledLoad(currentWindows().win);
+        return { url: agentContents().getURL(), title: agentContents().getTitle(), opened: true };
+      }
+      const showing = activateTabShowing(url, { countActive: true });
+      if (showing && !params.reload) {
+        return { url: showing.webContents.getURL(), title: showing.webContents.getTitle(), reused: true };
+      }
       const tab = agentTab();
       const contents = tab.webContents;
-      return agentNavigateTab(normalizeUrl(String(params.url || "")), {
+      const navigated = await agentNavigateTab(url, {
         load: (url) => contents.loadURL(url),
         isLoading: () => contents.isLoading(),
         currentUrl: () => contents.getURL(),
@@ -7170,6 +7181,7 @@ async function dispatchAgentCommand(method, params) {
         failure: () => tabLoadFailures.get(tab) || null,
         clearFailure: () => tabLoadFailures.delete(tab),
       });
+      return showing ? { ...navigated, reused: true, reloaded: true } : navigated;
     }
     case "back": {
       const history = agentContents().navigationHistory;
@@ -7223,10 +7235,12 @@ async function dispatchAgentCommand(method, params) {
     case "tab-new":
       if (params.url) {
         const url = normalizeUrl(String(params.url));
-        // An open copy of the page is shown and loaded again instead of a second one being made.
-        const existing = activateTabShowing(url, { countActive: true });
-        if (existing) void existing.webContents.loadURL(url).catch(() => {});
-        else openTabRouted(currentWindows().win, url, true);
+        // The same rule as `navigate`: an open copy of the page is switched to and left as it is,
+        // loaded again only with `reload`, and `new` makes a second one regardless.
+        const existing = params.new ? null : activateTabShowing(url, { countActive: true });
+        if (existing && params.reload) void existing.webContents.loadURL(url).catch(() => {});
+        else if (!existing) openTabRouted(currentWindows().win, url, true);
+        if (existing) return { ...agentTabList(), reused: true, reloaded: Boolean(params.reload) };
       }
       else refreshStartPage(createTab(newTabPage(), true));
       return agentTabList();
