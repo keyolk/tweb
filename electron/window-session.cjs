@@ -1,6 +1,7 @@
 "use strict";
 
 const { createHash } = require("node:crypto");
+const { dedupeSessionTabs, tabShowingPage } = require("./tab-dedupe.cjs");
 
 // === Which saved session belongs to which pane ======================================
 //
@@ -290,10 +291,12 @@ function normalizeWindowSession(parsed, defaultZoomFactor) {
     return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex, ...sessionEngine(entry.engine) }];
   });
   if (entries.length === 0) return null;
-  return {
-    tabs: entries.map(({ url, zoom, engine }) => ({ url, zoom, ...sessionEngine(engine) })),
-    activeIndex: activeRestoredIndex(entries, parsed.activeIndex),
-  };
+  // Each URL once (tab-dedupe.cjs): a session saved before this held repeats, and restoring them
+  // as saved brought every one back on every start.
+  return dedupeSessionTabs(
+    entries.map(({ url, zoom, engine }) => ({ url, zoom, ...sessionEngine(engine) })),
+    activeRestoredIndex(entries, parsed.activeIndex),
+  );
 }
 
 // A popup (`window.open`) is left out. Its page was set up by its opener — Multicampus hands the
@@ -306,11 +309,11 @@ function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
     return [{ url: entry.url, zoom: clampedZoom(entry.zoom, defaultZoomFactor), sourceIndex, ...sessionEngine(entry.engine) }];
   });
   if (entries.length === 0) return null;
-  return {
-    version: 1,
-    activeIndex: activeRestoredIndex(entries, activeIndex),
-    tabs: entries.map(({ url, zoom, engine }) => ({ url, zoom, ...sessionEngine(engine) })),
-  };
+  const kept = dedupeSessionTabs(
+    entries.map(({ url, zoom, engine }) => ({ url, zoom, ...sessionEngine(engine) })),
+    activeRestoredIndex(entries, activeIndex),
+  );
+  return { version: 1, activeIndex: kept.activeIndex, tabs: kept.tabs };
 }
 
 // A pane opened with a URL keeps the window's saved tabs and shows the URL among them: the tab
@@ -319,7 +322,8 @@ function windowSessionForSave(tabs, activeIndex, defaultZoomFactor) {
 function sessionWithOpenedUrl(session, url) {
   if (!isRestorableUrl(url)) return session;
   if (!session) return null;
-  const existing = session.tabs.findIndex((tab) => tab.url === url);
+  // The same page, not the same string: the saved tab may sit at another fragment of it.
+  const existing = tabShowingPage(session.tabs.map((tab) => tab.url), url);
   if (existing >= 0) return { tabs: session.tabs, activeIndex: existing };
   if (session.tabs.length >= 50) return session;
   return { tabs: [...session.tabs, { url }], activeIndex: session.tabs.length };
