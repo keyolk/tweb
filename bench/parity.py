@@ -16,6 +16,12 @@ is no substitute: it targets an element, so it never asks which frame is under a
   frame-drag    press in the iframe, move, release there.
                 ok = the frame got the press, the moves with the button held, and the release
   page-drag     the same drag on the parent's header, no frame involved
+  zoom-out-click / zoom-in-click
+                the pane zoomed two steps away from the default, then four clicks on the parent's
+                Share button. ok = every press and release landed on the button at the same point
+                and the button took each click. Chrome read mouse coordinates at its own scale or
+                the zoomed tab's from one event to the next, so a release could land at 1/1.44 of
+                the press and no click happened (`zoomLayout` in electron/cdp/engine.cjs)
 
 A pane runs in a private tmux server with a pixel-sized client attached (feel.py's `Pane`), so it
 is visible and its input takes the shipping path. A new scenario is a function in SCENARIOS that
@@ -50,10 +56,13 @@ class Page:
 
     def __init__(self, pane):
         self.pane = pane
-        cols, rows = SIZE[0], SIZE[1]
+        self.measure()
+
+    def measure(self):
+        """CSS pixels per cell, which a zoom changes."""
         view = self.eval("[innerWidth, innerHeight]")
-        self.col_px = view[0] / cols
-        self.row_px = view[1] / rows
+        self.col_px = view[0] / SIZE[0]
+        self.row_px = view[1] / SIZE[1]
 
     def eval(self, script):
         code, out, err = self.pane.agent("eval", f"JSON.stringify({script})", timeout=10)
@@ -152,7 +161,43 @@ def page_drag(page):
     return dragged(page, "")
 
 
-SCENARIOS = {"popover": popover, "frame-click": frame_click, "frame-drag": frame_drag, "page-drag": page_drag}
+def zoom_steps(page, steps):
+    """Ctrl-wheel `steps` notches (positive zooms out) over the page, then re-measure its cells."""
+    code = 81 if steps > 0 else 80
+    for _ in range(abs(steps)):
+        page.mouse(code, SIZE[0] // 2, SIZE[1] // 2)
+        time.sleep(0.6)
+    time.sleep(1.0)
+    page.measure()
+
+
+def zoomed_click(steps):
+    def scenario(page):
+        zoom_steps(page, steps)
+        try:
+            x, y, width, height = page.rect("#share")
+            inside = lambda px, py: x - 1 <= px <= x + width + 1 and y - 1 <= py <= y + height + 1
+            results = []
+            for _ in range(4):
+                # Counted on the button itself: the fixture's `status` is `window.status`, not its span.
+                page.eval("(() => { __log.length = 0; if (!window.__shareClicks) { window.__shareClicks = [0];"
+                          " share.addEventListener('click', () => __shareClicks[0]++); } __shareClicks[0] = 0;"
+                          " return 1; })()")
+                page.click(*page.cell(x + width / 2, y + height / 2))
+                log = page.settle(lambda log: any(entry.startswith("pointerup") for entry in log))
+                points = [tuple(map(int, entry.rsplit(" ", 1)[1].split(","))) for entry in log
+                          if entry.startswith(("pointerdown", "pointerup"))]
+                clicked = page.eval("__shareClicks[0] === 1")
+                ok = clicked and len(points) == 2 and points[0] == points[1] and inside(*points[0])
+                results.append((ok, points, clicked))
+            return all(ok for ok, _, _ in results), [r[1:] for r in results]
+        finally:
+            zoom_steps(page, -steps)
+    return scenario
+
+
+SCENARIOS = {"popover": popover, "frame-click": frame_click, "frame-drag": frame_drag, "page-drag": page_drag,
+             "zoom-out-click": zoomed_click(2), "zoom-in-click": zoomed_click(-2)}
 
 
 def prepare(page):

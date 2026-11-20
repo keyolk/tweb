@@ -499,6 +499,9 @@ class CdpWebContents extends EventEmitter {
     this.loading = false;
     this.zoomFactor = 1;
     this.deviceScaleFactor = options.deviceScaleFactor || 1;
+    // The `clip.scale` that brings a capture to the pane's pixel size; 1 at the default zoom. Set
+    // by the window's `relayout` (see `zoomLayout` in engine.cjs).
+    this.captureScale = 1;
     this.viewport = { width: options.width || 800, height: options.height || 600 };
     this.frameRate = 30;
     this.painting = true;
@@ -714,8 +717,14 @@ class CdpWebContents extends EventEmitter {
       const candidates = [1, dsf, dsf / real, real / dsf];
       const match = candidates.find((value) => Math.abs(ratio - value) < 0.06 * Math.max(1, value));
       const scale = match ?? (this.inputScale || 1);
-      if (scale !== 1 && this.inputScale !== scale && this.engine.debug) {
-        console.error(`tweb: chrome input skew ${(1 / scale).toFixed(3)} measured, correcting`);
+      // Logged whether or not debugging is on. The emulated scale is kept at the browser's (see
+      // `zoomLayout` in engine.cjs), and with the two equal no skew has been measured; one here
+      // means that invariant broke somewhere. Corrected silently, the last such break showed only
+      // as clicks that sometimes did nothing.
+      if (scale !== 1 && this.inputScale !== scale) {
+        this.inputSkews = (this.inputSkews || 0) + 1;
+        console.error(`tweb: chrome input skew ${(1 / scale).toFixed(3)} measured, correcting `
+          + `(emulated ${this.deviceScaleFactor}, browser ${real})`);
       }
       return scale;
     } catch (_) {
@@ -1376,7 +1385,15 @@ class CdpWebContents extends EventEmitter {
       // frames come at the pane's size, so nothing changes there.
       let image = decoded;
       let bitmap = null;
-      if (got.width !== want.width || got.height !== want.height) {
+      // Away from the default zoom the device picture is the viewport at the browser's scale, not
+      // the pane's size (see `zoomLayout` in engine.cjs): the same picture a capture takes, before
+      // its `clip.scale`. Scaled here the same way, so a scroll at that zoom is still drawn from
+      // the screencast rather than waiting a capture per step.
+      if (this.isUnscaledDeviceFrame(got)) {
+        image = decoded.resize({ width: want.width, height: want.height, quality: "good" });
+        countCast(this, "rescaled");
+      }
+      if (image.getSize().width !== want.width || image.getSize().height !== want.height) {
         const filled = fitNearFrame(decoded.toBitmap(), got, capture.lastCast, want);
         if (!filled) {
           countCast(this, "css");
@@ -1403,9 +1420,10 @@ class CdpWebContents extends EventEmitter {
       // sent during a capture on Wikipedia, GitHub and Hacker News while scrolling, every one the
       // right picture by column profile and by eye, and ~140 such frames drawn showed none either.
       // Refused, a key pressed while a settle capture ran waited for that capture and then one more.
-      // A tab zoomed away from the default puts the two scales apart again, and there they are
-      // still only a signal.
-      if (capture.pendingInCapture && !this.scalesAgree()) {
+      // A zoomed tab keeps them equal too (see `zoomLayout` in engine.cjs), but its captures are
+      // taken at a `clip.scale` other than 1, and frames sent while one renders were not checked;
+      // there they stay only a signal.
+      if (capture.pendingInCapture && (!this.scalesAgree() || Math.abs((this.captureScale || 1) - 1) >= 0.001)) {
         countCast(this, "incap");
         this.requestCapture();
         return;
@@ -1442,6 +1460,16 @@ class CdpWebContents extends EventEmitter {
       capture.expedite = false;
       this.emit("paint", {}, dirty, image);
     }, Math.max(0, wait));
+  }
+
+  // A screencast frame holding the whole viewport at the emulated scale, while captures are scaled
+  // to the pane by `captureScale` (a tab away from the default zoom). Two pixels either way are the
+  // viewport's rounding.
+  isUnscaledDeviceFrame(got) {
+    if (this.deviceEmulation || Math.abs((this.captureScale || 1) - 1) < 0.001) return false;
+    const dsf = this.deviceScaleFactor || 1;
+    return Math.abs(got.width - this.viewport.width * dsf) <= 2
+      && Math.abs(got.height - this.viewport.height * dsf) <= 2;
   }
 
   // Whether the tab is emulated at the scale the browser draws at; see `presentScreencastFrame`.
@@ -1562,7 +1590,7 @@ class CdpWebContents extends EventEmitter {
         timer = setTimeout(() => reject(new Error("captureScreenshot timed out")), CAPTURE_TIMEOUT_MS);
       });
       shot = await Promise.race([
-        this.session.send("Page.captureScreenshot", { format: "png", optimizeForSpeed: true }),
+        this.captureClip().then((clip) => this.session.send("Page.captureScreenshot", { format: "png", optimizeForSpeed: true, ...clip })),
         deadline,
       ]);
     } catch (error) {
@@ -1612,6 +1640,32 @@ class CdpWebContents extends EventEmitter {
     this.emit("paint", {}, dirty ? clampRect(dirty, size) : whole, image);
   }
 
+  // The `clip` a capture is taken with: the region (the visible viewport when none is given) at the
+  // scale that makes it the pane's pixel size. None at all at scale 1 for the whole page, the
+  // capture Chrome is fastest at. Device emulation (DevTools' device mode) sets its own scale, and
+  // its picture is drawn as Chrome makes it.
+  //
+  // A clip is in DOCUMENT coordinates, not the viewport's: measured, a clip at 0,0 on a page
+  // scrolled 4500px down came back blank. So the viewport's clip starts where the page is
+  // scrolled to, read just before the capture. A scroll landing between the read and the capture
+  // draws the previous position once, and the screencast frame of that scroll asks for the next.
+  async captureClip(rect = null) {
+    const scale = this.deviceEmulation ? 1 : this.captureScale || 1;
+    if (rect) return { clip: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scale } };
+    if (Math.abs(scale - 1) < 0.001) return {};
+    const metrics = await this.session.send("Page.getLayoutMetrics");
+    const view = metrics.cssVisualViewport || {};
+    return {
+      clip: {
+        x: Number(view.pageX) || 0,
+        y: Number(view.pageY) || 0,
+        width: this.viewport.width,
+        height: this.viewport.height,
+        scale,
+      },
+    };
+  }
+
   // A capture asked for from outside — an agent's screenshot, an inspect handoff, a recording's
   // keyframe — takes the same single in-flight slot as the frame pump (`pumpCapture`). Two
   // captures at once came back with the page shrunk into a corner, and a screencast frame sent
@@ -1626,8 +1680,7 @@ class CdpWebContents extends EventEmitter {
     }
     capture.inFlight += 1;
     try {
-      const params = { format: "png" };
-      if (rect) params.clip = { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scale: 1 };
+      const params = { format: "png", ...await this.captureClip(rect) };
       const shot = await this.session.send("Page.captureScreenshot", params);
       return nativeImage.createFromBuffer(Buffer.from(shot.data, "base64"));
     } finally {
