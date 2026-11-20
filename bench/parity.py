@@ -16,6 +16,11 @@ is no substitute: it targets an element, so it never asks which frame is under a
   frame-drag    press in the iframe, move, release there.
                 ok = the frame got the press, the moves with the button held, and the release
   page-drag     the same drag on the parent's header, no frame involved
+  file-isolation
+                pages/file-isolation/probe.html opened as file://. ok = fetch and XHR of a sibling
+                file and of /etc/hosts are refused, the same-folder iframe's DOM is unreadable, and
+                the page's relative <img> still loads. Electron needs its file-privilege fuse off,
+                which the `tweb` binary under test turns off before the engine starts
   zoom-out-click / zoom-in-click
                 the pane zoomed two steps away from the default, then four clicks on the parent's
                 Share button. ok = every press and release landed on the button at the same point
@@ -243,10 +248,26 @@ def canvas_hints(page):
     return detail["asked"] >= 2, detail
 
 
+def file_isolation(page):
+    """A file:// page reads no other local file, as Chrome refuses it too."""
+    deadline = time.time() + 8
+    probe = {}
+    while time.time() < deadline and not probe.get("done"):
+        time.sleep(0.25)
+        probe = page.eval("window.__probe || {}")
+    refused = all(str(probe.get(key, "")).startswith("blocked")
+                  for key in ("fetchSibling", "fetchOutside", "xhrSibling", "xhrOutside"))
+    frame_closed = not str(probe.get("iframeDom", "")).startswith("READ FRAME-DOM")
+    return bool(probe.get("done")) and refused and frame_closed and probe.get("img") == "loaded", probe
+
+
 SCENARIOS = {"popover": popover, "frame-click": frame_click, "frame-drag": frame_drag, "page-drag": page_drag,
-             "zoom-out-click": zoomed_click(2), "zoom-in-click": zoomed_click(-2), "canvas-hints": canvas_hints}
-# The fixture each scenario runs on, when not the frame overlay.
-FIXTURES = {"canvas-hints": "canvas-targets.html"}
+             "zoom-out-click": zoomed_click(2), "zoom-in-click": zoomed_click(-2), "canvas-hints": canvas_hints,
+             "file-isolation": file_isolation}
+# The fixture each scenario runs on, when not the frame overlay. A `file:` entry is opened from disk,
+# not through the fixture server: the scenario is about what a local page can read.
+FIXTURES = {"canvas-hints": "canvas-targets.html",
+            "file-isolation": "file:" + str(REPO / "bench" / "pages" / "file-isolation" / "probe.html")}
 
 
 def prepare(page):
@@ -285,8 +306,9 @@ def main():
             for name in args.scenario:
                 fixture = FIXTURES.get(name, "frame-overlay.html")
                 if fixture != at:
-                    code, _, err = pane.agent("navigate", base.replace("127.0.0.1", "localhost") + "/" + fixture,
-                                              timeout=20)
+                    target = ("file://" + fixture[len("file:"):] if fixture.startswith("file:")
+                              else base.replace("127.0.0.1", "localhost") + "/" + fixture)
+                    code, _, err = pane.agent("navigate", target, timeout=20)
                     if code != 0:
                         raise RuntimeError(f"navigate to {fixture} failed: {err}")
                     time.sleep(1.0)

@@ -1620,6 +1620,23 @@ pub fn find_electron() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     // Here, not at install: runtimes unpacked before this, and workspace node_modules, need it too.
     #[cfg(target_os = "macos")]
     engine_app::keep_out_of_dock(&executable);
+    // Before the engine runs, every time: a runtime unpacked by an older tweb, or a workspace
+    // `node_modules` Electron, has the fuse on. See `deny_file_protocol_privileges`.
+    match engine_app::deny_file_protocol_privileges(&executable) {
+        Ok(engine_app::FileFuse::Disabled) => {
+            tracing::info!(path = %executable.display(), "file:// extra privileges turned off in Electron");
+        }
+        Ok(engine_app::FileFuse::NoWire) => {
+            tracing::warn!(path = %executable.display(), "this Electron has no fuse wire; file:// pages can read local files");
+        }
+        Ok(engine_app::FileFuse::AlreadyOff) => {}
+        Err(err) => {
+            // Logged where a person sees it: the engine still starts, but a file:// page in it
+            // can read every file this user can.
+            eprintln!("tweb: warning: could not turn off Electron's file:// privileges: {err:#}");
+            tracing::warn!(error = %format!("{err:#}"), "file:// extra privileges stay on");
+        }
+    }
     Ok(resolve_electron_paths(
         executable,
         electron_app_directory()?,

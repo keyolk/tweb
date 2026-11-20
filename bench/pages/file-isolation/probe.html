@@ -1,0 +1,23 @@
+<!doctype html><meta charset=utf-8><title>file-isolation</title>
+<!-- bench/parity.py file-isolation: opened as a file:// URL. Each probe tries to read another local
+     file the way a hostile page would; window.__probe says what each one got. A page must not read
+     a sibling file, a file outside its folder, or a same-folder iframe's DOM, and its relative
+     <img> must still load. -->
+<img id=img src="dot.png"><link rel=stylesheet href="data:text/css,body{}">
+<iframe id=fr src="frame.html"></iframe>
+<script>
+window.__probe = {};
+const P = window.__probe;
+const tryFetch = async (key, url) => { try { const r = await fetch(url); P[key] = "READ " + r.status + " " + (await r.text()).slice(0, 20).trim(); } catch (e) { P[key] = "blocked " + e.name; } };
+const tryXhr = (key, url) => new Promise((done) => { try { const x = new XMLHttpRequest(); x.open("GET", url); x.onload = () => { P[key] = "READ " + x.status + " " + x.responseText.slice(0, 20).trim(); done(); }; x.onerror = () => { P[key] = "blocked error"; done(); }; x.send(); } catch (e) { P[key] = "blocked " + e.name; done(); } });
+(async () => {
+  await tryFetch("fetchSibling", "sibling.txt");
+  await tryFetch("fetchOutside", "file:///etc/hosts");
+  await tryXhr("xhrSibling", "sibling.txt");
+  await tryXhr("xhrOutside", "file:///etc/hosts");
+  await new Promise((r) => { fr.addEventListener("load", r, { once: true }); setTimeout(r, 1500); });
+  try { P.iframeDom = "READ " + (fr.contentDocument && fr.contentDocument.getElementById("x") ? fr.contentDocument.getElementById("x").textContent : "null-doc"); } catch (e) { P.iframeDom = "blocked " + e.name; }
+  P.img = img.complete && img.naturalWidth > 0 ? "loaded" : "NOT LOADED";
+  P.done = true;
+})();
+</script>
