@@ -12,6 +12,10 @@
 // snapshot → click → snapshot → fill with model think time between calls; shorter than that gap
 // and the badge would blink off mid-flow.
 const DRIVING_MS = 8000;
+// How long a read (snapshot, screenshot) shows. It changes nothing the person sees, so it is shown
+// quieter and shorter than driving — but shown: an agent looking at the page is something the
+// person sharing it should know.
+const READING_MS = 3000;
 
 // A link nobody renews is gone after its ttl; a controller that crashed leaves no badge behind.
 const DEFAULT_LINK_TTL_S = 30;
@@ -55,8 +59,11 @@ function noteAgentCall(presence, method, params, now) {
   if (kind === "passive") return false;
   const step = { method: verbOf(method, params), at: now };
   if (kind === "read") {
+    // Re-sent only when it changes what is shown: not while driving (that badge wins), and not for
+    // a read inside a reading window already up — a burst of snapshots is one badge.
+    const shown = isDriving(presence, now) || isReading(presence, now);
     presence.read = step;
-    return false;
+    return !shown;
   }
   presence.drive = step;
   return true;
@@ -64,6 +71,10 @@ function noteAgentCall(presence, method, params, now) {
 
 function isDriving(presence, now) {
   return Boolean(presence.drive && now - presence.drive.at < DRIVING_MS);
+}
+
+function isReading(presence, now) {
+  return Boolean(presence.read && now - presence.read.at < READING_MS);
 }
 
 // `link` RPC: `{owner, ttl}` renews, `{clear: true}` drops it. The owner is free text the caller
@@ -100,6 +111,8 @@ function presenceModel(presence, now) {
   const driving = isDriving(presence, now);
   return {
     driving: driving ? { method: presence.drive.method, at: presence.drive.at } : null,
+    // Only when not driving: driving already says an agent is at the page.
+    reading: !driving && isReading(presence, now) ? { method: presence.read.method, at: presence.read.at } : null,
     lastAgent: presence.drive || presence.read
       ? [presence.drive, presence.read].filter(Boolean).sort((a, b) => b.at - a.at)[0]
       : null,
@@ -112,6 +125,7 @@ function presenceModel(presence, now) {
 function nextChange(presence, now) {
   const times = [];
   if (isDriving(presence, now)) times.push(presence.drive.at + DRIVING_MS);
+  if (isReading(presence, now)) times.push(presence.read.at + READING_MS);
   const link = liveLink(presence, now);
   if (link) times.push(link.expiresAt);
   return times.length ? Math.min(...times) : null;
@@ -119,6 +133,7 @@ function nextChange(presence, now) {
 
 module.exports = {
   DRIVING_MS,
+  READING_MS,
   DEFAULT_LINK_TTL_S,
   applyLink,
   classify,

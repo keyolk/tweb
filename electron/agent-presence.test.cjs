@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  DRIVING_MS, applyLink, classify, createPresence, nextChange, noteAgentCall, noteUserInput, presenceModel,
+  DRIVING_MS, READING_MS, applyLink, classify, createPresence, nextChange, noteAgentCall, noteUserInput, presenceModel,
 } = require("./agent-presence.cjs");
 
 test("status, audio-sync and link are bookkeeping; reads look; the rest drives", () => {
@@ -20,14 +20,21 @@ test("status, audio-sync and link are bookkeeping; reads look; the rest drives",
 test("a page-changing call drives the pane for a while, then the badge runs out", () => {
   const p = createPresence();
   assert.equal(noteAgentCall(p, "status", {}, 1000), false);
-  assert.equal(noteAgentCall(p, "snapshot", {}, 1000), false);
+  // A read shows, quieter than driving, and is re-sent only when it changes what is shown.
+  assert.equal(noteAgentCall(p, "snapshot", {}, 1000), true);
+  assert.equal(noteAgentCall(p, "snapshot", {}, 1200), false);
   assert.equal(presenceModel(p, 1000).driving, null);
+  assert.deepEqual(presenceModel(p, 1300).reading, { method: "snapshot", at: 1200 });
   assert.equal(presenceModel(p, 1000).lastAgent.method, "snapshot");
   assert.equal(noteAgentCall(p, "act", { action: "click" }, 2000), true);
   assert.deepEqual(presenceModel(p, 2500).driving, { method: "click", at: 2000 });
-  assert.equal(nextChange(p, 2500), 2000 + DRIVING_MS);
+  // Driving wins over reading, and a read while driving changes nothing shown.
+  assert.equal(presenceModel(p, 2500).reading, null);
+  assert.equal(noteAgentCall(p, "snapshot", {}, 2600), false);
+  assert.equal(nextChange(p, 2700), Math.min(2000 + DRIVING_MS, 2600 + READING_MS));
   assert.equal(presenceModel(p, 2000 + DRIVING_MS).driving, null);
   assert.equal(nextChange(p, 2000 + DRIVING_MS), null);
+  assert.equal(presenceModel(p, 2600 + READING_MS).reading, null);
 });
 
 test("a link lives for its ttl, renews in place, and clears", () => {
