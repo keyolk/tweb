@@ -362,7 +362,25 @@ pub fn render(method: &str, result: &Value) -> String {
     render_inner(method, result)
 }
 
+/// The one line `tweb status` leads with when the engine has caught exceptions: how many, and the
+/// last. Nothing when there are none, so a healthy status reads as before.
+fn engine_error_line(result: &Value) -> Option<String> {
+    let errors = result.get("engineErrors")?;
+    let count = errors.get("count").and_then(Value::as_u64).unwrap_or(0);
+    if count == 0 {
+        return None;
+    }
+    let last = errors.get("last").and_then(Value::as_str).unwrap_or("");
+    Some(format!("engine errors: {count} (last: {last})\n"))
+}
+
 fn render_inner(method: &str, result: &Value) -> String {
+    if method == "status" {
+        if let Some(line) = engine_error_line(result) {
+            let rest = serde_json::to_string_pretty(result).unwrap_or_default();
+            return format!("{line}{rest}\n");
+        }
+    }
     match method {
         "snapshot" => render_snapshot(result),
         // Strings bare, as before, so `$(tweb eval 'location.href')` stays a plain string.
@@ -927,6 +945,22 @@ pub fn list_panes(as_json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `tweb status` leads with one line when the engine has caught exceptions, and reads as before
+    /// when it has not.
+    #[test]
+    fn status_leads_with_engine_errors_only_when_there_are_some() {
+        let quiet = serde_json::json!({ "pid": 1, "engineErrors": { "count": 0, "last": null } });
+        assert!(!super::render("status", &quiet).starts_with("engine errors"));
+        let noisy = serde_json::json!({
+            "pid": 1,
+            "engineErrors": { "count": 3, "last": "exception in %5: Object has been destroyed" },
+        });
+        let text = super::render("status", &noisy);
+        assert!(text
+            .starts_with("engine errors: 3 (last: exception in %5: Object has been destroyed)\n"));
+        assert!(text.contains("\"pid\": 1"));
+    }
     use serde_json::json;
 
     #[test]

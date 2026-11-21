@@ -326,6 +326,12 @@ installPrintShim();
   let transferBadge = null;
   let recordBadge = null;
   let agentBadge = null;
+  // The engine caught an exception (main.cjs `noteUncaught`): shown for a few seconds, red, without
+  // touching the mode — a dialog used to say this, and silence would hide it.
+  let errorBadge = null;
+  let engineError = null;
+  let engineErrorTimer = null;
+  const ENGINE_ERROR_SHOW_MS = 8000;
   // Whether this pane is being recorded (`gr`, `tweb record`). The engine says so on every new
   // document; while it is on, clicks and committed field changes are reported (see recordClick).
   let recordingOn = false;
@@ -889,7 +895,15 @@ installPrintShim();
     const engineMenu = document.createElement("div");
     engineMenu.setAttribute("role", "menu");
     engineMenu.style.cssText = popover.style.cssText;
-    shadow.append(agent, label, input, audio, record, transfer, engine, badge, popover, engineMenu);
+    const error = document.createElement("span");
+    error.style.cssText = [
+      "box-sizing:border-box", "display:none", "max-width:min(40ch,50vw)", "height:18px",
+      "padding:1px 6px", "border:1px solid #f28b8299", "border-radius:4px", "background:#3c1f1fdd",
+      "color:#f28b82", "box-shadow:0 1px 4px #0007", "overflow:hidden", "text-overflow:ellipsis",
+      "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace",
+      "white-space:nowrap", "backdrop-filter:blur(3px)",
+    ].join(";");
+    shadow.append(agent, label, input, audio, record, transfer, error, engine, badge, popover, engineMenu);
     document.documentElement.append(host);
     indicatorHost = host;
     indicatorLabel = label;
@@ -898,6 +912,7 @@ installPrintShim();
     recordBadge = record;
     agentBadge = agent;
     transferBadge = transfer;
+    errorBadge = error;
     tabBadge = badge;
     tabPopover = popover;
     engineBadge = engine;
@@ -1139,6 +1154,13 @@ installPrintShim();
         ? "Recording a flow for the agent to learn — gR stops and asks for the playbook"
         : "Recording for the agent — gr stops and sends the timeline";
     recordBadge.style.display = recordingOn ? "" : "none";
+    errorBadge.textContent = engineError
+      ? `⚠ engine error${engineError.count > 1 ? ` ×${engineError.count}` : ""}: ${engineError.message}`
+      : "";
+    errorBadge.title = engineError
+      ? `tweb's engine caught an exception and kept going (${engineError.total} so far) · tweb status shows them`
+      : "";
+    errorBadge.style.display = engineError ? "" : "none";
     renderAgentBadge();
     // The absolute path is what a terminal has instead of "Show in folder", and it is
     // strictly more useful: a path can be fed to the user's own tools, a Finder window
@@ -7518,6 +7540,23 @@ installPrintShim();
     document.documentElement.append(host);
     permissionHost = host;
     paintNow();
+  });
+
+  // A new kind of failure is shown; a repeat only counts on a badge already up (see main.cjs
+  // `announceUncaught`), so one bug firing on every pointer move cannot keep it on screen.
+  ipcRenderer.on("tweb-engine-error", (_event, report) => {
+    if (!topFrame || !report || typeof report.message !== "string") return;
+    if (!report.first && engineError?.key !== report.key) return;
+    engineError = { key: report.key, message: report.message.slice(0, 160), count: report.count, total: report.total };
+    if (report.first) {
+      if (engineErrorTimer) clearTimeout(engineErrorTimer);
+      engineErrorTimer = setTimeout(() => {
+        engineErrorTimer = null;
+        engineError = null;
+        renderIndicator();
+      }, ENGINE_ERROR_SHOW_MS);
+    }
+    renderIndicator();
   });
 
   ipcRenderer.on("tweb-flash", (_event, message) => {

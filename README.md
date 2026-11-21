@@ -469,6 +469,11 @@ dropped. `engine-log` returns the engine lines behind that judgement (`resize ge
 `frame dropped got=… want=…`). Those used to go only to the pane's stderr, so observing them
 previously meant relaunching the pane under a separate harness.
 
+An exception the engine catches does not stop it or raise a dialog. It is logged with the pane it
+happened in, shown for a few seconds as a red `⚠ engine error` badge in that pane's status line
+(the mode is left alone; a repeat of the same failure only raises its count), and counted:
+`tweb status` then leads with `engine errors: N (last: …)`, and `--json`/`diag` list the kinds.
+
 `diag`'s `page` is the shortcut runtime's own state — the current mode and its detail, the kind of
 picker open with its candidate count and the label being typed, the visual/caret state, the scroll
 surface currently held (including which frame it is in), and how many targets `f`/`v` would find
