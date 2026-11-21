@@ -172,6 +172,24 @@ function scaledSurfaceSize(logical, scale) {
   };
 }
 
+/// The size a floating tab's page is laid out at.
+///
+/// The viewer draws each frame over its whole content area (`100vw x 100vh`), so the frame has
+/// to be the shape of that area or the page comes out stretched. That shape is the viewer's,
+/// which the user sizes by dragging the window, not the pane's: the pane does not show the page
+/// while it floats. The once-a-second reconciler took the pane's size for every float that was
+/// not fullscreen, so a resize of the viewer held for under a second and the surface went back
+/// to the pane. Measured on a YouTube float: surface 795x707 (the pane), viewer content about
+/// 938x572, and every frame stretched 1.46x across.
+///
+/// Fullscreen keeps the monitor size it measured on entering. Before the viewer exists (the
+/// tick that opens it) there is nothing to match but the pane, and the viewer opens at that.
+function floatingLayoutSize({ fullscreen, viewer, pane }) {
+  if (fullscreen) return fullscreen;
+  if (viewer && viewer.width > 0 && viewer.height > 0) return { width: viewer.width, height: viewer.height };
+  return pane;
+}
+
 /// Maps a point on the viewer's canvas to a point in the page.
 ///
 /// Three coordinate spaces meet here and getting it wrong is silent — the click lands
@@ -246,6 +264,7 @@ module.exports = {
   centeredStatusSequence,
   fullscreenSurfaceScale,
   scaledSurfaceSize,
+  floatingLayoutSize,
   displayWindowOptions,
   centeredDisplayBounds,
   canvasPointToPage,

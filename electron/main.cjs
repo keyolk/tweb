@@ -94,6 +94,7 @@ const {
   centeredStatusSequence,
   fullscreenSurfaceScale,
   scaledSurfaceSize,
+  floatingLayoutSize,
   displayWindowOptions,
   centeredDisplayBounds,
   relayInputEvents,
@@ -3215,10 +3216,15 @@ function updatePaintingState() {
     // toggle, and passing it for every tab opened a display window per tab. A non-active
     // tab has no viewer and no user looking at it, so it paints only when the pane is visible.
     const floating = isActiveTab(tab) && inputState().floating;
-    // Fullscreen float uses the fullscreen display's size, not the pane's — the watchdog
-    // runs every second and would otherwise resize the tab back to the pane, clobbering
-    // the fullscreen resolution the viewer is showing.
-    const logical = (floating && fullscreenFloat && fullscreenSize) ? fullscreenSize : logicalContentSize(currentViewport());
+    // A float is laid out at its viewer's size, not the pane's: the watchdog runs every second
+    // and would otherwise resize the tab back to the pane, and the viewer stretches whatever
+    // frame it gets over its whole window. See `floatingLayoutSize`.
+    const paneSize = logicalContentSize(currentViewport());
+    const logical = floating ? floatingLayoutSize({
+      fullscreen: fullscreenFloat ? fullscreenSize : null,
+      viewer: viewerContentSize(tab),
+      pane: paneSize,
+    }) : paneSize;
     const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logical, held, floating, keepsSizeInStandby(tab));
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
     tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
@@ -10146,6 +10152,14 @@ function openDisplayWindow(tab, plan) {
     if (tab === currentWindows().win && !quitting) showPageBackInPane();
     restoreFocusFromFloat({ skipHide: wasFullscreen });
   }));
+}
+
+/// A floating tab's viewer content size in DIPs, or null when it has no live viewer.
+function viewerContentSize(tab) {
+  const display = displayWindows.get(tab);
+  if (!display || display.isDestroyed()) return null;
+  const [width, height] = display.getContentSize();
+  return { width, height };
 }
 
 /// Tears the viewer down: on pin, on the tab closing, and on the pane detaching.
