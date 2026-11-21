@@ -11148,7 +11148,12 @@ function handleAttach(command) {
   record.session.restore = Boolean(command.restoreSession);
 
   const url = normalizeUrl(command.url || "https://example.com");
-  const explicitUrl = Boolean(command.url);
+  // A pane asking to be restored is coming back — after a daemon restart, a lost session, a bare
+  // `tweb open` — and the URL it carries is the one it was first opened with, hours ago perhaps.
+  // Treated as a fresh request it was added to the restored tabs and made active: after a restart
+  // every pane showed its first page again instead of the tab it had been on (measured: the active
+  // tab B came back as A, the launch URL). With nothing saved to restore, it is still the first page.
+  const explicitUrl = Boolean(command.url) && !command.restoreSession;
   // Everything below this line is the shipping path, run for the attached pane: the same
   // `applyViewport`, the same `createWindow`, the same input and agent handling. It reaches the
   // right pane because every one of them takes the record and the frame context, which is what
@@ -11590,7 +11595,10 @@ app.whenReady().then(async () => {
   // Before the window either way: it is what keys the window session, and a pane opened with a URL
   // reads the saved tabs too. Deferred, the first save overwrote them with the URL alone.
   initializeTmuxVisibility();
-  createWindow(currentUrl, currentFrames(), { explicit: Boolean(process.env.TWEB_URL || commandLineUrl()) });
+  // The same rule for a pane's own engine: restoring is coming back, not opening its first URL again.
+  createWindow(currentUrl, currentFrames(), {
+    explicit: Boolean(process.env.TWEB_URL || commandLineUrl()) && process.env.TWEB_RESTORE_SESSION !== "1",
+  });
   markInteractionActivity();
   agentServer = startAgentServer({
     // The pane, not the process. `solePaneId` is this pane's registered identity — the same

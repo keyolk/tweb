@@ -143,7 +143,7 @@ class Pane:
     never exercises. Keys are written into the client, as a terminal would.
     """
 
-    def __init__(self, tweb, engine, url, workdir, size=(COLS, ROWS, PX_W, PX_H), tmux=False):
+    def __init__(self, tweb, engine, url, workdir, size=(COLS, ROWS, PX_W, PX_H), tmux=False, daemon=False):
         self.dir = Path(tempfile.mkdtemp(prefix=f"feel-{engine}-", dir=os.path.abspath(workdir)))
         self.trace_path = self.dir / "trace.jsonl"
         # A unix socket path is capped at 104 bytes on macOS, and a scratch workdir is often longer.
@@ -152,7 +152,10 @@ class Pane:
         env = {k: v for k, v in os.environ.items() if not k.startswith("TMUX")}
         env.update({
             "TWEB_ASSUME_GRAPHICS": "1",   # the capability probe cannot answer from a bare PTY
-            "TWEB_DAEMON": "0",            # this build's app code, not the installed daemon's
+            # This build's app code, not the installed daemon's. `daemon=True` runs a daemon of the
+            # pane's own instead, in its private runtime directory (tmux only), for what happens
+            # across `tweb daemon restart`; see `self.cli_env`.
+            "TWEB_DAEMON": "1" if daemon else "0",
             "TWEB_USER_DATA_DIR": str(self.dir / "userData"),
             "TWEB_AGENT_SOCKET": self.socket,
             "TWEB_INPUT_TRACE": str(self.trace_path),
@@ -163,9 +166,12 @@ class Pane:
             args[2:2] = ["--engine", engine]
         cols, rows, width, height = size
         self.tmux = None
+        self.cli_env = {}
         if tmux:
             self.tmux = f"feel-{os.getpid()}-{self.dir.name[-6:]}"
             env["TWEB_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="feelrt-", dir="/tmp")
+            # What a `tweb` command run from outside needs to reach this pane and its daemon.
+            self.cli_env = {k: v for k, v in env.items() if k.startswith("TWEB_") and k != "TWEB_AGENT_SOCKET"}
             base = ["tmux", "-L", self.tmux, "-f", "/dev/null"]
             subprocess.run(base + ["new-session", "-d", "-s", "feel", "-x", str(cols), "-y", str(rows)],
                            env=env, check=True)
