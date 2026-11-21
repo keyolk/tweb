@@ -216,9 +216,17 @@ pub enum Command {
         agent: AgentOptions,
     },
     /// Navigate the resolved browser page. Exits non-zero when the page fails to load.
+    /// Show a URL in the pane. A tab that already shows the page is switched to and left as it
+    /// is, not loaded again; otherwise the active tab loads it.
     Navigate {
         /// URL, host or local path. `back`, `forward` and `reload` run those commands instead.
         url: String,
+        /// Load the page again in the tab already showing it.
+        #[arg(long, conflicts_with = "new")]
+        reload: bool,
+        /// Open the page in a new tab even when one already shows it.
+        #[arg(long)]
+        new: bool,
         #[command(flatten)]
         agent: AgentOptions,
     },
@@ -669,9 +677,15 @@ pub enum TabAction {
         #[command(flatten)]
         agent: AgentOptions,
     },
-    /// New tab.
+    /// New tab. A URL already open in a tab switches to that tab instead, as `navigate` does.
     New {
         url: Option<String>,
+        /// Load the page again in the tab already showing it.
+        #[arg(long, conflicts_with = "new")]
+        reload: bool,
+        /// Make a new tab even when one already shows the page.
+        #[arg(long)]
+        new: bool,
         #[command(flatten)]
         agent: AgentOptions,
     },
@@ -1151,9 +1165,18 @@ pub async fn run() -> Result<()> {
             let (method, params, agent) = match action {
                 TabAction::List { agent } => ("tabs", json!({}), agent),
                 TabAction::Switch { index, agent } => ("tab", json!({ "index": index }), agent),
-                TabAction::New { url, agent } => {
+                TabAction::New {
+                    url,
+                    reload,
+                    new,
+                    agent,
+                } => {
                     let url = url.map(|value| resolve_url_argument(&value, &working_directory));
-                    ("tab-new", json!({ "url": url }), agent)
+                    (
+                        "tab-new",
+                        json!({ "url": url, "reload": reload, "new": new }),
+                        agent,
+                    )
                 }
                 TabAction::Close { index, agent } => {
                     ("tab-close", json!({ "index": index }), agent)
@@ -1280,13 +1303,22 @@ fn agent_call(
     Ok(match command {
         // `back`, `forward` and `reload` are commands, not hosts: as URLs they became
         // `https://back`, a DNS failure that left every following read on an error page.
-        Command::Navigate { url, agent } => match url.trim().to_ascii_lowercase().as_str() {
+        Command::Navigate {
+            url,
+            reload,
+            new,
+            agent,
+        } => match url.trim().to_ascii_lowercase().as_str() {
             "back" => ("back", json!({}), agent),
             "forward" => ("forward", json!({}), agent),
             "reload" => ("reload", json!({}), agent),
             _ => {
                 let url = resolve_url_argument(&url, working_directory);
-                ("navigate", json!({ "url": url }), agent)
+                (
+                    "navigate",
+                    json!({ "url": url, "reload": reload, "new": new }),
+                    agent,
+                )
             }
         },
         Command::Back { agent } => ("back", json!({}), agent),
@@ -1870,6 +1902,36 @@ mod tests {
         let (called, params, _) = super::agent_call(cli.command, &directory).expect("call");
         assert_eq!(called, "navigate");
         assert_eq!(params["url"], "back.example.com");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A page already open in a tab is switched to, not loaded again; `--reload` and `--new` are
+    /// the two ways out of that, and they cannot both be asked for.
+    #[test]
+    fn navigate_reload_and_new_reach_the_engine() {
+        let directory = std::env::temp_dir().join(format!("tweb-nav-flags-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("dir");
+        let call = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            super::agent_call(cli.command, &directory).expect("call").1
+        };
+        let plain = call(&["tweb", "navigate", "https://a.test/"]);
+        assert_eq!(
+            (plain["reload"].as_bool(), plain["new"].as_bool()),
+            (Some(false), Some(false))
+        );
+        assert_eq!(
+            call(&["tweb", "navigate", "https://a.test/", "--reload"])["reload"],
+            true
+        );
+        assert_eq!(
+            call(&["tweb", "navigate", "https://a.test/", "--new"])["new"],
+            true
+        );
+        assert!(
+            Cli::try_parse_from(["tweb", "navigate", "https://a.test/", "--reload", "--new"])
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 

@@ -561,8 +561,10 @@ applies.
 Every engine persists the open tab URLs, the active tab and each tab's zoom per tmux window.
 Omitting the URL — plain `tweb open` — restores the last state. Naming a URL restores it too and shows
 that URL among the tabs: the tab already on that page (any `#fragment` of it), or a new last tab.
-A pane keeps one tab per page. `tweb navigate` and `tweb tab new` go to the tab that already shows the
-page and load it there instead of making a second copy, and a stored session keeps each URL once, so
+A pane keeps one tab per page. `tweb navigate` and `tweb tab new` switch to the tab that already shows
+the page and leave it as it is — a half-filled form or a scroll position survives; the output says
+the tab was reused. `--reload` loads the page again in that tab, `--new` opens a second tab for it
+anyway. A stored session keeps each URL once, so
 copies saved before this are dropped on the next restore. Following a link inside a page is left as
 the page does it. Electron does not store
 `about:blank` or its internal loading/notice pages, so a valid previous session is never overwritten.
