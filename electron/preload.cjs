@@ -1187,14 +1187,46 @@ installPrintShim();
 
   function renderAgentBadge() {
     const driving = presenceState?.driving;
+    const reading = presenceState?.reading;
     const link = presenceState?.link;
-    agentBadge.textContent = driving ? `◐ AGENT ${driving.method}` : link ? `⇄ ${link.owner}` : "";
+    agentBadge.textContent = driving ? `◐ AGENT ${driving.method}`
+      : reading ? `◔ AGENT ${reading.method}`
+      : link ? `⇄ ${link.owner}` : "";
     agentBadge.title = driving
       ? `An agent is driving this page (${driving.method})${link ? ` · linked: ${link.owner}` : ""} — input now races it`
+      : reading ? `An agent is reading this page (${reading.method})${link ? ` · linked: ${link.owner}` : ""}`
       : link ? `Linked to ${link.owner}: it can see and drive this pane` : "";
-    agentBadge.style.background = driving ? "#d97757" : "";
-    agentBadge.style.color = driving ? "#202124" : "";
-    agentBadge.style.display = driving || link ? "" : "none";
+    // Filled while driving; otherwise the badge's own dark ground and orange text. Clearing the
+    // two left the reading and link badges with no background at all: dark text on the page.
+    agentBadge.style.background = driving ? "#d97757" : "#111d";
+    agentBadge.style.color = driving ? "#202124" : "#d97757";
+    agentBadge.style.display = driving || reading || link ? "" : "none";
+    renderAgentFrame(Boolean(driving));
+  }
+
+  // The page's edges, in the agent's colour, while an agent drives it. The badge sits in a corner
+  // of the status line; this is in view wherever on the page the person is looking. Not a cover:
+  // pointer events pass through, so the person can still take the page back.
+  let agentFrame = null;
+  function renderAgentFrame(on) {
+    if (!topFrame) return;
+    if (!on) {
+      if (agentFrame) {
+        agentFrame.remove();
+        agentFrame = null;
+        paintNow();
+      }
+      return;
+    }
+    if (agentFrame?.isConnected) return;
+    agentFrame = document.createElement("div");
+    agentFrame.id = "__tweb_agent_frame__";
+    agentFrame.style.cssText = [
+      "position:fixed", "inset:0", "z-index:2147483645", "pointer-events:none",
+      "box-sizing:border-box", "border:3px solid #d97757", "box-shadow:inset 0 0 0 1px #0006",
+    ].join(";");
+    document.documentElement.append(agentFrame);
+    paintNow();
   }
 
   function updateTabState(model) {
@@ -2514,6 +2546,45 @@ installPrintShim();
     if (restoreMode) normalMode();
   }
 
+  // Where an agent acts: the element's box in the agent's colour, labelled with the verb, for a
+  // moment — the same two painted steps as `showHintFeedback`, for the same reason (the pane does
+  // not show every frame). Drawn in the frame that owns the element, so it lands on it.
+  function showAgentMark(item, verb) {
+    const rect = visibleRect(item.element) || item.rect;
+    if (!rect) return;
+    document.getElementById("__tweb_agent_mark__")?.remove();
+    const host = document.createElement("div");
+    host.id = "__tweb_agent_mark__";
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none";
+    const shadow = host.attachShadow({ mode: "open" });
+    const outline = document.createElement("div");
+    outline.style.cssText = [
+      "position:fixed", `left:${Math.max(0, rect.left - 3)}px`, `top:${Math.max(0, rect.top - 3)}px`,
+      `width:${Math.max(10, rect.width + 6)}px`, `height:${Math.max(10, rect.height + 6)}px`,
+      "box-sizing:border-box", "border:2px solid #d97757", "border-radius:4px", "background:#d9775722",
+      "box-shadow:0 0 0 1px #0009",
+    ].join(";");
+    const label = document.createElement("div");
+    label.textContent = `AGENT ${verb}`;
+    label.style.cssText = [
+      "position:fixed", `left:${Math.max(0, rect.left - 3)}px`, `top:${Math.max(0, rect.top - 21)}px`,
+      "padding:1px 5px", "border-radius:3px", "background:#d97757", "color:#202124",
+      "font:700 11px/14px ui-monospace,SFMono-Regular,Menlo,monospace", "white-space:nowrap",
+      "box-shadow:0 1px 4px #0008",
+    ].join(";");
+    shadow.append(outline, label);
+    document.documentElement.append(host);
+    paintNow();
+    setTimeout(() => {
+      host.style.opacity = "0.5";
+      paintNow();
+    }, 700);
+    setTimeout(() => {
+      host.remove();
+      paintNow();
+    }, 1200);
+  }
+
   // A short mark on what a hint picked: the target's box and the point that was clicked.
   //
   // It was a CSS transition — fade, a 4% grow and an 18px glow — over 320ms. A pane does not
@@ -3616,10 +3687,19 @@ installPrintShim();
     element.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  // The actions that change the page, which get a mark on their target (`showAgentMark`). Reads
+  // (text, html, attr, describe) do not: they leave the page as it was.
+  const MARKED_AGENT_ACTIONS = new Set(["click", "hover", "fill", "focus", "select", "check", "uncheck", "scrollto"]);
+
   function agentAct(params) {
     const { ref, action, value } = params;
     const item = agentResolve(ref);
     const element = item.element;
+    if (MARKED_AGENT_ACTIONS.has(action)) {
+      // After a scroll that brings it into view, so the mark is where the element is.
+      if (action !== "scrollto") element.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+      try { showAgentMark(item, action); } catch (_) { /* a mark is not worth failing the action */ }
+    }
     switch (action) {
       case "click":
       case "hover":

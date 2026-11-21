@@ -456,6 +456,14 @@ been started by this version or later, which allows exactly its own DevTools pag
 debugging port. An engine Chrome started earlier answers with an error: quit it while no
 Chrome-engine pane is open, and the next pane starts a new one.
 
+An agent's commands act on the pane's active tab — the one the person is looking at — so the two
+share it, and the tab shows when an agent is at work: while it changes the page (click, fill,
+navigate, eval…) an orange frame runs round the page and the status line reads `◐ AGENT <verb>` for
+eight seconds after its last such call; the element it acts on is outlined for a moment, labelled
+`AGENT click`/`AGENT fill`; a read (snapshot, screenshot) shows `◔ AGENT <verb>` for three seconds.
+Input from the person meanwhile is not blocked, only flagged as racing the agent. For work that must
+not share a screen with a person, give the agent a pane of its own (`tweb split`).
+
 Output defaults to a human-readable summary; `--json` returns the raw form. `--pane` can be omitted —
 with one pane it picks that one, and with several it uses **panes in the same tmux window**. Browsers
 in other windows are never candidates, so you can keep a browser open per window without looking up
