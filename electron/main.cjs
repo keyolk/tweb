@@ -4282,7 +4282,14 @@ function activateTab(index) {
   }
   const normalized = ((index % currentWindows().tabs.length) + currentWindows().tabs.length) % currentWindows().tabs.length;
   // The tab being left keeps its last frame only if it is drawn from it on the way back.
-  const leaving = currentWindows().win;
+  //
+  // Only a live one. When the active tab closes, this runs from its `closed` handler with that tab
+  // still in `win`, destroyed; `keepsSizeInStandby` then asked its webContents and threw "Object has
+  // been destroyed", the handler stopped half way, and the pane kept the dead tab as its active one
+  // with an index past the end of its list — every later agent call answered "no active tab" and
+  // every mouse report threw again. That throw was the stream of "Uncaught Exception" dialogs.
+  const current = currentWindows().win;
+  const leaving = current && !current.isDestroyed() ? current : null;
   if (leaving && leaving !== currentWindows().tabs[normalized] && !keepsSizeInStandby(leaving)) tabFrames.delete(leaving);
   // Edit mode a page asked for belongs to that page's tab, not to whichever tab comes next.
   if (leaving && leaving !== currentWindows().tabs[normalized] && pageKeyTabs.has(leaving)) {
@@ -7106,6 +7113,9 @@ function noteUserInput() {
 }
 
 async function dispatchAgentCommand(method, params) {
+  // An agent call reaches the pane without any terminal input, which is where a dead tab used to be
+  // dropped (`reconcileDestroyedTabs`); a pane left on one answered every call "no active tab".
+  reconcileDestroyedTabs();
   switch (method) {
     // Page-side methods run inside the preload, next to the hint machinery.
     case "snapshot":
@@ -9220,7 +9230,11 @@ function adoptTab(tab, url, activate = true, initialZoomFactor = paneZoomFactor(
       else app.quit();
       return;
     }
-    if (wasActive) activateTab(Math.min(closedIndex, currentWindows().tabs.length - 1));
+    if (wasActive) {
+      // Let go of the closed tab first, so nothing on the way treats it as the one being left.
+      currentWindows().win = null;
+      activateTab(Math.min(closedIndex, currentWindows().tabs.length - 1));
+    }
     else {
       if (closedIndex < currentWindows().activeTabIndex) currentWindows().activeTabIndex -= 1;
       sendTabState();
