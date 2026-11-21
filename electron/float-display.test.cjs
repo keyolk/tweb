@@ -7,6 +7,7 @@ const {
   centeredStatusSequence,
   fullscreenSurfaceScale,
   scaledSurfaceSize,
+  floatingLayoutSize,
   displayWindowOptions,
   centeredDisplayBounds,
   canvasPointToPage,
@@ -278,4 +279,17 @@ test("a missing label is still a valid sequence", () => {
   for (const label of [undefined, null, ""]) {
     assert.match(centeredStatusSequence(label, 20, 6), /\x1b\[2;\d+H/, String(label));
   }
+});
+
+test("a float is laid out at its viewer's size, not the pane's", () => {
+  const pane = { width: 795, height: 707 };
+  // The viewer the user dragged wider: the page follows it, so the frame is the window's shape.
+  assert.deepEqual(floatingLayoutSize({ fullscreen: null, viewer: { width: 938, height: 572 }, pane }),
+    { width: 938, height: 572 });
+  // Fullscreen keeps the monitor size it measured.
+  assert.deepEqual(floatingLayoutSize({ fullscreen: { width: 2560, height: 1440 }, viewer: { width: 938, height: 572 }, pane }),
+    { width: 2560, height: 1440 });
+  // The tick that opens the viewer has none yet, and a zero-sized one is not a shape to match.
+  assert.deepEqual(floatingLayoutSize({ fullscreen: null, viewer: null, pane }), pane);
+  assert.deepEqual(floatingLayoutSize({ fullscreen: null, viewer: { width: 0, height: 0 }, pane }), pane);
 });
