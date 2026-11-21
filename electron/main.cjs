@@ -546,12 +546,58 @@ console.error = (...args) => {
 // is still found — and the engine keeps serving the other panes.
 let uncaughtErrors = 0;
 let lastUncaught = null;
+// Per kind of failure: its message and the first frame of its stack. One bug thrown on every mouse
+// report is one entry with a count, not a page of the same line.
+const uncaughtByKind = new Map();
+
+function uncaughtKind(error) {
+  const frame = String(error?.stack || "").split("\n").find((line) => line.trim().startsWith("at ")) || "";
+  return `${String(error?.message || error)}|${frame.trim()}`;
+}
+
 function noteUncaught(kind, error) {
   uncaughtErrors += 1;
-  let pane = null;
-  try { pane = paneScope.getStore()?.paneId || null; } catch (_) { /* scope not set up yet */ }
-  lastUncaught = { at: Date.now(), kind, pane, message: String(error?.message || error) };
+  let record = null;
+  try { record = paneScope.getStore() || null; } catch (_) { /* scope not set up yet */ }
+  const pane = record?.paneId || null;
+  const message = String(error?.message || error);
+  lastUncaught = { at: Date.now(), kind, pane, message };
   console.error(`tweb: uncaught ${kind}${pane ? ` in ${pane}` : ""}: ${error?.stack || error}`);
+  const key = uncaughtKind(error);
+  const entry = uncaughtByKind.get(key) || { key, kind, message, count: 0, firstAt: Date.now(), sentAt: 0 };
+  entry.count += 1;
+  entry.at = Date.now();
+  uncaughtByKind.set(key, entry);
+  // Shown, briefly and without taking anything away: the dialog this replaced was at least seen.
+  // Never allowed to throw from here — a throw in this handler has nothing left to catch it.
+  try { announceUncaught(entry, record); } catch (_) { /* nothing to report it with */ }
+}
+
+/// What `tweb status` says about failures: how many, the last one on one line, the commonest kinds.
+function engineErrorSummary() {
+  const kinds = [...uncaughtByKind.values()].sort((a, b) => b.count - a.count).slice(0, 5)
+    .map(({ kind, message, count, at }) => ({ kind, message, count, at }));
+  const last = lastUncaught
+    ? `${lastUncaught.kind}${lastUncaught.pane ? ` in ${lastUncaught.pane}` : ""}: ${lastUncaught.message}`
+    : null;
+  return { count: uncaughtErrors, last, kinds };
+}
+
+// A kind seen for the first time is shown in the pane it happened in (every pane when no pane was
+// in scope); a repeat only updates the count of a badge already up, at most once a second, so one
+// bug firing on every pointer move is one badge and a number, not a flicker.
+const UNCAUGHT_REPEAT_MS = 1000;
+function announceUncaught(entry, record) {
+  const now = Date.now();
+  if (entry.count > 1 && now - entry.sentAt < UNCAUGHT_REPEAT_MS) return;
+  entry.sentAt = now;
+  const payload = { key: entry.key, message: entry.message, count: entry.count, first: entry.count === 1, total: uncaughtErrors };
+  const tell = () => {
+    const tab = currentWindows().win;
+    if (tab && !tab.isDestroyed()) sendToMainTabFrame(tab, "tweb-engine-error", payload);
+  };
+  if (record) withPaneScope(record, tell);
+  else forEachPane(tell);
 }
 process.on("uncaughtException", (error) => noteUncaught("exception", error));
 process.on("unhandledRejection", (reason) => noteUncaught("rejection", reason));
@@ -5953,7 +5999,7 @@ function agentDiagnostics() {
       scaleFactor: renderScaleFactor(),
     },
     // Exceptions nothing caught in this engine, all panes; see `noteUncaught`.
-    engine: { uncaught: uncaughtErrors, lastUncaught },
+    engine: { uncaught: uncaughtErrors, lastUncaught, kinds: engineErrorSummary().kinds },
     window: {
       contentSize: size ? { width: size[0], height: size[1] } : null,
       zoomFactor: tab ? tab.webContents.getZoomFactor() : null,
@@ -7351,6 +7397,8 @@ async function dispatchAgentCommand(method, params) {
         // Every engine with tabs in this pane: a Chrome tab in an Electron pane drives Chrome too.
         engines: pageBackend.startedKinds(),
         tabs: agentTabList(),
+        // Exceptions this engine caught instead of crashing or showing a dialog; see `noteUncaught`.
+        engineErrors: engineErrorSummary(),
       };
     // A peer says the claim changed. Nothing is returned and nothing is trusted — the
     // claim file is still the truth, this only saves waiting for the next poll.

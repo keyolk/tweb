@@ -94,7 +94,7 @@ test("an uncaught exception is logged with its pane and counted, not shown as a 
   const note = between("function noteUncaught(kind, error) {", 'process.on("uncaughtException"');
   assert.match(note, /uncaughtErrors \+= 1/);
   assert.match(note, /console\.error\(`tweb: uncaught/);
-  assert.match(main, /engine: \{ uncaught: uncaughtErrors, lastUncaught \}/);
+  assert.match(main, /engine: \{ uncaught: uncaughtErrors, lastUncaught, kinds: engineErrorSummary\(\)\.kinds \}/);
 });
 
 // The root cause of the destroyed active tab: closing the active tab ran `activateTab` from the
