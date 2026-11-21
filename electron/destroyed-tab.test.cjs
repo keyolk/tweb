@@ -96,3 +96,21 @@ test("an uncaught exception is logged with its pane and counted, not shown as a 
   assert.match(note, /console\.error\(`tweb: uncaught/);
   assert.match(main, /engine: \{ uncaught: uncaughtErrors, lastUncaught \}/);
 });
+
+// The root cause of the destroyed active tab: closing the active tab ran `activateTab` from the
+// tab's own `closed` handler, and `activateTab` asked the closed tab — still in `win`, destroyed —
+// whether it keeps its size. The throw stopped the handler half way and left the pane on the dead
+// tab with an index past the end of its list. Reproduced with `tweb tab close` on the active tab:
+// one tab left, active index 1, every later call "no active tab".
+test("activating a tab never asks a destroyed tab anything, and a closed active tab is let go first", () => {
+  const activate = between("function activateTab(index) {", "currentWindows().activeTabIndex = normalized;");
+  assert.match(activate, /const leaving = current && !current\.isDestroyed\(\) \? current : null;/);
+  assert.doesNotMatch(activate, /const leaving = currentWindows\(\)\.win;/);
+  const closed = between('tab.on("closed", bindPane', "scheduleWindowSessionSave();\n  }));");
+  assert.match(closed, /if \(wasActive\) \{\n\s+\/\/[^\n]*\n\s+currentWindows\(\)\.win = null;\n\s+activateTab\(/);
+});
+
+test("an agent call drops a dead tab before it looks for the active one", () => {
+  const dispatch = between("async function dispatchAgentCommand(method, params) {", 'case "snapshot":');
+  assert.match(dispatch, /reconcileDestroyedTabs\(\);\n  switch \(method\) \{/);
+});
