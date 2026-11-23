@@ -295,8 +295,15 @@ installPrintShim();
   // never arrives, and the backstop that closes a bar whose Enter never landed.
   let searchPending = 0;
   let searchRestoreTimer = null;
-  // An `n`/`N` step waiting for its result so it can end the session with the match selected.
-  let stepSearchPending = false;
+  // What the engine says about the tab's search, whichever frame's bar it came from: `bar` while
+  // a bar is open somewhere in the tab, `lit` while a find session holds its highlights, and
+  // the last query. A frame other than the bar's own needs all three, because Chromium's find
+  // moves focus to the frame holding the match it activates. With the bar in the top document
+  // and the match inside a cross-origin iframe, every key after the first went to the iframe,
+  // which knew of no search: measured on a claude.ai artifact, typing stopped reaching the
+  // query after one letter, the rest ran as normal-mode commands, and Enter, `n` and `N` did
+  // nothing at all.
+  let findState = { bar: false, lit: false, query: "" };
   const FIND_PLACEHOLDER = "Find in page";
   let visualState = null;
   let inspectState = null;
@@ -4528,14 +4535,48 @@ installPrintShim();
     send("find", { query, forward });
   }
 
+  // Closing the bar without clearing (Enter) leaves the find session running, so its highlights
+  // stay: every match yellow, the current one orange, the way Chrome's find bar leaves them while
+  // it is open. Ending the session with `keepSelection` here, as this used to, wiped all of them
+  // and left only a selection, and a selection in a frame without focus is painted in the
+  // inactive colour — measured on a dark page, a faint grey-blue box that was the only sign of
+  // where `n` had gone. Escape in normal mode ends the session (`clearFindHighlights`).
   function cancelSearch(clearSelection = true, restoreMode = true) {
     if (!searchState) return;
     clearTimeout(searchRestoreTimer);
     searchPending = 0;
     searchState.host.remove();
     searchState = null;
-    send("stop-find", clearSelection ? "clearSelection" : "keepSelection");
+    if (clearSelection) send("stop-find", "clearSelection");
+    send("search-bar", false);
     if (restoreMode) normalMode();
+  }
+
+  // A key that reached this frame while the bar is open in another one. The bar's frame does the
+  // editing; this one only hands the key over.
+  function forwardSearchKey(event, key) {
+    if (searchState || !findState.bar) return false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    send("search-key", {
+      key,
+      shiftKey: Boolean(event.shiftKey),
+      ctrlKey: Boolean(event.ctrlKey),
+      metaKey: Boolean(event.metaKey),
+      altKey: Boolean(event.altKey),
+    });
+    return true;
+  }
+
+  // Escape in normal mode ends a session the bar left running, keeping the current match
+  // selected. The highlights are the tab's, so whichever frame has focus can do it.
+  function clearFindHighlights(event, key) {
+    if (key !== "Escape" || !findState.lit || searchState) return false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    findState = { ...findState, lit: false };
+    send("stop-find", "keepSelection");
+    return true;
   }
 
   // Chromium's find moves focus to the match it activates, so after the first keystroke
@@ -4588,20 +4629,14 @@ installPrintShim();
     return true;
   }
 
-  // `n`/`N` step without a bar, so nothing closes the session afterwards and the match would
-  // stay a compositor-only highlight the page cannot show as a selection. Ending each step
-  // with `keepSelection` is what makes the match visible, the same way Enter does.
+  // `n`/`N` step the running session, so the highlights stay as they are after Enter. With no
+  // session (Escape ended it) the engine opens a new one from the selected match.
   function stepSearch(forward) {
-    stepSearchPending = true;
     send("find", { query: lastSearch, forward });
   }
 
   function showSearch() {
     cancelTransient(false);
-    // An `n` step whose result has not landed yet must not close the session the bar is
-    // about to open: its `keepSelection` would arrive during the first typed request and
-    // cancel it, which is the same race that made Enter lose its match.
-    stepSearchPending = false;
     // Opening the bar clears whatever the last search left behind. Without this, a second
     // search whose first request opens a new session while a kept selection from the
     // previous one is still live loses that selection when the bar closes: measured over
@@ -4690,6 +4725,8 @@ installPrintShim();
     shadow.append(box);
     document.documentElement.append(host);
     searchState = { host, input, canvas, paintBar, count: "", closeOnResult: false };
+    // Every other frame forwards its keys here until the bar closes (`forwardSearchKey`).
+    send("search-bar", true);
     paintBar();
     paintNow();
     setMode("search");
@@ -7149,6 +7186,10 @@ installPrintShim();
       return;
     }
 
+    // The search bar's keys, when the bar is in another frame, before anything here can read
+    // them as commands.
+    if (forwardSearchKey(event, key)) return;
+
     // The copy menu's second key, before anything else can claim it — including Escape, which
     // closes only the menu and leaves a `v` pick where it was.
     if (handleCopyMenuKey(event, key)) return;
@@ -7201,6 +7242,8 @@ installPrintShim();
       if (eventIsEditable(event)) setMode("insert");
       return;
     }
+
+    if (clearFindHighlights(event, key)) return;
 
     // The keys a Chrome refugee's hands already know. `H`/`L` do the same thing and are
     // what a vim user reaches for, but nobody arrives with that reflex — they arrive with
@@ -7415,11 +7458,25 @@ installPrintShim();
     reportCaret();
   });
 
+  ipcRenderer.on("tweb-find-state", (_event, state) => {
+    if (!state) return;
+    findState = { bar: Boolean(state.bar), lit: Boolean(state.lit), query: String(state.query || "") };
+    // The bar's own frame keeps the query it is editing; every other frame takes the tab's, so
+    // `n` works from whichever frame the match left focus in.
+    if (!searchState) lastSearch = findState.query;
+  });
+
+  // A key another frame received while this frame's bar is open (`forwardSearchKey`).
+  ipcRenderer.on("tweb-search-key", (_event, payload) => {
+    if (!searchState || !payload || typeof payload.key !== "string") return;
+    handleSearchKey({
+      ...payload,
+      preventDefault: () => {},
+      stopImmediatePropagation: () => {},
+    }, payload.key);
+  });
+
   ipcRenderer.on("tweb-find-result", (_event, result) => {
-    if (stepSearchPending) {
-      stepSearchPending = false;
-      send("stop-find", "keepSelection");
-    }
     if (!searchState) return;
     // Only the last outstanding request un-hides the bar: typing faster than the search
     // answers would otherwise put the query back into the document mid-search, and the

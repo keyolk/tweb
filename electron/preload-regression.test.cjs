@@ -3402,3 +3402,62 @@ test("a page's tweb:keys meta puts the pane in edit mode and only that is undone
   assert.match(main, /function toggleBrowserShortcuts\(\) \{[\s\S]*?pageKeyTabs\.delete\(currentWindows\(\)\.win\)/);
   assert.match(main, /insertModeOwners\.delete\(tab\);\s*\/\/ Whatever the last page asked for[^\n]*\n\s*pageKeysWanted\(tab, false\);/);
 });
+
+// Chromium's find moves focus to the frame holding the match it activates. With the bar in the
+// top document and the match in a cross-origin iframe, every key after the first reached the
+// iframe, which knew of no search: measured on a claude.ai artifact, the query stopped after
+// one letter, the rest ran as commands, and Enter, `n` and `N` did nothing.
+test("a frame without the find bar hands its keys to the frame that has it", () => {
+  const normal = electron.slice(electron.indexOf("function handleNormalKey"), electron.indexOf("function handleNormalKey") + 3000);
+  assert.ok(normal.indexOf("forwardSearchKey(event, key)") > 0, "the normal-key handler must forward first");
+  assert.ok(normal.indexOf("forwardSearchKey(event, key)") < normal.indexOf("handleCopyMenuKey(event, key)"),
+    "forwarding has to come before anything that reads the key as a command");
+  const forward = electron.slice(electron.indexOf("function forwardSearchKey"), electron.indexOf("function clearFindHighlights"));
+  assert.match(forward, /if \(searchState \|\| !findState\.bar\) return false;/);
+  assert.match(forward, /send\("search-key"/);
+  assert.match(electron, /ipcRenderer\.on\("tweb-search-key"[\s\S]{0,200}handleSearchKey\(/);
+  // The bar says when it opens and closes, or no other frame would know to forward.
+  const bar = electron.slice(electron.indexOf("function showSearch"), electron.indexOf("function cancelTabList"));
+  assert.match(bar, /send\("search-bar", true\)/);
+  const cancel = electron.slice(electron.indexOf("function cancelSearch"), electron.indexOf("function forwardSearchKey"));
+  assert.match(cancel, /send\("search-bar", false\)/);
+
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const routed = main.slice(main.indexOf('case "search-key"'), main.indexOf('case "search-key"') + 600);
+  assert.match(routed, /owner\.send\("tweb-search-key", value\)/);
+  // `f` and `v` open a hint round that sends the key to every frame; with a bar open that
+  // would type the letter twice.
+  const hints = main.slice(main.indexOf("function routeHintShortcut"), main.indexOf("function routeHintShortcut") + 1200);
+  assert.ok(hints.indexOf("if (liveSearchBarOwner(tab)) return false;") > 0
+    && hints.indexOf("if (liveSearchBarOwner(tab)) return false;") < hints.indexOf("startHintRound(tab)"));
+  // Every change to the session reaches every frame, so `n` works from wherever focus went.
+  assert.doesNotMatch(main.replace(/function setFindSession[\s\S]*?\n}\n/, ""), /findSessionByTab\.set\(/,
+    "the session must change only through setFindSession, which tells the frames");
+});
+
+// Ending the session with `keepSelection` after Enter wiped every highlight and left a selection,
+// painted in the inactive colour in a frame without focus: a faint box on a dark page was the
+// only sign of where `n` had gone.
+test("Enter and n leave the find highlights on until Escape", () => {
+  const cancel = electron.slice(electron.indexOf("function cancelSearch"), electron.indexOf("function forwardSearchKey"));
+  assert.match(cancel, /if \(clearSelection\) send\("stop-find", "clearSelection"\);/);
+  assert.doesNotMatch(cancel, /keepSelection/);
+  const step = electron.slice(electron.indexOf("function stepSearch"), electron.indexOf("function showSearch"));
+  assert.doesNotMatch(step, /stop-find|keepSelection/);
+  assert.doesNotMatch(electron, /stepSearchPending/);
+  const clear = electron.slice(electron.indexOf("function clearFindHighlights"), electron.indexOf("function clearFindHighlights") + 500);
+  assert.match(clear, /key !== "Escape" \|\| !findState\.lit/);
+  assert.match(clear, /send\("stop-find", "keepSelection"\)/);
+});
+
+// Electron's `findNext` opens a session; the Chrome and WebKit engines read it as "continue", so
+// typing walked on from the last match and Enter jumped back to the first.
+test("the Chrome and WebKit engines start over on a new find session, not on a follow-up", () => {
+  for (const file of ["cdp/web-contents.cjs", "webkit/web-contents.cjs"]) {
+    const source = fs.readFileSync(path.join(__dirname, file), "utf8");
+    const find = source.slice(source.indexOf("findInPage(text"), source.indexOf("stopFindInPage("));
+    assert.match(find, /const newSession = \$\{Boolean\(options\.findNext\)\};/, file);
+    assert.match(find, /if \(newSession\) \{[\s\S]*?removeAllRanges\(\);[\s\S]*?state\.ordinal = 0;/, file);
+    assert.doesNotMatch(find, /if \(!findNext\)/, file);
+  }
+});

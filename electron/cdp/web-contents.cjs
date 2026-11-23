@@ -1895,16 +1895,27 @@ class CdpWebContents extends EventEmitter {
       const query = ${JSON.stringify(query)};
       const matchCase = ${matchCase};
       const forward = ${forward};
-      const findNext = ${Boolean(options.findNext)};
+      const newSession = ${Boolean(options.findNext)};
       const body = document.body ? document.body.innerText : "";
       const haystack = matchCase ? body : body.toLowerCase();
       const needle = matchCase ? query : query.toLowerCase();
       let matches = 0;
       if (needle) for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + needle.length)) matches += 1;
-      if (!findNext) { const s = getSelection(); s && s.removeAllRanges(); }
-      const found = matches > 0 && window.find(query, matchCase, !forward, true, false, false, false);
       const state = window.__twebFind || (window.__twebFind = { ordinal: 0 });
-      if (!findNext) state.ordinal = 0;
+      // Electron's \`findNext\` is true for the request that OPENS a session (find-session.cjs),
+      // not for "the next match". Read the other way round, as it was, every typed letter walked
+      // on from the last match and Enter started again at the top. A new session for the text
+      // already selected (\`n\` after Escape ended the last one) carries on from it, as
+      // Chromium's does; any other starts at the top.
+      if (newSession) {
+        const s = getSelection();
+        const selected = s ? String(s) : "";
+        if ((matchCase ? selected : selected.toLowerCase()) !== needle) {
+          s && s.removeAllRanges();
+          state.ordinal = 0;
+        }
+      }
+      const found = matches > 0 && window.find(query, matchCase, !forward, true, false, false, false);
       state.ordinal = matches ? ((state.ordinal + (forward ? 1 : -1) - 1 + matches) % matches) + 1 : 0;
       let rect = { x: 0, y: 0, width: 0, height: 0 };
       const sel = getSelection();
