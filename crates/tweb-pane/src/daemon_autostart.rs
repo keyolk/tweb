@@ -101,18 +101,17 @@ pub fn ensure_running(socket: &Path) -> Result<(), String> {
     start_with(socket, twebd)
 }
 
-/// `ensure_running` with the binary already resolved.
+/// The `twebd serve` command a pane or `tweb daemon restart` starts the shared daemon with.
 ///
-/// Split out so the tests pass a path rather than setting `TWEB_TWEBD`: they run on one process and
-/// a shared environment variable made them race — each test's cleanup cleared the next one's setup,
-/// and which test failed depended on scheduling.
-fn start_with(socket: &Path, twebd: Result<PathBuf, String>) -> Result<(), String> {
-    if socket_is_live(socket) {
-        return Ok(());
-    }
-    let twebd = twebd?;
-
-    let mut command = std::process::Command::new(&twebd);
+/// One builder for both, because the daemon outlives whoever starts it and that has to hold for
+/// every starter. `tweb daemon restart` built its own and left out `setsid`, so the daemon it
+/// started stayed in the caller's process group. An agent's shell tool runs each command in a
+/// group of its own and signals the group when it is done with it, and on 2026-11-23 that took a
+/// freshly restarted daemon and its engine down 22 seconds after the restart, with every pane it
+/// hosted. Measured with bench/restart-detach.py: the daemon came up with the calling shell's pgid
+/// and was gone one signal later.
+pub fn serve_command(twebd: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(twebd);
     command.arg("serve");
     // The daemon outlives this pane and must not hold its terminal: stdout is this pane's Kitty
     // graphics channel, and a daemon inheriting it would write log lines into the frame stream.
@@ -154,6 +153,21 @@ fn start_with(socket: &Path, twebd: Result<PathBuf, String>) -> Result<(), Strin
         }
     }
 
+    command
+}
+
+/// `ensure_running` with the binary already resolved.
+///
+/// Split out so the tests pass a path rather than setting `TWEB_TWEBD`: they run on one process and
+/// a shared environment variable made them race — each test's cleanup cleared the next one's setup,
+/// and which test failed depended on scheduling.
+fn start_with(socket: &Path, twebd: Result<PathBuf, String>) -> Result<(), String> {
+    if socket_is_live(socket) {
+        return Ok(());
+    }
+    let twebd = twebd?;
+
+    let mut command = serve_command(&twebd);
     let mut child = command
         .spawn()
         .map_err(|err| format!("{}: {err}", twebd.display()))?;
@@ -205,6 +219,38 @@ pub fn daemon_log() -> std::process::Stdio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon must not share its starter's process group: a signal to the caller's group (an
+    /// agent shell tool's cleanup, a Ctrl-C) must not reach it. A script stands in for twebd and
+    /// prints its own pid and process group, which `serve_command`'s `setsid` makes the same.
+    #[test]
+    fn the_daemon_leads_a_process_group_of_its_own() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new("detach");
+        let script = dir.0.join("twebd");
+        std::fs::write(&script, "#!/bin/sh\nps -o pid=,pgid= -p $$\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let output = serve_command(&script)
+            .stdout(std::process::Stdio::piped())
+            .output()
+            .expect("the stand-in ran");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let fields: Vec<i32> = text
+            .split_whitespace()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        assert_eq!(fields.len(), 2, "pid and pgid from ps: {text:?}");
+        assert_eq!(
+            fields[0], fields[1],
+            "the daemon leads its own process group"
+        );
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let ours = unsafe { libc::getpgrp() };
+        assert_ne!(
+            fields[1], ours,
+            "the daemon left the starter's process group"
+        );
+    }
 
     /// A temp directory that is removed however the test ends.
     ///
