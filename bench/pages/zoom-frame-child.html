@@ -1,0 +1,7 @@
+<!doctype html><meta charset=utf-8>
+<style>body{margin:0;font:14px system-ui;background:#eef} button{position:absolute;width:140px;height:60px}</style>
+<button id=b1 style="left:300px;top:120px">b1</button><button id=b2 style="left:520px;top:240px">b2</button>
+<script>
+for (const type of ["pointerdown", "pointerup", "click"])
+  addEventListener(type, (e) => parent.__log.push(`frame:${type} ${e.target.id || e.target.tagName}`), true);
+</script>

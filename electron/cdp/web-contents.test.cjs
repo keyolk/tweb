@@ -582,7 +582,7 @@ test("the input skew is accepted at the ratio between the real and emulated scal
   created.deviceScaleFactor = 1.6;
   created.frames.set(created.mainFrameId || created.targetId, { isolatedContextId: 7 });
   let seen = null;
-  created.evaluateIn = async (_session, _context, expression) => (expression.includes("__twebProbe\"") || expression === "globalThis.__twebProbe" ? seen : undefined);
+  created.evaluateIn = async (_session, _context, expression) => (expression.includes("seen: globalThis.__twebProbe") ? { seen, devicePixelRatio: 1.6 } : undefined);
   created.session.send = async () => ({});
   seen = [17 / 0.8, 13 / 0.8];
   assert.strictEqual(await created.measureInputScale(), 0.8);
@@ -593,6 +593,43 @@ test("the input skew is accepted at the ratio between the real and emulated scal
   created.inputScale = 1;
   seen = [5, 5];
   assert.strictEqual(await created.measureInputScale(), 1, "a probe that missed keeps the last value");
+});
+
+// 2026-11-23: platform-portal had a 50% zoom saved in the engine profile. The page's viewport was
+// twice what the pane's point was converted for, and every mouse click landed at half its point —
+// inside the iframe that covers the page, on nothing — while `f` still worked.
+test("a zoom Chrome applies on its own divides every mouse point, press and release alike", async () => {
+  const { created } = contents();
+  created.deviceScaleFactor = 1.6;
+  created.frames.set(created.mainFrameId || created.targetId, { isolatedContextId: 7 });
+  let devicePixelRatio = 0.8;
+  created.evaluateIn = async (_session, _context, expression) =>
+    (expression.includes("seen: globalThis.__twebProbe") ? { seen: [17, 13], devicePixelRatio } : undefined);
+  const sent = [];
+  created.session.send = async (method, params) => {
+    if (method === "Input.dispatchMouseEvent" && params.type !== "mouseMoved") sent.push(params);
+    return {};
+  };
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mousePressed", x: 60, y: 59.5, button: "left", buttons: 1 });
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mouseReleased", x: 60, y: 59.5, button: "left", buttons: 0 });
+  assert.deepStrictEqual(sent.map(({ type, x, y }) => [type, x, y]),
+    [["mousePressed", 120, 119], ["mouseReleased", 120, 119]], "both at the page's CSS point");
+
+  // Chrome's zoom back to 100%: points go as they are again, from the next press.
+  devicePixelRatio = 1.6;
+  sent.length = 0;
+  await created.sendInput("Input.dispatchMouseEvent", { type: "mousePressed", x: 60, y: 59.5, button: "left", buttons: 1 });
+  assert.deepStrictEqual(sent.map(({ x, y }) => [x, y]), [[60, 59.5]]);
+});
+
+test("only a plausible zoom is read from devicePixelRatio", () => {
+  const { created } = contents();
+  created.deviceScaleFactor = 1.6;
+  assert.strictEqual(created.browserZoomFrom(0.8), 0.5);
+  assert.strictEqual(created.browserZoomFrom(1.6), 1);
+  assert.strictEqual(created.browserZoomFrom(1.6005), 1, "rounding is not a zoom");
+  assert.strictEqual(created.browserZoomFrom(undefined), 1);
+  assert.strictEqual(created.browserZoomFrom(0.01), 1);
 });
 
 test("a frame at the forced browser scale is the viewport, not the window", () => {

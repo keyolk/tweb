@@ -146,6 +146,7 @@ class Pane:
     def __init__(self, tweb, engine, url, workdir, size=(COLS, ROWS, PX_W, PX_H), tmux=False, daemon=False):
         self.dir = Path(tempfile.mkdtemp(prefix=f"feel-{engine}-", dir=os.path.abspath(workdir)))
         self.trace_path = self.dir / "trace.jsonl"
+        self.engine = engine
         # A unix socket path is capped at 104 bytes on macOS, and a scratch workdir is often longer.
         self.socket = tempfile.mktemp(prefix="feel-", suffix=".sock", dir="/tmp")
         self.tweb = tweb
