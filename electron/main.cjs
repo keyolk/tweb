@@ -331,6 +331,35 @@ const contextMenuStateByTab = new WeakMap();
 // Whether Chromium currently holds an open find session for a tab. See find-session.cjs:
 // the renderer emits nothing at all for a follow-up request with no session behind it.
 const findSessionByTab = new WeakMap();
+// The frame whose find bar is open, and the tab's last query. Chromium's find moves focus to the
+// frame holding the match it activates, so the frame the person types into stops being the bar's
+// frame as soon as the match is in an iframe. Every frame is told both (`broadcastFindState`),
+// and a frame without the bar hands its keys back to this one.
+const searchBarOwnerByTab = new WeakMap();
+const lastFindQueryByTab = new WeakMap();
+
+function setFindSession(tab, state) {
+  findSessionByTab.set(tab, state);
+  if (state.active) lastFindQueryByTab.set(tab, state.query);
+  broadcastFindState(tab);
+}
+
+function liveSearchBarOwner(tab) {
+  const frame = searchBarOwnerByTab.get(tab);
+  if (frame && !frame.isDestroyed() && !frame.detached) return frame;
+  searchBarOwnerByTab.delete(tab);
+  return null;
+}
+
+function broadcastFindState(tab) {
+  if (!tab || tab.isDestroyed()) return;
+  sendToTabFrames(tab, "tweb-find-state", {
+    bar: Boolean(liveSearchBarOwner(tab)),
+    lit: Boolean(findSessionByTab.get(tab)?.active),
+    query: lastFindQueryByTab.get(tab) || "",
+  });
+}
+
 function commandLineValue(name) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -5338,14 +5367,33 @@ function handleNativeShortcut(tab, action, value, sourceFrame = null) {
       const query = String(value?.query || "");
       if (query) {
         const step = findStep(findSessionByTab.get(tab) ?? FIND_IDLE, query, value?.forward !== false);
-        findSessionByTab.set(tab, step.state);
+        setFindSession(tab, step.state);
         if (debugLogging) console.error(`tweb: find ${JSON.stringify(query)} findNext=${step.options.findNext} forward=${step.options.forward}`);
         contents.findInPage(query, step.options);
       }
       break;
     }
+    // The bar opened or closed in `sourceFrame`. Opening starts from no query, as the bar does.
+    case "search-bar":
+      if (value === true && sourceFrame) {
+        searchBarOwnerByTab.set(tab, sourceFrame);
+        lastFindQueryByTab.delete(tab);
+      } else if (!sourceFrame || searchBarOwnerByTab.get(tab) === sourceFrame) {
+        searchBarOwnerByTab.delete(tab);
+      }
+      broadcastFindState(tab);
+      break;
+    // A key for the bar that reached another frame (the preload's `forwardSearchKey`).
+    case "search-key": {
+      const owner = liveSearchBarOwner(tab);
+      if (owner && owner !== sourceFrame && readyFrameKeys(tab).has(frameKey(owner))) owner.send("tweb-search-key", value);
+      // A bar whose frame is gone cannot close itself; without this every frame would keep
+      // forwarding its keys to nothing.
+      else if (!owner) broadcastFindState(tab);
+      break;
+    }
     case "stop-find":
-      findSessionByTab.set(tab, endStep().state);
+      setFindSession(tab, endStep().state);
       if (debugLogging) console.error(`tweb: stop-find ${JSON.stringify(value)}`);
       contents.stopFindInPage(["clearSelection", "keepSelection", "activateSelection"].includes(value) ? value : "clearSelection");
       break;
@@ -9076,7 +9124,10 @@ function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
     // A new document has no find session behind it. Carrying the old flag over would send
     // the next query as a follow-up to a session that no longer exists, and Chromium
     // answers that with silence — the exact failure this state exists to prevent.
-    if (details.isMainFrame) findSessionByTab.set(tab, endStep().state);
+    if (details.isMainFrame) {
+      searchBarOwnerByTab.delete(tab);
+      setFindSession(tab, endStep().state);
+    }
   });
   onContents("context-menu", (_event, params) => {
     if (inputState().vimium) showBrowserContextMenu(tab, params);
@@ -9210,7 +9261,8 @@ function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
   // offscreen one has no such trigger, so nothing ever comes back without this.
   onContents("render-process-gone", (_event, details) => {
     const reason = details?.reason;
-    findSessionByTab.set(tab, endStep().state);
+    searchBarOwnerByTab.delete(tab);
+    setFindSession(tab, endStep().state);
     const decision = recoveryDecision(reason, tabRendererRecoveries.get(tab), Date.now());
     tabRendererRecoveries.set(tab, decision.recent);
     if (decision.action === "ignore") return;
@@ -10495,6 +10547,11 @@ function routeHintShortcut(tab, key, modifiers) {
   if (!tab || !inputState().vimium || inputState().insertMode || modifiers.includes("meta")) {
     return false;
   }
+  // With a find bar open, `f` and `v` are letters of the query. Opening a round here sent the
+  // letter to every frame, so a frame without the bar handed it to the bar as well and the
+  // query got it twice ("ssrf" became "ssrff"); the frames that had typed it never answered
+  // the round either.
+  if (liveSearchBarOwner(tab)) return false;
   if ((key.length === 1 || key === "Escape" || key === "Backspace") && routeHintKey(tab, key)) {
     return true;
   }
