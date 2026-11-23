@@ -517,6 +517,24 @@ pub async fn serve(daemon: BoundDaemon) -> Result<()> {
 
     tracing::info!(socket = %supervisor.socket_path.display(), pid = std::process::id(), "twebd listening");
 
+    // A daemon told which engine to run (`tweb daemon restart` pins the installed one) starts it
+    // now rather than on the first pane: that pane otherwise waits out the engine start, 0.8-2.2s
+    // of the 2.7-6.1s it took to its first picture. A daemon a pane started has no pinned engine,
+    // and that pane's own request starts it a moment later anyway.
+    if let Some((executable, app_dir)) = supervisor.pinned_engine.clone() {
+        let engine = supervisor.engine_for(&executable, &app_dir);
+        // The same clock every request's start is recorded with: the crash budget compares them.
+        let now = now_ms();
+        tokio::spawn(async move {
+            match engine.prewarm(now).await {
+                Ok(()) => tracing::info!("engine prewarmed"),
+                Err(reason) => {
+                    tracing::warn!(%reason, "engine prewarm failed; panes will start it")
+                }
+            }
+        });
+    }
+
     let mut signals = shutdown_signals()?;
     let mut shutdown_rx = shutdown_tx.subscribe();
     loop {

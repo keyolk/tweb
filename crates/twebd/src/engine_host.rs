@@ -300,6 +300,27 @@ impl EngineHost {
             engine_wire::engine_line(open),
             engine_wire::open_line(open)
         );
+        self.ensure_started(now_ms).await?;
+        let Some(stdin) = self.register(&key, sink) else {
+            return Err("engine stdin closed".to_string());
+        };
+        stdin.send(line).map_err(|_| {
+            self.inner.lock().sinks.remove(&key);
+            "engine stdin closed".to_string()
+        })
+    }
+
+    /// Starts the engine before any pane asks for it, so the first pane after `tweb daemon
+    /// restart` attaches to a running engine. Measured 2026-11-23: that pane took 2.7-6.1s to its
+    /// first picture, 0.8-2.2s of it the engine starting, against 0.3-0.8s for every pane after.
+    /// A pane that arrives while this start is still running waits on the same start.
+    pub async fn prewarm(self: &Arc<Self>, now_ms: u64) -> std::result::Result<(), String> {
+        self.ensure_started(now_ms).await
+    }
+
+    /// The engine running and declared a pane host, started here if it is not. Shared by every
+    /// caller: one starts it, the rest wait on `starting` and find it running.
+    async fn ensure_started(self: &Arc<Self>, now_ms: u64) -> std::result::Result<(), String> {
         // Waited on by every pane that arrives during a start; the first one through starts the
         // engine, and the rest find its stdin and only register.
         let _starting = self.starting.lock().await;
@@ -338,14 +359,7 @@ impl EngineHost {
                 return Err(reason);
             }
         }
-        drop(_starting);
-        let Some(stdin) = self.register(&key, sink) else {
-            return Err("engine stdin closed".to_string());
-        };
-        stdin.send(line).map_err(|_| {
-            self.inner.lock().sinks.remove(&key);
-            "engine stdin closed".to_string()
-        })
+        Ok(())
     }
 
     /// Puts a pane in the routing table and returns the engine's stdin — or, with no engine to feed
@@ -911,6 +925,50 @@ mod tests {
         // And it stays refused, so the next pane does not pay for another ten-second start.
         assert!(!host.can_host());
         assert_eq!(host.hosted_pane_count(), 0);
+    }
+
+    // The first pane after a restart used to pay for the engine start. Prewarmed, the engine is
+    // running before any pane, and the pane that comes next attaches to it instead of starting one.
+    #[tokio::test]
+    async fn a_prewarmed_engine_is_the_one_the_first_pane_attaches_to() {
+        let starts = tempdir().join("starts");
+        let launcher = fake_engine(
+            "prewarm",
+            &format!(
+                "#!/bin/sh\necho start >> '{}'\necho 'READY {}'\nwhile IFS= read -r line; do :; done\n",
+                starts.display(),
+                crate::protocol::PROTOCOL_VERSION,
+            ),
+        );
+        let host = Arc::new(EngineHost::new(launcher));
+        host.prewarm(0).await.expect("a ready engine prewarms");
+        assert!(host.can_host());
+        assert_eq!(host.hosted_pane_count(), 0, "prewarming hosts no pane");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        host.open(key(), tx, &open_request(), 0)
+            .await
+            .expect("the pane attaches");
+        assert_eq!(host.hosted_pane_count(), 1);
+        let started = std::fs::read_to_string(&starts).expect("the engine ran");
+        assert_eq!(
+            started.lines().count(),
+            1,
+            "one engine, started by the prewarm"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prewarm_that_cannot_start_leaves_the_host_refusing_with_the_reason() {
+        let host = Arc::new(EngineHost::new(fake_engine(
+            "prewarm-silent",
+            "#!/bin/sh\nexit 3\n",
+        )));
+        let error = host
+            .prewarm(0)
+            .await
+            .expect_err("an engine that exits cannot host");
+        assert!(error.contains("exited before declaring"), "{error}");
+        assert!(!host.can_host());
     }
 
     // 2026-11-23: every `cargo test` truncated the person's engine-hosted.log, because the stand-in
