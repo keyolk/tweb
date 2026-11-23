@@ -541,7 +541,13 @@ pub async fn serve(daemon: BoundDaemon) -> Result<()> {
                 break;
             }
             _ = signals.recv() => {
-                tracing::info!("signal received");
+                let origin = crate::signal_origin::describe();
+                tracing::info!(%origin, "signal received");
+                crate::signal_origin::append_log(&format!(
+                    "twebd pid={} socket={} {origin}",
+                    std::process::id(),
+                    supervisor.socket_path.display()
+                ));
                 break;
             }
         }
@@ -563,6 +569,8 @@ fn shutdown_signals() -> Result<tokio::sync::mpsc::Receiver<()>> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
+    // After tokio's own registrations, so both run: tokio wakes the loop, this names the sender.
+    crate::signal_origin::record(&[libc::SIGINT, libc::SIGTERM]);
     tokio::spawn(async move {
         tokio::select! {
             _ = interrupt.recv() => {}

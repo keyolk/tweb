@@ -27,9 +27,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# `unshare` for the sandbox probe in chromium_platform.rs.
+# `signal_origin`: who sent a shutdown signal (si_pid), alongside tokio's own handlers.
+signal-hook-registry = "1.4"
+# Also `unshare` for the sandbox probe in chromium_platform.rs (Linux).
 libc = "0.2"
 
 [dev-dependencies]

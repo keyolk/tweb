@@ -1323,6 +1323,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "signal-hook-registry",
  "thiserror",
  "tokio",
  "tracing",

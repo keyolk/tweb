@@ -38,5 +38,6 @@ pub mod profile_manager;
 pub mod protocol;
 pub mod resource_broker;
 pub mod server;
+pub mod signal_origin;
 pub mod singleton;
 pub mod tmux;

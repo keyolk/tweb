@@ -1344,14 +1344,23 @@ async fn run_hosted_session(
     let mut sigint = signal_stream(libc::SIGINT);
     let mut sigterm = signal_stream(libc::SIGTERM);
     let mut sighup = signal_stream(libc::SIGHUP);
+    // Who ended the pane, written to signals.log: on 2026-11-23 every frontend ended together three
+    // times and nothing said why. See `twebd::signal_origin`.
+    twebd::signal_origin::record(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+    let ended_by = |how: &str| {
+        twebd::signal_origin::append_log(&format!(
+            "frontend pane={pane} pid={} ended by {how}",
+            std::process::id()
+        ));
+    };
     let outcome = tokio::select! {
         finished = pump => Some(
             finished.unwrap_or_else(|err| attach::SpawnReason::HostedSessionLost(err.to_string())),
         ),
-        _ = recv_any(&mut sigint) => None,
-        _ = recv_any(&mut sigterm) => None,
-        _ = recv_any(&mut sighup) => None,
-        _ = interrupt_rx.recv() => None,
+        _ = recv_any(&mut sigint) => { ended_by(&twebd::signal_origin::describe()); None }
+        _ = recv_any(&mut sigterm) => { ended_by(&twebd::signal_origin::describe()); None }
+        _ = recv_any(&mut sighup) => { ended_by(&twebd::signal_origin::describe()); None }
+        _ = interrupt_rx.recv() => { ended_by("a Ctrl-C typed into the pane"); None }
     };
 
     input_handle.abort();
