@@ -59,11 +59,11 @@ pub fn restart() -> Result<()> {
     let old = daemon_pid(&socket);
     twebd("stop").ok();
     let path = twebd_binary()?;
-    // `serve` is the long-running supervisor. It must not inherit this process's stdout — the
-    // Kitty graphics channel owns that — so stdout is detached and stderr goes to the same log a
-    // pane-started daemon writes.
-    let mut serve = Command::new(&path);
-    serve.arg("serve");
+    // The same command a pane starts the daemon with: its own session (`setsid`), no terminal, the
+    // daemon log for stderr. Built here before, without `setsid`, the daemon stayed in the caller's
+    // process group, and an agent shell tool signalling that group when the command was done took
+    // the daemon, its engine and every pane it hosted down with it. See `serve_command`.
+    let mut serve = tweb_pane::daemon_autostart::serve_command(&path);
     // A restart is usually how newly installed code is loaded, but the engine app is named by
     // whichever pane reattaches first — an old frontend, naming the app it extracted when it
     // started. This `tweb` is the installed one, so its engine is pinned for the new daemon.
@@ -73,9 +73,6 @@ pub fn restart() -> Result<()> {
             .env(twebd::server::PINNED_ENGINE_APP_DIR, app_dir);
     }
     let mut child = serve
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(tweb_pane::daemon_autostart::daemon_log())
         .spawn()
         .with_context(|| format!("cannot start {} serve", path.display()))?;
     // Printed "restarted" unconditionally before, with the new daemon's stderr discarded, so a

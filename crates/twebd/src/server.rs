@@ -573,6 +573,11 @@ fn shutdown_signals() -> Result<tokio::sync::mpsc::Receiver<()>> {
     Ok(rx)
 }
 
+/// Whether `peer_cred` failed because the peer had already closed its end.
+fn peer_left(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotConnected
+}
+
 async fn handle_connection(
     supervisor: Arc<Supervisor>,
     stream: UnixStream,
@@ -588,8 +593,18 @@ async fn handle_connection(
     // and then waited forever — `tweb open` sat there with no pane, no error, and one more
     // `refusing a connection from another user` in a log nobody was reading. The two cases are
     // separated here so the second one says what actually happened.
+    //
+    // A peer that has already hung up is not refused, it has left: every pane checks the socket is
+    // live by connecting and closing at once (`socket_is_live`), and that probe lands here as
+    // ENOTCONN. Logged as a refusal, a restart's fourteen probes read as fourteen panes turned away
+    // and sent the 2026-11-23 diagnosis the wrong way; the panes had reattached on their next
+    // connection. See `peer_left`.
     let peer_uid = match stream.peer_cred() {
         Ok(cred) => cred.uid(),
+        Err(error) if peer_left(&error) => {
+            tracing::debug!(%error, "a peer hung up before it was identified (a liveness probe)");
+            return Ok(());
+        }
         Err(error) => {
             tracing::warn!(%error, "cannot read the peer's credentials; refusing the connection");
             return Ok(());
@@ -667,6 +682,16 @@ async fn handle_connection(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_peer_that_hung_up_is_not_a_refusal() {
+        assert!(super::peer_left(&std::io::Error::from(
+            std::io::ErrorKind::NotConnected
+        )));
+        assert!(!super::peer_left(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
     use super::*;
     use crate::protocol::PaneRef;
 
