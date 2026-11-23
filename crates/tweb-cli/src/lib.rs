@@ -156,28 +156,32 @@ impl BrowserOptions {
         self.frame_rate.unwrap_or_else(config::frame_rate_max)
     }
 
-    fn shell_args(&self) -> String {
-        let mut value = format!(
-            "--engine {} --frame-rate {}",
+    /// The options a split pane's `tweb __pane` is started with, one argument each.
+    fn pane_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "--engine".to_string(),
             match self.engine() {
                 BrowserEngineArg::Electron => "electron",
                 BrowserEngineArg::Chrome => "chrome",
                 BrowserEngineArg::Webkit => "webkit",
-            },
-            self.max_frame_rate()
-        );
-        value.push_str(if self.adaptive() {
-            " --adaptive-frame-rate"
-        } else {
-            " --no-adaptive-frame-rate"
-        });
+            }
+            .to_string(),
+            "--frame-rate".to_string(),
+            self.max_frame_rate().to_string(),
+            if self.adaptive() {
+                "--adaptive-frame-rate"
+            } else {
+                "--no-adaptive-frame-rate"
+            }
+            .to_string(),
+        ];
         if let Some(ssh) = &self.ssh {
-            value.push_str(&format!(" --ssh={}", shell_quote(ssh)));
+            args.push(format!("--ssh={ssh}"));
         }
         if self.transparent {
-            value.push_str(" --transparent");
+            args.push("--transparent".to_string());
         }
-        value
+        args
     }
 }
 
@@ -1479,9 +1483,23 @@ async fn run_pane(url: Option<&str>, browser: &BrowserOptions) -> Result<()> {
     tweb_pane::run_with_options(url.unwrap_or("about:blank"), options).await
 }
 
+/// What a split pane runs: the command line, and whether it goes through the default shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneCommand {
+    /// `NAME=VALUE` pairs and the argv, which tmux execs directly. Given more than one argument,
+    /// tmux runs them as they are instead of handing one string to `default-shell -c`. That shell
+    /// was fish here, and `fish -c` cost 150-280ms on every split (zsh: 10-30ms) before tweb
+    /// started, then stayed resident as the pane's parent for the pane's whole life. Measured
+    /// 2026-11-23; see keyolk/tweb#301.
+    Direct { env: Vec<String>, argv: Vec<String> },
+    /// One shell command line. Kept for `--ssh`: ssh finds its agent, keys and config through the
+    /// environment the person's shell sets up, which the tmux server's environment may not have.
+    Shell(String),
+}
+
 /// Arguments for tmux split-window. Knowing the calling pane, we split the window that pane
 /// belongs to rather than the client's active window.
-fn split_window_args(pane: Option<&str>, command: &str) -> Vec<String> {
+fn split_window_args(pane: Option<&str>, command: &PaneCommand) -> Vec<String> {
     // -P -F makes tmux print the new pane's id once the pane exists.
     let mut args = ["split-window", "-h", "-p", "50", "-P", "-F", "#{pane_id}"]
         .map(String::from)
@@ -1489,8 +1507,44 @@ fn split_window_args(pane: Option<&str>, command: &str) -> Vec<String> {
     if let Some(pane) = pane {
         args.extend(["-t".to_string(), pane.to_string()]);
     }
-    args.push(command.to_string());
+    match command {
+        PaneCommand::Direct { env, argv } => {
+            for pair in env {
+                args.extend(["-e".to_string(), pair.clone()]);
+            }
+            args.extend(argv.iter().cloned());
+        }
+        PaneCommand::Shell(line) => args.push(line.clone()),
+    }
     args
+}
+
+/// The split pane's command: `tweb __pane <options> [url]` with `env` set for it alone.
+fn pane_command(
+    executable: &str,
+    browser: &BrowserOptions,
+    url: Option<&str>,
+    env: &[(String, String)],
+) -> PaneCommand {
+    let mut argv = vec![executable.to_string(), "__pane".to_string()];
+    argv.extend(browser.pane_args());
+    argv.extend(url.map(str::to_string));
+    if browser.ssh.is_some() {
+        let mut line = String::new();
+        for (name, value) in env {
+            line.push_str(&format!("{name}={} ", shell_quote(value)));
+        }
+        let quoted: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
+        line.push_str(&quoted.join(" "));
+        return PaneCommand::Shell(line);
+    }
+    PaneCommand::Direct {
+        env: env
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect(),
+        argv,
+    }
 }
 
 /// Creates a pane via tmux split-window and runs `tweb __pane` inside it.
@@ -1511,7 +1565,7 @@ async fn split_and_run_pane(
     // by the same rules — from where the binary lives, not from the directory `tweb split` was run
     // in. Resolving them here instead looked for `electron/` under the cwd, so a split opened from
     // inside a checkout ran that checkout's older app code. Only an explicit override is passed on.
-    let mut env_str = String::new();
+    let mut env = Vec::new();
     for name in [
         "TWEB_ELECTRON",
         "TWEB_ELECTRON_DIR",
@@ -1519,28 +1573,18 @@ async fn split_and_run_pane(
         "TWEB_NATIVE_INPUT",
     ] {
         if let Ok(value) = std::env::var(name) {
-            env_str.push_str(&format!("{name}={} ", shell_quote(&value)));
+            env.push((name.to_string(), value));
         }
     }
-
     for (name, value) in extra_env {
-        env_str.push_str(&format!("{name}={} ", shell_quote(value)));
+        env.push((name.to_string(), value.to_string()));
     }
 
-    let url_arg = url
-        .map(|value| format!(" {}", shell_quote(value)))
-        .unwrap_or_default();
-    let pane_command = format!(
-        "{}{} __pane {}{}",
-        env_str,
-        shell_quote(&pane_bin_str),
-        browser.shell_args(),
-        url_arg
-    );
+    let command = pane_command(&pane_bin_str, browser, url, &env);
     let target_pane = beside
         .map(str::to_string)
         .or_else(|| std::env::var("TMUX_PANE").ok());
-    let split_args = split_window_args(target_pane.as_deref(), &pane_command);
+    let split_args = split_window_args(target_pane.as_deref(), &command);
     let output = std::process::Command::new("tmux")
         .args(split_args)
         .output()
@@ -1808,8 +1852,11 @@ mod tests {
         ));
         let target = browser.ssh_target().unwrap().unwrap();
         assert_eq!(target.destination, "me@box");
-        let args = browser.shell_args();
-        assert!(args.ends_with("--ssh='-J bastion me@box'"), "{args}");
+        let command = super::pane_command("/bin/tweb", &browser, None, &[]);
+        let super::PaneCommand::Shell(line) = command else {
+            panic!("an ssh pane goes through the shell: {command:?}");
+        };
+        assert!(line.ends_with("'--ssh=-J bastion me@box'"), "{line}");
         // And the pane parses what the split wrote.
         let pane =
             Cli::try_parse_from(["tweb", "__pane", "--ssh=-J bastion me@box", "about:blank"])
@@ -1847,7 +1894,10 @@ mod tests {
             panic!("not a split");
         };
         assert!(browser.check_transparent().is_ok());
-        assert!(browser.shell_args().ends_with(" --transparent"));
+        assert_eq!(
+            browser.pane_args().last().map(String::as_str),
+            Some("--transparent")
+        );
         for engine in ["chrome", "webkit"] {
             let cli =
                 Cli::try_parse_from(["tweb", "open", "--engine", engine, "--transparent"]).unwrap();
@@ -1998,10 +2048,79 @@ mod tests {
         assert_eq!(params["ttl"], 30);
     }
 
+    // 2026-11-23: one command string made tmux run it through `default-shell -c`, which was fish
+    // here: 150-280ms on every split before tweb started, and a fish left as the pane's parent.
+    // More than one argument makes tmux exec them directly; the environment goes through `-e`.
+    #[test]
+    fn a_split_pane_is_execed_without_the_shell() {
+        let cli = Cli::try_parse_from([
+            "tweb",
+            "split",
+            "--engine",
+            "chrome",
+            "--frame-rate",
+            "30",
+            "--adaptive-frame-rate",
+            "https://a.test/?q=1 2",
+        ])
+        .unwrap();
+        let Command::Split { browser, .. } = cli.command else {
+            panic!("not a split");
+        };
+        let env = [(
+            "TWEB_ELECTRON_DIR".to_string(),
+            "/a dir/electron".to_string(),
+        )];
+        let command = super::pane_command(
+            "/opt/my tweb/tweb",
+            &browser,
+            Some("https://a.test/?q=1 2"),
+            &env,
+        );
+        assert_eq!(
+            split_window_args(Some("%42"), &command),
+            vec![
+                "split-window",
+                "-h",
+                "-p",
+                "50",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "%42",
+                "-e",
+                "TWEB_ELECTRON_DIR=/a dir/electron",
+                "/opt/my tweb/tweb",
+                "__pane",
+                "--engine",
+                "chrome",
+                "--frame-rate",
+                "30",
+                "--adaptive-frame-rate",
+                "https://a.test/?q=1 2",
+            ]
+        );
+        // What the pane receives parses back to the same options, spaces and all.
+        let super::PaneCommand::Direct { argv, .. } = command else {
+            panic!("not direct");
+        };
+        let pane = Cli::try_parse_from(&argv).expect("the pane parses its argv");
+        let Command::PaneInternal { browser, url, .. } = pane.command else {
+            panic!("not a pane");
+        };
+        assert_eq!(url.as_deref(), Some("https://a.test/?q=1 2"));
+        assert!(matches!(
+            browser.engine,
+            Some(super::BrowserEngineArg::Chrome)
+        ));
+    }
+
     #[test]
     fn split_targets_the_calling_pane() {
+        let line = super::PaneCommand::Shell("tweb __pane".into());
         assert_eq!(
-            split_window_args(Some("%42"), "tweb __pane"),
+            split_window_args(Some("%42"), &line),
             vec![
                 "split-window",
                 "-h",
@@ -2016,7 +2135,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            split_window_args(None, "tweb __pane"),
+            split_window_args(None, &line),
             vec![
                 "split-window",
                 "-h",

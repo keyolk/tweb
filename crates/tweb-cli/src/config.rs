@@ -128,7 +128,9 @@ fn from_env(setting: &Setting, raw: &str) -> Option<serde_json::Value> {
 fn split_list(raw: &str) -> Vec<serde_json::Value> {
     let trimmed = raw.trim();
     if trimmed.starts_with('[') {
-        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Ok(serde_json::Value::Array(items)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
             if items.iter().all(serde_json::Value::is_string) {
                 return items
                     .iter()
