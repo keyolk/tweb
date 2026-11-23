@@ -242,6 +242,23 @@ impl PollBackoff {
 
 /// Runs the chained probe. Returns `None` outside tmux or when the call fails, in which
 /// case the caller keeps whatever it already had rather than reporting a blank pane.
+/// Whether any attached client shows this pane: a client on the pane's session and window, and,
+/// when that window is zoomed, only for its active pane. The rule `visibleTmuxClientTtys`
+/// (electron/tmux-visibility.cjs) applies; `None` when the probe could not place the pane.
+pub fn pane_visible(probe: &TmuxProbe) -> Option<bool> {
+    let (session, window, pane) = probe.placement.as_ref()?;
+    Some(probe.clients.iter().any(|client| {
+        let fields: Vec<&str> = client.split('\t').collect();
+        let [tty, client_session, client_window, zoomed, active_pane, ..] = fields[..] else {
+            return false;
+        };
+        !tty.is_empty()
+            && client_session == session
+            && client_window == window
+            && (zoomed != "1" || active_pane == pane)
+    }))
+}
+
 pub fn run_probe(pane: &str) -> Option<TmuxProbe> {
     let output = std::process::Command::new("tmux")
         .args(probe_args(pane))
@@ -425,5 +442,51 @@ mod tests {
         assert!(
             args[8].contains("#{window_zoomed_flag}") && args[8].contains("#{client_key_table}")
         );
+    }
+
+    fn placed_probe(clients: &[&str]) -> TmuxProbe {
+        TmuxProbe {
+            geometry: None,
+            placement: Some(("2".into(), "@191".into(), "%631".into())),
+            clients: clients.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    // 2026-11-23: a pane opened in a session no client was attached to recorded first_frame=8101ms,
+    // which was the engine holding frames for a hidden pane, not a slow start.
+    #[test]
+    fn a_pane_is_visible_only_where_a_client_shows_its_window() {
+        assert_eq!(
+            pane_visible(&placed_probe(&[])),
+            Some(false),
+            "no client at all"
+        );
+        assert_eq!(
+            pane_visible(&placed_probe(&["/dev/ttys000\t1\t@197\t0\t%570\troot"])),
+            Some(false),
+            "a client on another session"
+        );
+        assert_eq!(
+            pane_visible(&placed_probe(&["/dev/ttys000\t2\t@190\t0\t%570\troot"])),
+            Some(false),
+            "a client on another window of the same session"
+        );
+        assert_eq!(
+            pane_visible(&placed_probe(&["/dev/ttys000\t2\t@191\t0\t%545\troot"])),
+            Some(true)
+        );
+        assert_eq!(
+            pane_visible(&placed_probe(&["/dev/ttys000\t2\t@191\t1\t%545\troot"])),
+            Some(false),
+            "zoomed onto another pane"
+        );
+        assert_eq!(
+            pane_visible(&placed_probe(&["/dev/ttys000\t2\t@191\t1\t%631\troot"])),
+            Some(true),
+            "zoomed onto this pane"
+        );
+        let mut unplaced = placed_probe(&[]);
+        unplaced.placement = None;
+        assert_eq!(pane_visible(&unplaced), None);
     }
 }
