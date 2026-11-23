@@ -1219,8 +1219,11 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
         Err(reason) => return HostedOutcome::Spawn(reason),
     };
     tracing::info!(pane, %generation, "hosted by twebd");
-    launch_timeline::mark(launch_timeline::Step::Hosted);
     launch_timeline::route("hosted");
+    launch_timeline::visible(
+        visibility::run_probe(pane).and_then(|probe| visibility::pane_visible(&probe)),
+    );
+    launch_timeline::mark(launch_timeline::Step::Hosted);
 
     let outcome = run_hosted_session(stream, pane, &pane_ref, generation, options).await;
     // Whichever way the session ended, this pane's image has to come off the terminal before

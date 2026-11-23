@@ -61,6 +61,9 @@ pub struct Record {
     /// The engine answered `status` without a `loading` field: an engine from before it was added,
     /// still running in a daemon that was not restarted.
     pub load_not_reported: bool,
+    /// Whether a tmux client showed the pane when the daemon took it. A hidden pane gets no frames
+    /// until it is shown, so its `first_frame` measures the wait for a client, not the start-up.
+    pub visible: Option<bool>,
 }
 
 struct Timeline {
@@ -98,6 +101,7 @@ pub fn begin(pane: &str, engine: &str, url: &str) -> Guard {
                 route: None,
                 marks: [None; 5],
                 load_not_reported: false,
+                visible: None,
             },
             written: false,
         });
@@ -109,7 +113,8 @@ pub fn begin(pane: &str, engine: &str, url: &str) -> Guard {
     Guard
 }
 
-/// Records `step` the first time it happens. Later ones (a reattach) do not move it.
+/// Records `step` the first time it happens. Later ones (a reattach) do not move it. Writes the
+/// line as soon as nothing more is coming (see `complete`).
 pub fn mark(step: Step) {
     with(|timeline| {
         let slot = &mut timeline.record.marks[index(step)];
@@ -117,6 +122,28 @@ pub fn mark(step: Step) {
             *slot = Some(timeline.started.elapsed().as_millis() as u64);
         }
     });
+    settle();
+}
+
+/// Whether the pane was on a tmux client's screen when it was hosted.
+pub fn visible(shown: Option<bool>) {
+    with(|timeline| timeline.record.visible = shown);
+}
+
+/// Whether the line has everything it is going to get: the page loaded, or — on an engine that
+/// does not report loading — the first frame arrived. Without the second case the line waited for
+/// the 60-second limit on every pane of a daemon not yet restarted onto a reporting engine.
+pub fn complete(record: &Record) -> bool {
+    record.marks[index(Step::Loaded)].is_some()
+        || (record.load_not_reported && record.marks[index(Step::FirstFrame)].is_some())
+}
+
+fn settle() {
+    let mut done = false;
+    with(|timeline| done = complete(&timeline.record));
+    if done {
+        finish();
+    }
 }
 
 pub fn marked(step: Step) -> bool {
@@ -166,12 +193,17 @@ pub fn finish() {
 /// `1795416756.101 pane=%5 pid=123 engine=electron route=hosted daemon=12ms hosted=150ms ... url=...`
 pub fn format_line(record: &Record) -> String {
     let mut line = format!(
-        "{:.3} pane={} pid={} engine={} route={}",
+        "{:.3} pane={} pid={} engine={} route={} visible={}",
         record.started_at,
         record.pane,
         record.pid,
         record.engine,
         record.route.as_deref().unwrap_or("-").replace(' ', "_"),
+        match record.visible {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "-",
+        },
     );
     for (index, (step, name)) in STEPS.iter().enumerate() {
         let value = match record.marks[index] {
@@ -281,12 +313,13 @@ pub fn watch_load(socket: String) {
                 let state = load_state(&answer);
                 if state == LoadState::NotReported {
                     with(|timeline| timeline.record.load_not_reported = true);
+                    // The first frame may already be here; if not, its mark writes the line.
+                    settle();
                     return;
                 }
                 seen_loading |= state == LoadState::Loading;
                 if counts_as_loaded(&state, seen_loading, &requested) {
                     mark(Step::Loaded);
-                    finish();
                     return;
                 }
             }
@@ -325,6 +358,7 @@ mod tests {
             route: Some("hosted".into()),
             marks: [Some(12), Some(150), Some(172), Some(310), Some(1840)],
             load_not_reported: false,
+            visible: Some(true),
         }
     }
 
@@ -332,8 +366,8 @@ mod tests {
     fn a_full_launch_is_one_line_of_milliseconds() {
         assert_eq!(
             format_line(&record()),
-            "1795416756.101 pane=%5 pid=123 engine=electron route=hosted daemon=12ms hosted=150ms \
-             page=172ms first_frame=310ms loaded=1840ms url=https://example.test/a\n"
+            "1795416756.101 pane=%5 pid=123 engine=electron route=hosted visible=1 daemon=12ms \
+             hosted=150ms page=172ms first_frame=310ms loaded=1840ms url=https://example.test/a\n"
         );
     }
 
@@ -420,5 +454,35 @@ mod tests {
             true,
             "https://a.test/"
         ));
+    }
+
+    // A hidden pane's first frame waits for a client to show it; the line says so.
+    #[test]
+    fn the_line_says_whether_the_pane_was_on_screen() {
+        let mut hidden = record();
+        hidden.visible = Some(false);
+        assert!(format_line(&hidden).contains(" route=hosted visible=0 daemon="));
+        hidden.visible = None;
+        assert!(format_line(&hidden).contains(" visible=- "));
+    }
+
+    // 2026-11-23: on the person's daemon, still running an engine without `loading`, the line for
+    // a pane was written only at the 60-second limit. With no load to wait for, the first frame is
+    // the last step.
+    #[test]
+    fn without_a_load_report_the_first_frame_completes_the_line() {
+        let mut waiting = record();
+        waiting.marks = [Some(1), Some(2), Some(3), None, None];
+        waiting.load_not_reported = true;
+        assert!(!complete(&waiting), "no first frame yet");
+        waiting.marks[index(Step::FirstFrame)] = Some(300);
+        assert!(complete(&waiting));
+
+        // A reporting engine still waits for the load.
+        let mut reporting = record();
+        reporting.marks = [Some(1), Some(2), Some(3), Some(300), None];
+        assert!(!complete(&reporting));
+        reporting.marks[index(Step::Loaded)] = Some(900);
+        assert!(complete(&reporting));
     }
 }
