@@ -6332,6 +6332,14 @@ function agentWaitFor(params) {
   });
 }
 
+function tabIsLoading(tab) {
+  try {
+    return Boolean(tab && !tab.isDestroyed?.() && tab.webContents?.isLoading?.());
+  } catch {
+    return false;
+  }
+}
+
 function agentTabList() {
   const memory = tabMemoryByTab();
   return {
@@ -6342,6 +6350,9 @@ function agentTabList() {
       url: tabDisplayUrl(tab),
       active: index === currentWindows().activeTabIndex,
       engine: tabEngine(tab),
+      // Read by the pane frontend's launch timeline (launch_timeline.rs) through `status`, which,
+      // unlike `wait --load`, does not show the agent badge on a pane that is only starting up.
+      loading: tabIsLoading(tab),
       // MB of the renderer the tab's main frame runs in; null on the Chrome and WebKit engines,
       // whose processes are not this one's children. See renderer-memory.cjs.
       memoryMb: memory.get(tab)?.mb ?? null,

@@ -206,6 +206,10 @@ pub struct Launcher {
     /// Chromium switches the platform needs, from `chromium_platform::engine_switches`. Decided
     /// once where the launcher is built, not per start: the answer is about the machine.
     pub switches: Vec<String>,
+    /// Whether the engine's stderr goes to `engine-hosted.log` (started over with each engine) or
+    /// nowhere. The daemon logs; tests do not: their stand-in engines went through the same file
+    /// and truncated the person's log on every `cargo test`.
+    pub log_stderr: bool,
 }
 
 impl EngineHost {
@@ -229,6 +233,7 @@ impl EngineHost {
             executable: PathBuf::new(),
             app_dir: PathBuf::new(),
             switches: Vec::new(),
+            log_stderr: false,
         });
         host.inner.lock().state = EngineState::Unavailable {
             reason: reason.into(),
@@ -577,7 +582,11 @@ fn start_process(launcher: &Launcher) -> Result<Child> {
         // panes and has no single terminal to inherit. Frames come back here and go out over each
         // frontend's own connection.
         .stdout(Stdio::piped())
-        .stderr(engine_stderr())
+        .stderr(if launcher.log_stderr {
+            engine_stderr()
+        } else {
+            Stdio::null()
+        })
         // The engine must die when its supervisor does. An orphaned engine keeps painting into
         // panes that have moved on — `electron/orphan-watch.cjs` exists because one drew a stale
         // page over two other panes for four hours, and a hosted engine is that hazard with N
@@ -633,16 +642,10 @@ fn start_process(launcher: &Launcher) -> Result<Child> {
 /// A file, for the same reason the per-pane path uses one: Chromium's diagnostics on a terminal
 /// show through on top of the page. The daemon has no terminal at all, but its stderr is the
 /// operator's log and interleaving Chromium's output into it would bury the supervisor's own.
+/// Started over with each engine, in this daemon's own logs directory (`paths::logs_dir`): it was
+/// `$HOME/.cache/tweb/logs` for every daemon, so a test daemon truncated the person's.
 fn engine_stderr() -> Stdio {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Stdio::null();
-    };
-    let directory = PathBuf::from(home).join(".cache/tweb/logs");
-    if std::fs::create_dir_all(&directory).is_err() {
-        return Stdio::null();
-    }
-    std::fs::File::create(directory.join("engine-hosted.log"))
-        .map_or_else(|_| Stdio::null(), Stdio::from)
+    crate::paths::open_log("engine-hosted.log", true).map_or_else(Stdio::null, Stdio::from)
 }
 
 #[cfg(test)]
@@ -846,6 +849,7 @@ mod tests {
             executable,
             app_dir: dir,
             switches: Vec::new(),
+            log_stderr: false,
         }
     }
 
@@ -907,6 +911,33 @@ mod tests {
         // And it stays refused, so the next pane does not pay for another ten-second start.
         assert!(!host.can_host());
         assert_eq!(host.hosted_pane_count(), 0);
+    }
+
+    // 2026-11-23: every `cargo test` truncated the person's engine-hosted.log, because the stand-in
+    // engines below were started through the same stderr file as the daemon's real one. A test
+    // engine's stderr goes nowhere; this one writes a marker there and the log must not have it.
+    #[tokio::test]
+    async fn a_test_engine_never_writes_the_daemons_engine_log() {
+        let marker = format!("stand-in-engine-stderr-{}", std::process::id());
+        let launcher = fake_engine(
+            "stderr-marker",
+            &format!(
+                "#!/bin/sh\necho '{marker}' >&2\necho 'READY {}'\nwhile IFS= read -r line; do :; done\n",
+                crate::protocol::PROTOCOL_VERSION,
+            ),
+        );
+        assert!(!launcher.log_stderr);
+        let host = Arc::new(EngineHost::new(launcher));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        host.open(key(), tx, &open_request(), 0)
+            .await
+            .expect("a ready engine hosts");
+        // Read, never written: the file is the person's if it exists.
+        let log = crate::paths::logs_dir().map(|dir| dir.join("engine-hosted.log"));
+        let text = log
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        assert!(!text.contains(&marker));
     }
 
     // Two panes with one tmux pane id cannot both be hosted here, because the engine addresses

@@ -274,6 +274,17 @@ class Pane:
             os.kill(self.pid, signal.SIGKILL)
         os.close(self.fd)
         if self.tmux:
+            # The frontends first, by pid, then this run's own daemon over its socket, and only then
+            # the tmux server. Killing the server alone left `tweb __pane` running with ppid 1
+            # (measured 2026-11-23: 14 frontends outlived their server), and each one started a
+            # fresh daemon once the old one was stopped — the orphans this harness kept leaving.
+            panes = subprocess.run(["tmux", "-L", self.tmux, "list-panes", "-a", "-F", "#{pane_pid}"],
+                                   capture_output=True, text=True).stdout.split()
+            for pane_pid in panes:
+                end_process(int(pane_pid))
+            if self.cli_env:
+                subprocess.run([self.tweb, "daemon", "stop"], env=dict(os.environ, **self.cli_env),
+                               capture_output=True, timeout=20)
             subprocess.run(["tmux", "-L", self.tmux, "kill-server"], capture_output=True)
         # An engine that did not shut down cleanly (the SIGKILL above, or a crash) leaves its
         # detached Chrome running; see `reap_orphan_chromes`.

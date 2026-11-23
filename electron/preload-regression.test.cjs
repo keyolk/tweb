@@ -3461,3 +3461,14 @@ test("the Chrome and WebKit engines start over on a new find session, not on a f
     assert.doesNotMatch(find, /if \(!findNext\)/, file);
   }
 });
+
+// The pane frontend's launch timeline (crates/tweb-pane/src/launch_timeline.rs) reads the active
+// tab's load state from `status`: `wait --load` would have shown the agent badge on every pane
+// that was only starting up.
+test("status reports whether each tab is loading, and status stays a passive call", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const list = main.slice(main.indexOf("function agentTabList"), main.indexOf("function tabRendererPids"));
+  assert.match(list, /loading: tabIsLoading\(tab\),/);
+  const presence = fs.readFileSync(path.join(__dirname, "agent-presence.cjs"), "utf8");
+  assert.match(presence, /PASSIVE_METHODS = new Set\(\["status",/);
+});

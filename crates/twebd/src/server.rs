@@ -107,6 +107,7 @@ impl Supervisor {
                     executable: PathBuf::from(executable),
                     app_dir,
                     switches,
+                    log_stderr: true,
                 })),
                 Err(reason) => Arc::new(EngineHost::unavailable(reason)),
             }

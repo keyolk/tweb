@@ -86,21 +86,11 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
-/// Appends one line to `~/.cache/tweb/logs/signals.log`. One write per line, so processes ending
-/// together do not interleave.
+/// Appends one line to `signals.log` in this daemon's logs directory (`paths::logs_dir`:
+/// `~/.cache/tweb/logs` for the person's own). One write per line, so processes ending together do
+/// not interleave.
 pub fn append_log(line: &str) {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let directory = std::path::PathBuf::from(home).join(".cache/tweb/logs");
-    if std::fs::create_dir_all(&directory).is_err() {
-        return;
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("signals.log"))
-    else {
+    let Some(mut file) = crate::paths::open_log("signals.log", false) else {
         return;
     };
     let at = std::time::SystemTime::now()

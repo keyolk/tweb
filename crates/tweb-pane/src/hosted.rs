@@ -224,10 +224,40 @@ pub fn pump(stream: UnixStream, ours: Generation, writer: Arc<PaneWriter>) -> Sp
         if let Err(reason) = apply(&response, ours, &writer) {
             return reason;
         }
+        note_launch(&response, ours);
     }
     // The daemon went away. The pane is still alive and still owns its terminal, so it falls back
     // rather than exiting — a user's browser does not close because a supervisor did.
     SpawnReason::HostedSessionLost("twebd closed the connection".into())
+}
+
+/// Marks the start-up steps this pane learns from the daemon: the page existing (its agent socket
+/// arrives) and the first picture on the tty. See `launch_timeline`.
+fn note_launch(response: &Response, ours: Generation) {
+    use crate::launch_timeline::{self as launch, Step};
+    match response {
+        Response::Frame {
+            generation,
+            payload,
+            ..
+        } if message_is_current(ours.0, generation.0) && !launch::marked(Step::FirstFrame) => {
+            // Decoded again only until the first picture: after that this is one lock and out.
+            if twebd::engine_wire::decode_hex(payload)
+                .is_some_and(|bytes| launch::is_picture(&bytes))
+            {
+                launch::mark(Step::FirstFrame);
+            }
+        }
+        Response::Event {
+            generation,
+            event: PaneEvent::AgentSocket { path },
+            ..
+        } if message_is_current(ours.0, generation.0) && !launch::marked(Step::Page) => {
+            launch::mark(Step::Page);
+            launch::watch_load(path.clone());
+        }
+        _ => {}
+    }
 }
 
 /// One control line for a hosted pane, in the grammar the engine already parses.
