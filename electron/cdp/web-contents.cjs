@@ -687,8 +687,27 @@ class CdpWebContents extends EventEmitter {
   // skew (navigation, a metrics change), and re-checked every few seconds of pointer use, because
   // the defect can begin after the tab has already been used. Only 1 or the current
   // deviceScaleFactor are accepted: anything else is a probe that missed, and leaves input as is.
+  //
+  // The same probe reads Chrome's own zoom: one saved for the site in the engine's profile (a
+  // Cmd-minus in a Chrome that shares it), or its default zoom. It multiplies the page's
+  // `devicePixelRatio` and widens its CSS viewport, while the pane's point is turned into CSS
+  // pixels with this engine's zoom alone (`scaleMouse`). On platform-portal, saved at 50%, the
+  // viewport was 1595 CSS px against the 797 assumed, and every click landed at half its point —
+  // on a page that is one big iframe, never on what was under the pointer; `f`, which aims at an
+  // element, still worked. Chrome itself reads `Input.dispatchMouseEvent` in true CSS pixels at
+  // any zoom (measured, top frame and a same-origin iframe), so the point is divided by the zoom.
   invalidateInputScale() {
     this.inputScale = null;
+  }
+
+  // Chrome's own zoom from the page's `devicePixelRatio`: the emulated scale is always the
+  // browser's (`zoomLayout` in engine.cjs), so anything else on top is Chrome's zoom. 1 when the
+  // ratio is missing or not a plausible zoom (Chrome's range is 25%-500%).
+  browserZoomFrom(devicePixelRatio) {
+    const dsf = this.deviceScaleFactor || 1;
+    const zoom = Number(devicePixelRatio) / dsf;
+    if (!Number.isFinite(zoom) || zoom < 0.2 || zoom > 5.5) return 1;
+    return Math.abs(zoom - 1) < 0.01 ? 1 : zoom;
   }
 
   async measureInputScale() {
@@ -704,7 +723,15 @@ class CdpWebContents extends EventEmitter {
         }
       })()`);
       await this.session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: probe.x, y: probe.y, button: "none" });
-      const seen = await this.evaluateIn(this.session.id, frame.isolatedContextId, "globalThis.__twebProbe");
+      const answer = await this.evaluateIn(this.session.id, frame.isolatedContextId,
+        "({ seen: globalThis.__twebProbe, devicePixelRatio })");
+      const browserZoom = this.browserZoomFrom(answer?.devicePixelRatio);
+      if (browserZoom !== (this.browserZoom || 1)) {
+        console.error(`tweb: chrome zoom ${browserZoom.toFixed(3)} on this tab (devicePixelRatio `
+          + `${answer?.devicePixelRatio}, emulated ${this.deviceScaleFactor}); mouse points follow it`);
+      }
+      this.browserZoom = browserZoom;
+      const seen = answer?.seen;
       if (!Array.isArray(seen) || !(seen[0] > 0)) return this.inputScale || 1;
       const ratio = probe.x / seen[0];
       const dsf = this.deviceScaleFactor || 1;
@@ -778,7 +805,10 @@ class CdpWebContents extends EventEmitter {
       // 1.6, the fourth of four clicks landed at (106,260) instead of (177,442) — 1/1.6 of the way —
       // within the cache's three seconds, putting the caret a dozen lines from where the user
       // clicked. The moves of a drag keep the press's value (see `pointerHeld`).
-      const scale = await this.inputScaleReady(params.type === "mousePressed");
+      const skew = await this.inputScaleReady(params.type === "mousePressed");
+      // See `browserZoomFrom`: the point is in CSS pixels of this engine's zoom, the page's are
+      // Chrome's zoom smaller again.
+      const scale = skew / (this.browserZoom || 1);
       const sent = { ...params, x: params.x * scale, y: params.y * scale };
       const drag = this.dragInput(sent);
       if (drag) return [this.session.send("Input.dispatchDragEvent", drag)];

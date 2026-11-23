@@ -27,6 +27,13 @@ is no substitute: it targets an element, so it never asks which frame is under a
                 and the button took each click. Chrome read mouse coordinates at its own scale or
                 the zoomed tab's from one event to the next, so a release could land at 1/1.44 of
                 the press and no click happened (`zoomLayout` in electron/cdp/engine.cjs)
+  host-zoom-click
+                Chrome only, on zoom-frame.html (a header and a same-origin iframe over the rest, as
+                platform-portal is laid out): the engine Chrome's own zoom set to 50%, as a zoom saved
+                for a site in its profile is, then a click on each of two buttons in the iframe and
+                one in the header, all away from the origin. ok = each took its click. With 50% saved
+                for platform-portal every mouse click there landed at half its point while `f` still
+                worked: the pane's point was made CSS pixels with tweb's zoom alone. Other engines: n/a
   canvas-hints  `f` on canvas-targets.html, three nodes drawn on one <canvas> that answers tweb's
                 `tweb:targets` event. ok = the page was asked, a badge sits on each node, typing
                 node b's label clicks node b and node c's double-clicks node c
@@ -204,6 +211,83 @@ def zoomed_click(steps):
     return scenario
 
 
+def chrome_debug_port(pane):
+    """The debugging port of the pane's own engine Chrome, from its command line."""
+    profile = str(pane.dir / "userData" / "chrome-profile")
+    ps = subprocess.run(["ps", "-Ao", "command="], capture_output=True, text=True).stdout
+    for line in ps.splitlines():
+        if f"--user-data-dir={profile}" in line and "--type=" not in line:
+            for arg in line.split():
+                if arg.startswith("--remote-debugging-port="):
+                    return int(arg.split("=", 1)[1])
+    return None
+
+
+def set_chrome_default_zoom(port, factor):
+    """Chrome's default page zoom, set the way its settings page does, in a background target that
+    is closed again. The engine adopts only http(s) targets it did not open, so it leaves this one."""
+    script = r"""
+const [port, factor] = process.argv.slice(1);
+const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+const ws = new WebSocket(version.webSocketDebuggerUrl);
+let id = 0; const pending = new Map();
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); } };
+await new Promise((r) => (ws.onopen = r));
+const send = (method, params = {}, sessionId) => new Promise((r) => { const n = ++id; pending.set(n, r);
+  ws.send(JSON.stringify({ id: n, method, params, ...(sessionId ? { sessionId } : {}) })); });
+const { result: { targetId } } = await send("Target.createTarget", { url: "chrome://settings/appearance", background: true, newWindow: true });
+const { result: { sessionId } } = await send("Target.attachToTarget", { targetId, flatten: true });
+let out = null;
+for (let i = 0; i < 50; i++) {
+  const m = await send("Runtime.evaluate", { expression: `typeof chrome.settingsPrivate?.setDefaultZoom === "function"`, returnByValue: true }, sessionId);
+  if (m.result?.result?.value === true) break;
+  await new Promise((r) => setTimeout(r, 100));
+}
+out = await send("Runtime.evaluate", { expression: `new Promise((r) => chrome.settingsPrivate.setDefaultZoom(${Number(factor)}, r)).then(() => true)`, awaitPromise: true, returnByValue: true }, sessionId);
+await send("Target.closeTarget", { targetId });
+ws.close();
+console.log(JSON.stringify(out.result?.result?.value ?? out.error ?? null));
+"""
+    out = subprocess.run(["node", "--input-type=module", "-e", script, "--", str(port), str(factor)],
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode != 0 or "true" not in out.stdout:
+        raise RuntimeError(f"setting Chrome's zoom failed: {out.stdout.strip()} {out.stderr.strip()[:300]}")
+
+
+def zoom_frame_targets(page):
+    """Each target's centre in the top page's CSS pixels: two buttons in the iframe, one in the header."""
+    return page.eval("(() => { const f = frame.getBoundingClientRect(); const at = (el, dx, dy) => {"
+                     " const r = el.getBoundingClientRect(); return [dx + r.x + r.width / 2, dy + r.y + r.height / 2]; };"
+                     " const d = frame.contentDocument; return {b1: at(d.getElementById('b1'), f.x, f.y),"
+                     " b2: at(d.getElementById('b2'), f.x, f.y), top: at(document.getElementById('top'), 0, 0)}; })()")
+
+
+def host_zoom_click(page):
+    if page.pane.engine != "chrome":
+        return True, "n/a: only the Chrome engine has a zoom of its own"
+    port = chrome_debug_port(page.pane)
+    if not port:
+        return False, "no engine Chrome found for this pane"
+    set_chrome_default_zoom(port, 0.5)
+    try:
+        time.sleep(1.0)
+        page.measure()
+        detail = {"dpr": page.eval("devicePixelRatio"), "clicks": {}}
+        ok = True
+        for name, (x, y) in zoom_frame_targets(page).items():
+            want = f"frame:click {name}" if name != "top" else "top:click top"
+            page.eval("(() => { __log.length = 0; return 1; })()")
+            page.click(*page.cell(x, y))
+            log = page.settle(lambda log: any(":click" in entry for entry in log))
+            detail["clicks"][name] = log
+            ok &= want in log
+        return ok, detail
+    finally:
+        set_chrome_default_zoom(port, 1)
+        time.sleep(1.0)
+        page.measure()
+
+
 def badges(page):
     """The labels of the `f` round now on screen, each with its top-left: the picker is an open shadow root."""
     return page.eval("(() => { const h = document.getElementById('__tweb_picker__');"
@@ -262,11 +346,12 @@ def file_isolation(page):
 
 
 SCENARIOS = {"popover": popover, "frame-click": frame_click, "frame-drag": frame_drag, "page-drag": page_drag,
-             "zoom-out-click": zoomed_click(2), "zoom-in-click": zoomed_click(-2), "canvas-hints": canvas_hints,
+             "zoom-out-click": zoomed_click(2), "zoom-in-click": zoomed_click(-2), "host-zoom-click": host_zoom_click,
+             "canvas-hints": canvas_hints,
              "file-isolation": file_isolation}
 # The fixture each scenario runs on, when not the frame overlay. A `file:` entry is opened from disk,
 # not through the fixture server: the scenario is about what a local page can read.
-FIXTURES = {"canvas-hints": "canvas-targets.html",
+FIXTURES = {"canvas-hints": "canvas-targets.html", "host-zoom-click": "zoom-frame.html",
             "file-isolation": "file:" + str(REPO / "bench" / "pages" / "file-isolation" / "probe.html")}
 
 

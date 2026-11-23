@@ -1,0 +1,13 @@
+<!doctype html><meta charset=utf-8><title>zoom frame</title>
+<!-- host-zoom-click in parity.py: a header, and a same-origin iframe covering the rest of the page,
+     as platform-portal is laid out. Targets sit away from the origin, where a point at half its
+     value lands somewhere else. -->
+<style>body{margin:0;font:14px system-ui} header{height:49px;background:#223;display:flex;align-items:center;justify-content:flex-end;padding:0 24px}
+iframe{position:absolute;left:0;top:49px;width:100%;height:calc(100% - 49px);border:0} button{width:160px;height:36px}</style>
+<header><button id=top>top</button></header>
+<iframe id=frame src="zoom-frame-child.html"></iframe>
+<script>
+window.__log = [];
+for (const type of ["pointerdown", "pointerup", "click"])
+  addEventListener(type, (e) => __log.push(`top:${type} ${e.target.id || e.target.tagName}`), true);
+</script>
