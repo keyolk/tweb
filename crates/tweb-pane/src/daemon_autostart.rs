@@ -202,18 +202,10 @@ fn start_with(socket: &Path, twebd: Result<PathBuf, String>) -> Result<(), Strin
 /// the page would be a visible defect, and the log is wanted either way when a pane silently falls
 /// back.
 pub fn daemon_log() -> std::process::Stdio {
-    let Some(home) = std::env::var_os("HOME") else {
-        return std::process::Stdio::null();
-    };
-    let directory = PathBuf::from(home).join(".cache/tweb/logs");
-    if std::fs::create_dir_all(&directory).is_err() {
-        return std::process::Stdio::null();
-    }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("twebd.log"))
-        .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from)
+    // The daemon's own logs directory: a daemon started for a private runtime directory appended
+    // its lines to the person's twebd.log before; see `twebd::paths::logs_dir_for`.
+    twebd::paths::open_log("twebd.log", false)
+        .map_or_else(std::process::Stdio::null, std::process::Stdio::from)
 }
 
 #[cfg(test)]

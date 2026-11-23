@@ -89,6 +89,71 @@ pub fn socket_path_too_long(path: &Path) -> bool {
     path.as_os_str().len() >= SUN_PATH_MAX
 }
 
+/// The environment inputs that pick where the daemon's logs go, pulled out for the same reason as
+/// [`RuntimeDirEnv`].
+#[derive(Debug, Clone, Default)]
+pub struct LogsDirEnv<'a> {
+    pub tweb_runtime_dir: Option<&'a str>,
+    pub tweb_cache_dir: Option<&'a str>,
+    pub xdg_cache_home: Option<&'a str>,
+    pub home: Option<&'a str>,
+}
+
+/// Where `twebd.log`, `engine-hosted.log`, `signals.log` and `launch.log` go.
+///
+/// A daemon is named by its runtime directory, so one started with its own `$TWEB_RUNTIME_DIR` is
+/// a different daemon and logs beside its socket. These paths used to be `$HOME/.cache/tweb/logs`
+/// whatever else was set: on 2026-11-23 a test daemon with its own runtime and cache directories
+/// started an engine whose `engine-hosted.log` was created over — truncated — the one the
+/// person's daemon was writing, and its frontends' exits went into the person's `signals.log`.
+/// Otherwise the logs sit under the cache root `engine_app::cache_root` uses, which is where
+/// `fallback.log` already goes.
+pub fn logs_dir_for(env: &LogsDirEnv<'_>) -> Option<PathBuf> {
+    let given = |value: Option<&str>| value.filter(|dir| !dir.is_empty()).map(PathBuf::from);
+    if let Some(runtime) = given(env.tweb_runtime_dir) {
+        return Some(runtime.join("logs"));
+    }
+    if let Some(cache) = given(env.tweb_cache_dir) {
+        return Some(cache.join("logs"));
+    }
+    if let Some(xdg) = given(env.xdg_cache_home) {
+        return Some(xdg.join("tweb").join("logs"));
+    }
+    given(env.home).map(|home| home.join(".cache").join("tweb").join("logs"))
+}
+
+/// [`logs_dir_for`] for this process's environment.
+pub fn logs_dir() -> Option<PathBuf> {
+    let read = |name: &str| std::env::var(name).ok();
+    let (runtime, cache, xdg, home) = (
+        read("TWEB_RUNTIME_DIR"),
+        read("TWEB_CACHE_DIR"),
+        read("XDG_CACHE_HOME"),
+        read("HOME"),
+    );
+    logs_dir_for(&LogsDirEnv {
+        tweb_runtime_dir: runtime.as_deref(),
+        tweb_cache_dir: cache.as_deref(),
+        xdg_cache_home: xdg.as_deref(),
+        home: home.as_deref(),
+    })
+}
+
+/// Opens `name` in [`logs_dir`], creating the directory. `truncate` starts the file over (one
+/// engine's stderr); otherwise lines are appended.
+pub fn open_log(name: &str, truncate: bool) -> Option<std::fs::File> {
+    let directory = logs_dir()?;
+    std::fs::create_dir_all(&directory).ok()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true);
+    if truncate {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    options.open(directory.join(name)).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +231,53 @@ mod tests {
         assert!(!socket_path_too_long(&ok));
         let long = PathBuf::from(format!("/tmp/{}/twebd.sock", "a".repeat(120)));
         assert!(socket_path_too_long(&long));
+    }
+
+    fn logs(runtime: Option<&'static str>, cache: Option<&'static str>) -> Option<PathBuf> {
+        logs_dir_for(&LogsDirEnv {
+            tweb_runtime_dir: runtime,
+            tweb_cache_dir: cache,
+            xdg_cache_home: None,
+            home: Some("/Users/me"),
+        })
+    }
+
+    // The person's daemon: nothing set but HOME, so the logs stay where they always were.
+    #[test]
+    fn the_default_daemon_logs_under_the_home_cache() {
+        assert_eq!(
+            logs(None, None),
+            Some(PathBuf::from("/Users/me/.cache/tweb/logs"))
+        );
+    }
+
+    // 2026-11-23: a test daemon with its own runtime and cache directories truncated the person's
+    // engine-hosted.log. Any isolation setting must move the logs off the shared path.
+    #[test]
+    fn an_isolated_daemon_never_logs_to_the_shared_path() {
+        let shared = logs(None, None);
+        for (runtime, cache) in [
+            (Some("/tmp/lnrt-x"), None),
+            (None, Some("/tmp/cache-x")),
+            (Some("/tmp/lnrt-x"), Some("/tmp/cache-x")),
+        ] {
+            let dir = logs(runtime, cache);
+            assert_ne!(dir, shared, "runtime={runtime:?} cache={cache:?}");
+        }
+        // The runtime directory names the daemon, so it decides when both are given.
+        assert_eq!(
+            logs(Some("/tmp/lnrt-x"), Some("/tmp/cache-x")),
+            Some(PathBuf::from("/tmp/lnrt-x/logs"))
+        );
+        assert_eq!(
+            logs(None, Some("/tmp/cache-x")),
+            Some(PathBuf::from("/tmp/cache-x/logs"))
+        );
+    }
+
+    #[test]
+    fn empty_values_count_as_unset() {
+        assert_eq!(logs(Some(""), Some("")), logs(None, None));
+        assert_eq!(logs_dir_for(&LogsDirEnv::default()), None);
     }
 }

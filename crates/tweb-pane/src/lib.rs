@@ -19,6 +19,7 @@ pub mod hosted;
 pub mod image_id;
 pub mod image_sweep;
 pub mod input;
+pub mod launch_timeline;
 pub mod pane_writer;
 pub mod remote_terminal;
 pub mod resize;
@@ -477,6 +478,13 @@ pub async fn run(url: &str) -> Result<()> {
 /// Runs tweb __pane on the chosen browser engine and frame policy.
 pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
     tracing::info!(url, ?options, "tweb __pane starting");
+    // Where this pane's start-up time goes, written to launch.log when the page has loaded or the
+    // pane ends; see `launch_timeline`.
+    let _launch = launch_timeline::begin(
+        &std::env::var("TMUX_PANE").unwrap_or_else(|_| "%0".to_string()),
+        &format!("{:?}", options.engine).to_lowercase(),
+        url,
+    );
 
     // The WebKit engine's page host is WKWebView. Elsewhere the host binary exists only to say
     // so, and an engine that spawned it would sit on a blank pane; refusing here says it first.
@@ -595,10 +603,20 @@ pub async fn run_with_options(url: &str, options: PaneOptions) -> Result<()> {
         Some(HostedOutcome::Finished) => return Ok(()),
         Some(HostedOutcome::Spawn(reason)) if !matches!(reason, attach::SpawnReason::FlagOff) => {
             tracing::info!(reason = %reason, "spawning this pane's own engine");
+            // Its own engine writes the tty itself, so nothing after this is visible from here.
+            launch_timeline::route(&format!("spawn ({reason})"));
+            launch_timeline::finish();
             record_fallback(&pane, &reason);
             options.restore_session |= restores_after(&reason);
         }
-        Some(HostedOutcome::Spawn(_)) | None => {}
+        Some(HostedOutcome::Spawn(reason)) => {
+            launch_timeline::route(&format!("spawn ({reason})"));
+            launch_timeline::finish();
+        }
+        None => {
+            launch_timeline::route("spawn (ssh tunnel)");
+            launch_timeline::finish();
+        }
     }
 
     let (mut command, engine_description) = match options.engine {
@@ -1154,6 +1172,7 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
         tracing::debug!(%err, "no twebd for this pane");
         return HostedOutcome::Spawn(attach::SpawnReason::DaemonStartFailed(err));
     }
+    launch_timeline::mark(launch_timeline::Step::Daemon);
     // A pane the daemon cannot name is a pane it cannot key, and its whole identity model is
     // (tmux server, pane id). Outside tmux there is no server identity, so there is nothing to
     // host against.
@@ -1200,6 +1219,8 @@ async fn try_hosted(url: &str, options: PaneOptions, pane: &str, image_id: u32) 
         Err(reason) => return HostedOutcome::Spawn(reason),
     };
     tracing::info!(pane, %generation, "hosted by twebd");
+    launch_timeline::mark(launch_timeline::Step::Hosted);
+    launch_timeline::route("hosted");
 
     let outcome = run_hosted_session(stream, pane, &pane_ref, generation, options).await;
     // Whichever way the session ended, this pane's image has to come off the terminal before
