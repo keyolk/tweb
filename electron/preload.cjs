@@ -2088,27 +2088,58 @@ installPrintShim();
     return !element.matches(EDITOR_BLOCKS);
   }
 
+  // What a `v` pick of element is: how it is coloured and what the visual keys do with it.
+  function visualClass(element) {
+    const link = element.closest("a[href]");
+    const image = element.matches("img,picture,canvas,svg,video,[role=img]")
+      ? element.querySelector?.("img,canvas,svg,video") || element
+      : link?.querySelector?.("img,picture,canvas,svg,video,[role=img]") || null;
+    return {
+      // A video or audio is picked to be controlled, not saved: `holdMedia`.
+      kind: isEditable(element) ? "editable" : isMediaElement(element) ? "media"
+        : image ? "image" : link ? "link" : "text",
+      link,
+      image,
+      imageURL: imageSource(image),
+    };
+  }
+
+  // The cell `uniqueVisibleTargets` keys a box on: one badge per top-left corner.
+  function targetCell(rect) {
+    return `${Math.round(rect.left / 4)},${Math.round(rect.top / 4)}`;
+  }
+
   function visualTargets() {
     const selector = [
       "a[href]", "img", "picture", "canvas", "svg", "video", "audio", "p", "li", "pre", "code", "blockquote",
       "h1", "h2", "h3", "h4", "h5", "h6", "figcaption", "article", "[role=article]", "[role=img]",
       "input:not([type=hidden])", "textarea", "[contenteditable=true]",
     ].join(",");
-    const blocks = uniqueVisibleTargets(collectRoots().flatMap((root) => [...root.querySelectorAll(selector)]), (element) => {
-      const link = element.closest("a[href]");
-      const image = element.matches("img,picture,canvas,svg,video,[role=img]")
-        ? element.querySelector?.("img,canvas,svg,video") || element
-        : link?.querySelector?.("img,picture,canvas,svg,video,[role=img]") || null;
-      return {
-        // A video or audio is picked to be controlled, not saved: `holdMedia`.
-        kind: isEditable(element) ? "editable" : isMediaElement(element) ? "media"
-          : image ? "image" : link ? "link" : "text",
-        link,
-        image,
-        imageURL: imageSource(image),
-      };
-    }).filter((item) => item.kind !== "text" || item.element.innerText?.trim())
+    const blocks = uniqueVisibleTargets(collectRoots().flatMap((root) => [...root.querySelectorAll(selector)]), visualClass)
+      .filter((item) => item.kind !== "text" || item.element.innerText?.trim())
       .filter((item) => !insideEditorButNotBlock(item.element));
+    // Everything `f` labels is a `v` target too. The selector above names content, so buttons,
+    // tabs, rows with a click handler and the items a canvas declares (`data-tweb-targets`) had
+    // no `v` label at all, while `f` labelled them: on the briefs index `f` found 119 targets and
+    // 110 of them were missing from `v`, the Graph tab's nodes among them. A pick of one points
+    // the mouse at it (`enterVisual`), which is the hover `f` cannot give, since `f` clicks.
+    //
+    // The element itself is left to the content list when it is there, since that list knows it
+    // as a link, an image or a field. A video is too: `v` holds it whole, and its per-button
+    // targets from `f` are pointed at like any control. A part of an element — a declared item, a
+    // media button — is its own target and never stands in for the element.
+    const whole = (item) => !item.declared && !item.mediaControl;
+    const controls = interactiveTargets()
+      .filter((item) => !(whole(item) && isMediaElement(item.element)))
+      .map((item) => {
+        const visual = whole(item) ? visualClass(item.element) : { kind: "control" };
+        return { ...item, ...visual, kind: visual.kind === "text" ? "control" : visual.kind };
+      });
+    const controlElements = new Set(controls.filter(whole).map((item) => item.element));
+    // A content box sharing a control's corner would put two badges on one spot, and the control
+    // is what `f` shows there, so it keeps the cell.
+    const controlCells = new Set(controls.map((item) => targetCell(item.rect)));
+    const content = blocks.filter((item) => !controlElements.has(item.element) && !controlCells.has(targetCell(item.rect)));
     // Inner scroll and drag-pan areas share this picker: like every other `v` target, picking
     // one points the next keys at it rather than clicking it — `j`/`k` scroll that area until
     // `Esc` hands them back to the page. The page entry `scrollableTargets` adds is left out
@@ -2116,7 +2147,7 @@ installPrintShim();
     const areas = scrollableTargets()
       .filter((item) => !item.page)
       .map((item) => ({ ...item, kind: "scroll" }));
-    return [...blocks, ...areas]
+    return [...controls, ...content, ...areas]
       .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
   }
 
@@ -2703,8 +2734,9 @@ installPrintShim();
   // A `v` badge's colour says what picking it will do, before the label is typed: text is
   // selected (yellow), a link is followed or copied (blue), an image is saved or copied (pink),
   // an editable takes the caret (green, the insert-mode colour of the mode label), and an area
-  // takes the scroll keys (teal), and a video or audio takes the media keys (orange). `f` badges
-  // have no kind and stay yellow.
+  // takes the scroll keys (teal), a video or audio takes the media keys (orange), and anything
+  // else `f` would click is pointed at, and clicked on Enter (purple). `f` badges have no kind
+  // and stay yellow.
   const BADGE_COLORS = {
     text: { fill: "#ffd75f", border: "#9b6b00" },
     link: { fill: "#8ab4f8", border: "#1a5fb4" },
@@ -2712,6 +2744,7 @@ installPrintShim();
     editable: { fill: "#81c995", border: "#1e7a3a" },
     scroll: { fill: "#64ffda", border: "#00796b" },
     media: { fill: "#fcad70", border: "#b45309" },
+    control: { fill: "#c58af9", border: "#7b1fa2" },
   };
   function badgeColors(target) {
     return BADGE_COLORS[target.kind] || BADGE_COLORS.text;
@@ -2721,7 +2754,7 @@ installPrintShim();
   // closed while the badges are up. So a `v` round carries its own key, in the corner across
   // from the mode label, for as long as the badges are on screen.
   const BADGE_LEGEND = [["text", "text"], ["link", "link"], ["image", "image"],
-    ["editable", "edit"], ["scroll", "scroll area"], ["media", "media"]];
+    ["editable", "edit"], ["scroll", "scroll area"], ["media", "media"], ["control", "control"]];
   function badgeLegend() {
     const legend = document.createElement("div");
     legend.style.cssText = [
@@ -5908,6 +5941,9 @@ installPrintShim();
     }
     const elementRectAtPick = item.element?.getBoundingClientRect?.() || null;
     visualState = { ...item, outline, selectionMade, elementRectAtPick };
+    // A control is picked to be pointed at: its hover state (a menu, a tooltip, a canvas node's
+    // highlight) shows, and Enter clicks where the pointer already is.
+    if (item.kind === "control") send("native-hover", hintClickPoint(item));
     if (selectionMade) updateVisualSelection();
     else if (item.kind === "image") setMode("visual", "image ⏎·y…·Y·u·D·t·I");
     else setMode("visual", `${item.kind} ⏎·y…·Y·u·t·p·I`);
