@@ -171,11 +171,11 @@ test("the media keys are claimed before scroll and the single-key shortcuts, and
 
 test("f and v both hold media through the same holdMedia", () => {
   // `v`: a video or audio is its own kind, orange, and picking it holds it.
-  const visual = slice("function visualTargets()", "function scrollableTargets()");
+  const visual = slice("function visualClass(element)", "function scrollableTargets()");
   assert.match(visual, /"video", "audio"/);
   assert.match(visual, /isMediaElement\(element\) \? "media"/);
   assert.match(electron, /media: \{ fill: "#fcad70"/);
-  assert.match(electron, /\["media", "media"\]\];/);
+  assert.match(electron, /\["media", "media"\]/);
   const enter = slice("function enterVisual(item)", "function startVisual()");
   assert.match(enter, /item\.kind === "media"\) \{\s*holdMedia\(item\);/);
 
