@@ -94,6 +94,7 @@ electron-check: electron-test ## Check the Electron JavaScript syntax
 	node --check electron/renderer-recovery.cjs
 	node --check electron/renderer-memory.cjs
 	node --check electron/keymap.cjs
+	node --check electron/cdp-relay.cjs
 	node --check electron/paint-memory.cjs
 	node --check electron/find-session.cjs
 	node --check electron/history-lock.cjs

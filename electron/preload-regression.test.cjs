@@ -3483,21 +3483,22 @@ test("terminal keys lift the paint rate and the send interval, mouse and focus d
   assert.match(main, /setFrameRate\(windows\.appliedPaintRate\)/);
 });
 
-// `tweb action` drives a tab with agent-browser over CDP. Three things make that work and each was
-// checked live: the Electron engine opens a CDP port before ready (Chromium reads the switch only
-// then), the target call holds a hidden pane's surface past its own return (agent-browser talks to
-// the page directly, outside withAgentSurface), and the release is geometry-free so ending the hold
-// does not restore the surface again. tweb's own badge stays out of agent-browser's a11y snapshot.
-test("tweb action: CDP port at start, a hold that outlives the call, a release that ends it", () => {
+// `tweb action` drives a tab with agent-browser over CDP. The Electron engine opens no CDP port of
+// its own (it did in #313, for its whole life, unauthenticated on 127.0.0.1): the endpoint is the
+// per-run relay in cdp-relay.cjs, opened by action-target and closed by action-release or the hold's
+// timer. The target call also holds a hidden pane's surface past its own return (agent-browser talks
+// to the page directly, outside withAgentSurface), and the release is geometry-free so ending the
+// hold does not restore the surface again. tweb's own badge stays out of agent-browser's snapshot.
+test("tweb action: no CDP port at start, a relay per run, a release that closes it", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /if \(agentCdpEnabled\) \{\s*app\.commandLine\.appendSwitch\("remote-debugging-port", "0"\);/);
-  // The port turns navigator.webdriver on; without this switch YouTube stops a minute in (#153).
-  assert.match(main, /app\.commandLine\.appendSwitch\("disable-blink-features", "AutomationControlled"\);/);
-  assert.ok(main.indexOf('appendSwitch("remote-debugging-port"') < main.indexOf("app.whenReady()"));
+  assert.doesNotMatch(main, /appendSwitch\(\s*"remote-debugging-port"/, "the engine must not open a CDP port at start");
   assert.match(main, /case "action-target":\s*return actionTarget\(params\);/);
-  const target = main.slice(main.indexOf("async function actionTarget(params)"), main.indexOf("function actionRelease("));
+  const target = main.slice(main.indexOf("async function actionTarget(params)"), main.indexOf("async function closeActionRelay("));
+  assert.match(target, /windows\.actionRelay = await openCdpRelay\(/);
   assert.match(target, /holdSurface\(windows, Date\.now\(\), holdMs\);/);
   assert.match(target, /windows\.actionHold = setTimeout\(/);
+  const release = main.slice(main.indexOf("async function actionRelease("), main.indexOf("async function dispatchAgentCommand("));
+  assert.match(release, /await closeActionRelay\(windows\);/);
   const { agentNeedsGeometry } = require("./surface-policy.cjs");
   assert.equal(agentNeedsGeometry("action-release"), false);
   assert.equal(agentNeedsGeometry("action-target"), true);

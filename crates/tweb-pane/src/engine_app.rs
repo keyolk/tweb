@@ -157,6 +157,10 @@ const FILES: &[(&str, &str)] = &[
     ),
     ("keymap.cjs", include_str!("../../../electron/keymap.cjs")),
     (
+        "cdp-relay.cjs",
+        include_str!("../../../electron/cdp-relay.cjs"),
+    ),
+    (
         "paint-memory.cjs",
         include_str!("../../../electron/paint-memory.cjs"),
     ),
