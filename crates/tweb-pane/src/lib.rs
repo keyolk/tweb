@@ -1068,6 +1068,28 @@ fn restores_after(reason: &attach::SpawnReason) -> bool {
 const REATTACH_ATTEMPTS: u32 = 6;
 const REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
 
+/// How long a hosted session has to have run for its end to start a fresh budget.
+///
+/// The budget is for one outage, not for the pane's life. It used to be one `for` loop over the
+/// pane's whole life, and every hosted session is one turn of it, so each `tweb daemon restart`
+/// spent an attempt: a pane that had lived through six restarts started an engine of its own at the
+/// seventh, from the app embedded in its (old) binary. Seen 2026-11-26: four panes opened on
+/// Nov 23-24 came back from a restart on their own engines running that old app, without the fixes
+/// just installed, while three opened on Nov 25 went back to the daemon.
+///
+/// A session that ended at once is not a recovery: an engine that dies on every attach must still
+/// use the budget up, so only a session that ran this long resets it.
+const SETTLED_SESSION: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The reattach attempts used so far, after a hosted try that ran for `ran` and ended with `reason`.
+fn attempts_after(used: u32, reason: &attach::SpawnReason, ran: std::time::Duration) -> u32 {
+    if matches!(reason, attach::SpawnReason::HostedSessionLost(_)) && ran >= SETTLED_SESSION {
+        0
+    } else {
+        used
+    }
+}
+
 /// [`try_hosted`], and again after a lost session or a daemon that could not be reached, until the
 /// pane finishes or a lasting reason says to spawn.
 ///
@@ -1089,9 +1111,11 @@ async fn host_until_settled(
     pane: &str,
     image_id: u32,
 ) -> HostedOutcome {
+    let mut started = std::time::Instant::now();
     let mut outcome = try_hosted(url, options.clone(), pane, image_id).await;
     let mut again = options.clone();
-    for attempt in 1..=REATTACH_ATTEMPTS {
+    let mut used = 0;
+    loop {
         let reason = match &outcome {
             HostedOutcome::Spawn(reason @ attach::SpawnReason::HostedSessionLost(_)) => {
                 // What the session was showing is in the window session by now (`restores_after`).
@@ -1115,8 +1139,13 @@ async fn host_until_settled(
             ) => reason,
             _ => return outcome,
         };
-        tracing::info!(%reason, attempt, "not hosted yet; going back to the daemon");
+        used = attempts_after(used, reason, started.elapsed()) + 1;
+        if used > REATTACH_ATTEMPTS {
+            break;
+        }
+        tracing::info!(%reason, attempt = used, "not hosted yet; going back to the daemon");
         tokio::time::sleep(REATTACH_DELAY).await;
+        started = std::time::Instant::now();
         outcome = try_hosted(url, again.clone(), pane, image_id).await;
     }
     // The budget is spent. A daemon whose engine cannot host is waited out rather than fallen back
@@ -1687,6 +1716,40 @@ mod tests {
 
     // A daemon restart ends hosting; the pane's own engine then restores the tabs the hosted one
     // saved. Never hosted (no daemon, flag off, inline frames): the URL it was opened with.
+    // The reattach budget is per outage. A session that ran resets it, so the seventh daemon restart
+    // of a pane's life goes back to the daemon like the first; one that ended at once does not, so an
+    // engine dying on every attach still runs the budget out.
+    #[test]
+    fn a_session_that_ran_starts_a_fresh_reattach_budget() {
+        use super::{attempts_after, REATTACH_ATTEMPTS, SETTLED_SESSION};
+        use crate::attach::SpawnReason;
+        use std::time::Duration;
+        let lost = SpawnReason::HostedSessionLost("twebd closed the connection".into());
+        let mut used = 0;
+        for _restart in 0..20 {
+            used = attempts_after(used, &lost, Duration::from_secs(3600)) + 1;
+            assert!(
+                used <= REATTACH_ATTEMPTS,
+                "a long-lived pane ran out of reattaches"
+            );
+        }
+        let mut used = 0;
+        for _ in 0..REATTACH_ATTEMPTS {
+            used = attempts_after(used, &lost, Duration::from_millis(200)) + 1;
+        }
+        assert_eq!(
+            attempts_after(used, &lost, Duration::from_millis(200)) + 1,
+            REATTACH_ATTEMPTS + 1
+        );
+        let refused = SpawnReason::ConnectFailed("refused".into());
+        assert_eq!(
+            attempts_after(4, &refused, SETTLED_SESSION * 10),
+            4,
+            "only a lost session resets it"
+        );
+        assert_eq!(attempts_after(4, &lost, SETTLED_SESSION), 0);
+    }
+
     #[test]
     fn a_daemon_whose_engine_cannot_host_is_waited_out_never_fallen_back_from() {
         use super::{after_budget, AfterBudget};
