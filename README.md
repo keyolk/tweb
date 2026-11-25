@@ -41,10 +41,11 @@ make install PREFIX=/usr/local
 make uninstall
 ```
 
-Prebuilt macOS binaries (arm64, amd64) are attached to each `v*` release as
-`tweb_<version>_darwin_<arch>.tar.gz` with a `checksums.txt`; the archive holds `tweb`, `twebd`,
-`tweb-webkit` and `tweb-native-input`, which go side by side on `PATH` (`tweb` finds its helpers
-beside itself). Pushing a `v*` tag that matches the workspace version runs `.github/workflows/release.yml`.
+Prebuilt binaries are attached to each `v*` release with a `checksums.txt`, for macOS and Linux on
+arm64 and amd64. `tweb_<version>_darwin_<arch>.tar.gz` holds `tweb`, `twebd`, `tweb-webkit` and
+`tweb-native-input`; `tweb_<version>_linux_<arch>.tar.gz` holds `tweb` and `twebd` (built on Ubuntu
+22.04, glibc 2.35 or newer; the WebKit host and the pointer helper are macOS-only). The binaries go
+side by side on `PATH` (`tweb` finds its helpers beside itself). Pushing a `v*` tag that matches the workspace version runs `.github/workflows/release.yml`.
 
 Only the binary gets installed. The Electron app code (`main.cjs`, `preload.cjs` and friends, 198KB)
 is embedded in the binary and unpacked into `~/.cache/tweb/app-<hash>` on first run. The directory
@@ -67,12 +68,14 @@ it reports each of the points below.
   `tweb doctor` lists the ones `ldd` cannot resolve. On Ubuntu 24.04:
 
   ```sh
-  sudo apt-get install --no-install-recommends libnss3 libatk-bridge2.0-0t64 libcups2t64 \
-    libgtk-3-0t64 libgbm1 libxkbcommon0 libasound2t64 libxcomposite1 libxdamage1 libxrandr2 \
-    fonts-dejavu-core fonts-noto-cjk
+  sudo apt-get install --no-install-recommends curl unzip ca-certificates libnss3 libatk-bridge2.0-0t64 \
+    libcups2t64 libgtk-3-0t64 libgbm1 libxkbcommon0 libasound2t64 libxcomposite1 libxdamage1 \
+    libxrandr2 fonts-dejavu-core fonts-noto-cjk
   ```
 
-  (Drop the `t64` suffixes on 22.04.) Without fonts the engine starts and draws every glyph as nothing.
+  (Drop the `t64` suffixes on 22.04.) `curl` and `unzip` fetch and unpack the runtime on first run;
+  without them the first pane fails with "cannot run curl". Without fonts the engine starts and
+  draws every glyph as nothing.
 - **No display server is needed.** With neither `DISPLAY` nor `WAYLAND_DISPLAY` set, the engine
   starts on Chromium's headless Ozone platform with SwiftShader for GL, so WebGL works. Floating
   mode (`w`) needs a real display and says so instead.
