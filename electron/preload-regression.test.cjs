@@ -3490,7 +3490,9 @@ test("terminal keys lift the paint rate and the send interval, mouse and focus d
 // does not restore the surface again. tweb's own badge stays out of agent-browser's a11y snapshot.
 test("tweb action: CDP port at start, a hold that outlives the call, a release that ends it", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-  assert.match(main, /if \(agentCdpEnabled\) app\.commandLine\.appendSwitch\("remote-debugging-port", "0"\);/);
+  assert.match(main, /if \(agentCdpEnabled\) \{\s*app\.commandLine\.appendSwitch\("remote-debugging-port", "0"\);/);
+  // The port turns navigator.webdriver on; without this switch YouTube stops a minute in (#153).
+  assert.match(main, /app\.commandLine\.appendSwitch\("disable-blink-features", "AutomationControlled"\);/);
   assert.ok(main.indexOf('appendSwitch("remote-debugging-port"') < main.indexOf("app.whenReady()"));
   assert.match(main, /case "action-target":\s*return actionTarget\(params\);/);
   const target = main.slice(main.indexOf("async function actionTarget(params)"), main.indexOf("function actionRelease("));

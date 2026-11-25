@@ -62,7 +62,15 @@ const { createPaintCollector, minorCollector } = require("./paint-memory.cjs");
 // about); a local process of the same user can, as it can with the Chrome engine's own port.
 // `agent.cdp = false` turns it off, and `tweb action` then says so.
 const agentCdpEnabled = settings.get("agent.cdp") !== false;
-if (agentCdpEnabled) app.commandLine.appendSwitch("remote-debugging-port", "0");
+//
+// The port alone turns `navigator.webdriver` on for every page, which sites read as automation:
+// YouTube stops playback about a minute in, and sign-in pages refuse. The Chrome engine met this
+// first (#153, cdp/connection.cjs); the same switch keeps it off here. Measured on the installed
+// engine after #313: webdriver true with the port, false with the port and this switch.
+if (agentCdpEnabled) {
+  app.commandLine.appendSwitch("remote-debugging-port", "0");
+  app.commandLine.appendSwitch("disable-blink-features", "AutomationControlled");
+}
 const { ENGINE_LABELS, engineBadgeModel, pinLists, pinTable, routeNavigation } = require("./engine-routing.cjs");
 const { engineKind } = require("./cdp/backend.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
