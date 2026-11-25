@@ -32,6 +32,7 @@ function fakeMedia(overrides = {}) {
     currentTime: 100,
     duration: 600,
     playbackRate: 1,
+    getBoundingClientRect() { return { width: 640, height: 360 }; },
     plays: 0,
     play() { this.paused = false; this.plays += 1; return Promise.resolve(); },
     pause() { this.paused = true; },
@@ -46,11 +47,12 @@ function harness() {
   const sent = [];
   const modes = [];
   const location = { href: "https://www.youtube.com/watch?v=one" };
-  const api = new Function("sent", "modes", "location", `
+  const document = { documentElement: { dataset: { twebMode: "media" } }, fullscreenElement: null };
+  const api = new Function("sent", "modes", "location", "document", `
     let mediaTarget = null;
     let mediaTargetWatch = null;
     let mediaHeldPage = null;
-    const document = { documentElement: { dataset: { twebMode: "media" } } };
+    let mediaHeldByFullscreen = false;
     const isTag = (element, ...names) => names.includes(element?.localName);
     const visibleRect = () => ({ left: 0, top: 0, right: 640, bottom: 360, width: 640, height: 360 });
     const topViewportPoint = (point) => point;
@@ -64,11 +66,12 @@ function harness() {
         const event = { prevented: false, preventDefault() { this.prevented = true; }, stopImmediatePropagation() {} };
         return { handled: handleMediaKey(event, key), prevented: event.prevented };
       },
+      fullscreenChanged: () => onFullscreenChange(),
       held: () => mediaTarget,
       status: (media) => mediaStatus(media),
     };
-  `)(sent, modes, location);
-  return { ...api, sent, modes, location };
+  `)(sent, modes, location, document);
+  return { ...api, sent, modes, location, document };
 }
 
 test("with nothing held the media keys go on to the page", () => {
@@ -182,6 +185,61 @@ test("a same-document navigation tells the top frame at once", () => {
   const listener = slice('ipcRenderer.on("tweb-page-changed"', 'ipcRenderer.on("tweb-audio-state"');
   assert.match(listener, /if \(!mediaSurface\(\) && showing\) normalMode\(\);/,
     "the indicator is redrawn only when it was showing the media, not over a hint round");
+});
+
+test("going fullscreen on a player holds it, and leaving fullscreen lets it go", () => {
+  const h = harness();
+  const small = fakeMedia({ getBoundingClientRect: () => ({ width: 100, height: 50 }) });
+  const big = fakeMedia();
+  // A site makes its player container fullscreen, with a thumbnail video beside the real one.
+  h.document.fullscreenElement = { querySelectorAll: () => [small, big] };
+  h.fullscreenChanged();
+  assert.equal(h.held(), big, "the biggest video in the fullscreen element");
+  assert.equal(h.key("k").handled, true, "the media keys work at once");
+  assert.equal(big.volume, 0.6);
+
+  h.document.fullscreenElement = null;
+  h.fullscreenChanged();
+  assert.equal(h.held(), null, "released with fullscreen");
+  assert.equal(h.key("k").handled, false);
+  assert.equal(big.listeners.size, 0);
+});
+
+test("the fullscreen element can be the video itself, and audio counts", () => {
+  const h = harness();
+  const video = fakeMedia();
+  h.document.fullscreenElement = video;
+  h.fullscreenChanged();
+  assert.equal(h.held(), video);
+  const audio = fakeMedia({ localName: "audio" });
+  h.document.fullscreenElement = null;
+  h.fullscreenChanged();
+  h.document.fullscreenElement = { querySelectorAll: () => [audio] };
+  h.fullscreenChanged();
+  assert.equal(h.held(), audio);
+});
+
+test("media picked with f or v stays held after fullscreen ends", () => {
+  const h = harness();
+  const media = fakeMedia();
+  h.hold(media);
+  h.document.fullscreenElement = media;
+  h.fullscreenChanged();
+  assert.equal(h.held(), media, "already held: nothing is taken over");
+  h.document.fullscreenElement = null;
+  h.fullscreenChanged();
+  assert.equal(h.held(), media, "the person held it, so only Esc lets it go");
+});
+
+test("a fullscreen element with no media holds nothing", () => {
+  const h = harness();
+  h.document.fullscreenElement = { querySelectorAll: () => [] };
+  h.fullscreenChanged();
+  assert.equal(h.held(), null);
+});
+
+test("the document reports fullscreen changes to the hold", () => {
+  assert.match(electron, /document\.addEventListener\("fullscreenchange", onFullscreenChange\);/);
 });
 
 test("the indicator reads volume, speed and position", () => {

@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fullscreen video</title>
+<style>html,body{margin:0;background:#111;color:#eee;font:16px sans-serif}#player{width:640px;background:#000}video{display:block;width:100%}button{margin:12px;padding:8px 14px}</style>
+<!-- A site player: the fullscreen element is the container around the <video>, not the video. -->
+<div id="player"><video src="media/testsrc.webm" autoplay muted loop playsinline></video></div>
+<button id="fs" onclick="document.getElementById('player').requestFullscreen()">fullscreen</button>
+<p id="state"></p>
+<script>
+  document.addEventListener("fullscreenchange", () => {
+    document.getElementById("state").textContent = document.fullscreenElement ? "fullscreen" : "windowed";
+  });
+</script>

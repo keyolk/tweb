@@ -118,6 +118,9 @@ installPrintShim();
   // The page the media was held on (`heldPage`). A single-page site keeps its <video> in the
   // document when it moves to another page, so being connected is not enough to stay held.
   let mediaHeldPage = null;
+  // Whether the media is held only because the page went fullscreen on it, so that leaving
+  // fullscreen lets it go again. A video the person picked with f or v stays held.
+  let mediaHeldByFullscreen = false;
   let tabListRefresh = false;
   let pendingG = false;
   // The `y` copy menu while it is open (startCopyMenu).
@@ -2486,6 +2489,7 @@ installPrintShim();
     mediaTargetWatch = null;
     mediaTarget = null;
     mediaHeldPage = null;
+    mediaHeldByFullscreen = false;
     if (watch) {
       for (const type of watch.events) watch.element.removeEventListener(type, watch.refresh);
       watch.element.removeEventListener("timeupdate", watch.tick);
@@ -2507,6 +2511,33 @@ installPrintShim();
     if (mediaTarget?.isConnected && heldPage() === mediaHeldPage) return mediaTarget;
     if (mediaTarget) releaseMedia(false);
     return null;
+  }
+
+  // The video or audio a fullscreen element shows: the element itself, or the biggest one inside
+  // it (a site makes its player container fullscreen, not the <video>).
+  function fullscreenMedia(root) {
+    if (!root) return null;
+    if (isMediaElement(root)) return root;
+    const area = (media) => {
+      const rect = media.getBoundingClientRect();
+      return rect.width * rect.height;
+    };
+    const found = [...(root.querySelectorAll?.("video, audio") || [])];
+    return found.sort((a, b) => area(b) - area(a))[0] || null;
+  }
+
+  // Going fullscreen on a player holds it, as picking it with f or v does: the person is there to
+  // watch it, and the keys that drive it (volume, seek, pause) are the ones they reach for. Leaving
+  // fullscreen lets it go again, unless it was held on purpose before.
+  function onFullscreenChange() {
+    const media = fullscreenMedia(document.fullscreenElement);
+    if (media) {
+      if (mediaTarget === media) return;
+      holdMedia({ element: media });
+      mediaHeldByFullscreen = true;
+    } else if (mediaHeldByFullscreen) {
+      releaseMedia();
+    }
   }
 
   function mediaClock(seconds) {
@@ -7618,6 +7649,8 @@ installPrintShim();
     }
     if (topFrame) renderIndicator();
   });
+
+  document.addEventListener("fullscreenchange", onFullscreenChange);
 
   // A same-document navigation (pushState, popstate) in the top frame. The held media is let go
   // by `mediaSurface` on the next key or the element's next event either way; this makes the
