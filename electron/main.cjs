@@ -51,6 +51,7 @@ const { MouseClickState } = require("./mouse-click-state.cjs");
 const { tabShowingPage } = require("./tab-dedupe.cjs");
 const os = require("node:os");
 const settings = require("./settings.cjs");
+const { parseKeymap } = require("./keymap.cjs");
 const { createPaintCollector, minorCollector } = require("./paint-memory.cjs");
 const { ENGINE_LABELS, engineBadgeModel, pinLists, pinTable, routeNavigation } = require("./engine-routing.cjs");
 const { engineKind } = require("./cdp/backend.cjs");
@@ -493,7 +494,16 @@ settings.watch((changed, resolved) => {
   if (changed.some((key) => /^engine\.(?:chrome|webkit|electron)_sites$/.test(key))) {
     forEachPane(() => sendTabState());
   }
+  // Live: every frame of every tab gets the new keymap, so a remap works without a reload.
+  if (changed.includes("keys.map")) {
+    const { pairs, warnings } = parseKeymap(settings.get("keys.map"));
+    for (const warning of warnings) console.error(`tweb: config.toml: ${warning}`);
+    forEachPane(() => {
+      for (const tab of currentWindows().tabs || []) sendToTabFrames(tab, "tweb-keymap", pairs);
+    });
+  }
 });
+for (const warning of parseKeymap(settings.get("keys.map")).warnings) console.error(`tweb: config.toml: ${warning}`);
 for (const warning of settings.snapshot().warnings) console.error(`tweb: config.toml: ${warning}`);
 
 // --- frame latency probe -------------------------------------------------------------
@@ -5736,6 +5746,7 @@ ipcMain.on("tweb-preload-ready", bindPane(
   else shortcutFrameKeys(tab).delete(key);
   readyFrameKeys(tab).add(frameKey(frame));
   event.reply("tweb-shortcuts-mode", shortcutModeMessage());
+  event.reply("tweb-keymap", parseKeymap(settings.get("keys.map")).pairs);
   // A new document in a recorded tab starts listening for clicks again.
   if (recordingForTab(tab)) event.reply("tweb-recording", { recording: true });
   if (tab === currentWindows().win && frame === tab.webContents.mainFrame) {

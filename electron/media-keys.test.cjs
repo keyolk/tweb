@@ -256,7 +256,7 @@ test("the media keys are claimed before scroll and the single-key shortcuts, and
   const claim = normal.indexOf("if (handleMediaKey(event, key)) return;");
   assert.notEqual(claim, -1);
   assert.ok(claim < normal.indexOf("if (scrollHeldSurface(key, event.shiftKey))"), "before a held scroll area");
-  assert.ok(claim < normal.indexOf("const action = normalKeyActions.get(key);"), "before j/k/m as shortcuts");
+  assert.ok(claim < normal.indexOf("const action = normalKeyAction(key);"), "before j/k/m as shortcuts");
   assert.ok(claim > normal.indexOf("if (eventIsEditable(event))"), "never while typing in a field");
   assert.ok(claim > normal.indexOf("if (insertMode)"), "never in insert mode");
 });

@@ -207,7 +207,7 @@ test("the preload spends an announced key once and lets it past the TWeb command
   const handler = preload.slice(preload.indexOf("function handleNormalKey(event)"));
   const take = handler.indexOf("takeAgentKey(event, key)");
   const passed = handler.indexOf("if (agentKey) {");
-  const commands = handler.indexOf("normalKeyActions.get(key)");
+  const commands = handler.indexOf("normalKeyAction(key)");
   assert.ok(take !== -1 && passed !== -1 && commands !== -1);
   assert.ok(take < passed && passed < commands, "the pass-through comes before the command table");
   // Overlays keep their keys: the pass-through sits after the help, picker and palette handlers.

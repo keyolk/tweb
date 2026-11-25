@@ -214,6 +214,7 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
 | `frame_rate.typing_paint` | `typing` (`always`, `off`) | live |
+| `keys.map` | `[]` — e.g. `["n=j", "e=k", "-x"]` | live |
 | `memory.renderer_limit_mb` | `1536` (0 turns it off) | live |
 | `page.transparent` | `false` | next new tab |
 | `downloads.dir` | system Downloads | next engine start |

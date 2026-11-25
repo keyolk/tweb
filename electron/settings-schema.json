@@ -140,6 +140,13 @@
       "env": "TWEB_ELECTRON_SITES",
       "applies": "live",
       "description": "Sites pinned to the Electron engine: an exception carved out of a broader chrome or webkit entry, or a site kept on Electron in a pane opened on another engine. Same rules as engine.chrome_sites."
+    },
+    {
+      "key": "keys.map",
+      "type": "list",
+      "default": [],
+      "applies": "live",
+      "description": "Your own normal-mode keys. \"NEW=OLD\" makes NEW do what OLD does (the single keys `?` lists) and OLD keeps working; \"-KEY\" leaves KEY to the page. Single printable keys only: chords (gg, zi), Esc and Ctrl/Alt/Cmd keys stay as they are. `?` lists your remaps first."
     }
   ]
 }
