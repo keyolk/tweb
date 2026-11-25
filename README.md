@@ -68,12 +68,14 @@ it reports each of the points below.
   `tweb doctor` lists the ones `ldd` cannot resolve. On Ubuntu 24.04:
 
   ```sh
-  sudo apt-get install --no-install-recommends libnss3 libatk-bridge2.0-0t64 libcups2t64 \
-    libgtk-3-0t64 libgbm1 libxkbcommon0 libasound2t64 libxcomposite1 libxdamage1 libxrandr2 \
-    fonts-dejavu-core fonts-noto-cjk
+  sudo apt-get install --no-install-recommends curl unzip ca-certificates libnss3 libatk-bridge2.0-0t64 \
+    libcups2t64 libgtk-3-0t64 libgbm1 libxkbcommon0 libasound2t64 libxcomposite1 libxdamage1 \
+    libxrandr2 fonts-dejavu-core fonts-noto-cjk
   ```
 
-  (Drop the `t64` suffixes on 22.04.) Without fonts the engine starts and draws every glyph as nothing.
+  (Drop the `t64` suffixes on 22.04.) `curl` and `unzip` fetch and unpack the runtime on first run;
+  without them the first pane fails with "cannot run curl". Without fonts the engine starts and
+  draws every glyph as nothing.
 - **No display server is needed.** With neither `DISPLAY` nor `WAYLAND_DISPLAY` set, the engine
   starts on Chromium's headless Ozone platform with SwiftShader for GL, so WebGL works. Floating
   mode (`w`) needs a real display and says so instead.
