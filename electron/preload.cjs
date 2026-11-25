@@ -799,6 +799,10 @@ installPrintShim();
     if (!topFrame || !document.documentElement || indicatorHost?.isConnected) return;
     const host = document.createElement("div");
     host.id = "__tweb_mode__";
+    // Out of the accessibility tree, as `tweb snapshot` already leaves out every `__tweb_` host:
+    // an agent reading the page through agent-browser (`tweb action -- snapshot`) saw the engine
+    // badge and the tab counter as two of the page's buttons.
+    host.setAttribute("aria-hidden", "true");
     host.style.cssText = "position:fixed;right:5px;bottom:5px;z-index:2147483647;display:flex;gap:4px;align-items:flex-end;pointer-events:none";
     const shadow = host.attachShadow({ mode: "closed" });
     const label = document.createElement("div");

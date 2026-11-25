@@ -4,6 +4,7 @@
 //! after: `tweb snapshot --pane %3`. A leading `--pane %3` is moved behind the subcommand
 //! (`hoist_leading_pane`), so `tweb --pane %3 snapshot` works too.
 
+pub mod action;
 pub mod agent;
 pub mod chrome;
 pub mod config;
@@ -474,6 +475,21 @@ pub enum Command {
         limit: usize,
         #[command(flatten)]
         agent: AgentOptions,
+    },
+    /// Run an agent-browser command on this pane's tab: `tweb action -- snapshot -i`.
+    ///
+    /// Everything after `--` goes to agent-browser (on PATH, or `TWEB_AGENT_BROWSER`) unchanged,
+    /// pointed at the pane's tab over CDP. A hidden pane's page is held at its real size for the
+    /// run. Needs the Electron engine with `agent.cdp` on (the default) or the Chrome engine.
+    Action {
+        /// End a hold left by an interrupted run, now rather than when it times out.
+        #[arg(long)]
+        done: bool,
+        #[command(flatten)]
+        agent: AgentOptions,
+        /// The agent-browser command and its arguments.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Open Chrome's DevTools for a Chrome-engine pane's page in a pane beside it.
     ///
@@ -1099,6 +1115,12 @@ pub async fn run() -> Result<()> {
         },
         Command::Panes { agent } => agent::list_panes(agent.json)?,
         Command::Devtools { agent } => open_devtools(agent.pane.as_deref()).await?,
+        Command::Action { done, agent, args } => {
+            let code = action::run(agent.pane.as_deref(), done, &args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Command::Profile {
             action: ProfileAction::List { json },
         } => chrome::list_profiles(json)?,

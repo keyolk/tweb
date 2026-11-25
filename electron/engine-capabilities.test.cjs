@@ -57,6 +57,8 @@ test("main.cjs compares engine names only where an engine is chosen", () => {
     ["serveLocalMarkdown", "remote"],
     // One implementation per engine: Electron's session API, CDP storage calls, none on WebKit.
     ["clearBrowsingData", "per-engine implementation"],
+    // Where each engine's CDP endpoint is: Electron's own port, the engine Chrome's, none on WebKit.
+    ["actionTarget", "per-engine implementation"],
   ]);
   const lines = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8").split("\n");
   const offenders = [];

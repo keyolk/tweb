@@ -214,6 +214,7 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
 | `frame_rate.typing_paint` | `typing` (`always`, `off`) | live |
+| `agent.cdp` | `true` | next engine start |
 | `keys.map` | `[]` — e.g. `["n=j", "e=k", "-x"]` | live |
 | `memory.renderer_limit_mb` | `1536` (0 turns it off) | live |
 | `page.transparent` | `false` | next new tab |
@@ -460,6 +461,22 @@ off so every key reaches DevTools; `Ctrl-/` turns them back on. It needs the eng
 been started by this version or later, which allows exactly its own DevTools page to connect to its
 debugging port. An engine Chrome started earlier answers with an error: quit it while no
 Chrome-engine pane is open, and the next pane starts a new one.
+
+`tweb action -- <command>` runs an [agent-browser](https://github.com/vercel-labs/agent-browser)
+command on the pane's tab, for an agent that already speaks agent-browser (and, with a release that
+has it, its WebMCP commands). Everything after `--` goes to agent-browser unchanged; tweb finds the
+pane's tab among the CDP targets (one engine serves many panes), selects it, and holds a hidden pane's
+page at its real size for the run — a bare `agent-browser --cdp` on a hidden pane reads a page one
+pixel tall. `close`, `connect`, `launch` and the connection flags are refused: over CDP `close` would
+close tweb's engine. It needs agent-browser on PATH (or `TWEB_AGENT_BROWSER`), and the Electron engine
+with `agent.cdp` on (the default: a CDP port on 127.0.0.1, opened at engine start; web pages cannot
+reach it) or the Chrome engine.
+
+```bash
+tweb action -- snapshot -i
+tweb action -- click @e1
+tweb action -- get title
+```
 
 An agent's commands act on the pane's active tab — the one the person is looking at — so the two
 share it, and the tab shows when an agent is at work: while it changes the page (click, fill,

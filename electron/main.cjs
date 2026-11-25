@@ -53,6 +53,16 @@ const os = require("node:os");
 const settings = require("./settings.cjs");
 const { parseKeymap } = require("./keymap.cjs");
 const { createPaintCollector, minorCollector } = require("./paint-memory.cjs");
+
+// `tweb action` drives a tab with agent-browser over the Chrome DevTools Protocol, and an Electron
+// tab has no CDP endpoint unless the engine opens one at start: Chromium reads this switch before
+// `ready` and never after. Port 0 lets Chromium pick a free one and write it to DevToolsActivePort
+// in the profile. It listens on 127.0.0.1 only, and with no --remote-allow-origins a web page
+// cannot open it (Chromium refuses a DevTools WebSocket that carries an Origin it was not told
+// about); a local process of the same user can, as it can with the Chrome engine's own port.
+// `agent.cdp = false` turns it off, and `tweb action` then says so.
+const agentCdpEnabled = settings.get("agent.cdp") !== false;
+if (agentCdpEnabled) app.commandLine.appendSwitch("remote-debugging-port", "0");
 const { ENGINE_LABELS, engineBadgeModel, pinLists, pinTable, routeNavigation } = require("./engine-routing.cjs");
 const { engineKind } = require("./cdp/backend.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
@@ -7302,6 +7312,77 @@ function noteUserInput() {
   console.error("tweb: user input while an agent is driving");
 }
 
+// --- `tweb action`: agent-browser on this pane's tab ------------------------------------------
+//
+// The CLI runs agent-browser against a CDP port and needs two things from here: which port, and
+// which of the targets on it is this pane's tab (one engine serves many panes, and they all share
+// the port). The tab is named by its URL and `performance.timeOrigin`, which the CLI matches against
+// what agent-browser lists; a Chrome-engine tab also has its target id.
+//
+// The surface is held open for the whole run, not only for this call: agent-browser talks to the
+// page directly, so the hold every `tweb` agent method gets around itself (`withAgentSurface`)
+// never wraps it, and a hidden pane's page would be laid out one pixel tall underneath it. The
+// hold ends at `action-release`, or after `holdMs` if the CLI never sends that.
+const ACTION_HOLD_MAX_MS = 120_000;
+
+function readElectronCdpPort() {
+  try {
+    const text = readFileSync(path.join(app.getPath("userData"), "DevToolsActivePort"), "utf8");
+    const port = Number.parseInt(text.split("\n")[0], 10);
+    return Number.isInteger(port) && port > 0 ? port : null;
+  } catch (error) {
+    void error;
+    return null;
+  }
+}
+
+async function actionTarget(params) {
+  const tab = agentTab();
+  const kind = tabEngine(tab);
+  let port = null;
+  let targetId = null;
+  if (kind === "electron") {
+    if (!agentCdpEnabled) throw new Error("agent.cdp is off in config.toml, so this engine has no CDP port for agent-browser");
+    port = readElectronCdpPort();
+    if (!port) throw new Error("this engine opened no CDP port (started before agent.cdp existed?) — restart it: tweb daemon restart");
+  } else if (kind === "chrome") {
+    const engine = pageBackend.engineFor("chrome");
+    port = engine?.debuggingPort || null;
+    targetId = tab.webContents.targetId || null;
+    if (!port) throw new Error("the Chrome engine has no debugging port yet");
+  } else {
+    throw new Error(`a ${kind} tab has no CDP endpoint; agent-browser needs the Electron or Chrome engine (tweb tab engine chrome)`);
+  }
+  const windows = currentWindows();
+  const record = currentPane();
+  const holdMs = Math.max(1000, Math.min(ACTION_HOLD_MAX_MS, Number(params?.holdMs) || 60_000));
+  if (!record.visible && !windows.actionHold) {
+    holdSurface(windows, Date.now(), holdMs);
+    windows.actionHold = setTimeout(() => withPaneScope(record, () => actionRelease(windows)), holdMs);
+    updatePaintingState();
+    await awaitRestoredLayout(tab.webContents);
+  }
+  const contents = tab.webContents;
+  const timeOrigin = await contents.executeJavaScript("performance.timeOrigin", true).catch(() => null);
+  return {
+    engine: kind,
+    port,
+    targetId,
+    url: contents.getURL(),
+    title: contents.getTitle(),
+    timeOrigin,
+    held: Boolean(windows.actionHold),
+  };
+}
+
+function actionRelease(windows = currentWindows()) {
+  if (!windows.actionHold) return { released: false };
+  clearTimeout(windows.actionHold);
+  windows.actionHold = null;
+  if (releaseSurface(windows)) updatePaintingState();
+  return { released: true };
+}
+
 async function dispatchAgentCommand(method, params) {
   // An agent call reaches the pane without any terminal input, which is where a dead tab used to be
   // dropped (`reconcileDestroyedTabs`); a pane left on one answered every call "no active tab".
@@ -7336,6 +7417,10 @@ async function dispatchAgentCommand(method, params) {
     // without re-reading the profile directory.
     case "extensions":
       return extensionReport(extensionResults, extensionsDirectory);
+    case "action-target":
+      return actionTarget(params);
+    case "action-release":
+      return actionRelease();
     case "engine-log": {
       const limit = Number.isInteger(params?.limit) ? Math.max(1, Math.min(400, params.limit)) : 60;
       return { lines: engineLog.slice(-limit) };

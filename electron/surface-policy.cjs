@@ -100,6 +100,8 @@ const GEOMETRY_FREE_METHODS = new Set([
   "record-start",
   "record-stop",
   "record-status",
+  // `tweb action` ends its own hold; restoring the surface to answer that would undo it.
+  "action-release",
 ]);
 
 /// Whether `method` should hold the active tab's surface open while it runs.

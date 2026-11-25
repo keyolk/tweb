@@ -3482,3 +3482,23 @@ test("terminal keys lift the paint rate and the send interval, mouse and focus d
   assert.match(main, /const delay = immediate \? 0 : Math\.max\(0, sendIntervalMs\(\) - elapsed\);/);
   assert.match(main, /setFrameRate\(windows\.appliedPaintRate\)/);
 });
+
+// `tweb action` drives a tab with agent-browser over CDP. Three things make that work and each was
+// checked live: the Electron engine opens a CDP port before ready (Chromium reads the switch only
+// then), the target call holds a hidden pane's surface past its own return (agent-browser talks to
+// the page directly, outside withAgentSurface), and the release is geometry-free so ending the hold
+// does not restore the surface again. tweb's own badge stays out of agent-browser's a11y snapshot.
+test("tweb action: CDP port at start, a hold that outlives the call, a release that ends it", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /if \(agentCdpEnabled\) app\.commandLine\.appendSwitch\("remote-debugging-port", "0"\);/);
+  assert.ok(main.indexOf('appendSwitch("remote-debugging-port"') < main.indexOf("app.whenReady()"));
+  assert.match(main, /case "action-target":\s*return actionTarget\(params\);/);
+  const target = main.slice(main.indexOf("async function actionTarget(params)"), main.indexOf("function actionRelease("));
+  assert.match(target, /holdSurface\(windows, Date\.now\(\), holdMs\);/);
+  assert.match(target, /windows\.actionHold = setTimeout\(/);
+  const { agentNeedsGeometry } = require("./surface-policy.cjs");
+  assert.equal(agentNeedsGeometry("action-release"), false);
+  assert.equal(agentNeedsGeometry("action-target"), true);
+  const preload = fs.readFileSync(path.join(__dirname, "preload.cjs"), "utf8");
+  assert.match(preload, /host\.id = "__tweb_mode__";[\s\S]{0,400}host\.setAttribute\("aria-hidden", "true"\);/);
+});

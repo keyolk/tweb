@@ -72,6 +72,10 @@ page, so a page's own shortcuts (`g`, `]`, a canvas tool's `1`-`9`) see them.
 - `click` is a trusted native click (`isTrusted` is true), not a synthetic DOM event. `fill` is safe
   to use with React and other frameworks.
 
+If you already know agent-browser, `tweb action -- <agent-browser command>` runs it on this pane's
+tab (`tweb action -- snapshot -i`, `tweb action -- click @e1`). Prefer the `tweb` commands above: their
+refs are the `f` labels the person sees, and they hold a hidden pane open the same way.
+
 ## See what happened
 
 ```sh
