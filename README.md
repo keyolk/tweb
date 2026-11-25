@@ -108,7 +108,7 @@ tweb
 # Use the explicit subcommand when passing a URL or any open option
 tweb open https://localhost:5173
 
-# Create a tmux browser pane (default: Electron, adaptive 4–30fps)
+# Create a tmux browser pane (default: Electron, adaptive: 30fps after input, 4fps idle)
 tweb split https://localhost:5173
 
 # Open on the macOS WebKit engine (`--engine tauri` is the old name and still works)
@@ -595,16 +595,20 @@ tmux server restart. Renaming the session or changing the window index is treate
 
 `--frame-rate N` is the maximum frame rate during the active window right after user input or a resize,
 in the range 1–60. Adaptive mode, the default, uses the maximum for 700ms after terminal input or a
-resize, then settles by what the page is doing: it **keeps the full rate while the page is still
-painting on its own** — video, an animation, a canvas — and drops to 4fps once it stops. Playback is detected by counting paints over
-a window rather than by watching for a keystroke, so a video holds a watchable rate without anyone
-touching the keyboard, and a page that merely finished loading still falls all the way to idle.
+resize, then settles by what the page is doing. While the page is still painting on its own — video,
+an animation, a canvas — it holds a **playback** rate, and it drops to 4fps once the page stops.
+Playback is detected by counting paints over a window rather than by watching for a keystroke, so a
+video holds a watchable rate without anyone touching the keyboard, and a page that merely finished
+loading still falls all the way to idle.
 
-Playback held a lower cap when this tier was introduced, on the theory that it is the one workload
-running unbounded. Measured on YouTube, the pipeline carries 28fps against a 30fps cap with nothing
-dropped, so the cap was only ever a worse picture; the saving comes from the idle rate instead. Frames
-travel over a local file transport, leaving only a small Kitty graphics command on the tmux/Ghostty
-stream, and when the writer falls behind, intermediate frames are dropped and only the latest is kept.
+The playback rate is bounded by bytes per second, not by a fixed number: a small pane keeps the full
+rate, and a large one gets what fits in about 60MB/s of raw frames (`TWEB_PLAYBACK_BUDGET`, in bytes per
+second), never below 8fps. A 980x456 pane plays at 30fps; a full 2520x1400 Retina pane at about 8–17fps,
+rising as frames keep up. The full rate was tried and measured: Ghostty's CPU follows bytes/second, and
+on a busy machine that delayed input in other tmux panes (see `electron/frame-rate-policy.cjs`). Whole
+frames travel as raw pixels through shared memory on a local Ghostty (a file otherwise), leaving only a
+small Kitty graphics command on the tmux/Ghostty stream, and when the writer falls behind, intermediate
+frames are dropped and only the latest is kept.
 `--no-adaptive-frame-rate` pins the given value, holding it even on a still page;
 `--adaptive-frame-rate` states the default policy explicitly. `tweb diag` reports which tier is
 in force as `frames.rateKind`.

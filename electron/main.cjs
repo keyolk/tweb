@@ -51,6 +51,7 @@ const { MouseClickState } = require("./mouse-click-state.cjs");
 const { tabShowingPage } = require("./tab-dedupe.cjs");
 const os = require("node:os");
 const settings = require("./settings.cjs");
+const { createPaintCollector, minorCollector } = require("./paint-memory.cjs");
 const { ENGINE_LABELS, engineBadgeModel, pinLists, pinTable, routeNavigation } = require("./engine-routing.cjs");
 const { engineKind } = require("./cdp/backend.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
@@ -379,6 +380,9 @@ function commandLineUrl() {
   }
   return undefined;
 }
+
+// Every paint's NativeImage is native memory V8 does not count; see paint-memory.cjs.
+const notePaintedBytes = createPaintCollector(minorCollector());
 
 // The CLI resolves `frame_rate.*` from config.toml and passes the result as a flag; the setting is
 // the fallback for an engine started some other way.
@@ -9016,6 +9020,7 @@ function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
       if (recording) recording.dirty = true;
     }
     const size = image.getSize();
+    notePaintedBytes(size.width * size.height * 4);
     const expected = currentFrames().viewport && renderedFrameSize(currentFrames().viewport);
     if (loggedFrameGeneration !== currentFrames().generation && !image.isEmpty()
       && size.width === expected?.width && size.height === expected?.height) {
