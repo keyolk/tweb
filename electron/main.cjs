@@ -9221,6 +9221,8 @@ function configureTab(tab, initialZoomFactor = paneZoomFactor()) {
     recordNavigation(url);
     updatePaneTitle();
     recordTabNavigation(tab, url, true);
+    // Media held with f/v belongs to the page it was picked on (preload `mediaSurface`).
+    sendToMainTabFrame(tab, "tweb-page-changed", url);
     // A same-document navigation (a hash or pushState change) puts the factor Electron reports
     // back to 1 while the page goes on rendering at the pane's zoom. Every click tweb places
     // reads that factor to turn a page point into a window point, so after a page changed its
