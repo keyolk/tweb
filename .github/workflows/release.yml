@@ -91,14 +91,14 @@ jobs:
           - target: aarch64-apple-darwin
             os: darwin
             arch: arm64
-            runner: macos-14
+            runner: macos-15
             bins: tweb twebd tweb-webkit tweb-native-input
           # Cross-built on the arm64 runner: the Intel macOS runners are being retired, and
           # every crate here builds for either Apple target from the same SDK.
           - target: x86_64-apple-darwin
             os: darwin
             arch: amd64
-            runner: macos-14
+            runner: macos-15
             bins: tweb twebd tweb-webkit tweb-native-input
           # Linux builds natively on Ubuntu 22.04 runners, so the binaries need no glibc newer
           # than 2.35 and the frame addon embedded in `tweb` is built for the target it ships on.
