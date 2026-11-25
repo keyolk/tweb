@@ -268,9 +268,11 @@ function rawCommands(message, bgra) {
   // the sampling decision is invisible: a frame that should compress and does not looks exactly
   // like one that should not, and the first symptom would be dropped frames with no cause.
   lastFrameCompressed = compressed;
+  const written = writeFrameFile(message.filePath, payload);
+  releasePixels(rgba);
   return [{
     header: `${message.header},f=32${options},s=${message.width},v=${message.height},t=f,q=2`,
-    payload: writeFrameFile(message.filePath, payload),
+    payload: written,
   }];
 }
 
@@ -305,6 +307,26 @@ function cleanup() {
 }
 
 process.on("exit", cleanup);
+// Gives a frame's pixels back to the allocator now instead of at this thread's next GC.
+//
+// Each whole frame arrives as a fresh 14MB copy (2520x1400) transferred from the main thread, and
+// the file path allocates as much again for the channel swap. This thread makes almost no JS
+// garbage of its own, so its GC seldom runs, and V8 frees a backing store only when it collects
+// the ArrayBuffer that owns it. Detaching (`transfer(0)`) frees it at once. Nothing else needs
+// these bytes by now: the shm object or the frame file holds its own copy.
+//
+// Only a view that owns its whole buffer is detached. `Buffer.allocUnsafe` under 4KB, and
+// `Buffer.from` of a small buffer, slice Node's shared pool, and detaching that would break every
+// small Buffer allocated after it.
+function releasePixels(view) {
+  try {
+    const buffer = view instanceof ArrayBuffer ? view : view?.buffer;
+    if (!buffer || buffer.detached || typeof buffer.transfer !== "function") return;
+    if (!(view instanceof ArrayBuffer) && (view.byteOffset !== 0 || view.byteLength !== buffer.byteLength)) return;
+    buffer.transfer(0);
+  } catch {}
+}
+
 // Guarded so the command builders above can be required and tested without a worker host.
 // Without it, requiring this file on the main thread throws on a null `parentPort`.
 if (parentPort) {
@@ -325,11 +347,16 @@ if (parentPort) {
       parentPort.postMessage({ type: "ready", paneKey, commands, compressed: lastFrameCompressed, shm, shmError });
     } catch (error) {
       parentPort.postMessage({ type: "error", paneKey, message: error.message, commands: [] });
+    } finally {
+      // The main thread sends a buffer it owns whole (`sendGfxFrameToWorker` copies otherwise),
+      // so the ArrayBuffer itself is what to release.
+      if (message?.buffer instanceof ArrayBuffer && message.byteOffset === 0
+        && message.byteLength === message.buffer.byteLength) releasePixels(message.buffer);
     }
   });
 }
 
 module.exports = {
-  directCommands, fileCommands, rawCommands, shmCommands, frameCommands, swapBytewise, swapU32,
+  releasePixels, directCommands, fileCommands, rawCommands, shmCommands, frameCommands, swapBytewise, swapU32,
   maybeDeflate, sampleRatio, CHUNK, MIN_RATIO,
 };
