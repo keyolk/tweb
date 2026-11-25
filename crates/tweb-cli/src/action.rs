@@ -7,8 +7,9 @@
 //! `--` goes to agent-browser unchanged, and its output and exit status are this command's.
 //!
 //! What tweb adds over a bare `agent-browser --cdp`: the tab is this pane's, not whichever target
-//! comes first on an engine that serves several panes; and a hidden pane's page is held at its real
-//! size for the run (the engine collapses a page nobody looks at to one pixel).
+//! comes first on an engine that serves several panes; a hidden pane's page is held at its real
+//! size for the run (the engine collapses a page nobody looks at to one pixel); and on the Electron
+//! engine the CDP endpoint exists only for the run, so the engine keeps no CDP port open otherwise.
 
 use std::process::{Command, Stdio};
 
@@ -191,16 +192,8 @@ pub fn run(pane: Option<&str>, done: bool, args: &[String]) -> Result<i32> {
     }
     let bin = binary()?;
     let target = agent::request(pane, "action-target", json!({ "holdMs": 60_000 }))?;
-    let port = target
-        .get("port")
-        .and_then(Value::as_u64)
-        .context("the engine reported no CDP port")?
-        .to_string();
-    // One agent-browser session per engine port: its daemon keeps the CDP connection warm
-    // between calls, and two panes on one engine share it the way they share the port.
-    let session = format!("tweb-{port}");
     let outcome = (|| -> Result<i32> {
-        select_tab(&bin, &session, &port, &target)?;
+        let session = connect(&bin, &target)?;
         let status = Command::new(&bin)
             .arg("--session")
             .arg(&session)
@@ -209,9 +202,45 @@ pub fn run(pane: Option<&str>, done: bool, args: &[String]) -> Result<i32> {
             .with_context(|| format!("running {}", bin.display()))?;
         Ok(status.code().unwrap_or(1))
     })();
-    // Always end the hold; a failed release is only a late collapse (the engine's timer ends it).
-    let _ = agent::request(pane, "action-release", json!({})); // ok: the hold also times out in the engine
+    // Always end the run, whatever happened: on an Electron tab this closes the CDP endpoint the
+    // engine opened for it. A failed release is only a late close (the engine's timer ends it).
+    let _ = agent::request(pane, "action-release", json!({})); // ok: the engine's hold timer closes it too
     outcome
+}
+
+/// Points an agent-browser session at the pane's tab and returns the session's name.
+///
+/// An Electron tab comes with `wsUrl`, a CDP endpoint the engine opened for this run that shows only
+/// this tab, so the session is connected to it and there is nothing to pick. A Chrome-engine tab is
+/// on the engine Chrome's debugging port with every Chrome pane's tabs, so the tab is picked there.
+fn connect(bin: &std::path::Path, target: &Value) -> Result<String> {
+    if let Some(ws_url) = target.get("wsUrl").and_then(Value::as_str) {
+        let session = target
+            .get("session")
+            .and_then(Value::as_str)
+            .unwrap_or("tweb-pane")
+            .to_string();
+        // `connect` replaces whatever the session was connected to: the last run's endpoint is
+        // closed by now, and its port is not this one.
+        let (ok, out) = run_captured(bin, &["--session", &session, "connect", ws_url])?;
+        if !ok {
+            bail!(
+                "agent-browser could not connect to this tab's CDP endpoint: {}",
+                out.trim()
+            );
+        }
+        return Ok(session);
+    }
+    let port = target
+        .get("port")
+        .and_then(Value::as_u64)
+        .context("the engine reported no CDP endpoint")?
+        .to_string();
+    // The engine Chrome's port is shared by every Chrome pane: one session per port, and the tab
+    // is selected in it before each command.
+    let session = format!("tweb-{port}");
+    select_tab(bin, &session, &port, target)?;
+    Ok(session)
 }
 
 #[cfg(test)]

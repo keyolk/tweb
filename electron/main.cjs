@@ -54,23 +54,11 @@ const settings = require("./settings.cjs");
 const { parseKeymap } = require("./keymap.cjs");
 const { createPaintCollector, minorCollector } = require("./paint-memory.cjs");
 
-// `tweb action` drives a tab with agent-browser over the Chrome DevTools Protocol, and an Electron
-// tab has no CDP endpoint unless the engine opens one at start: Chromium reads this switch before
-// `ready` and never after. Port 0 lets Chromium pick a free one and write it to DevToolsActivePort
-// in the profile. It listens on 127.0.0.1 only, and with no --remote-allow-origins a web page
-// cannot open it (Chromium refuses a DevTools WebSocket that carries an Origin it was not told
-// about); a local process of the same user can, as it can with the Chrome engine's own port.
-// `agent.cdp = false` turns it off, and `tweb action` then says so.
-const agentCdpEnabled = settings.get("agent.cdp") !== false;
-//
-// The port alone turns `navigator.webdriver` on for every page, which sites read as automation:
-// YouTube stops playback about a minute in, and sign-in pages refuse. The Chrome engine met this
-// first (#153, cdp/connection.cjs); the same switch keeps it off here. Measured on the installed
-// engine after #313: webdriver true with the port, false with the port and this switch.
-if (agentCdpEnabled) {
-  app.commandLine.appendSwitch("remote-debugging-port", "0");
-  app.commandLine.appendSwitch("disable-blink-features", "AutomationControlled");
-}
+// `tweb action` drives a tab with agent-browser over CDP. The Electron engine opens no CDP port for
+// it: the endpoint is cdp-relay.cjs, opened per run and closed after (see there for why not
+// --remote-debugging-port). `agent.cdp = false` refuses `tweb action` on Electron tabs outright.
+const { openCdpRelay } = require("./cdp-relay.cjs");
+const agentCdpAllowed = () => settings.get("agent.cdp") !== false;
 const { ENGINE_LABELS, engineBadgeModel, pinLists, pinTable, routeNavigation } = require("./engine-routing.cjs");
 const { engineKind } = require("./cdp/backend.cjs");
 const { PasteState, PASTE_START } = require("./paste-state.cjs");
@@ -7322,73 +7310,87 @@ function noteUserInput() {
 
 // --- `tweb action`: agent-browser on this pane's tab ------------------------------------------
 //
-// The CLI runs agent-browser against a CDP port and needs two things from here: which port, and
-// which of the targets on it is this pane's tab (one engine serves many panes, and they all share
-// the port). The tab is named by its URL and `performance.timeOrigin`, which the CLI matches against
-// what agent-browser lists; a Chrome-engine tab also has its target id.
+// The CLI runs agent-browser against a CDP endpoint and needs to know which. On an Electron tab that
+// is a relay opened here for this run (cdp-relay.cjs): it shows this pane's tab and nothing else,
+// so there is no tab to pick, and it closes at `action-release` or when the hold times out. A
+// Chrome-engine tab is on the engine Chrome's own debugging port, which that engine has always had
+// (cdp/connection.cjs), and the CLI picks the tab there by its target id, URL and timeOrigin.
 //
 // The surface is held open for the whole run, not only for this call: agent-browser talks to the
 // page directly, so the hold every `tweb` agent method gets around itself (`withAgentSurface`)
-// never wraps it, and a hidden pane's page would be laid out one pixel tall underneath it. The
-// hold ends at `action-release`, or after `holdMs` if the CLI never sends that.
+// never wraps it, and a hidden pane's page would be laid out one pixel tall underneath it.
 const ACTION_HOLD_MAX_MS = 120_000;
-
-function readElectronCdpPort() {
-  try {
-    const text = readFileSync(path.join(app.getPath("userData"), "DevToolsActivePort"), "utf8");
-    const port = Number.parseInt(text.split("\n")[0], 10);
-    return Number.isInteger(port) && port > 0 ? port : null;
-  } catch (error) {
-    void error;
-    return null;
-  }
-}
 
 async function actionTarget(params) {
   const tab = agentTab();
   const kind = tabEngine(tab);
+  const windows = currentWindows();
+  const record = currentPane();
+  const holdMs = Math.max(1000, Math.min(ACTION_HOLD_MAX_MS, Number(params?.holdMs) || 60_000));
+  const contents = tab.webContents;
   let port = null;
   let targetId = null;
+  let wsUrl = null;
   if (kind === "electron") {
-    if (!agentCdpEnabled) throw new Error("agent.cdp is off in config.toml, so this engine has no CDP port for agent-browser");
-    port = readElectronCdpPort();
-    if (!port) throw new Error("this engine opened no CDP port (started before agent.cdp existed?) — restart it: tweb daemon restart");
+    if (!agentCdpAllowed()) throw new Error("agent.cdp is off in config.toml, so tweb action cannot drive an Electron tab");
+    if (!ensureDebugger(tab)) throw new Error("this tab's debugger is held by something else (DevTools?), so agent-browser cannot reach it");
+    // One run at a time per pane: a second `tweb action` while one is open replaces its relay.
+    await closeActionRelay(windows);
+    windows.actionRelay = await openCdpRelay({
+      debugger: contents.debugger,
+      page: () => ({ url: contents.isDestroyed() ? "" : contents.getURL(), title: contents.isDestroyed() ? "" : contents.getTitle() }),
+    });
+    wsUrl = windows.actionRelay.url;
   } else if (kind === "chrome") {
     const engine = pageBackend.engineFor("chrome");
     port = engine?.debuggingPort || null;
-    targetId = tab.webContents.targetId || null;
+    targetId = contents.targetId || null;
     if (!port) throw new Error("the Chrome engine has no debugging port yet");
   } else {
     throw new Error(`a ${kind} tab has no CDP endpoint; agent-browser needs the Electron or Chrome engine (tweb tab engine chrome)`);
   }
-  const windows = currentWindows();
-  const record = currentPane();
-  const holdMs = Math.max(1000, Math.min(ACTION_HOLD_MAX_MS, Number(params?.holdMs) || 60_000));
-  if (!record.visible && !windows.actionHold) {
+  // The timer is the backstop for both the surface and the relay: a CLI killed mid-run never sends
+  // the release, and neither may outlive the run by more than the hold.
+  if (windows.actionHold) clearTimeout(windows.actionHold);
+  if (!record.visible && !windows.actionHeld) {
     holdSurface(windows, Date.now(), holdMs);
-    windows.actionHold = setTimeout(() => withPaneScope(record, () => actionRelease(windows)), holdMs);
+    windows.actionHeld = true;
     updatePaintingState();
-    await awaitRestoredLayout(tab.webContents);
+    await awaitRestoredLayout(contents);
   }
-  const contents = tab.webContents;
+  windows.actionHold = setTimeout(() => withPaneScope(record, () => { void actionRelease(windows); }), holdMs);
   const timeOrigin = await contents.executeJavaScript("performance.timeOrigin", true).catch(() => null);
   return {
     engine: kind,
     port,
     targetId,
+    wsUrl,
+    // The agent-browser session the CLI uses for this pane: one per pane, so two panes' runs do not
+    // share a connection, and a pane's next run reconnects the same session to its new relay.
+    session: `tweb-${String(record.key || "pane").replace(/[^A-Za-z0-9_-]/g, "_")}`,
     url: contents.getURL(),
     title: contents.getTitle(),
     timeOrigin,
-    held: Boolean(windows.actionHold),
+    held: Boolean(windows.actionHeld),
   };
 }
 
-function actionRelease(windows = currentWindows()) {
-  if (!windows.actionHold) return { released: false };
-  clearTimeout(windows.actionHold);
+async function closeActionRelay(windows) {
+  const relay = windows.actionRelay;
+  windows.actionRelay = null;
+  if (relay) await relay.close();
+}
+
+async function actionRelease(windows = currentWindows()) {
+  if (windows.actionHold) clearTimeout(windows.actionHold);
   windows.actionHold = null;
-  if (releaseSurface(windows)) updatePaintingState();
-  return { released: true };
+  const hadRelay = Boolean(windows.actionRelay);
+  await closeActionRelay(windows);
+  if (windows.actionHeld) {
+    windows.actionHeld = false;
+    if (releaseSurface(windows)) updatePaintingState();
+  }
+  return { released: true, relayClosed: hadRelay };
 }
 
 async function dispatchAgentCommand(method, params) {

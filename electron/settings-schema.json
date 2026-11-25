@@ -152,8 +152,8 @@
       "key": "agent.cdp",
       "type": "bool",
       "default": true,
-      "applies": "engine",
-      "description": "Open a Chrome DevTools Protocol port on 127.0.0.1 in the Electron engine, so `tweb action` can drive a tab with agent-browser. Web pages cannot reach it; local processes of your user can, as with the Chrome engine's port."
+      "applies": "live",
+      "description": "Let `tweb action` drive an Electron tab with agent-browser. The engine opens no CDP port: each `tweb action` run gets an endpoint on 127.0.0.1 that shows only that pane's tab, needs a one-time token in its URL, and closes when the run ends. false refuses `tweb action` on Electron tabs."
     }
   ]
 }

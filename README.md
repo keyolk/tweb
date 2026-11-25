@@ -214,7 +214,7 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
 | `frame_rate.typing_paint` | `typing` (`always`, `off`) | live |
-| `agent.cdp` | `true` | next engine start |
+| `agent.cdp` | `true` | live |
 | `keys.map` | `[]` — e.g. `["n=j", "e=k", "-x"]` | live |
 | `memory.renderer_limit_mb` | `1536` (0 turns it off) | live |
 | `page.transparent` | `false` | next new tab |
@@ -468,9 +468,14 @@ has it, its WebMCP commands). Everything after `--` goes to agent-browser unchan
 pane's tab among the CDP targets (one engine serves many panes), selects it, and holds a hidden pane's
 page at its real size for the run — a bare `agent-browser --cdp` on a hidden pane reads a page one
 pixel tall. `close`, `connect`, `launch` and the connection flags are refused: over CDP `close` would
-close tweb's engine. It needs agent-browser on PATH (or `TWEB_AGENT_BROWSER`), and the Electron engine
-with `agent.cdp` on (the default: a CDP port on 127.0.0.1, opened at engine start; web pages cannot
-reach it) or the Chrome engine.
+close tweb's engine. It needs agent-browser on PATH (or `TWEB_AGENT_BROWSER`).
+
+The Electron engine keeps no CDP port open. Each `tweb action` run gets an endpoint of its own on
+127.0.0.1, at a random port and a path holding a one-time token, that shows only that pane's tab and
+relays it through the tab's own debugger; it closes when the run ends (or after a minute if the run
+is killed). Commands that would act on the engine rather than the tab (`Browser.close`,
+`Target.createTarget`…) are refused there. `agent.cdp = false` refuses `tweb action` on Electron tabs
+altogether. A Chrome-engine tab is driven through the engine Chrome's own debugging port.
 
 ```bash
 tweb action -- snapshot -i
