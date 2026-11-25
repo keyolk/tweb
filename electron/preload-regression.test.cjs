@@ -770,7 +770,7 @@ test("a normal-mode shortcut cannot be bound without a help line", () => {
     // The only key left in the switch is Escape, which has no single action to name.
     assert.deepEqual([...dispatch.matchAll(/case "([^"]+)":/g)].map((m) => m[1]), ["Escape"],
       `${name} binds a normal-mode key outside shortcutHelpSections`);
-    assert.match(dispatch, /const action = normalKeyActions\.get\(key\);/);
+    assert.match(dispatch, /const action = normalKeyAction\(key\);/);
     // Evaluate the table: every bound key must sit in a row whose key column names it.
     const start = source.indexOf("  const shortcutHelpSections = [");
     const end = source.indexOf("\n", source.indexOf("entries.flatMap(([, , bindings])", start)) + 1;
@@ -2640,7 +2640,7 @@ test("colon opens the command line, in normal mode only", () => {
   // colon has to stay a character the page receives (DESIGN.md 16.3), and that table is only
   // consulted from handleNormalKey.
   const normalKey = preload.indexOf("function handleNormalKey");
-  const lookup = preload.indexOf("normalKeyActions.get(key)");
+  const lookup = preload.indexOf("normalKeyAction(key)", preload.indexOf("function handleNormalKey"));
   assert.ok(normalKey >= 0 && lookup > normalKey, "the key table should be read inside handleNormalKey");
   const table = preload.slice(preload.indexOf("const shortcutHelpSections = ["),
     preload.indexOf("const normalKeyActions"));
@@ -3321,7 +3321,7 @@ test("a picked scroll area claims every scroll key before the page sees it", () 
     electron.indexOf("// This frame's share of a hint round"));
   const claim = normal.indexOf("if (scrollHeldSurface(key, event.shiftKey))");
   assert.notEqual(claim, -1);
-  assert.ok(claim < normal.indexOf("const action = normalKeyActions.get(key);"),
+  assert.ok(claim < normal.indexOf("const action = normalKeyAction(key);"),
     "claimed before the single-key shortcuts and before the page");
   const held = electron.slice(electron.indexOf("function scrollHeldSurface(key, shift)"),
     electron.indexOf("// Point the scroll keys at an inner area picked from `v`."));

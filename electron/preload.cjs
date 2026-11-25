@@ -4070,8 +4070,31 @@ installPrintShim();
     return ["Commands (: and the c palette)", rows];
   }
 
+  // `keys.map` from config.toml, parsed by the engine (keymap.cjs) and sent over `tweb-keymap`:
+  // key -> the key whose action it runs, or null for a key left to the page.
+  let keymap = new Map();
+
+  // The action a normal-mode key runs, after the person's own keymap.
+  function normalKeyAction(key) {
+    if (keymap.has(key)) {
+      const target = keymap.get(key);
+      return target === null ? null : normalKeyActions.get(target) || null;
+    }
+    return normalKeyActions.get(key) || null;
+  }
+
+  // The person's remaps, so `?` shows the keys that actually work here.
+  function keymapHelpSection() {
+    const describe = new Map(shortcutHelpSections.flatMap(([, entries]) =>
+      entries.flatMap(([, description, bindings]) => Object.keys(bindings || {}).map((key) => [key, description]))));
+    const rows = [...keymap].map(([key, target]) => target === null
+      ? [key, "left to the page (keys.map)"]
+      : [key, `same as ${target}: ${describe.get(target) || "no single-key action"} (keys.map)`]);
+    return rows.length ? [["Your keys (keys.map in config.toml)", rows]] : [];
+  }
+
   function helpSections() {
-    return [...shortcutHelpSections, commandHelpSection()];
+    return [...keymapHelpSection(), ...shortcutHelpSections, commandHelpSection()];
   }
 
   const normalKeyActions = new Map(shortcutHelpSections.flatMap(([, entries]) =>
@@ -7429,7 +7452,7 @@ installPrintShim();
     // Single-key shortcuts come from `shortcutHelpSections`, the same table `?` renders, so a key cannot
     // be bound without a line in the help. An action returning `false` declines the key.
     let handled = true;
-    const action = normalKeyActions.get(key);
+    const action = normalKeyAction(key);
     if (action) {
       handled = action.call(null) !== false;
     } else switch (key) {
@@ -7507,6 +7530,9 @@ installPrintShim();
     paintNow();
   });
 
+  ipcRenderer.on("tweb-keymap", (_event, pairs) => {
+    keymap = new Map(Array.isArray(pairs) ? pairs.filter((pair) => Array.isArray(pair) && typeof pair[0] === "string") : []);
+  });
   ipcRenderer.on("tweb-shortcuts-mode", (_event, mode) => {
     const next = mode || {};
     vimiumEnabled = Boolean(next.vimium);
