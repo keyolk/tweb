@@ -107,6 +107,10 @@ const {
   playbackWindowMs,
   settledFrameRate,
   interactionRate,
+  KEY_ECHO_MS,
+  TYPING_PAINT_MS,
+  paintsAhead,
+  isKeyboardInput,
   PLAYBACK_BYTE_BUDGET,
   remoteFrameRateTiers,
   nextWireEstimate,
@@ -2201,7 +2205,8 @@ function applyActiveFrameRate(rate, windows = currentWindows(), record = current
   // instead — so a pane scrolled out of view still has someone looking at its page. Without
   // this the rate reached the tab only when the per-second watchdog got round to it.
   if (windows.win && !windows.win.isDestroyed() && (record.visible || inputState().floating)) {
-    windows.win.webContents.setFrameRate(change.rate);
+    windows.appliedPaintRate = paintRate(windows);
+    windows.win.webContents.setFrameRate(windows.appliedPaintRate);
   }
   if (debugLogging) console.error(`tweb: frame rate ${change.rate}fps`);
 }
@@ -2230,6 +2235,63 @@ function markInteractionActivity() {
   // sits between them.
   currentWindows().paintsSinceSettle = 0;
   currentWindows().frameIdleTimer = setTimeout(settleFrameRate, 700);
+}
+
+// How often Chromium paints this pane's page, as against how often its frames are sent.
+//
+// They were the same number, and that is what made a key typed beside an animation slow: the
+// playback tier set both to 8-17fps on a large pane, so the paint carrying the key came at that
+// rate. Raising the rate on the key could not help, because Chromium adopts a new rate only at its
+// next tick (bench/keyvis.py: it took p50 from 104 to 136ms). So while someone types into a page
+// that plays (`paintsAhead`), Chromium paints at the maximum and `queueFrame` still sends whole
+// frames at the playback interval, taking the latest one when it is time. The bytes the tier
+// bounds are what reach the terminal, and those do not change. bench/keyvis.py at 2880x1800, the
+// pixels that show each key, p50 / p90 / max:
+//
+//     whole page animating     104 / 136-153 / 230-259ms  ->  43-55 / 68 / 72-74ms
+//     320x200 corner animation  98 / 202 / 253ms          ->  41-46 / 47-50 / 51-64ms
+function paintRate(windows) {
+  if (!adaptiveFrameRate || !windows.settledPainting) return windows.activeFrameRate;
+  if (!paintsAhead(settings.get("frame_rate.typing_paint"), windows.lastKeyAt || 0, Date.now())) {
+    return windows.activeFrameRate;
+  }
+  return Math.max(windows.activeFrameRate, windows.maxFrameRate);
+}
+
+function applyPaintRate(windows, record) {
+  if (!windows.win || windows.win.isDestroyed() || !(record.visible || inputState().floating)) return;
+  const rate = paintRate(windows);
+  if (windows.appliedPaintRate === rate) return;
+  windows.appliedPaintRate = rate;
+  windows.win.webContents.setFrameRate(rate);
+}
+
+// A key typed into a page that paints on its own: the page starts painting ahead (`paintRate`),
+// and for `KEY_ECHO_MS` frames are sent at the maximum rate too, so the paint that carries the
+// key does not wait for the next playback-tier send. A frame already waiting is moved up to the
+// faster interval. Only a key: see `KEY_ECHO_MS`.
+function boostKeyEcho(windows = currentWindows(), record = currentPane()) {
+  windows.lastKeyAt = Date.now();
+  if (!adaptiveFrameRate || !windows.settledPainting) return;
+  applyPaintRate(windows, record);
+  if (windows.paintAheadTimer) clearTimeout(windows.paintAheadTimer);
+  windows.paintAheadTimer = setTimeout(() => withPaneScope(record, () => {
+    windows.paintAheadTimer = null;
+    applyPaintRate(windows, record);
+  }), TYPING_PAINT_MS + 10);
+  windows.keyEchoUntil = Date.now() + KEY_ECHO_MS;
+  const frames = currentFrames();
+  if (frames.pendingFrameTimer) {
+    clearTimeout(frames.pendingFrameTimer);
+    const elapsed = Date.now() - frames.lastFrameSentAt;
+    frames.pendingFrameTimer = setTimeout(flushPendingFrame, Math.max(0, sendIntervalMs(windows) - elapsed));
+  }
+}
+
+// The interval whole frames are paced to: the pane's tier, or the maximum while a key is echoing.
+function sendIntervalMs(windows = currentWindows()) {
+  if ((windows.keyEchoUntil || 0) > Date.now()) return Math.ceil(1000 / windows.maxFrameRate);
+  return windows.frameIntervalMs;
 }
 
 // Where the rate lands once the active window expires: the playback rate while the page is
@@ -2719,7 +2781,7 @@ function queueFrame(tab, image, immediate = false, dirty = null) {
   currentFrames().pendingFrame = { tab, image, generation, queuedAt: frameProbeMark() };
   if (currentFrames().pendingFrameTimer) return;
   const elapsed = Date.now() - currentFrames().lastFrameSentAt;
-  const delay = immediate ? 0 : Math.max(0, currentWindows().frameIntervalMs - elapsed);
+  const delay = immediate ? 0 : Math.max(0, sendIntervalMs() - elapsed);
   currentFrames().pendingFrameTimer = setTimeout(flushPendingFrame, delay);
 }
 
@@ -3260,7 +3322,9 @@ function updatePaintingState() {
     }) : paneSize;
     const plan = surfacePlan(isActiveTab(tab), currentPane().visible, logical, held, floating, keepsSizeInStandby(tab));
     tab.webContents.setBackgroundThrottling(plan.backgroundThrottling);
-    tab.webContents.setFrameRate(plan.painting ? currentWindows().activeFrameRate : 1);
+    const tabRate = plan.painting ? paintRate(currentWindows()) : 1;
+    tab.webContents.setFrameRate(tabRate);
+    if (tab === currentWindows().win) currentWindows().appliedPaintRate = tabRate;
     // A floating tab's audio should keep playing — the display window's viewer draws
     // frames on a canvas, but the page's audio comes from the same webContents,
     // and the user expects to hear it while watching the floating window. Do not
@@ -11462,6 +11526,7 @@ function handleTargetedCommand(command, target) {
     reconcileDestroyedTabs();
     inputTrace.mark("in", { hex: command.hex });
     markInteractionActivity();
+    if (isKeyboardInput(command.hex)) boostKeyEcho();
     const input = inputState();
     if (input.flushTimer) {
       clearTimeout(input.flushTimer);

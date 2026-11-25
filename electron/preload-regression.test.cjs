@@ -3472,3 +3472,13 @@ test("status reports whether each tab is loading, and status stays a passive cal
   const presence = fs.readFileSync(path.join(__dirname, "agent-presence.cjs"), "utf8");
   assert.match(presence, /PASSIVE_METHODS = new Set\(\["status",/);
 });
+
+// A key on a playing page: Chromium paints ahead of the send rate while someone types, and the
+// key's own frames go at the maximum for a moment. Both halves were measured to be needed
+// (bench/keyvis.py); losing either brings back the 100-250ms echo.
+test("terminal keys lift the paint rate and the send interval, mouse and focus do not", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  assert.match(main, /inputTrace\.mark\("in", \{ hex: command\.hex \}\);\s*markInteractionActivity\(\);\s*if \(isKeyboardInput\(command\.hex\)\) boostKeyEcho\(\);/);
+  assert.match(main, /const delay = immediate \? 0 : Math\.max\(0, sendIntervalMs\(\) - elapsed\);/);
+  assert.match(main, /setFrameRate\(windows\.appliedPaintRate\)/);
+});
