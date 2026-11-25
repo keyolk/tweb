@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>spa video</title>
+<style>html,body{margin:0;background:#111;color:#eee;font:16px sans-serif}video{display:block;width:640px}</style>
+<!-- A single-page site in miniature: "next" moves to another page with pushState and keeps the
+     same <video> in the document, as YouTube does between a video and its home page. -->
+<video src="media/testsrc.webm" autoplay muted loop playsinline></video>
+<p id="where"></p>
+<script>
+  const where = document.getElementById("where");
+  const show = () => { where.textContent = location.search || "(first page)"; };
+  window.goPage = (q) => { history.pushState(null, "", location.pathname + q); show(); };
+  window.goHash = (h) => { location.hash = h; show(); };
+  show();
+</script>

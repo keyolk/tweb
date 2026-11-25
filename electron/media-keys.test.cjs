@@ -45,9 +45,11 @@ function fakeMedia(overrides = {}) {
 function harness() {
   const sent = [];
   const modes = [];
-  const api = new Function("sent", "modes", `
+  const location = { href: "https://www.youtube.com/watch?v=one" };
+  const api = new Function("sent", "modes", "location", `
     let mediaTarget = null;
     let mediaTargetWatch = null;
+    let mediaHeldPage = null;
     const document = { documentElement: { dataset: { twebMode: "media" } } };
     const isTag = (element, ...names) => names.includes(element?.localName);
     const visibleRect = () => ({ left: 0, top: 0, right: 640, bottom: 360, width: 640, height: 360 });
@@ -65,8 +67,8 @@ function harness() {
       held: () => mediaTarget,
       status: (media) => mediaStatus(media),
     };
-  `)(sent, modes);
-  return { ...api, sent, modes };
+  `)(sent, modes, location);
+  return { ...api, sent, modes, location };
 }
 
 test("with nothing held the media keys go on to the page", () => {
@@ -148,6 +150,38 @@ test("a held element removed from the page releases itself", () => {
   media.isConnected = false;
   assert.equal(h.key("k").handled, false);
   assert.equal(h.held(), null);
+});
+
+test("moving to another page lets the held media go, though the element stays in the page", () => {
+  // YouTube: a video page to the home page, or to the next video, is pushState with the same <video>.
+  for (const next of ["https://www.youtube.com/", "https://www.youtube.com/watch?v=two"]) {
+    const h = harness();
+    const media = fakeMedia();
+    h.hold(media);
+    h.location.href = next;
+    assert.equal(h.key("k").handled, false, `${next}: k is the page's again`);
+    assert.equal(media.volume, 0.5, "and does not change the old player's volume");
+    assert.equal(h.held(), null);
+    assert.equal(media.listeners.size, 0, "its listeners go with it");
+  }
+});
+
+test("a hash change is the same page, and the media stays held", () => {
+  const h = harness();
+  const media = fakeMedia();
+  h.hold(media);
+  h.location.href += "#chapter-2";
+  assert.equal(h.key("k").handled, true);
+  assert.equal(h.held(), media);
+});
+
+test("a same-document navigation tells the top frame at once", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
+  const inPage = main.slice(main.indexOf('onContents("did-navigate-in-page"'));
+  assert.match(inPage.slice(0, inPage.indexOf("});")), /sendToMainTabFrame\(tab, "tweb-page-changed", url\)/);
+  const listener = slice('ipcRenderer.on("tweb-page-changed"', 'ipcRenderer.on("tweb-audio-state"');
+  assert.match(listener, /if \(!mediaSurface\(\) && showing\) normalMode\(\);/,
+    "the indicator is redrawn only when it was showing the media, not over a hint round");
 });
 
 test("the indicator reads volume, speed and position", () => {

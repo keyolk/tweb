@@ -115,6 +115,9 @@ installPrintShim();
   // (`handleMediaKey`) act on it, and Esc lets it go. See `holdMedia`.
   let mediaTarget = null;
   let mediaTargetWatch = null;
+  // The page the media was held on (`heldPage`). A single-page site keeps its <video> in the
+  // document when it moves to another page, so being connected is not enough to stay held.
+  let mediaHeldPage = null;
   let tabListRefresh = false;
   let pendingG = false;
   // The `y` copy menu while it is open (startCopyMenu).
@@ -2451,6 +2454,7 @@ installPrintShim();
   function holdMedia(item) {
     releaseMedia(false);
     mediaTarget = item.element;
+    mediaHeldPage = heldPage();
     const refresh = () => {
       if (mediaTarget && document.documentElement?.dataset.twebMode === "media") normalMode();
     };
@@ -2481,6 +2485,7 @@ installPrintShim();
     const watch = mediaTargetWatch;
     mediaTargetWatch = null;
     mediaTarget = null;
+    mediaHeldPage = null;
     if (watch) {
       for (const type of watch.events) watch.element.removeEventListener(type, watch.refresh);
       watch.element.removeEventListener("timeupdate", watch.tick);
@@ -2488,8 +2493,18 @@ installPrintShim();
     if (restoreMode) normalMode();
   }
 
+  // The page as far as holding media is concerned: the URL without its fragment. A hash change
+  // (a chapter link, a tab inside the page) is the same page; a new path or query is another one.
+  function heldPage() {
+    return String(location.href).split("#")[0];
+  }
+
+  // The held element, or null once it is gone from the page or the page itself has changed.
+  // YouTube moves from a video to its home page or to the next video with pushState and keeps
+  // the same <video> connected (playing in the miniplayer, or hidden), so the indicator and the
+  // media keys stayed on a player the person had navigated away from.
   function mediaSurface() {
-    if (mediaTarget?.isConnected) return mediaTarget;
+    if (mediaTarget?.isConnected && heldPage() === mediaHeldPage) return mediaTarget;
     if (mediaTarget) releaseMedia(false);
     return null;
   }
@@ -7604,6 +7619,14 @@ installPrintShim();
     if (topFrame) renderIndicator();
   });
 
+  // A same-document navigation (pushState, popstate) in the top frame. The held media is let go
+  // by `mediaSurface` on the next key or the element's next event either way; this makes the
+  // indicator go at the moment the page changes, even with the video paused and nothing firing.
+  ipcRenderer.on("tweb-page-changed", () => {
+    if (!mediaTarget) return;
+    const showing = document.documentElement?.dataset.twebMode === "media";
+    if (!mediaSurface() && showing) normalMode();
+  });
   ipcRenderer.on("tweb-audio-state", (_event, state) => {
     audioState = { muted: Boolean(state?.muted), owner: state?.owner || null };
     renderIndicator();
