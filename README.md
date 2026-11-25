@@ -213,6 +213,7 @@ tweb config edit                     # $EDITOR; a new file lists every setting c
 | `zoom.default` | `0.8` | next new tab |
 | `frame_rate.max` | `30` | next `tweb open` |
 | `frame_rate.adaptive` | `true` | next `tweb open` |
+| `frame_rate.typing_paint` | `typing` (`always`, `off`) | live |
 | `memory.renderer_limit_mb` | `1536` (0 turns it off) | live |
 | `page.transparent` | `false` | next new tab |
 | `downloads.dir` | system Downloads | next engine start |
@@ -612,6 +613,11 @@ on a busy machine that delayed input in other tmux panes (see `electron/frame-ra
 frames travel as raw pixels through shared memory on a local Ghostty (a file otherwise), leaving only a
 small Kitty graphics command on the tmux/Ghostty stream, and when the writer falls behind, intermediate
 frames are dropped and only the latest is kept.
+A key typed into a page that plays does not wait for the playback rate. While someone types (3s after
+each key), Chromium paints at the full rate and frames are still sent at the playback rate, and each key's
+own frames go at the full rate for 200ms; at 2880x1800 that took a key's echo beside an animation from
+p50 ~100ms / max ~250ms to ~45ms / ~80ms (`bench/keyvis.py`). It costs browser CPU only while typing;
+`frame_rate.typing_paint = "always"` keeps it on, `"off"` turns it off.
 `--no-adaptive-frame-rate` pins the given value, holding it even on a still page;
 `--adaptive-frame-rate` states the default policy explicitly. `tweb diag` reports which tier is
 in force as `frames.rateKind`.

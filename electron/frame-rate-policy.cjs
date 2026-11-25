@@ -290,6 +290,63 @@ function interactionRate(painting, tiers) {
 }
 
 /**
+ * How long a key lifts the playback cap.
+ *
+ * The playback tier holds a large pane at 8-17fps, and on a page that paints on its own that is
+ * also how often Chromium paints: a key typed into a form beside a spinner or a video waited for
+ * the next paint at that rate and then for the next paced whole frame. Measured with
+ * bench/keyvis.py at 2880x1800 (the pixels that show the key, not the next frame): 13ms p50 on a
+ * still page, which echoes through a patch, against 98ms p50 / 202ms p90 / 253ms max with a
+ * 320x200 animation in a corner, and 104 / 142 / 234ms with the whole page animating.
+ *
+ * So a key, and only a key, raises the pane to its maximum for this long. Long enough for the
+ * paint that carries the key (one frame at 30fps, plus the renderer's own turn) to be sent at the
+ * faster interval; short enough that typing is the only thing that pays for it. A hover or a
+ * loading page still gets the capped rate (`interactionRate`), which is what that cap is for.
+ */
+const KEY_ECHO_MS = 200;
+
+/**
+ * How long after a key the page keeps painting ahead of the send rate (`frame_rate.typing_paint`).
+ *
+ * Painting at the full rate while frames are sent at the playback rate is what makes a typed key
+ * show at once on a playing page (see `paintRate` in main.cjs), and it is paid in browser CPU:
+ * 2880x1800, a full-page animation, 40s, two runs each: 15.6-17.5% painting at the send rate,
+ * 27.8-28.7% painting at 30fps. So by default it lasts while someone is typing. The first key of a
+ * burst still waits for Chromium's next tick at the slower rate; the keys after it do not.
+ */
+const TYPING_PAINT_MS = 3000;
+
+/**
+ * Whether a playing page should be painting at the full rate now.
+ *
+ * @param {string} mode `frame_rate.typing_paint`: "typing", "always" or "off"
+ * @param {number} lastKeyAt when the last key arrived, ms (Date.now), 0 for never
+ * @param {number} now ms
+ */
+function paintsAhead(mode, lastKeyAt, now) {
+  if (mode === "off") return false;
+  if (mode === "always") return true;
+  return lastKeyAt > 0 && now - lastKeyAt < TYPING_PAINT_MS;
+}
+
+/**
+ * Whether a chunk of terminal input is the person typing, as against a mouse report or a focus
+ * change, which arrive on the same stream and must not lift the cap (`interactionRate`).
+ *
+ * @param {string} hex the input bytes as hex, as the pane hands them over
+ */
+function isKeyboardInput(hex) {
+  const bytes = String(hex || "").toLowerCase();
+  if (!bytes) return false;
+  // SGR (ESC [ <) and X10 (ESC [ M) mouse reports.
+  if (bytes.startsWith("1b5b3c") || bytes.startsWith("1b5b4d")) return false;
+  // Focus in / out (ESC [ I, ESC [ O).
+  if (bytes === "1b5b49" || bytes === "1b5b4f") return false;
+  return true;
+}
+
+/**
  * How long to wait before judging again.
  *
  * Long enough that a page painting at the *idle* rate still clears the threshold — at 4fps
@@ -314,6 +371,10 @@ function settledFrameRate(paints, tiers) {
 }
 
 module.exports = {
+  KEY_ECHO_MS,
+  TYPING_PAINT_MS,
+  paintsAhead,
+  isKeyboardInput,
   remoteFrameRateTiers, nextWireEstimate, REMOTE_BYTE_BUDGET, REMOTE_MIN_RATE,
   playbackHeadroom, HEADROOM_MIN_SENT,
   frameRateTiers, floatingFrameRateTiers, playbackWindowMs, settledFrameRate, playbackRateForArea,

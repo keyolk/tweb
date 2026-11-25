@@ -53,6 +53,14 @@
       "description": "Drop to a low idle rate when nothing moves. `--no-adaptive-frame-rate` overrides it."
     },
     {
+      "key": "frame_rate.typing_paint",
+      "type": "string",
+      "default": "typing",
+      "env": "TWEB_TYPING_PAINT",
+      "applies": "live",
+      "description": "On a page that paints on its own (a video, an animation), when Chromium paints at the full rate so a typed key shows at once: typing (for a few seconds after each key), always, or off (at the slower playback rate; a key then shows up to ~250ms late on a large pane). Frames sent to the terminal stay at the playback rate either way; painting faster costs the browser CPU."
+    },
+    {
       "key": "memory.renderer_limit_mb",
       "type": "int",
       "default": 1536,

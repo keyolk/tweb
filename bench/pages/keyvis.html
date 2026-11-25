@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>keyvis</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #202020; color: #ddd; font: 16px monospace; }
+  #field { position: fixed; left: 40px; top: 20px; width: 600px; font: 20px monospace; }
+  /* bench/keyvis.py samples the centre of this block: each key turns it the next colour. */
+  #marker { position: fixed; left: 40px; top: 120px; width: 120px; height: 60px; background: #000; }
+  #busy { position: fixed; display: none; }
+  body.busy-corner #busy { display: block; right: 40px; bottom: 40px; width: 320px; height: 200px; }
+  body.busy-full #busy { display: block; left: 0; top: 0; width: 100%; height: 100%; z-index: -1; }
+  #page { height: 6000px; background: repeating-linear-gradient(#202020 0 40px, #262626 40px 80px); }
+</style></head>
+<body>
+<input id="field" autofocus autocomplete="off">
+<div id="marker"></div>
+<canvas id="busy"></canvas>
+<div id="page"></div>
+<script>
+  // ?busy=corner: a small animation in a corner, as a spinner or a playing video beside a form.
+  // ?busy=full: the whole page animates behind the form.
+  const busy = new URLSearchParams(location.search).get("busy");
+  if (busy) document.body.classList.add("busy-" + busy);
+  const COLOURS = ["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#ff00ff", "#00ffff"];
+  let count = 0;
+  const marker = document.getElementById("marker");
+  addEventListener("keydown", (event) => {
+    if (event.key.length !== 1) return;
+    marker.style.background = COLOURS[count % COLOURS.length];
+    count += 1;
+  }, true);
+  const canvas = document.getElementById("busy");
+  const context = canvas.getContext("2d");
+  function tick(now) {
+    if (busy) {
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+      context.fillStyle = `hsl(${(now / 4) % 360}, 60%, 35%)`;
+      context.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>
+</body></html>

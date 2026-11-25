@@ -329,3 +329,23 @@ test("the wire estimate starts at the first frame and moves halfway toward each 
   assert.equal(nextWireEstimate(2000, 0), 2000);
   assert.equal(nextWireEstimate(null, undefined), null);
 });
+
+test("only typing counts as a key: mouse reports and focus changes do not lift the cap", () => {
+  const { isKeyboardInput } = require("./frame-rate-policy.cjs");
+  for (const hex of ["61", "1b", "0d", "1b5b41", "e38184", "1b5b3230307e6869"]) {
+    assert.equal(isKeyboardInput(hex), true, hex);
+  }
+  for (const hex of ["", "1b5b3c303b31303b3230", "1b5b4d202020", "1b5b49", "1b5b4f"]) {
+    assert.equal(isKeyboardInput(hex), false, hex);
+  }
+});
+
+test("a playing page paints ahead while someone types, always, or never", () => {
+  const { paintsAhead, TYPING_PAINT_MS } = require("./frame-rate-policy.cjs");
+  const now = 1_000_000;
+  assert.equal(paintsAhead("typing", 0, now), false, "no key yet");
+  assert.equal(paintsAhead("typing", now - 10, now), true);
+  assert.equal(paintsAhead("typing", now - TYPING_PAINT_MS, now), false, "the window has passed");
+  assert.equal(paintsAhead("always", 0, now), true);
+  assert.equal(paintsAhead("off", now, now), false);
+});
