@@ -41,10 +41,11 @@ make install PREFIX=/usr/local
 make uninstall
 ```
 
-Prebuilt macOS binaries (arm64, amd64) are attached to each `v*` release as
-`tweb_<version>_darwin_<arch>.tar.gz` with a `checksums.txt`; the archive holds `tweb`, `twebd`,
-`tweb-webkit` and `tweb-native-input`, which go side by side on `PATH` (`tweb` finds its helpers
-beside itself). Pushing a `v*` tag that matches the workspace version runs `.github/workflows/release.yml`.
+Prebuilt binaries are attached to each `v*` release with a `checksums.txt`, for macOS and Linux on
+arm64 and amd64. `tweb_<version>_darwin_<arch>.tar.gz` holds `tweb`, `twebd`, `tweb-webkit` and
+`tweb-native-input`; `tweb_<version>_linux_<arch>.tar.gz` holds `tweb` and `twebd` (built on Ubuntu
+22.04, glibc 2.35 or newer; the WebKit host and the pointer helper are macOS-only). The binaries go
+side by side on `PATH` (`tweb` finds its helpers beside itself). Pushing a `v*` tag that matches the workspace version runs `.github/workflows/release.yml`.
 
 Only the binary gets installed. The Electron app code (`main.cjs`, `preload.cjs` and friends, 198KB)
 is embedded in the binary and unpacked into `~/.cache/tweb/app-<hash>` on first run. The directory

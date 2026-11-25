@@ -1,6 +1,6 @@
 name: release
 
-# Prebuilt macOS binaries for `tweb` and its helpers.
+# Prebuilt macOS and Linux binaries for `tweb` and its helpers.
 #
 # Every merge to main publishes the next patch release (latest v* tag + 1), so
 # what `cc-mods-tools update` installs is never older than main. Push a v* tag
@@ -8,7 +8,8 @@ name: release
 # merges do not release.
 #
 # Asset contract (cc-mods installs from it; keep the names stable):
-#   tweb_<version>_darwin_<arm64|amd64>.tar.gz  binaries at the archive root
+#   tweb_<version>_darwin_<arm64|amd64>.tar.gz  tweb twebd tweb-webkit tweb-native-input, at the root
+#   tweb_<version>_linux_<arm64|amd64>.tar.gz   tweb twebd, at the root (glibc <= 2.35)
 #   checksums.txt                                sha256sum format over every archive
 #
 # workflow_dispatch and pull_request build the same archives and keep them as run artifacts;
@@ -88,12 +89,33 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
+            os: darwin
             arch: arm64
+            runner: macos-14
+            bins: tweb twebd tweb-webkit tweb-native-input
           # Cross-built on the arm64 runner: the Intel macOS runners are being retired, and
           # every crate here builds for either Apple target from the same SDK.
           - target: x86_64-apple-darwin
+            os: darwin
             arch: amd64
-    runs-on: macos-14
+            runner: macos-14
+            bins: tweb twebd tweb-webkit tweb-native-input
+          # Linux builds natively on Ubuntu 22.04 runners, so the binaries need no glibc newer
+          # than 2.35 and the frame addon embedded in `tweb` is built for the target it ships on.
+          # Only `tweb` and `twebd` ship: `tweb-webkit` (WKWebView) and `tweb-native-input`
+          # (AppKit event monitors) are macOS-only and compile to stubs that just exit here.
+          # Electron itself is not in the archive; `tweb` fetches the linux zip on first run.
+          - target: aarch64-unknown-linux-gnu
+            os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            bins: tweb twebd
+          - target: x86_64-unknown-linux-gnu
+            os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            bins: tweb twebd
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,13 +126,23 @@ jobs:
         # The release version comes from the tag, not from Cargo.toml (merges
         # release without a bump), so write it in before building; otherwise
         # `tweb --version` would report the stale workspace version.
+        # `-i.bak` rather than `-i ''`: one spelling that both BSD and GNU sed accept.
         run: |
-          sed -i '' '/^\[workspace.package\]/,/^\[/s/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+          sed -i.bak '/^\[workspace.package\]/,/^\[/s/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+          rm Cargo.toml.bak
           cargo update --workspace --offline 2>/dev/null || cargo update --workspace
           grep -A1 '^\[workspace.package\]' Cargo.toml
 
       - name: Rust toolchain
-        run: rustup target add ${{ matrix.target }}
+        shell: bash
+        # The arm64 Ubuntu image is not guaranteed to carry rustup; install it when missing.
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup target add ${{ matrix.target }}
 
       - uses: actions/cache@v4
         with:
@@ -122,30 +154,57 @@ jobs:
           restore-keys: release-${{ matrix.target }}-
 
       - name: Build
-        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          pkgs=""
+          for bin in ${{ matrix.bins }}; do
+            case "$bin" in
+              tweb) pkgs="$pkgs -p tweb-cli" ;;
+              twebd) pkgs="$pkgs -p twebd" ;;
+              tweb-webkit) pkgs="$pkgs -p tweb-engine-webkit" ;;
+              tweb-native-input) pkgs="$pkgs -p tweb-native-input" ;;
+            esac
+          done
+          cargo build --release --locked --target ${{ matrix.target }} $pkgs
 
       - name: Package
         id: package
         shell: bash
         run: |
-          name="tweb_${{ needs.version.outputs.version }}_darwin_${{ matrix.arch }}"
+          name="tweb_${{ needs.version.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}"
           src="target/${{ matrix.target }}/release"
           mkdir -p "dist/$name"
-          for bin in tweb twebd tweb-webkit tweb-native-input; do
+          for bin in ${{ matrix.bins }}; do
             install -m 0755 "$src/$bin" "dist/$name/$bin"
             # Ad-hoc signature: an unsigned arm64 Mach-O is killed at exec.
-            codesign -f -s - "dist/$name/$bin"
+            if [ "${{ matrix.os }}" = darwin ]; then codesign -f -s - "dist/$name/$bin"; fi
           done
-          tar -C "dist/$name" -czf "dist/$name.tar.gz" tweb twebd tweb-webkit tweb-native-input
+          tar -C "dist/$name" -czf "dist/$name.tar.gz" ${{ matrix.bins }}
+          echo "dir=dist/$name" >> "$GITHUB_OUTPUT"
           echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
+      # Every runner but the Intel macOS cross build runs what it built.
       - name: Smoke test
-        if: matrix.arch == 'arm64'
-        run: dist/tweb_*_darwin_arm64/tweb --version
+        if: matrix.os == 'linux' || matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          ${{ steps.package.outputs.dir }}/tweb --version
+          ${{ steps.package.outputs.dir }}/twebd --help >/dev/null
+
+      - name: glibc floor
+        if: matrix.os == 'linux'
+        shell: bash
+        # The release has to run on Ubuntu 22.04 (glibc 2.35); fail if anything links newer.
+        run: |
+          for bin in ${{ matrix.bins }}; do
+            max=$(objdump -T "${{ steps.package.outputs.dir }}/$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+            echo "$bin needs $max"
+            [ "$(printf '%s\n%s\n' "${max#GLIBC_}" 2.35 | sort -V | tail -1)" = 2.35 ]
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.arch }}
+          name: ${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
