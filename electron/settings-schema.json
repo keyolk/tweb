@@ -147,6 +147,13 @@
       "default": [],
       "applies": "live",
       "description": "Your own normal-mode keys. \"NEW=OLD\" makes NEW do what OLD does (the single keys `?` lists) and OLD keeps working; \"-KEY\" leaves KEY to the page. Single printable keys only: chords (gg, zi), Esc and Ctrl/Alt/Cmd keys stay as they are. `?` lists your remaps first."
+    },
+    {
+      "key": "agent.cdp",
+      "type": "bool",
+      "default": true,
+      "applies": "engine",
+      "description": "Open a Chrome DevTools Protocol port on 127.0.0.1 in the Electron engine, so `tweb action` can drive a tab with agent-browser. Web pages cannot reach it; local processes of your user can, as with the Chrome engine's port."
     }
   ]
 }
